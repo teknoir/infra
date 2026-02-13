@@ -1,0 +1,38 @@
+apiVersion: v1
+entries:
+  infra:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-02-13T07:23:41.538295993Z"
+    dependencies:
+    - alias: istio-base
+      name: base
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    - alias: istiod
+      name: istiod
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    - alias: istio-ingressgateway
+      name: gateway
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    - alias: istio-egressgateway
+      name: gateway
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    - name: cert-manager
+      repository: https://charts.jetstack.io
+      version: '>=1.14.0 <2.0.0'
+    - alias: istio-csr
+      name: cert-manager-istio-csr
+      repository: https://charts.jetstack.io
+      version: '>=0.6.0 <1.0.0'
+    description: Infra Helm chart
+    digest: 96f25f376e2e66ba3fa59156885131a94f380ded92054dddbc7b1b95c6c868ce
+    name: infra
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/infra-0.1.1/infra-0.1.1.tgz
+    version: 0.1.1
+generated: "2026-02-13T07:23:41.538304637Z"
