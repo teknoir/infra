@@ -6,7 +6,7 @@ keycloak:
   fullnameOverride: keycloak
   service:
     port: 8080
-  extraEnv: []
+  extraEnv: ""
   admin:
     username: admin
     password: change-me
