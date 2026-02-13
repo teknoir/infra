@@ -1,0 +1,13 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: infra
+  namespace: istio-system
+spec:
+  repo: https://teknoir.github.io/infra
+  chart: infra
+  targetNamespace: istio-system
+  valuesContent: |-
+    # Example for minimal configuration
+    #test: nonsense

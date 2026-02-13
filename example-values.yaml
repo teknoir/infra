@@ -1,0 +1,4 @@
+# No overrides should be needed for this example, but you can add any overrides here if you want to test them out.
+# Test command:
+# helm dependency build charts/infra
+# helm -n istio-system template infra charts/infra --values example-values.yaml --debug --dry-run=client | yq

@@ -1,0 +1,35 @@
+# Default values for infra.
+istioNamespace: istio-system
+
+istio-base: {}
+
+istiod:
+  global:
+    istioNamespace: istio-system
+
+istio-ingressgateway:
+  name: istio-ingressgateway
+  labels:
+    istio: ingressgateway
+  service:
+    type: LoadBalancer
+
+istio-egressgateway:
+  name: istio-egressgateway
+  labels:
+    istio: egressgateway
+  service:
+    type: ClusterIP
+
+cert-manager:
+  installCRDs: true
+
+istio-csr:
+  app:
+    certmanager:
+      issuer:
+        name: istio-ca
+        kind: Issuer
+        group: cert-manager.io
+    istio:
+      namespace: istio-system

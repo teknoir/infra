@@ -1,0 +1,32 @@
+{{- $ns := .Values.istioNamespace | default .Release.Namespace -}}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: istio-selfsigned
+  namespace: {{ $ns }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: istio-ca
+  namespace: {{ $ns }}
+spec:
+  isCA: true
+  commonName: istio-ca
+  secretName: istio-ca
+  duration: 8760h
+  renewBefore: 720h
+  issuerRef:
+    name: istio-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: istio-ca
+  namespace: {{ $ns }}
+spec:
+  ca:
+    secretName: istio-ca
