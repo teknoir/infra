@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ID="teknoir"
 SERVICE_ACCOUNT="teknoir-admin@teknoir.iam.gserviceaccount.com"
-NAMESPACE="istio-system"
+NAMESPACE="cert-manager"
 SECRET_NAME="clouddns-dns01"
 KEY_NAME="key.json"
 MANIFEST_FILE="manifest-clouddns-secret.yaml"

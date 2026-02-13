@@ -14,5 +14,8 @@ helm -n istio-system template infra-stage-1 charts/infra-stage-1 --values exampl
 helm dependency build charts/infra-stage-2
 helm -n istio-system template infra-stage-2 charts/infra-stage-2 --values example-values.yaml --debug --dry-run=client | yq
 
+helm dependency build charts/infra-stage-2b
+helm -n istio-system template infra-stage-2 charts/infra-stage-2b --values example-values.yaml --debug --dry-run=client | yq
+
 helm dependency build charts/infra-stage-3
 helm -n istio-system template infra-stage-3 charts/infra-stage-3 --values example-values.yaml --debug --dry-run=client | yq
