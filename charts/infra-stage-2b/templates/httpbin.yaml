@@ -45,7 +45,7 @@ spec:
   - {{ . | quote }}
 {{- end }}
   gateways:
-    - {{ .Values.gateway.namespace }}/{{ .Values.gateway.name }}
+    - {{ .Values.gw.namespace }}/{{ .Values.gw.name }}
   http:
     - route:
         - destination:
