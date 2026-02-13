@@ -4,6 +4,9 @@ istioNamespace: istio-system
 istiod:
   global:
     istioNamespace: istio-system
+  pilot:
+    env:
+      ENABLE_NATIVE_SIDECARS: "true"
 
 istio-ingressgateway:
   name: istio-ingressgateway

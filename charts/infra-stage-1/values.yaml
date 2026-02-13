@@ -2,7 +2,3 @@
 istioNamespace: istio-system
 
 istio-base: {}
-
-cert-manager:
-  crds:
-    enabled: true

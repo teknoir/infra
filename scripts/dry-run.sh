@@ -5,6 +5,9 @@ helm repo add istio https://istio-release.storage.googleapis.com/charts >/dev/nu
 helm repo add jetstack https://charts.jetstack.io >/dev/null 2>&1 || true
 helm repo update
 
+helm dependency build charts/infra-stage-0
+helm -n cert-manager template infra-stage-0 charts/infra-stage-0 --values example-values.yaml --debug --dry-run=client | yq
+
 helm dependency build charts/infra-stage-1
 helm -n istio-system template infra-stage-1 charts/infra-stage-1 --values example-values.yaml --debug --dry-run=client | yq
 

@@ -1,0 +1,4 @@
+# Default values for infra-stage-0.
+cert-manager:
+  crds:
+    enabled: true

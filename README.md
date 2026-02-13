@@ -36,6 +36,9 @@ spec:
 Install in order to avoid CRD race conditions:
 
 ```sh
+helm dependency build charts/infra-stage-0
+helm upgrade --install infra-stage-0 charts/infra-stage-0 -n cert-manager --create-namespace
+
 helm dependency build charts/infra-stage-1
 helm upgrade --install infra-stage-1 charts/infra-stage-1 -n istio-system --create-namespace
 
@@ -49,7 +52,8 @@ helm upgrade --install infra-stage-3 charts/infra-stage-3 -n istio-system
 ## Layout
 
 - `charts/infra`: umbrella chart and values
-- `charts/infra-stage-1`: namespace, cert-manager, and Istio CRDs
+- `charts/infra-stage-0`: cert-manager (cert-manager namespace)
+- `charts/infra-stage-1`: istio-system namespace and Istio CRDs
 - `charts/infra-stage-2`: Istio control plane and gateways
 - `charts/infra-stage-3`: cert-manager Istio CSR integration
 - `example-values.yaml`: optional overrides for dry runs
