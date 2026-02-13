@@ -1,3 +1,4 @@
 .idea
 Chart.lock
 /*/**/charts/
+manifest-clouddns-secret.yaml

@@ -10,3 +10,19 @@ istio-csr:
         group: cert-manager.io
     istio:
       namespace: istio-system
+
+letsencrypt:
+  enabled: true
+  email: admin@teknoir.online
+  server: https://acme-v02.api.letsencrypt.org/directory
+  cloudDNS:
+    project: "teknoir"
+    serviceAccountSecretRef:
+      name: "clouddns-dns01"
+      key: key.json
+  certificate:
+    commonName: "*.teknoir.online"
+    dnsNames:
+      - "*.teknoir.online"
+      - "teknoir.online"
+    secretName: teknoir-online-wildcard-tls
