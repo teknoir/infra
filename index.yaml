@@ -38,6 +38,20 @@ entries:
   infra-stage-0:
   - apiVersion: v2
     appVersion: 0.1.0
+    created: "2026-02-13T10:02:31.529083686Z"
+    dependencies:
+    - name: cert-manager
+      repository: https://charts.jetstack.io
+      version: '>=1.14.0 <2.0.0'
+    description: Infra stage 0 - cert-manager only
+    digest: 11c62876332ebb2fac87278d01222c8c92d2b9a61b3e6b788a126d9e05b0bc57
+    name: infra-stage-0
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/infra-stage-0-0.1.3/infra-stage-0-0.1.3.tgz
+    version: 0.1.3
+  - apiVersion: v2
+    appVersion: 0.1.0
     created: "2026-02-13T08:40:09.550133423Z"
     dependencies:
     - name: cert-manager
@@ -51,6 +65,21 @@ entries:
     - https://github.com/teknoir/infra/releases/download/infra-stage-0-0.1.2/infra-stage-0-0.1.2.tgz
     version: 0.1.2
   infra-stage-1:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-02-13T10:02:31.707955194Z"
+    dependencies:
+    - alias: istio-base
+      name: base
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    description: Infra stage 1 - namespaces, cert-manager, and Istio CRDs
+    digest: 6de3b2380541d9a9b0abe63b1eac376cfff77fc0f5db6e6b25d0577545d6c709
+    name: infra-stage-1
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/infra-stage-1-0.1.3/infra-stage-1-0.1.3.tgz
+    version: 0.1.3
   - apiVersion: v2
     appVersion: 0.1.0
     created: "2026-02-13T08:40:09.738561383Z"
@@ -103,6 +132,29 @@ entries:
     - https://github.com/teknoir/infra/releases/download/infra-stage-1-0.1.0/infra-stage-1-0.1.0.tgz
     version: 0.1.0
   infra-stage-2:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-02-13T10:02:31.885017671Z"
+    dependencies:
+    - alias: istiod
+      name: istiod
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    - alias: istio-ingressgateway
+      name: gateway
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    - alias: istio-egressgateway
+      name: gateway
+      repository: https://istio-release.storage.googleapis.com/charts
+      version: '>=1.20.0 <2.0.0'
+    description: Infra stage 2 - Istio control plane and gateways
+    digest: ebee6939838d4dd72137c06175c680df1939840744c0d562e35893c5b007d56b
+    name: infra-stage-2
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/infra-stage-2-0.1.3/infra-stage-2-0.1.3.tgz
+    version: 0.1.3
   - apiVersion: v2
     appVersion: 0.1.0
     created: "2026-02-13T08:40:09.96752571Z"
@@ -175,6 +227,21 @@ entries:
   infra-stage-3:
   - apiVersion: v2
     appVersion: 0.1.0
+    created: "2026-02-13T10:02:32.067778772Z"
+    dependencies:
+    - alias: istio-csr
+      name: cert-manager-istio-csr
+      repository: https://charts.jetstack.io
+      version: '>=0.6.0 <1.0.0'
+    description: Infra stage 3 - cert-manager Istio CSR integration
+    digest: 580a0ac53af498cfc15ae305cf160a363d84552da8bc5ebc2a3df3d46a84f2a4
+    name: infra-stage-3
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/infra-stage-3-0.1.3/infra-stage-3-0.1.3.tgz
+    version: 0.1.3
+  - apiVersion: v2
+    appVersion: 0.1.0
     created: "2026-02-13T08:40:10.18921909Z"
     dependencies:
     - alias: istio-csr
@@ -218,4 +285,4 @@ entries:
     urls:
     - https://github.com/teknoir/infra/releases/download/infra-stage-3-0.1.0/infra-stage-3-0.1.0.tgz
     version: 0.1.0
-generated: "2026-02-13T08:40:10.189247518Z"
+generated: "2026-02-13T10:02:32.067830168Z"
