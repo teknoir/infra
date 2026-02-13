@@ -4,4 +4,5 @@ istioNamespace: istio-system
 istio-base: {}
 
 cert-manager:
-  installCRDs: true
+  crds:
+    enabled: true
