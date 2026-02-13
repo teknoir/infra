@@ -15,7 +15,7 @@ istio-egressgateway:
   service:
     type: ClusterIP
 
-gateway:
+gw:
   enabled: true
   name: teknoir-gateway
   namespace: istio-system

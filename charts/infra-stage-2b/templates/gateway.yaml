@@ -1,36 +1,36 @@
-{{- if .Values.gateway.enabled -}}
+{{- if .Values.gw.enabled -}}
 apiVersion: networking.istio.io/v1beta1
 kind: Gateway
 metadata:
-  name: {{ .Values.gateway.name }}
-  namespace: {{ .Values.gateway.namespace }}
+  name: {{ .Values.gw.name }}
+  namespace: {{ .Values.gw.namespace }}
 spec:
   selector:
-{{- toYaml .Values.gateway.selector | nindent 4 }}
+{{- toYaml .Values.gw.selector | nindent 4 }}
   servers:
   - port:
       number: 80
       name: http
       protocol: HTTP
     hosts:
-{{- range .Values.gateway.hosts }}
+{{- range .Values.gw.hosts }}
     - {{ . | quote }}
 {{- end }}
-{{- if .Values.gateway.httpsRedirect }}
+{{- if .Values.gw.httpsRedirect }}
     tls:
       httpsRedirect: true
 {{- end }}
-{{- if .Values.gateway.tls.enabled }}
+{{- if .Values.gw.tls.enabled }}
   - port:
       number: 443
       name: https
       protocol: HTTPS
     hosts:
-{{- range .Values.gateway.hosts }}
+{{- range .Values.gw.hosts }}
     - {{ . | quote }}
 {{- end }}
     tls:
       mode: SIMPLE
-      credentialName: {{ .Values.gateway.tls.credentialName | quote }}
+      credentialName: {{ .Values.gw.tls.credentialName | quote }}
 {{- end }}
 {{- end -}}
