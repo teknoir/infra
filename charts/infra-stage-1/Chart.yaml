@@ -1,0 +1,14 @@
+apiVersion: v2
+name: infra-stage-1
+description: Infra stage 1 - namespaces, cert-manager, and Istio CRDs
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+dependencies:
+  - name: base
+    alias: istio-base
+    version: ">=1.20.0 <2.0.0"
+    repository: https://istio-release.storage.googleapis.com/charts
+  - name: cert-manager
+    version: ">=1.14.0 <2.0.0"
+    repository: https://charts.jetstack.io

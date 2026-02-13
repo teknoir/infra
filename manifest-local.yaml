@@ -2,12 +2,35 @@
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
-  name: infra
+  name: infra-stage-1
   namespace: istio-system
 spec:
   repo: https://teknoir.github.io/infra
-  chart: infra
+  chart: infra-stage-1
   targetNamespace: istio-system
   valuesContent: |-
     # Example for minimal configuration
-    #test: nonsense
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: infra-stage-2
+  namespace: istio-system
+spec:
+  repo: https://teknoir.github.io/infra
+  chart: infra-stage-2
+  targetNamespace: istio-system
+  valuesContent: |-
+    # Example for minimal configuration
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: infra-stage-3
+  namespace: istio-system
+spec:
+  repo: https://teknoir.github.io/infra
+  chart: infra-stage-3
+  targetNamespace: istio-system
+  valuesContent: |-
+    # Example for minimal configuration

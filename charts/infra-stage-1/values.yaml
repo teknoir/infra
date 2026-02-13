@@ -1,0 +1,7 @@
+# Default values for infra-stage-1.
+istioNamespace: istio-system
+
+istio-base: {}
+
+cert-manager:
+  installCRDs: true

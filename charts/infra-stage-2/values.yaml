@@ -1,7 +1,5 @@
-# Default values for infra.
+# Default values for infra-stage-2.
 istioNamespace: istio-system
-
-istio-base: {}
 
 istiod:
   global:
@@ -20,16 +18,3 @@ istio-egressgateway:
     istio: egressgateway
   service:
     type: ClusterIP
-
-cert-manager:
-  installCRDs: true
-
-istio-csr:
-  app:
-    certmanager:
-      issuer:
-        name: istio-ca
-        kind: Issuer
-        group: cert-manager.io
-    istio:
-      namespace: istio-system

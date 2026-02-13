@@ -1,14 +1,10 @@
 apiVersion: v2
-name: infra
-description: Infra Helm chart
+name: infra-stage-2
+description: Infra stage 2 - Istio control plane and gateways
 type: application
-version: 0.1.1
+version: 0.1.0
 appVersion: "0.1.0"
 dependencies:
-  - name: base
-    alias: istio-base
-    version: ">=1.20.0 <2.0.0"
-    repository: https://istio-release.storage.googleapis.com/charts
   - name: istiod
     alias: istiod
     version: ">=1.20.0 <2.0.0"
@@ -21,10 +17,3 @@ dependencies:
     alias: istio-egressgateway
     version: ">=1.20.0 <2.0.0"
     repository: https://istio-release.storage.googleapis.com/charts
-  - name: cert-manager
-    version: ">=1.14.0 <2.0.0"
-    repository: https://charts.jetstack.io
-  - name: cert-manager-istio-csr
-    alias: istio-csr
-    version: ">=0.6.0 <1.0.0"
-    repository: https://charts.jetstack.io

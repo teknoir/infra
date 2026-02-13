@@ -1,5 +1,8 @@
 #!/bin/sh
 set -e
 
-INFRA_MANIFEST=$(cat manifest-local.yaml)
-ssh anders@rtx2000-pro-bw-se.teknoir bash -c "cat > /var/lib/rancher/k3s/server/manifests/teknoir-infra.yaml" <<< "${INFRA_MANIFEST}"
+MANIFEST_PATH=manifest-local.yaml
+
+ssh anders@rtx2000-pro-bw-se.teknoir \
+  "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-infra.yaml >/dev/null" \
+  < "${MANIFEST_PATH}"
