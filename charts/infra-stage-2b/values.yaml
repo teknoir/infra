@@ -1,0 +1,16 @@
+# Default values for infra-stage-2b.
+istioNamespace: istio-system
+
+istio-ingressgateway:
+  name: istio-ingressgateway
+  labels:
+    istio: ingressgateway
+  service:
+    type: LoadBalancer
+
+istio-egressgateway:
+  name: istio-egressgateway
+  labels:
+    istio: egressgateway
+  service:
+    type: ClusterIP

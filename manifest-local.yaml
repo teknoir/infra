@@ -12,6 +12,7 @@ metadata:
 spec:
   repo: https://teknoir.github.io/infra
   chart: infra-stage-0
+  version: 0.1.4
   targetNamespace: cert-manager
   createNamespace: true
   valuesContent: |-
@@ -25,6 +26,7 @@ metadata:
 spec:
   repo: https://teknoir.github.io/infra
   chart: infra-stage-1
+  version: 0.1.4
   targetNamespace: istio-system
   valuesContent: |-
     # Example for minimal configuration
@@ -37,6 +39,20 @@ metadata:
 spec:
   repo: https://teknoir.github.io/infra
   chart: infra-stage-2
+  version: 0.1.4
+  targetNamespace: istio-system
+  valuesContent: |-
+    # Example for minimal configuration
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: infra-stage-2b
+  namespace: teknoir-bootstrap
+spec:
+  repo: https://teknoir.github.io/infra
+  chart: infra-stage-2b
+  version: 0.1.4
   targetNamespace: istio-system
   valuesContent: |-
     # Example for minimal configuration
@@ -49,6 +65,7 @@ metadata:
 spec:
   repo: https://teknoir.github.io/infra
   chart: infra-stage-3
+  version: 0.1.4
   targetNamespace: istio-system
   valuesContent: |-
     # Example for minimal configuration

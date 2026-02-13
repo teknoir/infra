@@ -1,19 +1,11 @@
 apiVersion: v2
 name: infra-stage-2
-description: Infra stage 2 - Istio control plane and gateways
+description: Infra stage 2 - Istio control plane
 type: application
-version: 0.1.3
+version: 0.1.4
 appVersion: "0.1.0"
 dependencies:
   - name: istiod
     alias: istiod
-    version: ">=1.20.0 <2.0.0"
-    repository: https://istio-release.storage.googleapis.com/charts
-  - name: gateway
-    alias: istio-ingressgateway
-    version: ">=1.20.0 <2.0.0"
-    repository: https://istio-release.storage.googleapis.com/charts
-  - name: gateway
-    alias: istio-egressgateway
     version: ">=1.20.0 <2.0.0"
     repository: https://istio-release.storage.googleapis.com/charts
