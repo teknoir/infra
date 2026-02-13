@@ -1,0 +1,55 @@
+{{- if .Values.httpbin.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.httpbin.name }}
+  namespace: {{ .Values.httpbin.namespace }}
+spec:
+  selector:
+    app: {{ .Values.httpbin.name }}
+  ports:
+    - name: http
+      port: {{ .Values.httpbin.service.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Values.httpbin.name }}
+  namespace: {{ .Values.httpbin.namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ .Values.httpbin.name }}
+  template:
+    metadata:
+      labels:
+        app: {{ .Values.httpbin.name }}
+    spec:
+      containers:
+        - name: httpbin
+          image: {{ .Values.httpbin.image.repository }}:{{ .Values.httpbin.image.tag }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.httpbin.service.port }}
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: {{ .Values.httpbin.name }}
+  namespace: {{ .Values.httpbin.namespace }}
+spec:
+  hosts:
+{{- range .Values.httpbin.virtualService.hosts }}
+  - {{ . | quote }}
+{{- end }}
+  gateways:
+    - {{ .Values.gateway.namespace }}/{{ .Values.gateway.name }}
+  http:
+    - route:
+        - destination:
+            host: {{ .Values.httpbin.name }}.{{ .Values.httpbin.namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.httpbin.service.port }}
+{{- end -}}
