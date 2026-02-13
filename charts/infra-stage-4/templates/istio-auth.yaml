@@ -1,0 +1,73 @@
+{{- if .Values.oauth2Proxy.enabled -}}
+apiVersion: networking.istio.io/v1alpha3
+kind: EnvoyFilter
+metadata:
+  name: oauth2-proxy-ext-authz
+  namespace: {{ .Values.istio.gateway.namespace }}
+spec:
+  workloadSelector:
+    labels:
+{{- toYaml .Values.istio.gateway.selector | nindent 6 }}
+  configPatches:
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.router
+      patch:
+        operation: INSERT_BEFORE
+        value:
+          name: envoy.filters.http.ext_authz
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+            transport_api_version: V3
+            http_service:
+              server_uri:
+                uri: http://oauth2-proxy.{{ .Values.oauth2Proxy.namespace }}.svc.cluster.local:{{ .Values.oauth2Proxy.service.port }}
+                cluster: outbound|{{ .Values.oauth2Proxy.service.port }}||oauth2-proxy.{{ .Values.oauth2Proxy.namespace }}.svc.cluster.local
+                timeout: 10s
+              authorization_request:
+                allowed_headers:
+                  patterns:
+                    - exact: cookie
+                    - exact: authorization
+                    - exact: x-forwarded-proto
+                    - exact: x-forwarded-host
+                    - exact: x-forwarded-uri
+              authorization_response:
+                allowed_upstream_headers:
+                  patterns:
+                    - exact: authorization
+                    - exact: x-auth-request-user
+                    - exact: x-auth-request-email
+                    - exact: x-auth-request-preferred-username
+                allowed_client_headers:
+                  patterns:
+                    - exact: set-cookie
+                    - exact: location
+---
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: jwt-auth
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  jwtRules:
+    - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: require-jwt
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            requestPrincipals: ["*"]
+{{- end -}}

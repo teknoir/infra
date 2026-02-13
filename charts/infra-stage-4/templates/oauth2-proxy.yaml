@@ -1,0 +1,70 @@
+{{- if .Values.oauth2Proxy.enabled -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: oauth2-proxy-secret
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+type: Opaque
+stringData:
+  client-secret: {{ .Values.oauth2Proxy.oidc.clientSecret | quote }}
+  cookie-secret: {{ .Values.oauth2Proxy.cookie.secret | quote }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  selector:
+    app: oauth2-proxy
+  ports:
+    - name: http
+      port: {{ .Values.oauth2Proxy.service.port }}
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+  template:
+    metadata:
+      labels:
+        app: oauth2-proxy
+    spec:
+      containers:
+        - name: oauth2-proxy
+          image: {{ .Values.oauth2Proxy.image.repository }}:{{ .Values.oauth2Proxy.image.tag }}
+          args:
+            - --provider=oidc
+            - --oidc-issuer-url={{ .Values.oauth2Proxy.oidc.issuerUrl }}
+            - --client-id={{ .Values.oauth2Proxy.oidc.clientId }}
+            - --client-secret-file=/etc/oauth2-proxy/client-secret
+            - --cookie-secret-file=/etc/oauth2-proxy/cookie-secret
+            - --cookie-domain={{ .Values.oauth2Proxy.cookie.domain }}
+            - --cookie-secure=true
+            - --cookie-samesite=lax
+            - --email-domain={{ join "," .Values.oauth2Proxy.emailDomains }}
+            - --redirect-url={{ .Values.oauth2Proxy.redirectUrl }}
+            - --set-authorization-header=true
+            - --pass-authorization-header=true
+            - --set-xauthrequest=true
+            - --upstream=static://200
+            - --http-address=0.0.0.0:{{ .Values.oauth2Proxy.service.port }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.oauth2Proxy.service.port }}
+          volumeMounts:
+            - name: oauth2-proxy-secret
+              mountPath: /etc/oauth2-proxy
+              readOnly: true
+      volumes:
+        - name: oauth2-proxy-secret
+          secret:
+            secretName: oauth2-proxy-secret
+{{- end -}}
