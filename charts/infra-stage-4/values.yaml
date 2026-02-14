@@ -42,6 +42,11 @@ oauth2Proxy:
   cookie:
     domain: .teknoir.online
   redirectUrl: https://teknoir.online/oauth2/callback
+  whitelistDomains:
+    - .teknoir.online
+  authHosts:
+    - "teknoir.online"
+    - "*.teknoir.online"
   emailDomains:
     - "*"
   provider: keycloak-oidc

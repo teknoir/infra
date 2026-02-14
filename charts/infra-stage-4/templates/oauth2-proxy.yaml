@@ -40,6 +40,9 @@ spec:
             - --cookie-samesite=lax
             - --email-domain={{ join "," .Values.oauth2Proxy.emailDomains }}
             - --redirect-url={{ .Values.oauth2Proxy.redirectUrl }}
+{{- range .Values.oauth2Proxy.whitelistDomains }}
+            - --whitelist-domain={{ . | quote }}
+{{- end }}
             - --code-challenge-method={{ .Values.oauth2Proxy.pkceMethod }}
             - --set-authorization-header=true
             - --pass-authorization-header=true

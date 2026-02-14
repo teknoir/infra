@@ -1,5 +1,14 @@
 {{- if .Values.oauth2Proxy.enabled -}}
 {{- $jwksUri := .Values.istio.auth.jwksUri | default (printf "%s/protocol/openid-connect/certs" (trimSuffix "/" .Values.istio.auth.jwksIssuer)) -}}
+{{- $authPath := .Values.istio.auth.oauth2ProxyAuthPath | default "/oauth2/auth" -}}
+{{- $oauth2Hosts := .Values.oauth2Proxy.authHosts -}}
+{{- if not $oauth2Hosts -}}
+{{- $oauth2Hosts = list "teknoir.online" "*.teknoir.online" -}}
+{{- end }}
+{{- $httpbinSelector := .Values.istio.auth.httpbin.selector -}}
+{{- if not $httpbinSelector -}}
+{{- $httpbinSelector = dict "app" "httpbin" -}}
+{{- end }}
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -31,6 +40,7 @@ spec:
                 uri: http://oauth2-proxy.{{ .Values.oauth2Proxy.namespace }}.svc.cluster.local:{{ .Values.oauth2Proxy.service.port }}
                 cluster: outbound|{{ .Values.oauth2Proxy.service.port }}||oauth2-proxy.{{ .Values.oauth2Proxy.namespace }}.svc.cluster.local
                 timeout: 10s
+              path_prefix: {{ $authPath | quote }}
               authorization_request:
                 allowed_headers:
                   patterns:
@@ -65,6 +75,40 @@ spec:
             envoy.filters.http.ext_authz:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
               disabled: true
+{{- range $host := $oauth2Hosts }}
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            name: "{{ $host }}:80"
+            route:
+              match:
+                prefix: "/oauth2"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_authz:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+              disabled: true
+    - applyTo: HTTP_ROUTE
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            name: "{{ $host }}:443"
+            route:
+              match:
+                prefix: "/oauth2"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_authz:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+              disabled: true
+{{- end }}
 ---
 apiVersion: security.istio.io/v1beta1
 kind: RequestAuthentication
@@ -91,6 +135,19 @@ spec:
     - from:
         - source:
             requestPrincipals: ["*"]
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: oauth2-proxy-allow
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  selector:
+    matchLabels:
+      app: oauth2-proxy
+  action: ALLOW
+  rules:
+    - {}
 {{- if .Values.istio.auth.httpbin.enabled }}
 ---
 apiVersion: security.istio.io/v1beta1
@@ -100,7 +157,7 @@ metadata:
   namespace: {{ .Values.istio.auth.httpbin.namespace }}
 spec:
   selector:
-{{- toYaml .Values.istio.auth.httpbin.selector | nindent 4 }}
+{{- toYaml $httpbinSelector | nindent 4 }}
   jwtRules:
     - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
       jwksUri: {{ $jwksUri | quote }}
@@ -116,7 +173,7 @@ metadata:
   namespace: {{ .Values.istio.auth.httpbin.namespace }}
 spec:
   selector:
-{{- toYaml .Values.istio.auth.httpbin.selector | nindent 4 }}
+{{- toYaml $httpbinSelector | nindent 4 }}
   action: ALLOW
   rules:
     - from:
