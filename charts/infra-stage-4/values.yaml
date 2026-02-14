@@ -6,6 +6,7 @@ keycloak:
   fullnameOverride: keycloak
   service:
     name: keycloak-http
+    httpPort: 80
   command:
     - "/opt/keycloak/bin/kc.sh"
   args:
@@ -13,7 +14,6 @@ keycloak:
     - "--http-enabled=true"
     - "--http-port=8080"
     - "--hostname-strict=false"
-    httpPort: 80
   extraEnv: |
     - name: KEYCLOAK_ADMIN
       value: admin
