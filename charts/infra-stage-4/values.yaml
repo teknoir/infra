@@ -68,6 +68,10 @@ oauth2Proxy:
     clientId: teknoir-online
   cookie:
     domain: .teknoir.online
+    sameSite: none
+    path: /
+    csrfPerRequest: false
+    csrfExpire: 10m
   redirectUrl: https://teknoir.online/oauth2/callback
   whitelistDomains:
     - .teknoir.online
@@ -85,6 +89,8 @@ oauth2Proxy:
   allowedRoles: []
   allowedGroups: []
   passAccessToken: true
+  sessionCookieMinimal: true
+  reverseProxy: true
   service:
     port: 4180
 

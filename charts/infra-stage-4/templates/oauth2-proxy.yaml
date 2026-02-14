@@ -37,7 +37,18 @@ spec:
             - --client-id={{ .Values.oauth2Proxy.oidc.clientId }}
             - --cookie-domain={{ .Values.oauth2Proxy.cookie.domain }}
             - --cookie-secure=true
-            - --cookie-samesite=lax
+            - --cookie-samesite={{ .Values.oauth2Proxy.cookie.sameSite | default "lax" }}
+{{- if .Values.oauth2Proxy.cookie.path }}
+            - --cookie-path={{ .Values.oauth2Proxy.cookie.path }}
+{{- end }}
+{{- if .Values.oauth2Proxy.cookie.csrfPerRequest }}
+            - --cookie-csrf-per-request=true
+{{- else }}
+            - --cookie-csrf-per-request=false
+{{- end }}
+{{- if .Values.oauth2Proxy.cookie.csrfExpire }}
+            - --cookie-csrf-expire={{ .Values.oauth2Proxy.cookie.csrfExpire }}
+{{- end }}
             - --email-domain={{ join "," .Values.oauth2Proxy.emailDomains }}
             - --redirect-url={{ .Values.oauth2Proxy.redirectUrl }}
 {{- range .Values.oauth2Proxy.whitelistDomains }}
@@ -51,6 +62,12 @@ spec:
             - --pass-authorization-header=true
 {{- if .Values.oauth2Proxy.passAccessToken }}
             - --pass-access-token=true
+{{- end }}
+{{- if .Values.oauth2Proxy.sessionCookieMinimal }}
+            - --session-cookie-minimal=true
+{{- end }}
+{{- if .Values.oauth2Proxy.reverseProxy }}
+            - --reverse-proxy=true
 {{- end }}
             - --set-xauthrequest=true
             - --upstream=static://200
