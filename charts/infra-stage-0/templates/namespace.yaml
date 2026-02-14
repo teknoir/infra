@@ -12,3 +12,10 @@ metadata:
   name: istio-system
   labels:
     istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teknoir-auth
+  labels:
+    istio-injection: enabled
