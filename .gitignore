@@ -3,3 +3,4 @@ Chart.lock
 /*/**/charts/
 manifest-clouddns-secret.yaml
 manifest-oauth2-proxy-secret.yaml
+manifest-keycloak-db-secret.yaml

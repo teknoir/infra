@@ -49,6 +49,20 @@ helm dependency build charts/infra-stage-3
 helm upgrade --install infra-stage-3 charts/infra-stage-3 -n istio-system
 ```
 
+## Setup in Keycloak
+
+Minimal client setup in master realm:
+* Client ID: teknoir-online (or change oauth2-proxy to match)
+* OpenID Connect 
+* Client authentication: ON (this is “confidential”)
+* Standard flow: ON 
+* Valid redirect URI: https://teknoir.online/oauth2/callback
+* Web origins: https://teknoir.online
+Then update the secret
+* Take the client secret from Keycloak
+* Update oauth2-proxy-secret in teknoir-system (client-secret key)
+
+
 ## Layout
 
 - `charts/infra`: umbrella chart and values
