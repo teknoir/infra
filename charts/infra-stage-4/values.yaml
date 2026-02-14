@@ -47,6 +47,7 @@ oauth2Proxy:
   authHosts:
     - "teknoir.online"
     - "*.teknoir.online"
+  sharedHost: "teknoir.online"
   emailDomains:
     - "*"
   provider: keycloak-oidc
