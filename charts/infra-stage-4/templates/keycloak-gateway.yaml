@@ -33,5 +33,5 @@ spec:
         - destination:
             host: {{ .Values.keycloak.fullnameOverride }}.{{ .Values.authNamespace }}.svc.cluster.local
             port:
-              number: {{ .Values.keycloak.service.port }}
+              number: {{ .Values.keycloak.service.httpPort }}
 {{- end -}}

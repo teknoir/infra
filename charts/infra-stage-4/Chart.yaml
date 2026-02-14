@@ -1,11 +1,11 @@
 apiVersion: v2
 name: infra-stage-4
-description: Infra stage 4 - Keycloak, OAuth2/OIDC, and Istio auth
+description: Infra stage 4 - KeycloakX, OAuth2/OIDC, and Istio auth
 type: application
-version: 0.1.11
+version: 0.1.12
 appVersion: "0.1.0"
 dependencies:
-  - name: keycloak
+  - name: keycloakx
     alias: keycloak
-    version: ">=16.0.0 <18.0.0"
+    version: ">=7.1.0 <8.0.0"
     repository: https://codecentric.github.io/helm-charts

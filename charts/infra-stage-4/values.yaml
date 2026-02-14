@@ -4,12 +4,22 @@ authNamespace: teknoir-auth
 keycloak:
   enabled: true
   fullnameOverride: keycloak
+  command:
+    - "/opt/keycloak/bin/kc.sh"
+  args:
+    - "start"
+    - "--http-enabled=true"
+    - "--http-port=8080"
+    - "--hostname-strict=false"
   service:
-    port: 8080
-  extraEnv: ""
-  admin:
-    username: admin
-    password: change-me
+    httpPort: 80
+  extraEnv: |
+    - name: KEYCLOAK_ADMIN
+      value: admin
+    - name: KEYCLOAK_ADMIN_PASSWORD
+      value: change-me
+    - name: KC_HOSTNAME
+      value: auth.teknoir.online
 
 oauth2Proxy:
   enabled: true
