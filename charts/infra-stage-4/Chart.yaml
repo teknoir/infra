@@ -2,7 +2,7 @@ apiVersion: v2
 name: infra-stage-4
 description: Infra stage 4 - KeycloakX, OAuth2/OIDC, and Istio auth
 type: application
-version: 0.1.30
+version: 0.1.31
 appVersion: "0.1.0"
 dependencies:
   - name: keycloakx

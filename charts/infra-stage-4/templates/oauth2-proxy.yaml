@@ -44,7 +44,7 @@ spec:
             - --whitelist-domain={{ . | quote }}
 {{- end }}
 {{- range .Values.oauth2Proxy.extraAudiences }}
-            - --oidc-extra-audiences={{ . | quote }}
+            - --oidc-extra-audience={{ . | quote }}
 {{- end }}
             - --code-challenge-method={{ .Values.oauth2Proxy.pkceMethod }}
             - --set-authorization-header=true
