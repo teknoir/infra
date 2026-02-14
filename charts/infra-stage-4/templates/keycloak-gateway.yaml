@@ -12,7 +12,7 @@ spec:
   http:
     - route:
         - destination:
-            host: {{ .Values.keycloak.fullnameOverride }}.{{ .Values.authNamespace }}.svc.cluster.local
+            host: {{ .Values.keycloak.service.name | default (printf "%s-http" .Values.keycloak.fullnameOverride) }}.{{ .Values.authNamespace }}.svc.cluster.local
             port:
               number: {{ .Values.keycloak.service.httpPort }}
 {{- end -}}

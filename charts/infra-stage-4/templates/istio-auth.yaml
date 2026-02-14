@@ -109,7 +109,7 @@ metadata:
   name: keycloak-istio-mtls
   namespace: {{ .Values.istio.gateway.namespace }}
 spec:
-  host: {{ .Values.keycloak.fullnameOverride }}.{{ .Values.authNamespace }}.svc.cluster.local
+  host: {{ .Values.keycloak.service.name | default (printf "%s-http" .Values.keycloak.fullnameOverride) }}.{{ .Values.authNamespace }}.svc.cluster.local
   trafficPolicy:
     tls:
       mode: ISTIO_MUTUAL
