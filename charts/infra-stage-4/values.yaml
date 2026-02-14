@@ -89,7 +89,7 @@ oauth2Proxy:
   allowedRoles: []
   allowedGroups: []
   passAccessToken: true
-  sessionCookieMinimal: true
+  sessionCookieMinimal: false
   reverseProxy: true
   service:
     port: 4180
