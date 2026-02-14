@@ -15,12 +15,14 @@ keycloak:
     - "--http-port=8080"
     - "--hostname-strict=false"
   extraEnv: |
-    - name: KEYCLOAK_ADMIN
+    - name: KC_BOOTSTRAP_ADMIN_USERNAME
       value: admin
-    - name: KEYCLOAK_ADMIN_PASSWORD
+    - name: KC_BOOTSTRAP_ADMIN_PASSWORD
       value: change-me
     - name: KC_HOSTNAME
       value: auth.teknoir.online
+    - name: KC_HOSTNAME_URL
+      value: https://auth.teknoir.online
     - name: KC_PROXY_HEADERS
       value: xforwarded
     - name: KC_HTTP_RELATIVE_PATH
