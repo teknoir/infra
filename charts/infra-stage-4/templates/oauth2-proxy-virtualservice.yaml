@@ -12,7 +12,8 @@ spec:
   gateways:
     - {{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}
   http:
-    - match:
+    - name: oauth2-proxy-auth
+      match:
         - uri:
             prefix: /oauth2
       route:

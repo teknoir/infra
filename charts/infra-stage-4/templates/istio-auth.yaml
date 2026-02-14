@@ -1,10 +1,7 @@
 {{- if .Values.oauth2Proxy.enabled -}}
 {{- $jwksUri := .Values.istio.auth.jwksUri | default (printf "%s/protocol/openid-connect/certs" (trimSuffix "/" .Values.istio.auth.jwksIssuer)) -}}
 {{- $authPath := .Values.istio.auth.oauth2ProxyAuthPath | default "/oauth2/auth" -}}
-{{- $oauth2Hosts := .Values.oauth2Proxy.authHosts -}}
-{{- if not $oauth2Hosts -}}
-{{- $oauth2Hosts = list "teknoir.online" "*.teknoir.online" -}}
-{{- end }}
+{{- $oauth2RouteName := .Values.istio.auth.oauth2ProxyRouteName | default "oauth2-proxy-auth" -}}
 {{- $httpbinSelector := .Values.istio.auth.httpbin.selector -}}
 {{- if not $httpbinSelector -}}
 {{- $httpbinSelector = dict "app" "httpbin" -}}
@@ -62,6 +59,58 @@ spec:
                   patterns:
                     - exact: set-cookie
                     - exact: location
+    - applyTo: HTTP_FILTER
+      match:
+        context: GATEWAY
+        listener:
+          filterChain:
+            filter:
+              name: envoy.filters.network.http_connection_manager
+              subFilter:
+                name: envoy.filters.http.ext_authz
+      patch:
+        operation: INSERT_AFTER
+        value:
+          name: envoy.filters.http.lua
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+            inlineCode: |
+              local function urlencode(str)
+                if str == nil then
+                  return ""
+                end
+                return string.gsub(str, "([^%w%-_%.~])", function(c)
+                  return string.format("%%%02X", string.byte(c))
+                end)
+              end
+
+              function envoy_on_request(handle)
+                local h = handle:headers()
+                local scheme = h:get("x-forwarded-proto") or "https"
+                local host = h:get(":authority") or h:get("host") or ""
+                local path = h:get("x-forwarded-uri") or h:get(":path") or "/"
+                local rd = scheme .. "://" .. host .. path
+                local md = handle:streamInfo():dynamicMetadata()
+                md:set("oauth2_proxy", "rd", rd)
+                md:set("oauth2_proxy", "path", path)
+              end
+
+              function envoy_on_response(handle)
+                local status = handle:headers():get(":status")
+                if status ~= "401" and status ~= "403" then
+                  return
+                end
+                local md = handle:streamInfo():dynamicMetadata():get("oauth2_proxy") or {}
+                local path = md["path"] or ""
+                if string.sub(path, 1, 7) == "/oauth2" then
+                  return
+                end
+                local rd = md["rd"] or ""
+                local location = "/oauth2/start?rd=" .. urlencode(rd)
+                handle:headers():replace(":status", "302")
+                handle:headers():replace("location", location)
+                handle:headers():replace("content-length", "0")
+              end
     - applyTo: VIRTUAL_HOST
       match:
         context: GATEWAY
@@ -75,16 +124,13 @@ spec:
             envoy.filters.http.ext_authz:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
               disabled: true
-{{- range $host := $oauth2Hosts }}
     - applyTo: HTTP_ROUTE
       match:
         context: GATEWAY
         routeConfiguration:
           vhost:
-            name: "{{ $host }}:80"
             route:
-              match:
-                prefix: "/oauth2"
+              name: {{ $oauth2RouteName | quote }}
       patch:
         operation: MERGE
         value:
@@ -92,23 +138,6 @@ spec:
             envoy.filters.http.ext_authz:
               "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
               disabled: true
-    - applyTo: HTTP_ROUTE
-      match:
-        context: GATEWAY
-        routeConfiguration:
-          vhost:
-            name: "{{ $host }}:443"
-            route:
-              match:
-                prefix: "/oauth2"
-      patch:
-        operation: MERGE
-        value:
-          typed_per_filter_config:
-            envoy.filters.http.ext_authz:
-              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
-              disabled: true
-{{- end }}
 ---
 apiVersion: security.istio.io/v1beta1
 kind: RequestAuthentication
