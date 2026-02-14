@@ -43,6 +43,8 @@ spec:
                 allowed_upstream_headers:
                   patterns:
                     - exact: authorization
+                    - exact: x-forwarded-access-token
+                    - exact: x-auth-request-access-token
                     - exact: x-auth-request-user
                     - exact: x-auth-request-email
                     - exact: x-auth-request-preferred-username
@@ -73,6 +75,10 @@ spec:
   jwtRules:
     - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
       jwksUri: {{ $jwksUri | quote }}
+      fromHeaders:
+        - name: Authorization
+        - name: X-Forwarded-Access-Token
+        - name: X-Auth-Request-Access-Token
 ---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
@@ -98,6 +104,10 @@ spec:
   jwtRules:
     - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
       jwksUri: {{ $jwksUri | quote }}
+      fromHeaders:
+        - name: Authorization
+        - name: X-Forwarded-Access-Token
+        - name: X-Auth-Request-Access-Token
 ---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy

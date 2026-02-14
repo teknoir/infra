@@ -48,6 +48,7 @@ oauth2Proxy:
   pkceMethod: S256
   allowedRoles: []
   allowedGroups: []
+  passAccessToken: true
   service:
     port: 4180
 

@@ -43,6 +43,9 @@ spec:
             - --code-challenge-method={{ .Values.oauth2Proxy.pkceMethod }}
             - --set-authorization-header=true
             - --pass-authorization-header=true
+{{- if .Values.oauth2Proxy.passAccessToken }}
+            - --pass-access-token=true
+{{- end }}
             - --set-xauthrequest=true
             - --upstream=static://200
             - --http-address=0.0.0.0:{{ .Values.oauth2Proxy.service.port }}
