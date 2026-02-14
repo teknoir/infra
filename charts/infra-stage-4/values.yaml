@@ -37,6 +37,10 @@ oauth2Proxy:
   redirectUrl: https://teknoir.online/oauth2/callback
   emailDomains:
     - "*"
+  provider: keycloak-oidc
+  pkceMethod: S256
+  allowedRoles: []
+  allowedGroups: []
   service:
     port: 4180
 

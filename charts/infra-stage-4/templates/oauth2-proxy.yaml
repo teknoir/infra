@@ -32,7 +32,7 @@ spec:
         - name: oauth2-proxy
           image: {{ .Values.oauth2Proxy.image.repository }}:{{ .Values.oauth2Proxy.image.tag }}
           args:
-            - --provider=oidc
+            - --provider={{ .Values.oauth2Proxy.provider | default "oidc" }}
             - --oidc-issuer-url={{ .Values.oauth2Proxy.oidc.issuerUrl }}
             - --client-id={{ .Values.oauth2Proxy.oidc.clientId }}
             - --cookie-domain={{ .Values.oauth2Proxy.cookie.domain }}
@@ -40,11 +40,18 @@ spec:
             - --cookie-samesite=lax
             - --email-domain={{ join "," .Values.oauth2Proxy.emailDomains }}
             - --redirect-url={{ .Values.oauth2Proxy.redirectUrl }}
+            - --code-challenge-method={{ .Values.oauth2Proxy.pkceMethod }}
             - --set-authorization-header=true
             - --pass-authorization-header=true
             - --set-xauthrequest=true
             - --upstream=static://200
             - --http-address=0.0.0.0:{{ .Values.oauth2Proxy.service.port }}
+{{- range .Values.oauth2Proxy.allowedRoles }}
+            - --allowed-role={{ . | quote }}
+{{- end }}
+{{- range .Values.oauth2Proxy.allowedGroups }}
+            - --allowed-group={{ . | quote }}
+{{- end }}
           env:
             - name: OAUTH2_PROXY_CLIENT_SECRET
               valueFrom:

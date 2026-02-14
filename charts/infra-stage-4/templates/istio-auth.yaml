@@ -49,6 +49,19 @@ spec:
                   patterns:
                     - exact: set-cookie
                     - exact: location
+    - applyTo: VIRTUAL_HOST
+      match:
+        context: GATEWAY
+        routeConfiguration:
+          vhost:
+            name: "auth.teknoir.online:443"
+      patch:
+        operation: MERGE
+        value:
+          typed_per_filter_config:
+            envoy.filters.http.ext_authz:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthzPerRoute
+              disabled: true
 ---
 apiVersion: security.istio.io/v1beta1
 kind: RequestAuthentication
