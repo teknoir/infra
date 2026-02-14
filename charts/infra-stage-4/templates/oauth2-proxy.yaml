@@ -1,14 +1,5 @@
 {{- if .Values.oauth2Proxy.enabled -}}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: oauth2-proxy-secret
-  namespace: {{ .Values.oauth2Proxy.namespace }}
-type: Opaque
-stringData:
-  client-secret: {{ .Values.oauth2Proxy.oidc.clientSecret | quote }}
-  cookie-secret: {{ .Values.oauth2Proxy.cookie.secret | quote }}
----
+{{- $secretName := .Values.oauth2Proxy.secret.existingName | default "oauth2-proxy-secret" -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -58,12 +49,12 @@ spec:
             - name: OAUTH2_PROXY_CLIENT_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: oauth2-proxy-secret
+                  name: {{ $secretName }}
                   key: client-secret
             - name: OAUTH2_PROXY_COOKIE_SECRET
               valueFrom:
                 secretKeyRef:
-                  name: oauth2-proxy-secret
+                  name: {{ $secretName }}
                   key: cookie-secret
           ports:
             - name: http

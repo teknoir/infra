@@ -24,15 +24,15 @@ keycloak:
 oauth2Proxy:
   enabled: true
   namespace: teknoir-system
+  secret:
+    existingName: "oauth2-proxy-secret"
   image:
     repository: quay.io/oauth2-proxy/oauth2-proxy
     tag: v7.6.0
   oidc:
     issuerUrl: https://auth.teknoir.online/realms/teknoir
     clientId: teknoir-online
-    clientSecret: ""
   cookie:
-    secret: ""
     domain: .teknoir.online
   redirectUrl: https://teknoir.online/oauth2/callback
   emailDomains:
