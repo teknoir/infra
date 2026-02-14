@@ -91,6 +91,16 @@ oauth2Proxy:
   passAccessToken: true
   sessionCookieMinimal: false
   reverseProxy: true
+  redis:
+    enabled: true
+    host: oauth2-proxy-redis
+    port: 6379
+    database: 0
+    secretName: oauth2-proxy-redis-secret
+    passwordKey: password
+    storage:
+      size: 1Gi
+      hostPath: /opt/teknoir/oauth2-proxy/redis
   service:
     port: 4180
 

@@ -2,7 +2,7 @@ apiVersion: v2
 name: infra-stage-2
 description: Infra stage 2 - Istio control plane
 type: application
-version: 0.1.33
+version: 0.1.34
 appVersion: "0.1.0"
 dependencies:
   - name: istiod

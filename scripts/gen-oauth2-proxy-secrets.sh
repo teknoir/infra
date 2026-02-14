@@ -28,7 +28,7 @@ else
   fi
 fi
 
-read -r -p "Enter Keycloak client secret: " client_secret
+read -r -p "Enter Keycloak client secret, you can only get this after you have created the client: " client_secret
 if [ -z "${client_secret}" ]; then
   echo "Client secret is required." >&2
   exit 1
