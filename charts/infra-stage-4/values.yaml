@@ -21,6 +21,10 @@ keycloak:
       value: change-me
     - name: KC_HOSTNAME
       value: auth.teknoir.online
+    - name: KC_PROXY_HEADERS
+      value: xforwarded
+    - name: KC_HTTP_RELATIVE_PATH
+      value: /auth
 
 oauth2Proxy:
   enabled: true
@@ -31,7 +35,7 @@ oauth2Proxy:
     repository: quay.io/oauth2-proxy/oauth2-proxy
     tag: v7.6.0
   oidc:
-    issuerUrl: https://auth.teknoir.online/realms/master
+    issuerUrl: https://auth.teknoir.online/auth/realms/master
     clientId: teknoir-online
   cookie:
     domain: .teknoir.online
@@ -52,6 +56,6 @@ istio:
     selector:
       istio: ingressgateway
   auth:
-    jwksIssuer: https://auth.teknoir.online/realms/master
+    jwksIssuer: https://auth.teknoir.online/auth/realms/master
   mtls:
     enabled: true
