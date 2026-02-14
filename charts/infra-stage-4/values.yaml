@@ -79,6 +79,9 @@ oauth2Proxy:
     - "*"
   provider: keycloak-oidc
   pkceMethod: S256
+  extraAudiences:
+    - master-realm
+    - account
   allowedRoles: []
   allowedGroups: []
   passAccessToken: true

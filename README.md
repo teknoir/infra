@@ -61,7 +61,13 @@ Minimal client setup in master realm:
 Then update the secret
 * Take the client secret from Keycloak
 * Update oauth2-proxy-secret in teknoir-system (client-secret key)
-
+Then add client scope
+* Add (or create) a scope
+* Default
+Configure a new mapper for the scope
+* Mapper type: Audience
+* Included Client Audience: teknoir-online
+* Add to access token: ON
 
 ## Layout
 
