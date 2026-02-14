@@ -59,5 +59,11 @@ istio:
       istio: ingressgateway
   auth:
     jwksIssuer: https://auth.teknoir.online/auth/realms/master
+    jwksUri: https://auth.teknoir.online/auth/realms/master/protocol/openid-connect/certs
+    httpbin:
+      enabled: true
+      namespace: teknoir-system
+      selector:
+        app: httpbin
   mtls:
     enabled: true

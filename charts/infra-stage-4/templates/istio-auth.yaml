@@ -1,4 +1,5 @@
 {{- if .Values.oauth2Proxy.enabled -}}
+{{- $jwksUri := .Values.istio.auth.jwksUri | default (printf "%s/protocol/openid-connect/certs" (trimSuffix "/" .Values.istio.auth.jwksIssuer)) -}}
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
@@ -71,6 +72,7 @@ metadata:
 spec:
   jwtRules:
     - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
+      jwksUri: {{ $jwksUri | quote }}
 ---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
@@ -83,6 +85,34 @@ spec:
     - from:
         - source:
             requestPrincipals: ["*"]
+{{- if .Values.istio.auth.httpbin.enabled }}
+---
+apiVersion: security.istio.io/v1beta1
+kind: RequestAuthentication
+metadata:
+  name: httpbin-jwt
+  namespace: {{ .Values.istio.auth.httpbin.namespace }}
+spec:
+  selector:
+{{- toYaml .Values.istio.auth.httpbin.selector | nindent 4 }}
+  jwtRules:
+    - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
+      jwksUri: {{ $jwksUri | quote }}
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: httpbin-require-jwt
+  namespace: {{ .Values.istio.auth.httpbin.namespace }}
+spec:
+  selector:
+{{- toYaml .Values.istio.auth.httpbin.selector | nindent 4 }}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            requestPrincipals: ["*"]
+{{- end }}
 {{- if .Values.istio.mtls.enabled }}
 ---
 apiVersion: security.istio.io/v1beta1
