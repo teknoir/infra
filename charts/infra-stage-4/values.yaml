@@ -30,7 +30,7 @@ oauth2Proxy:
     repository: quay.io/oauth2-proxy/oauth2-proxy
     tag: v7.6.0
   oidc:
-    issuerUrl: https://auth.teknoir.online/realms/teknoir
+    issuerUrl: https://auth.teknoir.online/realms/master
     clientId: teknoir-online
   cookie:
     domain: .teknoir.online
@@ -51,4 +51,6 @@ istio:
     selector:
       istio: ingressgateway
   auth:
-    jwksIssuer: https://auth.teknoir.online/realms/teknoir
+    jwksIssuer: https://auth.teknoir.online/realms/master
+  mtls:
+    enabled: true

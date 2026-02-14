@@ -83,4 +83,46 @@ spec:
     - from:
         - source:
             requestPrincipals: ["*"]
+{{- if .Values.istio.mtls.enabled }}
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: strict-mtls-auth
+  namespace: {{ .Values.authNamespace }}
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: strict-mtls-system
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  mtls:
+    mode: STRICT
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: keycloak-istio-mtls
+  namespace: {{ .Values.istio.gateway.namespace }}
+spec:
+  host: {{ .Values.keycloak.fullnameOverride }}.{{ .Values.authNamespace }}.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: oauth2-proxy-istio-mtls
+  namespace: {{ .Values.istio.gateway.namespace }}
+spec:
+  host: oauth2-proxy.{{ .Values.oauth2Proxy.namespace }}.svc.cluster.local
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+{{- end }}
 {{- end -}}

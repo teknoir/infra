@@ -1,24 +1,5 @@
 {{- if .Values.keycloak.enabled -}}
 apiVersion: networking.istio.io/v1beta1
-kind: Gateway
-metadata:
-  name: keycloak-gateway
-  namespace: {{ .Values.istio.gateway.namespace }}
-spec:
-  selector:
-{{- toYaml .Values.istio.gateway.selector | nindent 4 }}
-  servers:
-    - port:
-        number: 443
-        name: https
-        protocol: HTTPS
-      hosts:
-        - "auth.teknoir.online"
-      tls:
-        mode: SIMPLE
-        credentialName: teknoir-online-wildcard-tls
----
-apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
   name: keycloak
@@ -27,7 +8,7 @@ spec:
   hosts:
     - "auth.teknoir.online"
   gateways:
-    - {{ .Values.istio.gateway.namespace }}/keycloak-gateway
+    - {{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}
   http:
     - route:
         - destination:
