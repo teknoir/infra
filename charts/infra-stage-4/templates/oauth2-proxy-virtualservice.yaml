@@ -1,0 +1,23 @@
+{{- if .Values.oauth2Proxy.enabled -}}
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: oauth2-proxy
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  hosts:
+{{- range .Values.oauth2Proxy.authHosts }}
+    - {{ . | quote }}
+{{- end }}
+  gateways:
+    - {{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}
+  http:
+    - match:
+        - uri:
+            prefix: /oauth2
+      route:
+        - destination:
+            host: oauth2-proxy.{{ .Values.oauth2Proxy.namespace }}.svc.cluster.local
+            port:
+              number: {{ .Values.oauth2Proxy.service.port }}
+{{- end -}}
