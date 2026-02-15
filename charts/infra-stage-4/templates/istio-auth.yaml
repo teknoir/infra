@@ -25,10 +25,8 @@ spec:
           filterChain:
             filter:
               name: envoy.filters.network.http_connection_manager
-              subFilter:
-                name: envoy.filters.http.router
       patch:
-        operation: INSERT_BEFORE
+        operation: INSERT_FIRST
         value:
           name: envoy.filters.http.ext_authz
           typed_config:
@@ -136,6 +134,7 @@ spec:
       match:
         context: GATEWAY
         routeConfiguration:
+          gateway: "{{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}"
           vhost:
             name: "auth.teknoir.online:443"
       patch:
@@ -149,10 +148,10 @@ spec:
       match:
         context: GATEWAY
         routeConfiguration:
+          gateway: "{{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}"
           vhost:
             route:
-              match:
-                prefix: "/oauth2"
+              name: {{ $oauth2RouteName | quote }}
       patch:
         operation: MERGE
         value:
