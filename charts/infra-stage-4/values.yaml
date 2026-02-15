@@ -73,6 +73,8 @@ oauth2Proxy:
     path: /
     csrfPerRequest: false
     csrfExpire: 10m
+    refresh: 1m
+    expire: 12h
   redirectUrl: https://teknoir.online/oauth2/callback
   whitelistDomains:
     - teknoir.online

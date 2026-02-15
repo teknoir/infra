@@ -52,6 +52,12 @@ spec:
 {{- if .Values.oauth2Proxy.cookie.csrfExpire }}
             - --cookie-csrf-expire={{ .Values.oauth2Proxy.cookie.csrfExpire }}
 {{- end }}
+{{- if .Values.oauth2Proxy.cookie.refresh }}
+            - --cookie-refresh={{ .Values.oauth2Proxy.cookie.refresh }}
+{{- end }}
+{{- if .Values.oauth2Proxy.cookie.expire }}
+            - --cookie-expire={{ .Values.oauth2Proxy.cookie.expire }}
+{{- end }}
             - --email-domain={{ join "," .Values.oauth2Proxy.emailDomains }}
             - --redirect-url={{ .Values.oauth2Proxy.redirectUrl }}
 {{- range .Values.oauth2Proxy.whitelistDomains }}
