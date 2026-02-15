@@ -3,6 +3,7 @@
 {{- $authPath := .Values.istio.auth.oauth2ProxyAuthPath | default "/oauth2/auth" -}}
 {{- $oauth2RouteName := .Values.istio.auth.oauth2ProxyRouteName | default "oauth2-proxy-auth" -}}
 {{- $oauth2SharedHost := .Values.oauth2Proxy.sharedHost | default "teknoir.online" -}}
+{{- $cookieName := .Values.oauth2Proxy.cookie.name | default "_oauth2_proxy" -}}
 {{- $httpbinSelector := .Values.istio.auth.httpbin.selector -}}
 {{- if not $httpbinSelector -}}
 {{- $httpbinSelector = dict "app" "httpbin" -}}
@@ -13,9 +14,6 @@ metadata:
   name: oauth2-proxy-ext-authz
   namespace: {{ .Values.istio.gateway.namespace }}
 spec:
-  workloadSelector:
-    labels:
-{{- toYaml .Values.istio.gateway.selector | nindent 6 }}
   configPatches:
     - applyTo: HTTP_FILTER
       match:
@@ -24,10 +22,8 @@ spec:
           filterChain:
             filter:
               name: envoy.filters.network.http_connection_manager
-              subFilter:
-                name: envoy.filters.http.router
       patch:
-        operation: INSERT_BEFORE
+        operation: INSERT_FIRST
         value:
           name: envoy.filters.http.ext_authz
           typed_config:
@@ -92,12 +88,21 @@ spec:
                 return scheme .. "://" .. host .. path, path
               end
 
+              local function has_session_cookie(h)
+                local cookie = h:get("cookie") or ""
+                if cookie == "" then
+                  return false
+                end
+                return string.find(cookie, "{{ $cookieName }}=") ~= nil
+              end
+
               function envoy_on_request(handle)
                 local h = handle:headers()
                 local rd, path = build_rd(h)
                 local md = handle:streamInfo():dynamicMetadata()
                 md:set("oauth2_proxy", "rd", rd)
                 md:set("oauth2_proxy", "path", path)
+                md:set("oauth2_proxy", "has_session", has_session_cookie(h) and "true" or "false")
               end
 
               function envoy_on_response(handle)
@@ -108,6 +113,9 @@ spec:
                 local md = handle:streamInfo():dynamicMetadata():get("oauth2_proxy") or {}
                 local path = md["path"] or ""
                 if string.sub(path, 1, 7) == "/oauth2" then
+                  return
+                end
+                if md["has_session"] == "true" then
                   return
                 end
                 local rd = md["rd"] or ""
