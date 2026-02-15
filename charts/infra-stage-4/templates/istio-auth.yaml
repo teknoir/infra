@@ -49,7 +49,6 @@ spec:
               authorization_response:
                 allowed_upstream_headers:
                   patterns:
-                    - exact: authorization
                     - exact: x-forwarded-access-token
                     - exact: x-auth-request-access-token
                     - exact: x-auth-request-user
