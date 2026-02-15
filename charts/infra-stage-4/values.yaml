@@ -67,7 +67,8 @@ oauth2Proxy:
     issuerUrl: https://auth.teknoir.online/auth/realms/master
     clientId: teknoir-online
   cookie:
-    domain: .teknoir.online
+    domain: teknoir.online
+    name: _teknoir_oauth2_proxy
     sameSite: none
     path: /
     csrfPerRequest: false

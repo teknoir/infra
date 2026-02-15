@@ -36,6 +36,9 @@ spec:
             - --oidc-issuer-url={{ .Values.oauth2Proxy.oidc.issuerUrl }}
             - --client-id={{ .Values.oauth2Proxy.oidc.clientId }}
             - --cookie-domain={{ .Values.oauth2Proxy.cookie.domain }}
+{{- if .Values.oauth2Proxy.cookie.name }}
+            - --cookie-name={{ .Values.oauth2Proxy.cookie.name | quote }}
+{{- end }}
             - --cookie-secure=true
             - --cookie-samesite={{ .Values.oauth2Proxy.cookie.sameSite | default "lax" }}
 {{- if .Values.oauth2Proxy.cookie.path }}
