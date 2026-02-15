@@ -60,6 +60,10 @@ spec:
       containers:
         - name: redis
           image: docker.io/redis:7.2-alpine
+          command:
+            - sh
+            - -c
+            - redis-server --requirepass "$REDIS_PASSWORD" --appendonly yes
           ports:
             - name: redis
               containerPort: {{ .Values.oauth2Proxy.redis.port }}
@@ -69,11 +73,6 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.oauth2Proxy.redis.secretName }}
                   key: {{ .Values.oauth2Proxy.redis.passwordKey }}
-          args:
-            - --requirepass
-            - "$(REDIS_PASSWORD)"
-            - --appendonly
-            - "yes"
           volumeMounts:
             - name: data
               mountPath: /data
