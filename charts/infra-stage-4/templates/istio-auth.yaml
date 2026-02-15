@@ -165,6 +165,9 @@ metadata:
   name: jwt-auth
   namespace: {{ .Values.oauth2Proxy.namespace }}
 spec:
+  selector:
+    matchLabels:
+      app: oauth2-proxy
   jwtRules:
     - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
       jwksUri: {{ $jwksUri | quote }}
