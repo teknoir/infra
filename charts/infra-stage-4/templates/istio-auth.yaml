@@ -168,6 +168,9 @@ metadata:
   name: require-jwt
   namespace: {{ .Values.oauth2Proxy.namespace }}
 spec:
+  selector:
+    matchLabels:
+      app: oauth2-proxy
   action: ALLOW
   rules:
     - from:
@@ -186,6 +189,22 @@ spec:
   action: ALLOW
   rules:
     - {}
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: oauth2-proxy-redis-allow
+  namespace: {{ .Values.oauth2Proxy.namespace }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.oauth2Proxy.redis.host }}
+  action: ALLOW
+  rules:
+    - from:
+        - source:
+            namespaces:
+              - {{ .Values.oauth2Proxy.namespace }}
 {{- if .Values.istio.auth.httpbin.enabled }}
 ---
 apiVersion: security.istio.io/v1beta1
