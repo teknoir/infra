@@ -68,7 +68,6 @@ oauth2Proxy:
     clientId: teknoir-online
   cookie:
     domain: teknoir.online
-    name: _teknoir_oauth2_proxy
     sameSite: none
     path: /
     csrfPerRequest: false
