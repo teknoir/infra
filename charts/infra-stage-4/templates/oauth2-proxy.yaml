@@ -37,7 +37,7 @@ spec:
             - --client-id={{ .Values.oauth2Proxy.oidc.clientId }}
             - --cookie-domain={{ .Values.oauth2Proxy.cookie.domain }}
 {{- if .Values.oauth2Proxy.cookie.name }}
-            - --cookie-name={{ .Values.oauth2Proxy.cookie.name | quote }}
+            - --cookie-name={{ .Values.oauth2Proxy.cookie.name }}
 {{- end }}
             - --cookie-secure=true
             - --cookie-samesite={{ .Values.oauth2Proxy.cookie.sameSite | default "lax" }}
@@ -96,13 +96,6 @@ spec:
                 secretKeyRef:
                   name: {{ $secretName }}
                   key: cookie-secret
-{{- if .Values.oauth2Proxy.redis.enabled }}
-            - name: OAUTH2_PROXY_REDIS_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.oauth2Proxy.redis.secretName }}
-                  key: {{ .Values.oauth2Proxy.redis.passwordKey }}
-{{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.oauth2Proxy.service.port }}

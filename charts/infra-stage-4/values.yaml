@@ -67,13 +67,15 @@ oauth2Proxy:
     issuerUrl: https://auth.teknoir.online/auth/realms/master
     clientId: teknoir-online
   cookie:
-    domain: .teknoir.online
-    sameSite: lax
+    domain: teknoir.online
+    name: _teknoir_oauth2_proxy
+    sameSite: none
     path: /
     csrfPerRequest: false
     csrfExpire: 10m
   redirectUrl: https://teknoir.online/oauth2/callback
   whitelistDomains:
+    - teknoir.online
     - .teknoir.online
   authHosts:
     - "teknoir.online"
@@ -98,6 +100,7 @@ oauth2Proxy:
     database: 0
     secretName: oauth2-proxy-redis-secret
     passwordKey: password
+    connectionUrlKey: connection-url
     storage:
       size: 1Gi
       hostPath: /opt/teknoir/oauth2-proxy/redis
