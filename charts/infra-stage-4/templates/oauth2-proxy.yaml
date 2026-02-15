@@ -69,6 +69,7 @@ spec:
 {{- if .Values.oauth2Proxy.redis.enabled }}
             - --session-store-type=redis
             - --redis-connection-url=redis://{{ .Values.oauth2Proxy.redis.host }}.{{ .Values.oauth2Proxy.namespace }}.svc.cluster.local:{{ .Values.oauth2Proxy.redis.port }}/{{ .Values.oauth2Proxy.redis.database }}
+            - --redis-password=$(REDIS_PASSWORD)
 {{- end }}
 {{- if .Values.oauth2Proxy.sessionCookieMinimal }}
             - --session-cookie-minimal=true
@@ -96,6 +97,13 @@ spec:
                 secretKeyRef:
                   name: {{ $secretName }}
                   key: cookie-secret
+{{- if .Values.oauth2Proxy.redis.enabled }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.oauth2Proxy.redis.secretName }}
+                  key: {{ .Values.oauth2Proxy.redis.passwordKey }}
+{{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.oauth2Proxy.service.port }}
