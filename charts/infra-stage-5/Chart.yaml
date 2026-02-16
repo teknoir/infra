@@ -1,0 +1,10 @@
+apiVersion: v2
+name: infra-stage-5
+description: Infra stage 5 - EMQX Operator for MQTT messaging
+type: application
+version: 0.1.52
+appVersion: "0.1.0"
+dependencies:
+  - name: emqx-operator
+    version: 2.1.4
+    repository: https://repos.emqx.io/charts

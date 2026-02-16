@@ -6,6 +6,7 @@ SECRET_MANIFEST_PATH=manifest-clouddns-secret.yaml
 OAUTH2_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-secret.yaml
 KEYCLOAK_DB_SECRET_MANIFEST_PATH=manifest-keycloak-db-secret.yaml
 OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
+GCR_SECRET_MANIFEST_PATH=manifest-gcr-json-key-secret.yaml
 
 ssh anders@rtx2000-pro-bw-se.teknoir \
   "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-infra.yaml >/dev/null" \
@@ -33,4 +34,10 @@ if [ -f "${OAUTH2_REDIS_SECRET_MANIFEST_PATH}" ]; then
   ssh anders@rtx2000-pro-bw-se.teknoir \
     "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-oauth2-proxy-redis-secret.yaml >/dev/null" \
     < "${OAUTH2_REDIS_SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${GCR_SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@rtx2000-pro-bw-se.teknoir \
+    "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-gcr-json-key-secret.yaml >/dev/null" \
+    < "${GCR_SECRET_MANIFEST_PATH}"
 fi
