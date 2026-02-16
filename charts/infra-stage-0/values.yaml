@@ -1,4 +1,6 @@
 # Default values for infra-stage-0.
 cert-manager:
+  nameOverride: cert-manager
+  fullnameOverride: cert-manager
   crds:
     enabled: true

@@ -1,1 +1,4 @@
 # Default values for infra-stage-5
+emqx-operator:
+  nameOverride: emqx-operator
+  fullnameOverride: emqx-operator
