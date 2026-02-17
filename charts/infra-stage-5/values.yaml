@@ -1,4 +1,13 @@
 # Default values for infra-stage-5
-emqx-operator:
-  nameOverride: emqx-operator
-  fullnameOverride: emqx-operator
+httpbin:
+  enabled: true
+  name: httpbin
+  namespace: teknoir-system
+  image:
+    repository: docker.io/kennethreitz/httpbin
+    tag: latest
+  service:
+    port: 80
+  virtualService:
+    hosts:
+      - "httpbin.teknoir.online"

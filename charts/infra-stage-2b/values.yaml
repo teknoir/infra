@@ -16,7 +16,6 @@ istio-egressgateway:
     type: ClusterIP
 
 gw:
-  enabled: true
   name: teknoir-gateway
   namespace: istio-system
   selector:
@@ -25,19 +24,4 @@ gw:
     - "teknoir.online"
     - "*.teknoir.online"
   tls:
-    enabled: true
     credentialName: teknoir-online-wildcard-tls
-  httpsRedirect: true
-
-httpbin:
-  enabled: true
-  name: httpbin
-  namespace: teknoir-system
-  image:
-    repository: docker.io/kennethreitz/httpbin
-    tag: latest
-  service:
-    port: 80
-  virtualService:
-    hosts:
-      - "httpbin.teknoir.online"
