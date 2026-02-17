@@ -2,54 +2,54 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Values.httpbin.name }}
-  namespace: {{ .Values.httpbin.namespace }}
+  name: httpbin
+  namespace: {{ .Release.Namespace }}
 spec:
   selector:
-    app: {{ .Values.httpbin.name }}
+    app: httpbin
   ports:
     - name: http
-      port: {{ .Values.httpbin.service.port }}
+      port: 80
       targetPort: http
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Values.httpbin.name }}
-  namespace: {{ .Values.httpbin.namespace }}
+  name: httpbin
+  namespace: {{ .Release.Namespace }}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: {{ .Values.httpbin.name }}
+      app: httpbin
   template:
     metadata:
       labels:
-        app: {{ .Values.httpbin.name }}
+        app: httpbin
     spec:
       containers:
         - name: httpbin
           image: {{ .Values.httpbin.image.repository }}:{{ .Values.httpbin.image.tag }}
           ports:
             - name: http
-              containerPort: {{ .Values.httpbin.service.port }}
+              containerPort: 80
 ---
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
-  name: {{ .Values.httpbin.name }}
-  namespace: {{ .Values.httpbin.namespace }}
+  name: httpbin
+  namespace: {{ .Release.Namespace }}
 spec:
   hosts:
 {{- range .Values.httpbin.virtualService.hosts }}
   - {{ . | quote }}
 {{- end }}
   gateways:
-    - {{ .Values.gw.namespace }}/{{ .Values.gw.name }}
+    - istio-system/teknoir-gateway
   http:
     - route:
         - destination:
-            host: {{ .Values.httpbin.name }}.{{ .Values.httpbin.namespace }}.svc.cluster.local
+            host: httpbin.{{ .Release.Namespace }}.svc.cluster.local
             port:
-              number: {{ .Values.httpbin.service.port }}
+              number: 80
 {{- end -}}

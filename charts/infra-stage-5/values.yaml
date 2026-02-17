@@ -1,13 +1,9 @@
 # Default values for infra-stage-5
 httpbin:
   enabled: true
-  name: httpbin
-  namespace: teknoir-system
   image:
     repository: docker.io/kennethreitz/httpbin
     tag: latest
-  service:
-    port: 80
   virtualService:
     hosts:
       - "httpbin.teknoir.online"

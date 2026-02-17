@@ -28,27 +28,28 @@ spec:
     tls:
       mode: SIMPLE
       credentialName: {{ .Values.gw.tls.credentialName | quote }}
-    - hosts:
+  - port:
+      name: tcp-mqttssl
+      number: 8883
+      protocol:
+        TCP
+    hosts:
+{{- range .Values.gw.hosts }}
+    - {{ . | quote }}
+{{- end }}
+  - port:
+      name: tcp-mqttwss
+      number: 8084
+      protocol: TCP
+    hosts:
 {{- range .Values.gw.hosts }}
       - {{ . | quote }}
 {{- end }}
-      port:
-        name: tcp-mqttssl
-        number: 8883
-        protocol: TCP
-    - hosts:
+  - port:
+      name: tcp-ssh
+      number: 2222
+      protocol: TCP
+    hosts:
 {{- range .Values.gw.hosts }}
       - {{ . | quote }}
 {{- end }}
-      port:
-        name: tcp-mqttwss
-        number: 8084
-        protocol: TCP
-      - hosts:
-{{- range .Values.gw.hosts }}
-          - {{ . | quote }}
-{{- end }}
-        port:
-          name: tcp-mqttwss
-          number: 2222
-          protocol: TCP
