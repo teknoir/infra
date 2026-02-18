@@ -1,0 +1,12 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: teknoir-gateway
+  namespace: kube-system
+spec:
+  repo: https://teknoir.github.io/infra
+  chart: stage-6-teknoir-gateway
+  targetNamespace: istio-system
+  valuesContent: |-
+    # Example for minimal configuration

@@ -1,0 +1,14 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: istiod
+  namespace: kube-system
+spec:
+  repo: https://istio-release.storage.googleapis.com/charts
+  chart: istiod
+  targetNamespace: istio-system
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+    # Example for minimal configuration

@@ -1,9 +1,0 @@
-# Default values for infra-stage-2.
-istioNamespace: istio-system
-
-istiod:
-  global:
-    istioNamespace: istio-system
-  pilot:
-    env:
-      ENABLE_NATIVE_SIDECARS: "true"

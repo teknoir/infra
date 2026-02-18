@@ -1,0 +1,14 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: auth
+  namespace: kube-system
+spec:
+  repo: https://teknoir.github.io/infra
+  chart: stage-7-auth
+  targetNamespace: teknoir-system
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+    # Example for minimal configuration

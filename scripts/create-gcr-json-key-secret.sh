@@ -3,7 +3,7 @@ set -euo pipefail
 
 PROJECT_ID="teknoir-mgmt"
 SERVICE_ACCOUNT="pull-secret-sa@teknoir-mgmt.iam.gserviceaccount.com"
-NAMESPACE="teknoir-system"
+NAMESPACE="teknoir-auth"
 SECRET_NAME="gcr-json-key"
 MANIFEST_FILE="manifest-gcr-json-key-secret.yaml"
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MANIFEST_FILE="manifest-oauth2-proxy-secret.yaml"
-NAMESPACE="teknoir-system"
+NAMESPACE="teknoir-auth"
 SECRET_NAME="oauth2-proxy-secret"
 
 cookie_secret="${1:-}"

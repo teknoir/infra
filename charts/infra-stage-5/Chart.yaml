@@ -1,6 +1,0 @@
-apiVersion: v2
-name: infra-stage-5
-description: Infra stage 5 - HTTPBin application deployment
-type: application
-version: 0.1.56
-appVersion: "0.1.0"

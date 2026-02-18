@@ -1,0 +1,18 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: istio-ingressgateway
+  namespace: kube-system
+spec:
+  repo: https://istio-release.storage.googleapis.com/charts
+  chart: gateway
+  targetNamespace: istio-system
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+    name: istio-ingressgateway
+    labels:
+      istio: ingressgateway
+    service:
+      type: LoadBalancer
