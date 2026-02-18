@@ -10,7 +10,7 @@ spec:
     - {{ . | quote }}
 {{- end }}
   gateways:
-    - {{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}
+    - istio-system/teknoir-gateway
   http:
     - name: oauth2-proxy-auth
       match:

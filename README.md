@@ -60,15 +60,17 @@ Minimal client setup in master realm:
 * Web origins: https://teknoir.online
 Then update the secret
 * Take the client secret from Keycloak
-* Update oauth2-proxy-secret in teknoir-system (client-secret key)
+* Update oauth2-proxy-secret (by running `./scripts/gen-oauth2-proxy-secrets.sh`)
+* `./scripts/deploy-local.sh` to deploy secret to cluster
 Then add client scope
-* Add (or create) a scope
-* Default
+* Add (or create) a scope: teknoir-online
+* Type: Default
 Configure a new mapper for the scope
 * Mapper type: Audience
 * Included Client Audience: teknoir-online
 * Add to access token: ON
-
+Restart oauth2-proxy deployment to pick up new secret and scope changes.
+* `kubectl -n teknoir-auth rollout restart deploy/oauth2-proxy`
 ## Layout
 
 - `charts/infra`: umbrella chart and values

@@ -7,9 +7,10 @@ spec:
   hosts:
     - "auth.teknoir.online"
   gateways:
-    - {{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}
+    - istio-system/teknoir-gateway
   http:
-    - route:
+    - name: keycloak
+      route:
         - destination:
             host: {{ .Values.keycloak.service.name | default (printf "%s-http" .Values.keycloak.fullnameOverride) }}.{{ .Release.Namespace }}.svc.cluster.local
             port:
@@ -31,3 +32,21 @@ spec:
         - source:
             namespaces:
               - {{ .Release.Namespace }}
+
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: keycloak-allow-ingress
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keycloak
+  action: ALLOW
+  rules:
+    - {}
+{{/*    - from:*/}}
+{{/*        - source:*/}}
+{{/*            principals:*/}}
+{{/*              - "cluster.local/ns/istio-system/sa/istio-ingressgateway"*/}}

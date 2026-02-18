@@ -7,7 +7,7 @@ metadata:
 spec:
   repo: https://teknoir.github.io/infra
   chart: stage-7-auth
-  targetNamespace: teknoir-system
+  targetNamespace: teknoir-auth
   createNamespace: true
   takeOwnership: true
   valuesContent: |-

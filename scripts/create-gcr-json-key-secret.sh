@@ -75,6 +75,16 @@ metadata:
 type: kubernetes.io/dockerconfigjson
 data:
   .dockerconfigjson: ${encoded_config}
+
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_NAME}
+  namespace: teknoir-system
+type: kubernetes.io/dockerconfigjson
+data:
+  .dockerconfigjson: ${encoded_config}
 EOF
 
 echo "Wrote manifest to ${MANIFEST_FILE}."

@@ -62,14 +62,17 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   selector:
-    app: httpbin
+    matchLabels:
+      app: httpbin
   jwtRules:
     - issuer: {{ .Values.istio.auth.jwksIssuer | quote }}
       jwksUri: {{ $jwksUri | quote }}
+      outputPayloadToHeader: verified-jwt
       fromHeaders:
         - name: Authorization
         - name: X-Forwarded-Access-Token
         - name: X-Auth-Request-Access-Token
+
 ---
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
@@ -78,7 +81,8 @@ metadata:
   namespace: {{ .Release.Namespace }}
 spec:
   selector:
-    app: httpbin
+    matchLabels:
+      app: httpbin
   action: ALLOW
   rules:
     - from:
