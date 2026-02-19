@@ -56,9 +56,12 @@ spec:
         - name: tcp-ssh
           port: 2222
           targetPort: 2222
+          protocol: TCP
         - name: https-mqtt
           port: 8084
           targetPort: 8084
-        - name: tls-mqtt
-          port: 8883
-          targetPort: 8883
+          protocol: TCP
+#        - name: tls-mqtt
+#          port: 8883
+#          targetPort: 8883
+#          protocol: TCP

@@ -40,17 +40,18 @@ spec:
   selector:
     istio: ingressgateway-public
   servers:
-    - port:
-        name: tls-mqtt
-        number: 8883
-        protocol: TLS
-      hosts:
-{{- range .Values.hosts }}
-        - {{ . | quote }}
-{{- end }}
-      tls:
-        mode: SIMPLE
-        credentialName: {{ .Values.tls.credentialName | quote }}
+#    - port:
+#        name: tls-mqtt
+#        number: 8883
+#        protocol: TLS
+#      hosts:
+#{{- range .Values.hosts }}
+#        - {{ . | quote }}
+#{{- end }}
+#      tls:
+#        mode: PASSTHROUGH
+        #mode: SIMPLE
+        #credentialName: {{ .Values.tls.credentialName | quote }}
     - port:
         name: https-mqtt
         number: 8084
