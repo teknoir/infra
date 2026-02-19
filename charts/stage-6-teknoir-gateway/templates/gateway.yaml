@@ -2,11 +2,11 @@
 apiVersion: networking.istio.io/v1beta1
 kind: Gateway
 metadata:
-  name: {{ .Values.name }}
+  name: teknoir-gateway
   namespace: {{ .Release.Namespace }}
 spec:
   selector:
-{{- toYaml .Values.selector | nindent 4 }}
+    istio: ingressgateway
   servers:
   - port:
       number: 80
@@ -29,28 +29,44 @@ spec:
     tls:
       mode: SIMPLE
       credentialName: {{ .Values.tls.credentialName | quote }}
-  - port:
-      name: tcp-mqttssl
-      number: 8883
-      protocol:
-        TCP
-    hosts:
+
+---
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: teknoir-gateway-public
+  namespace: {{ .Release.Namespace }}
+spec:
+  selector:
+    istio: ingressgateway-public
+  servers:
+    - port:
+        name: tls-mqtt
+        number: 8883
+        protocol: TLS
+      hosts:
 {{- range .Values.hosts }}
-    - {{ . | quote }}
+        - {{ . | quote }}
 {{- end }}
-  - port:
-      name: tcp-mqttwss
-      number: 8084
-      protocol: TCP
-    hosts:
+      tls:
+        mode: SIMPLE
+        credentialName: {{ .Values.tls.credentialName | quote }}
+    - port:
+        name: https-mqtt
+        number: 8084
+        protocol: HTTPS
+      hosts:
 {{- range .Values.hosts }}
-      - {{ . | quote }}
+        - {{ . | quote }}
 {{- end }}
-  - port:
-      name: tcp-ssh
-      number: 2222
-      protocol: TCP
-    hosts:
+      tls:
+        mode: SIMPLE
+        credentialName: {{ .Values.tls.credentialName | quote }}
+    - port:
+        name: tcp-ssh
+        number: 2222
+        protocol: TCP
+      hosts:
 {{- range .Values.hosts }}
-      - {{ . | quote }}
+        - {{ . | quote }}
 {{- end }}

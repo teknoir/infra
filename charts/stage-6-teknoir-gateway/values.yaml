@@ -1,7 +1,4 @@
 # Default values for infra-stage-5.
-name: teknoir-gateway
-selector:
-  istio: ingressgateway
 hosts:
   - "teknoir.online"
   - "*.teknoir.online"
