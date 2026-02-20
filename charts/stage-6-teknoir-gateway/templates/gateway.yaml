@@ -64,10 +64,13 @@ spec:
         mode: SIMPLE
         credentialName: {{ .Values.tls.credentialName | quote }}
     - port:
-        name: tcp-ssh
+        name: tls-ssh
         number: 2222
-        protocol: TCP
+        protocol: TLS
       hosts:
 {{- range .Values.hosts }}
         - {{ . | quote }}
 {{- end }}
+      tls:
+        mode: SIMPLE
+        credentialName: {{ .Values.tls.credentialName | quote }}
