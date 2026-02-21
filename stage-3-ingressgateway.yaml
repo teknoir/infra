@@ -61,7 +61,7 @@ spec:
           port: 8084
           targetPort: 8084
           protocol: TCP
-#        - name: tls-mqtt
-#          port: 8883
-#          targetPort: 8883
-#          protocol: TCP
+        - name: tls-mqtt
+          port: 8883
+          targetPort: 8883
+          protocol: TCP
