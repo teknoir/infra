@@ -69,7 +69,6 @@ spec:
       jwksUri: {{ $jwksUri | quote }}
       outputPayloadToHeader: verified-jwt
       fromHeaders:
-        - name: Authorization
         - name: X-Forwarded-Access-Token
         - name: X-Auth-Request-Access-Token
 

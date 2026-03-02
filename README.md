@@ -56,6 +56,7 @@ Minimal client setup in master realm:
 * OpenID Connect 
 * Client authentication: ON (this is “confidential”)
 * Standard flow: ON 
+* Service account roles: ON
 * Valid redirect URI: https://teknoir.online/oauth2/callback
 * Web origins: https://teknoir.online
 Then update the secret
@@ -69,6 +70,9 @@ Configure a new mapper for the scope
 * Mapper type: Audience
 * Included Client Audience: teknoir-online
 * Add to access token: ON
+Then add Service Account Role
+* Go to Service Account Roles for the client click Assign Roles
+* Assign "Client Roles": manage-users, query-users, view-users
 Restart oauth2-proxy deployment to pick up new secret and scope changes.
 * `kubectl -n teknoir-auth rollout restart deploy/oauth2-proxy`
 ## Layout
