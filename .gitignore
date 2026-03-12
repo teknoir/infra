@@ -6,3 +6,4 @@ manifest-oauth2-proxy-secret.yaml
 manifest-keycloak-db-secret.yaml
 manifest-oauth2-proxy-redis-secret.yaml
 manifest-gcr-json-key-secret.yaml
+manifest-harbor-secret.yaml

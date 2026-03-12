@@ -1,0 +1,20 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: harbor
+  namespace: kube-system
+spec:
+  repo: https://teknoir.github.io/infra
+  chart: stage-8-harbor
+  targetNamespace: teknoir-harbor
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+    # Platform-specific Harbor overrides
+    harbor:
+      externalURL: https://harbor.teknoir.online
+      # HostPath configuration for persistence
+      persistence:
+        hostPathPrefix: /opt/teknoir/harbor
+    hostname: harbor.teknoir.online

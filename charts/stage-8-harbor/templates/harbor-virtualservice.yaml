@@ -1,0 +1,17 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: harbor
+  namespace: {{ .Release.Namespace }}
+spec:
+  hosts:
+    - {{ .Values.hostname | quote }}
+  gateways:
+    - {{ .Values.istio.gateway.namespace }}/{{ .Values.istio.gateway.name }}
+  http:
+    - name: harbor
+      route:
+        - destination:
+            host: harbor-portal.{{ .Release.Namespace }}.svc.cluster.local
+            port:
+              number: 80

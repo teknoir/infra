@@ -75,6 +75,10 @@ Then add Service Account Role
 * Assign "Client Roles": manage-users, query-users, view-users
 Restart oauth2-proxy deployment to pick up new secret and scope changes.
 * `kubectl -n teknoir-auth rollout restart deploy/oauth2-proxy`
+
+
+
+
 ## Layout
 
 - `charts/infra`: umbrella chart and values

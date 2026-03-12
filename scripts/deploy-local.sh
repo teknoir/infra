@@ -7,7 +7,7 @@ OAUTH2_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-secret.yaml
 KEYCLOAK_DB_SECRET_MANIFEST_PATH=manifest-keycloak-db-secret.yaml
 OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
 GCR_SECRET_MANIFEST_PATH=manifest-gcr-json-key-secret.yaml
-
+HARBOR_SECRET_MANIFEST_PATH=manifest-harbor-secret.yaml
 
 
 
@@ -40,6 +40,12 @@ if [ -f "${GCR_SECRET_MANIFEST_PATH}" ]; then
   ssh anders@rtx2000-pro-bw-se.teknoir \
     "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-gcr-json-key-secret.yaml >/dev/null" \
     < "${GCR_SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${HARBOR_SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@rtx2000-pro-bw-se.teknoir \
+    "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-harbor-secret.yaml >/dev/null" \
+    < "${HARBOR_SECRET_MANIFEST_PATH}"
 fi
 
 
@@ -85,3 +91,7 @@ ssh anders@rtx2000-pro-bw-se.teknoir \
 #ssh anders@rtx2000-pro-bw-se.teknoir \
 #  "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-stage-7-auth.yaml >/dev/null" \
 #  < "stage-7-auth.yaml"
+
+helm -n teknoir-system template stage-8 ./charts/stage-8-harbor | \
+ssh anders@rtx2000-pro-bw-se.teknoir \
+  "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-stage-8-harbor.yaml >/dev/null"
