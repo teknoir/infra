@@ -4,6 +4,10 @@ authNamespace: teknoir-auth
 keycloak:
   enabled: true
   fullnameOverride: keycloak
+  image:
+    repository: us-docker.pkg.dev/teknoir/gcr.io/keycloak-themed
+    tag: "local-20260310-110746"
+    pullPolicy: IfNotPresent
   service:
     name: keycloak-http
     httpPort: 80
