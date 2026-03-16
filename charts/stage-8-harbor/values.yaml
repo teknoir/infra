@@ -7,20 +7,20 @@ harbor:
   enabled: true
   fullnameOverride: harbor
   expose:
-    # We use "ingress" type to enable the internal harbor-proxy (nginx)
-    # but we will primarily use Istio VirtualService for external exposure.
-    type: ingress
+    type: none
     tls:
       enabled: false
-    ingress:
-      hosts:
-        core: harbor.teknoir.online
-      annotations:
-        # Ensure Istio picks it up if it's watching Ingress, 
-        # but we also provide a VirtualService.
-        kubernetes.io/ingress.class: istio
-        # Disable cert-manager on this ingress as we use the wildcard cert
-        cert-manager.io/cluster-issuer: ""
+
+    # We use "clusterIP" type to enable the internal harbor-proxy (nginx)
+    # as the single backend for Istio VirtualService.
+#    type: clusterIP
+#    tls:
+#      # Istio handles TLS at the gateway, so we disable it for the internal proxy.
+#      enabled: false
+#    clusterIP:
+#      name: harbor-proxy
+#      ports:
+#        httpPort: 80
   
   externalURL: https://harbor.teknoir.online
   
@@ -125,7 +125,7 @@ harbor:
   existingSecretAdminPassword: "harbor-secret"
   existingSecretAdminPasswordKey: "HARBOR_ADMIN_PASSWORD"
   existingSecretSecretKey: "harbor-secret"
-  
+
   core:
     existingSecret: "harbor-secret"
     # Note: 'secret' is the default key in core.existingSecret
@@ -138,7 +138,9 @@ istio:
     name: teknoir-gateway
     namespace: istio-system
   auth:
-    enabled: false # Will be enabled when Keycloak integration is ready
+    # We use Harbor's native OIDC integration instead of oauth2-proxy
+    # to avoid breaking Docker/Helm CLI workflows.
+    enabled: false
 
 # Domain and naming conventions
 domain: teknoir.online

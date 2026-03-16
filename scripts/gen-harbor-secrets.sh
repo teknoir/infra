@@ -14,10 +14,10 @@ print(base64.b64encode(os.urandom($len)).decode()[:$len])
 PY
 }
 
-admin_password=$(gen_rand 24)
+admin_password=$(gen_rand 12)
 secret_key=$(gen_rand 16)
 core_secret=$(gen_rand 16)
-xsrf_key=$(gen_rand 16)
+xsrf_key=$(gen_rand 32)
 jobservice_secret=$(gen_rand 16)
 registry_secret=$(gen_rand 16)
 # database_password and redis_password if we ever need them for external or if chart supports them for internal

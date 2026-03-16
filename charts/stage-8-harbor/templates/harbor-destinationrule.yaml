@@ -1,0 +1,25 @@
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: harbor-core-mtls
+  namespace: {{ .Release.Namespace }}
+spec:
+  # Apply this rule to all services in the harbor namespace
+  host: "harbor-core.{{ .Release.Namespace }}.svc.cluster.local"
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: harbor-portal-mtls
+  namespace: {{ .Release.Namespace }}
+spec:
+  # Apply this rule to all services in the harbor namespace
+  host: "harbor-portal.{{ .Release.Namespace }}.svc.cluster.local"
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
