@@ -76,7 +76,12 @@ Then add Service Account Role
 Restart oauth2-proxy deployment to pick up new secret and scope changes.
 * `kubectl -n teknoir-auth rollout restart deploy/oauth2-proxy`
 
-
+TODO:
+Figure out how to label namespaces:
+```
+kubectl label namespace teknoir-auth istio-injection=enabled --overwrite
+kubectl label namespace teknoir-system istio-injection=enabled --overwrite
+```
 
 
 ## Layout

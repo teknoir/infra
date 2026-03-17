@@ -1,0 +1,87 @@
+#!/bin/sh
+set -e
+
+MANIFEST_PATH=manifest-local.yaml
+SECRET_MANIFEST_PATH=manifest-clouddns-secret.yaml
+OAUTH2_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-secret.yaml
+KEYCLOAK_DB_SECRET_MANIFEST_PATH=manifest-keycloak-db-secret.yaml
+OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
+GCR_SECRET_MANIFEST_PATH=manifest-gcr-json-key-secret.yaml
+HARBOR_SECRET_MANIFEST_PATH=manifest-harbor-secret.yaml
+
+
+
+# SECRETS
+if [ -f "${SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-clouddns-secret.yaml >/dev/null" \
+    < "${SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${OAUTH2_SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-oauth2-proxy-secret.yaml >/dev/null" \
+    < "${OAUTH2_SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${KEYCLOAK_DB_SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-keycloak-db-secret.yaml >/dev/null" \
+    < "${KEYCLOAK_DB_SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${OAUTH2_REDIS_SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-oauth2-proxy-redis-secret.yaml >/dev/null" \
+    < "${OAUTH2_REDIS_SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${GCR_SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-gcr-json-key-secret.yaml >/dev/null" \
+    < "${GCR_SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${HARBOR_SECRET_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-harbor-secret.yaml >/dev/null" \
+    < "${HARBOR_SECRET_MANIFEST_PATH}"
+fi
+
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-1-istio-base.yaml >/dev/null" \
+  < "stage-1-istio-base.yaml"
+
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-2-istiod.yaml >/dev/null" \
+  < "stage-2-istiod.yaml"
+
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-3-ingressgateway.yaml >/dev/null" \
+  < "stage-3-ingressgateway.yaml"
+
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-4-egressgateway.yaml >/dev/null" \
+  < "stage-4-egressgateway.yaml"
+
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-5-cert-manager.yaml >/dev/null" \
+  < "stage-5-cert-manager.yaml"
+
+helm -n istio-system template teknoir-gateway ./charts/stage-6-teknoir-gateway | \
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-6-teknoir-gateway.yaml >/dev/null"
+#ssh anders@r415 \
+#  "sudo tee /opt/k3s/server/manifests/teknoir-stage-6-teknoir-gateway.yaml >/dev/null" \
+#  < "stage-6-teknoir-gateway.yaml"
+
+helm -n teknoir-auth template teknoir-gateway ./charts/stage-7-auth | \
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-7-auth.yaml >/dev/null"
+#ssh anders@r415 \
+#  "sudo tee /opt/k3s/server/manifests/teknoir-stage-7-auth.yaml >/dev/null" \
+#  < "stage-7-auth.yaml"
+
+helm -n teknoir-system template stage-8 ./charts/stage-8-harbor | \
+ssh anders@r415 \
+  "sudo tee /opt/k3s/server/manifests/teknoir-stage-8-harbor.yaml >/dev/null"
