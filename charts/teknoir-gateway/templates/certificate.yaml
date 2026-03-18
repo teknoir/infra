@@ -1,0 +1,21 @@
+{{- $namespace := .Values.namespace | default .Release.Namespace -}}
+{{- $domain := .Values.domain | default (index .Values "global" "domain") | default "teknoir.online" -}}
+{{- $dnsNames := .Values.letsencrypt.certificate.dnsNames | default (list $domain (printf "*.%s" $domain)) -}}
+{{- $commonName := .Values.letsencrypt.certificate.commonName | default (printf "*.%s" $domain) -}}
+{{- $secretName := .Values.letsencrypt.certificate.secretName | default (printf "%s-wildcard-tls" (replace "." "-" $domain)) -}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: teknoir-wildcard
+  namespace: {{ $namespace }}
+spec:
+  secretName: {{ $secretName | quote }}
+  commonName: {{ $commonName | quote }}
+  dnsNames:
+{{- range $dnsNames }}
+    - {{ . | quote }}
+{{- end }}
+  issuerRef:
+    name: letsencrypt-dns
+    kind: ClusterIssuer

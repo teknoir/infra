@@ -8,88 +8,76 @@ cert-manager and cert-manager-istio-csr for certificate issuance.
 
 ## Quick start
 
-Run a local dry run render:
+The infrastructure is now managed via a single umbrella Helm chart located in `charts/infra`.
+
+### 1. Prerequisites (Secrets)
+
+Secrets are managed manually. Generate them before deploying:
 
 ```sh
-./scripts/dry-run.sh
+./scripts/create-clouddns-secret.sh <KEY_PATH>
+./scripts/create-gcr-json-key-secret.sh <KEY_PATH>
+./scripts/gen-harbor-secrets.sh
+./scripts/gen-keycloak-db-secret.sh
+./scripts/gen-oauth2-proxy-secrets.sh
+./scripts/gen-oauth2-proxy-redis-secret.sh
 ```
 
-Install into a cluster:
-Use the HelmChart to deploy to a K3s cluster:
-```yaml
----
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: infra
-  namespace: istio-system
-spec:
-  repo: https://teknoir.github.io/infra
-  chart: infra
-  targetNamespace: istio-system
-  valuesContent: |-
-    # Example for minimal configuration
-```
-
-## Staged install
-
-Install in order to avoid CRD race conditions:
+### 2. Deploy
 
 ```sh
-helm dependency build charts/infra-stage-0
-helm upgrade --install infra-stage-0 charts/infra-stage-0 -n cert-manager --create-namespace
-
-helm dependency build charts/infra-stage-1
-helm upgrade --install infra-stage-1 charts/infra-stage-1 -n istio-system --create-namespace
-
-helm dependency build charts/infra-stage-2
-helm upgrade --install infra-stage-2 charts/infra-stage-2 -n istio-system
-
-helm dependency build charts/infra-stage-3
-helm upgrade --install infra-stage-3 charts/infra-stage-3 -n istio-system
+helm dependency update charts/infra
+./scripts/deploy-infra.sh
 ```
 
-## Setup in Keycloak
+### 3. Important manual steps
 
-Minimal client setup in master realm:
-* Client ID: teknoir-online (or change oauth2-proxy to match)
-* OpenID Connect 
+**Setup in Keycloak**
+
+Client setup in master realm:
+* Client ID: teknoir (or change oauth2-proxy to match)
+* OpenID Connect
 * Client authentication: ON (this is “confidential”)
-* Standard flow: ON 
+* Standard flow: ON
 * Service account roles: ON
 * Valid redirect URI: https://teknoir.online/oauth2/callback
 * Web origins: https://teknoir.online
-Then update the secret
+
+Then update the secret:
 * Take the client secret from Keycloak
 * Update oauth2-proxy-secret (by running `./scripts/gen-oauth2-proxy-secrets.sh`)
 * `./scripts/deploy-local.sh` to deploy secret to cluster
-Then add client scope
-* Add (or create) a scope: teknoir-online
+
+Then add client scope:
+* Add (or create) a scope: teknoir
 * Type: Default
-Configure a new mapper for the scope
+  
+Configure a new mapper for the scope:
 * Mapper type: Audience
-* Included Client Audience: teknoir-online
+* Included Client Audience: teknoir
 * Add to access token: ON
-Then add Service Account Role
+
+Then add Service Account Role:
 * Go to Service Account Roles for the client click Assign Roles
 * Assign "Client Roles": manage-users, query-users, view-users
-Restart oauth2-proxy deployment to pick up new secret and scope changes.
-* `kubectl -n teknoir-auth rollout restart deploy/oauth2-proxy`
 
-TODO:
-Figure out how to label namespaces:
-```
-kubectl label namespace teknoir-auth istio-injection=enabled --overwrite
-kubectl label namespace teknoir-system istio-injection=enabled --overwrite
+Restart oauth2-proxy deployment to pick up new secret and scope changes:
+```bash
+kubectl -n teknoir-auth rollout restart deploy/oauth2-proxy
 ```
 
+## Domain Cascading
+
+You can change the entire environment domain by setting `global.domain` in `charts/infra/values.yaml` or via CLI:
+
+```sh
+helm template infra ./charts/infra --set global.domain=my-new-domain.com
+```
 
 ## Layout
 
-- `charts/infra`: umbrella chart and values
-- `charts/infra-stage-0`: cert-manager (cert-manager namespace)
-- `charts/infra-stage-1`: istio-system namespace and Istio CRDs
-- `charts/infra-stage-2`: Istio control plane and gateways
-- `charts/infra-stage-3`: cert-manager Istio CSR integration
-- `example-values.yaml`: optional overrides for dry runs
-- `scripts/dry-run.sh`: renders manifests with debug output
+- `charts/infra`: umbrella chart combining all components.
+- `charts/teknoir-gateway`: Istio Gateway and Cert-manager Certificate templates.
+- `charts/auth`: Keycloak and OAuth2-proxy configuration.
+- `charts/harbor`: Harbor configuration.
+- `scripts/`: helper scripts for secret generation and deployment.

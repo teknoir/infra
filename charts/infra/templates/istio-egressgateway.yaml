@@ -1,0 +1,14 @@
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: istio-egressgateway
+  namespace: kube-system
+spec:
+  repo: https://istio-release.storage.googleapis.com/charts
+  chart: gateway
+  targetNamespace: istio-system
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+{{ toYaml .Values.istio_egressgateway.valuesContent | indent 4 }}

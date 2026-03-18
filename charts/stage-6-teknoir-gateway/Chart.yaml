@@ -1,6 +1,0 @@
-apiVersion: v2
-name: stage-5-teknoir-gateway
-description: Infra stage 6 - Teknoir gateway and edge routing
-type: application
-version: 0.0.2
-appVersion: "0.1.0"

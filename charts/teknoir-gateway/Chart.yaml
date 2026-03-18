@@ -1,0 +1,6 @@
+apiVersion: v2
+name: teknoir-gateway
+description: Teknoir gateway and edge routing
+type: application
+version: 0.0.2
+appVersion: "0.1.0"

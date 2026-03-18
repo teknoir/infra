@@ -1,0 +1,17 @@
+{{- if .Values.keycloak.enabled -}}
+{{- $namespace := .Values.namespace | default .Release.Namespace -}}
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: harbor
+  namespace: kube-system
+spec:
+  repo: https://codecentric.github.io/helm-charts
+  chart: keycloakx
+  targetNamespace: {{ $namespace }}
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+{{ toYaml .Values.keycloak.valuesContent | indent 4 }}
+{{- end -}}

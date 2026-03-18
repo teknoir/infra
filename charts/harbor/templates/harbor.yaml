@@ -1,0 +1,17 @@
+{{- if .Values.harbor.enabled -}}
+{{- $namespace := .Values.namespace | default .Release.Namespace -}}
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: harbor
+  namespace: kube-system
+spec:
+  repo: https://helm.goharbor.io
+  chart: harbor
+  targetNamespace: {{ $namespace }}
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+{{ toYaml .Values.harbor.valuesContent | indent 4 }}
+{{- end -}}

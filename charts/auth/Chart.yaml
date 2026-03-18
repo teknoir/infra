@@ -1,0 +1,11 @@
+apiVersion: v2
+name: auth
+description: KeycloakX, OAuth2/OIDC, and Istio auth
+type: application
+version: 0.0.2
+appVersion: "0.1.0"
+#dependencies:
+#  - name: keycloakx
+#    alias: keycloak
+#    version: ">=7.1.0 <8.0.0"
+#    repository: https://codecentric.github.io/helm-charts

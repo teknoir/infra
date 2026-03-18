@@ -1,0 +1,87 @@
+{{- $namespace := .Values.namespace | default .Release.Namespace -}}
+{{- if .Values.keycloak.valuesContent.db.enabled -}}
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: keycloak-db-pv
+spec:
+  capacity:
+    storage: {{ .Values.keycloak.valuesContent.db.storage.size }}
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: ""
+  persistentVolumeReclaimPolicy: Retain
+  hostPath:
+    path: {{ .Values.keycloak.valuesContent.db.storage.hostPath | quote }}
+    type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keycloak-db-pvc
+  namespace: {{ $namespace }}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.keycloak.valuesContent.db.storage.size }}
+  storageClassName: ""
+  volumeName: keycloak-db-pv
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak-db
+  namespace: {{ $namespace }}
+spec:
+  selector:
+    app: keycloak-db
+  ports:
+    - name: postgres
+      port: {{ .Values.keycloak.valuesContent.db.port }}
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: keycloak-db
+  namespace: {{ $namespace }}
+spec:
+  serviceName: keycloak-db
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak-db
+  template:
+    metadata:
+      labels:
+        app: keycloak-db
+    spec:
+      containers:
+        - name: postgres
+          image: docker.io/postgres:16
+          ports:
+            - name: postgres
+              containerPort: {{ .Values.keycloak.valuesContent.db.port }}
+          env:
+            - name: POSTGRES_DB
+              value: {{ .Values.keycloak.valuesContent.db.database | quote }}
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.valuesContent.db.secretName }}
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.keycloak.valuesContent.db.secretName }}
+                  key: password
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: keycloak-db-pvc
+{{- end -}}

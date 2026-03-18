@@ -68,20 +68,20 @@ ssh anders@r415 \
   "sudo tee /opt/k3s/server/manifests/teknoir-stage-5-cert-manager.yaml >/dev/null" \
   < "stage-5-cert-manager.yaml"
 
-helm -n istio-system template teknoir-gateway ./charts/stage-6-teknoir-gateway | \
+helm -n istio-system template teknoir-gateway ./charts/teknoir-gateway | \
 ssh anders@r415 \
-  "sudo tee /opt/k3s/server/manifests/teknoir-stage-6-teknoir-gateway.yaml >/dev/null"
+  "sudo tee /opt/k3s/server/manifests/teknoir-gateway.yaml >/dev/null"
 #ssh anders@r415 \
-#  "sudo tee /opt/k3s/server/manifests/teknoir-stage-6-teknoir-gateway.yaml >/dev/null" \
-#  < "stage-6-teknoir-gateway.yaml"
+#  "sudo tee /opt/k3s/server/manifests/teknoir-gateway.yaml >/dev/null" \
+#  < "teknoir-gateway.yaml"
 
-helm -n teknoir-auth template teknoir-gateway ./charts/stage-7-auth | \
+helm -n teknoir-auth template teknoir-gateway ./charts/auth | \
 ssh anders@r415 \
-  "sudo tee /opt/k3s/server/manifests/teknoir-stage-7-auth.yaml >/dev/null"
+  "sudo tee /opt/k3s/server/manifests/teknoir-auth.yaml >/dev/null"
 #ssh anders@r415 \
-#  "sudo tee /opt/k3s/server/manifests/teknoir-stage-7-auth.yaml >/dev/null" \
-#  < "stage-7-auth.yaml"
+#  "sudo tee /opt/k3s/server/manifests/teknoir-auth.yaml >/dev/null" \
+#  < "auth.yaml"
 
-helm -n teknoir-system template stage-8 ./charts/stage-8-harbor | \
+helm -n teknoir-system template harbor ./charts/harbor | \
 ssh anders@r415 \
-  "sudo tee /opt/k3s/server/manifests/teknoir-stage-8-harbor.yaml >/dev/null"
+  "sudo tee /opt/k3s/server/manifests/teknoir-harbor.yaml >/dev/null"

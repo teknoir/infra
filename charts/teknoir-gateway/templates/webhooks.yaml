@@ -1,0 +1,33 @@
+{{- if eq .Values.letsencrypt.solver "godaddy" }}
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: cert-manager-webhook-godaddy
+  namespace: kube-system
+spec:
+  repo: https://snowdrop.github.io/godaddy-webhook
+  chart: godaddy-webhook
+  targetNamespace: cert-manager
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+    groupName: acme.webhook.godaddy.com
+{{- end }}
+
+{{- if eq .Values.letsencrypt.solver "loopia" }}
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: cert-manager-webhook-loopia
+  namespace: kube-system
+spec:
+  repo: https://identitry.github.io/cert-manager-webhook-loopia
+  chart: cert-manager-webhook-loopia
+  targetNamespace: cert-manager
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+    groupName: acme.webhook.loopia.com
+{{- end -}}
