@@ -1,4 +1,19 @@
 ---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: cert-manager-webhook-godaddy
+  namespace: kube-system
+spec:
+  repo: https://snowdrop.github.io/godaddy-webhook
+  chart: godaddy-webhook
+  targetNamespace: cert-manager
+  createNamespace: true
+  takeOwnership: true
+  valuesContent: |-
+    groupName: acme.webhook.godaddy.com
+
+---
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -14,8 +29,12 @@ spec:
           dnsZones:
             - "teknoir.online"
         dns01:
-          cloudDNS:
-            project: {{ .Values.letsencrypt.cloudDNS.project | quote }}
-            serviceAccountSecretRef:
-              name: {{ .Values.letsencrypt.cloudDNS.serviceAccountSecretRef.name | quote }}
-              key: {{ .Values.letsencrypt.cloudDNS.serviceAccountSecretRef.key | quote }}
+          webhook:
+            groupName: acme.webhook.godaddy.com
+            solverName: godaddy
+            config:
+              apiKeySecretRef:
+                name: godaddy-api-key-prod
+                key: token
+              production: true
+              ttl: 600

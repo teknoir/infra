@@ -7,3 +7,6 @@ manifest-keycloak-db-secret.yaml
 manifest-oauth2-proxy-redis-secret.yaml
 manifest-gcr-json-key-secret.yaml
 manifest-harbor-secret.yaml
+manifest-godaddy-secret.yaml
+manifest-letsencrypt-dns-account-key.yaml
+manifest-loopia-secret.yaml

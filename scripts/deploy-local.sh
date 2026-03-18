@@ -1,8 +1,7 @@
 #!/bin/sh
 set -e
 
-MANIFEST_PATH=manifest-local.yaml
-SECRET_MANIFEST_PATH=manifest-clouddns-secret.yaml
+CLOUDDNS_SECRET_MANIFEST_PATH=manifest-clouddns-secret.yaml
 OAUTH2_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-secret.yaml
 KEYCLOAK_DB_SECRET_MANIFEST_PATH=manifest-keycloak-db-secret.yaml
 OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
@@ -12,10 +11,10 @@ HARBOR_SECRET_MANIFEST_PATH=manifest-harbor-secret.yaml
 
 
 # SECRETS
-if [ -f "${SECRET_MANIFEST_PATH}" ]; then
+if [ -f "${CLOUDDNS_SECRET_MANIFEST_PATH}" ]; then
   ssh anders@rtx2000-pro-bw-se.teknoir \
     "sudo tee /var/lib/rancher/k3s/server/manifests/teknoir-clouddns-secret.yaml >/dev/null" \
-    < "${SECRET_MANIFEST_PATH}"
+    < "${CLOUDDNS_SECRET_MANIFEST_PATH}"
 fi
 
 if [ -f "${OAUTH2_SECRET_MANIFEST_PATH}" ]; then
