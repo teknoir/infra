@@ -1,20 +1,11 @@
 # Default values for infra.
 
 global:
-  domain: teknoir.dev
+  domain: teknoir.cloud
 
 # Dependency configurations
 # Only keeping values that change defaults or are required by the dependencies
 
-#istio-base:
-#  enabled: true
-#  defaultRevision: ""
-#
-#istiod:
-#  enabled: true
-#  autoscaleEnabled: true
-
-#istio-ingressgateway-enabled: true
 istio_ingressgateway:
   valuesContent:
     name: istio-ingressgateway
@@ -36,7 +27,6 @@ istio_ingressgateway:
           protocol: TCP
           targetPort: 443
 
-#istio-ingressgateway-public-enabled: true
 istio_ingressgateway_public:
   valuesContent:
     name: istio-ingressgateway-public
@@ -62,7 +52,6 @@ istio_ingressgateway_public:
           targetPort: 8883
           protocol: TCP
 
-#istio-egressgateway-enabled: true
 istio_egressgateway:
   valuesContent:
     name: istio-egressgateway
@@ -72,22 +61,15 @@ istio_egressgateway:
       type: ClusterIP
 
 cert_manager:
-#  enabled: true
   valuesContent:
     crds:
       enabled: true
 
 teknoir-gateway:
   enabled: true
-#  namespace: istio-system
 
 auth:
   enabled: true
-#  namespace: teknoir-auth
 
 harbor:
   enabled: true
-#  namespace: teknoir-system
-#  harbor:
-#    persistence:
-#      hostPathPrefix: /opt/teknoir/harbor

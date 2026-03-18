@@ -12,8 +12,7 @@ helm dependency update charts/infra
 
 # Validate the infra chart by generating templates with namespace mapping
 echo "Dry-run validation for charts/infra..."
-helm -n istio-system template infra charts/infra --debug --dry-run=client | \
-  yq '(select(.metadata.namespace != null and .metadata.name == "keycloak*") | .metadata.namespace) = "teknoir-auth" | (select(.metadata.namespace != null and .metadata.name == "harbor*") | .metadata.namespace) = "teknoir-system" | (select(.metadata.namespace != null and .metadata.name == "infra-cert-manager*") | .metadata.namespace) = "cert-manager"' \
+helm -n istio-system template infra charts/infra --debug --dry-run=client \
   > test-output.yaml
 
 echo "Infra chart validation successful."

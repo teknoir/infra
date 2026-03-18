@@ -6,7 +6,6 @@ tls:
   credentialName: ""
 
 letsencrypt:
-  email: ""
   server: https://acme-v02.api.letsencrypt.org/directory
   cloudDNS:
     project: "teknoir"

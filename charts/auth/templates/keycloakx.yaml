@@ -4,7 +4,7 @@
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
-  name: harbor
+  name: keycloak
   namespace: kube-system
 spec:
   repo: https://codecentric.github.io/helm-charts
