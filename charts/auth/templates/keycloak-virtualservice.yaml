@@ -14,6 +14,6 @@ spec:
     - name: keycloak
       route:
         - destination:
-            host: {{ .Values.keycloak.valuesContent.service.name | default (printf "%s-http" .Values.keycloak.valuesContent.fullnameOverride) }}.{{ $namespace }}.svc.cluster.local
+            host: keycloak-http.{{ $namespace }}.svc.cluster.local
             port:
-              number: {{ .Values.keycloak.valuesContent.service.httpPort }}
+              number: 80

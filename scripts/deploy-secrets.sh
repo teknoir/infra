@@ -9,6 +9,7 @@ KEYCLOAK_DB_SECRET_MANIFEST_PATH=manifest-keycloak-db-secret.yaml
 OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
 GCR_SECRET_MANIFEST_PATH=manifest-gcr-json-key-secret.yaml
 HARBOR_SECRET_MANIFEST_PATH=manifest-harbor-secret.yaml
+BACKSTAGE_KEYCLOAK_MANIFEST_PATH=manifest-backstage-keycloak-secret.yaml
 
 # SECRETS
 if [ -f "${LETSENCRYPT_SECRET_MANIFEST_PATH}" ]; then
@@ -51,4 +52,10 @@ if [ -f "${HARBOR_SECRET_MANIFEST_PATH}" ]; then
   ssh anders@r415 \
     "sudo tee /opt/k3s/server/manifests/teknoir-harbor-secret.yaml >/dev/null" \
     < "${HARBOR_SECRET_MANIFEST_PATH}"
+fi
+
+if [ -f "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-backstage-keycloak-secrets.yaml >/dev/null" \
+    < "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}"
 fi

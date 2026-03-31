@@ -40,15 +40,15 @@ Client setup in master realm:
 * Client authentication: ON (this is “confidential”)
 * Standard flow: ON
 * Service account roles: ON
-* Valid redirect URI: https://teknoir.online/oauth2/callback
-* Web origins: https://teknoir.online
+* Valid redirect URI: https://teknoir.cloud/oauth2/callback
+* Web origins: https://teknoir.cloud
 
 Then update the secret:
 * Take the client secret from Keycloak
 * Update oauth2-proxy-secret (by running `./scripts/gen-oauth2-proxy-secrets.sh`)
-* `./scripts/deploy-local.sh` to deploy secret to cluster
+* `./scripts/deploy-secrets.sh` to deploy secret to cluster
 
-Then add client scope:
+Then go to Client scopes menu:
 * Add (or create) a scope: teknoir
 * Type: Default
   
@@ -58,7 +58,7 @@ Configure a new mapper for the scope:
 * Add to access token: ON
 
 Then add Service Account Role:
-* Go to Service Account Roles for the client click Assign Roles
+* Go to Client menu for teknoir -> Service Account Roles for the client click Assign Roles
 * Assign "Client Roles": manage-users, query-users, view-users
 
 Restart oauth2-proxy deployment to pick up new secret and scope changes:

@@ -237,7 +237,7 @@ metadata:
   name: keycloak-istio-mtls
   namespace: {{ $namespace }}
 spec:
-  host: {{ .Values.keycloak.valuesContent.service.name | default (printf "%s-http" .Values.keycloak.valuesContent.fullnameOverride) }}.{{ $namespace }}.svc.cluster.local
+  host: keycloak-http.{{ $namespace }}.svc.cluster.local
   trafficPolicy:
     tls:
       mode: ISTIO_MUTUAL

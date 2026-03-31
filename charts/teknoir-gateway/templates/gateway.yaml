@@ -53,8 +53,7 @@ spec:
         - {{ . | quote }}
 {{- end }}
       tls:
-        mode: SIMPLE
-        credentialName: {{ $credentialName | quote }}
+        mode: PASSTHROUGH
     - port:
         name: https-mqtt
         number: 8084
@@ -75,5 +74,4 @@ spec:
         - {{ . | quote }}
 {{- end }}
       tls:
-        mode: SIMPLE
-        credentialName: {{ $credentialName | quote }}
+        mode: PASSTHROUGH

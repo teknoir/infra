@@ -1,18 +1,17 @@
 {{- $namespace := .Values.namespace | default .Release.Namespace -}}
-{{- if .Values.keycloak.valuesContent.db.enabled -}}
 apiVersion: v1
 kind: PersistentVolume
 metadata:
   name: keycloak-db-pv
 spec:
   capacity:
-    storage: {{ .Values.keycloak.valuesContent.db.storage.size }}
+    storage: 5Gi
   accessModes:
     - ReadWriteOnce
   storageClassName: ""
   persistentVolumeReclaimPolicy: Retain
   hostPath:
-    path: {{ .Values.keycloak.valuesContent.db.storage.hostPath | quote }}
+    path: /opt/teknoir/keycloak/pg
     type: DirectoryOrCreate
 ---
 apiVersion: v1
@@ -25,7 +24,7 @@ spec:
     - ReadWriteOnce
   resources:
     requests:
-      storage: {{ .Values.keycloak.valuesContent.db.storage.size }}
+      storage: 5Gi
   storageClassName: ""
   volumeName: keycloak-db-pv
 ---
@@ -39,7 +38,7 @@ spec:
     app: keycloak-db
   ports:
     - name: postgres
-      port: {{ .Values.keycloak.valuesContent.db.port }}
+      port: 5432
       targetPort: postgres
 ---
 apiVersion: apps/v1
@@ -63,19 +62,19 @@ spec:
           image: docker.io/postgres:16
           ports:
             - name: postgres
-              containerPort: {{ .Values.keycloak.valuesContent.db.port }}
+              containerPort: 5432
           env:
             - name: POSTGRES_DB
-              value: {{ .Values.keycloak.valuesContent.db.database | quote }}
+              value: "keycloak"
             - name: POSTGRES_USER
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.keycloak.valuesContent.db.secretName }}
+                  name: keycloak-db-secret
                   key: username
             - name: POSTGRES_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: {{ .Values.keycloak.valuesContent.db.secretName }}
+                  name: keycloak-db-secret
                   key: password
           volumeMounts:
             - name: data
@@ -84,4 +83,3 @@ spec:
         - name: data
           persistentVolumeClaim:
             claimName: keycloak-db-pvc
-{{- end -}}

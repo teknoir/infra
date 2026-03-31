@@ -1,4 +1,5 @@
 .idea
+tmp
 Chart.lock
 /*/**/charts/
 manifest-clouddns-secret.yaml
@@ -10,3 +11,5 @@ manifest-gcr-json-key-secret.yaml
 manifest-harbor-secret.yaml
 manifest-loopia-secret.yaml
 manifest-godaddy-secret.yaml
+manifest-backstage-keycloak-secret.yaml
+infra_.yaml

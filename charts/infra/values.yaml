@@ -39,7 +39,7 @@ istio_ingressgateway_public:
           port: 16021
           protocol: TCP
           targetPort: 15021
-        - name: tcp-ssh
+        - name: tls-ssh
           port: 2222
           targetPort: 2222
           protocol: TCP
