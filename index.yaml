@@ -14,6 +14,16 @@ entries:
   harbor:
   - apiVersion: v2
     appVersion: 2.12.0
+    created: "2026-04-07T10:44:34.434450506Z"
+    description: Harbor registry and virtual services
+    digest: 24ecb7967034b08c75f7ef4a9591852243a29851774627416c2acccf5c726d63
+    name: harbor
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/harbor-0.0.4/harbor-0.0.4.tgz
+    version: 0.0.4
+  - apiVersion: v2
+    appVersion: 2.12.0
     created: "2026-04-07T10:40:50.763104677Z"
     description: Harbor registry and virtual services
     digest: 0f9f89f9435d2899ddc2e64c6e34e9265672792735c4741a9fce2cdeae567aeb
@@ -5159,4 +5169,4 @@ entries:
     urls:
     - https://github.com/teknoir/infra/releases/download/teknoir-gateway-0.0.3/teknoir-gateway-0.0.3.tgz
     version: 0.0.3
-generated: "2026-04-07T10:40:51.31477116Z"
+generated: "2026-04-07T10:44:34.435067076Z"
