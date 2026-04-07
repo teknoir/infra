@@ -7,12 +7,13 @@ apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
   name: backstage
-  namespace: kube-system
+  namespace: teknoir-system
 spec:
   repo: https://teknoir.github.io/infra
   chart: monitoring
   version: 0.0.3
   targetNamespace: teknoir-system
+  takeOwnership: true
   valuesContent: |-
     domain: "teknoir.cloud"
     grafana:
