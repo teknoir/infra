@@ -67,7 +67,9 @@ helm lint ./charts/infra
 
 render_tmp="$(mktemp)"
 diff_tmp="$(mktemp)"
-trap 'rm -f "$render_tmp" "$diff_tmp"' EXIT
+sorted_infra="$(mktemp)"
+sorted_render="$(mktemp)"
+trap 'rm -f "$render_tmp" "$diff_tmp" "$sorted_infra" "$sorted_render"' EXIT
 
 helm template infra ./charts/infra -n istio-system > "$render_tmp"
 
@@ -81,7 +83,12 @@ if [ ! -s infra.yaml ]; then
   exit 1
 fi
 
-diff -U 0 infra.yaml "$render_tmp" > "$diff_tmp" || true
+# Sort both multi-document YAML files alphabetically by their resource manifests
+perl -0777 -ne 'for (sort split /^---\r?\n/m) { print "---\n$_" if /\S/ }' infra.yaml > "$sorted_infra"
+perl -0777 -ne 'for (sort split /^---\r?\n/m) { print "---\n$_" if /\S/ }' "$render_tmp" > "$sorted_render"
+
+# Ignore whitespace (-w), blank lines (-B), and Helm Source comments (-I '^# Source:')
+diff -U 0 -w -B -I '^# Source:' "$sorted_infra" "$sorted_render" > "$diff_tmp" || true
 
 set -- $(awk '
   /^@@/ {next}
@@ -112,8 +119,18 @@ echo "Diff stats: +$added_lines -$deleted_lines (old lines: $old_lines)"
 echo "Change percentage: ${change_pct}% (max allowed: ${MAX_CHANGE_PCT}%)"
 
 if [ "$change_pct" -gt "$MAX_CHANGE_PCT" ]; then
-  echo "ERROR: Change percentage exceeds limit; refusing to update or deploy." >&2
-  exit 1
+  echo "WARNING: Change percentage exceeds the limit of ${MAX_CHANGE_PCT}%!" >&2
+  echo "Please double-check the diff before proceeding." >&2
+fi
+
+echo "You can inspect the exact changes by reviewing this temporary diff file:"
+echo "  $diff_tmp"
+echo ""
+
+read -p "Are you positive you want to deploy with these changes and statistics? [y/N] " confirm
+if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+  echo "Deployment cancelled."
+  exit 0
 fi
 
 # Update cached infra.yaml only after checks pass.

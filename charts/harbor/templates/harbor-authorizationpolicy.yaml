@@ -15,6 +15,7 @@
 {{/*        - source:*/}}
 {{/*            principals:*/}}
 {{/*              - "cluster.local/ns/istio-system/sa/istio-ingressgateway"*/}}
+
 {{- $namespace := .Values.namespace | default .Release.Namespace -}}
 ---
 apiVersion: security.istio.io/v1beta1
@@ -25,7 +26,6 @@ metadata:
 spec:
   selector:
     matchLabels:
-      # Apply to the actual components receiving ingress traffic now
       app.kubernetes.io/name: harbor
   action: ALLOW
   rules:

@@ -70,6 +70,3 @@ teknoir-gateway:
 
 auth:
   enabled: true
-
-harbor:
-  enabled: true
