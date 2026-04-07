@@ -13,6 +13,20 @@ entries:
     version: 0.0.3
   harbor:
   - apiVersion: v2
+    appVersion: 1.18.3
+    created: "2026-04-07T11:08:30.495041527Z"
+    dependencies:
+    - name: harbor
+      repository: https://helm.goharbor.io
+      version: 1.18.3
+    description: Harbor registry and virtual services
+    digest: 2aec6ecc61f817b545f9bdf60e3c2331572d32a5addfcc9e3dad890330a96fad
+    name: harbor
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/harbor-0.0.5/harbor-0.0.5.tgz
+    version: 0.0.5
+  - apiVersion: v2
     appVersion: 2.12.0
     created: "2026-04-07T10:44:34.434450506Z"
     description: Harbor registry and virtual services
@@ -5169,4 +5183,4 @@ entries:
     urls:
     - https://github.com/teknoir/infra/releases/download/teknoir-gateway-0.0.3/teknoir-gateway-0.0.3.tgz
     version: 0.0.3
-generated: "2026-04-07T10:44:34.435067076Z"
+generated: "2026-04-07T11:08:30.495457665Z"
