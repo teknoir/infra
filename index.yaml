@@ -1,6 +1,47 @@
 apiVersion: v1
 entries:
+  auth:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-04-07T10:40:50.631140821Z"
+    description: KeycloakX, OAuth2/OIDC, and Istio auth
+    digest: 230816dc42d58558ffdce2619ac25c5657eaae0ff80a5e5077d267f785193e4f
+    name: auth
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/auth-0.0.3/auth-0.0.3.tgz
+    version: 0.0.3
+  harbor:
+  - apiVersion: v2
+    appVersion: 2.12.0
+    created: "2026-04-07T10:40:50.763104677Z"
+    description: Harbor registry and virtual services
+    digest: 0f9f89f9435d2899ddc2e64c6e34e9265672792735c4741a9fce2cdeae567aeb
+    name: harbor
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/harbor-0.0.3/harbor-0.0.3.tgz
+    version: 0.0.3
   infra:
+  - apiVersion: v2
+    appVersion: 1.0.0
+    created: "2026-04-07T10:40:50.907514608Z"
+    dependencies:
+    - condition: teknoir-gateway.enabled
+      name: teknoir-gateway
+      repository: file://../teknoir-gateway
+      version: 0.0.3
+    - condition: auth.enabled
+      name: auth
+      repository: file://../auth
+      version: 0.0.3
+    description: A Helm Chart for Teknoir infrastructure components
+    digest: 228e573fb8f5ed123ae8851a85f9a24b1330088d7ba19486d89bdbff9ee89970
+    name: infra
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/infra-0.2.1/infra-0.2.1.tgz
+    version: 0.2.1
   - apiVersion: v2
     appVersion: 0.1.0
     created: "2026-02-13T07:23:41.538295993Z"
@@ -5092,4 +5133,30 @@ entries:
     urls:
     - https://github.com/teknoir/infra/releases/download/infra-stage-5-0.1.52/infra-stage-5-0.1.52.tgz
     version: 0.1.52
-generated: "2026-02-17T18:08:41.740426942Z"
+  monitoring:
+  - apiVersion: v2
+    appVersion: 82.18.0
+    created: "2026-04-07T10:40:51.146048162Z"
+    dependencies:
+    - name: kube-prometheus-stack
+      repository: https://prometheus-community.github.io/helm-charts
+      version: 82.18.0
+    description: Prometheus and Grafana for cluster monitoring
+    digest: a8dd9dce8c7c34e47bbe8437cc7bf29d3e89eb270eccb1955df756648c12c175
+    name: monitoring
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/monitoring-0.0.3/monitoring-0.0.3.tgz
+    version: 0.0.3
+  teknoir-gateway:
+  - apiVersion: v2
+    appVersion: 0.1.0
+    created: "2026-04-07T10:40:51.313879337Z"
+    description: Teknoir gateway and edge routing
+    digest: f804c28361f663dc4852a924f5b5c366d75f7df1ebb61325b36a340bf9b5d923
+    name: teknoir-gateway
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/teknoir-gateway-0.0.3/teknoir-gateway-0.0.3.tgz
+    version: 0.0.3
+generated: "2026-04-07T10:40:51.31477116Z"
