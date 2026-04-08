@@ -10,6 +10,9 @@ OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
 GCR_SECRET_MANIFEST_PATH=manifest-gcr-json-key-secret.yaml
 HARBOR_SECRET_MANIFEST_PATH=manifest-harbor-secret.yaml
 BACKSTAGE_KEYCLOAK_MANIFEST_PATH=manifest-backstage-keycloak-secret.yaml
+BACKSTAGE_SECRETS_MANIFEST_PATH=manifest-backstage-secrets.yaml
+ARGOCD_KEYCLOAK_MANIFEST_PATH=manifest-argocd-keycloak-secret.yaml
+TEKNOIR_GITHUB_MANIFEST_PATH=manifest-teknoir-github-secret.yaml
 
 # SECRETS
 if [ -f "${LETSENCRYPT_SECRET_MANIFEST_PATH}" ]; then
@@ -58,4 +61,22 @@ if [ -f "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}" ]; then
   ssh anders@r415 \
     "sudo tee /opt/k3s/server/manifests/teknoir-backstage-keycloak-secrets.yaml >/dev/null" \
     < "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}"
+fi
+
+if [ -f "${BACKSTAGE_SECRETS_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-backstage-secrets.yaml >/dev/null" \
+    < "${BACKSTAGE_SECRETS_MANIFEST_PATH}"
+fi
+
+if [ -f "${ARGOCD_KEYCLOAK_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-argocd-keycloak-secrets.yaml >/dev/null" \
+    < "${ARGOCD_KEYCLOAK_MANIFEST_PATH}"
+fi
+
+if [ -f "${TEKNOIR_GITHUB_MANIFEST_PATH}" ]; then
+  ssh anders@r415 \
+    "sudo tee /opt/k3s/server/manifests/teknoir-github-secrets.yaml >/dev/null" \
+    < "${TEKNOIR_GITHUB_MANIFEST_PATH}"
 fi

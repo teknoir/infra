@@ -942,7 +942,12 @@ spec:
   createNamespace: true
   takeOwnership: true
   valuesContent: |-
-    # Only defaults
+    global:
+      proxy:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 50Mi
 ---
 # Source: infra/charts/auth/templates/istio-auth.yaml
 apiVersion: security.istio.io/v1beta1

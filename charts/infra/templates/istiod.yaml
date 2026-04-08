@@ -11,4 +11,9 @@ spec:
   createNamespace: true
   takeOwnership: true
   valuesContent: |-
-    # Only defaults
+    global:
+      proxy:
+        resources:
+          requests:
+            cpu: 10m
+            memory: 50Mi

@@ -12,4 +12,8 @@ manifest-harbor-secret.yaml
 manifest-loopia-secret.yaml
 manifest-godaddy-secret.yaml
 manifest-backstage-keycloak-secret.yaml
+manifest-backstage-secrets.yaml
+manifest-argocd-keycloak-secret.yaml
+manifest-teknoir-github-secret.yaml
 infra_.yaml
+*.pem

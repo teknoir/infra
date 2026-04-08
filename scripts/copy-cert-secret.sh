@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# TODO: Automate copying of certificates in profile-controller or k8s mechanism!!!
+
 # Target namespaces to copy the secret to
 NAMESPACES=("teknoir-demo" "avangard-production" "boxer-property" "prime-communications")
 
