@@ -3,6 +3,7 @@ apiVersion: argoproj.io/v1alpha1
 kind: AppProject
 metadata:
   name: default
+  namespace: teknoir-system
 spec:
   sourceRepos:
     - '*'
@@ -21,13 +22,14 @@ apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
   name: app-of-apps
+  namespace: teknoir-system
 spec:
   destination:
     namespace: teknoir-system
     server: https://kubernetes.default.svc
   source:
     path: charts/app-of-apps
-    repoURL: https://github.com/teknoir/profile-controller-helm
+    repoURL: https://github.com/teknoir/platform-applications-gitops
     targetRevision: teknoir-cloud
   sources: []
   project: default
