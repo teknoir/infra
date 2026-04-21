@@ -1,14 +1,13 @@
 # Infra
 
-Umbrella Helm chart for installing Istio (sidecar mode, ingress/egress) plus
-cert-manager and cert-manager-istio-csr for certificate issuance.
+Umbrella Helm chart for bootstrapping ArgoCD GitOps for Infrastructure and Platform.
 
 > The implementation of the Helm chart is the bare minimum.
 > The Helm Chart is not meant to be infinitely configurable, but to provide a quick way to deploy to a Kubernetes cluster.
 
 ## Quick start
 
-The infrastructure is now managed via a single umbrella Helm chart located in `charts/infra`.
+The infrastructure is now managed via GitOps from the repo `https://github.com/teknoir/platform-applications-gitops`.
 
 ### 1. Prerequisites (Secrets)
 
@@ -21,13 +20,14 @@ Secrets are managed manually. Generate them before deploying:
 ./scripts/gen-keycloak-db-secret.sh
 ./scripts/gen-oauth2-proxy-secrets.sh
 ./scripts/gen-oauth2-proxy-redis-secret.sh
+...
 ```
 
 ### 2. Deploy
 
 ```sh
-helm dependency update charts/infra
-./scripts/deploy-infra.sh
+./scripts/deploy-argocd.sh
+kubectl apply -f teknoir-cloud-app-of-apps.yaml
 ```
 
 ### 3. Important manual steps
