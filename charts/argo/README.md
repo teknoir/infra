@@ -12,13 +12,15 @@ Argo CD is deployed behind the Istio ingress gateway.
 
 ## Prerequisites
 
-1.  **Infrastructure Core**: The `infra` chart must be deployed (providing Istio).
-2.  **Authentication**: The `auth` chart must be deployed (providing Keycloak).
-3.  **Keycloak Client Setup**:
-*   Create an OpenID Connect client in Keycloak named `argocd`.
-*   Client Protocol: `openid-connect` (Standard flow)
-*   Access Type: `confidential` (Client authentication ON)
-*   Set **Valid Redirect URIs** to `https://argocd.<your-domain>/auth/callback`.
+1.  **ArgoCD chart**: The `argocd` chart must be deployed with `[deploy-argo.sh](../../scripts/deploy-argo.sh)`.
+2.  **App-of-apps**: The `[app-of-apps](https://github.com/teknoir/platform-applications-gitops/tree/teknoir-cloud/charts/app-of-apps)` application must be deployed (providing Keycloak).
+3.  **Setup in Keycloak**
+* Client setup in master realm - Client ID: `argocd`
+* OpenID Connect
+* Client authentication: ON (this is “confidential”)
+* Standard flow: ON
+* Service account roles: ON
+* Valid redirect URI: `https://argocd.<your-domain>/auth/callback`
 *   Ensure the `groups` scope is provided to map Keycloak groups (e.g., `admin`) to Argo CD RBAC roles.
     *   **How to add the groups scope in Keycloak**:
         1. In Keycloak, go to **Client Scopes** and click **Create client scope**. Name it `groups`, set Type to `Default`, Protocol to `OpenID Connect`, and enable **Include in token scope**.
@@ -26,6 +28,7 @@ Argo CD is deployed behind the Istio ingress gateway.
         3. Name the mapper `groups`, set **Token Claim Name** to `groups`, turn OFF **Full group path**, and turn ON **Add to ID token**, **Add to access token**, and **Add to userinfo**.
         4. Go to your `argocd` client, navigate to **Client Scopes**, and ensure the `groups` scope is assigned (add it as `Default` or `Optional` if missing).
 4.  **Secret Generation**: You must generate the Keycloak client secret before deploying.
+
 
 ## Setup Instructions
 

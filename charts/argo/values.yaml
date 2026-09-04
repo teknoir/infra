@@ -19,7 +19,6 @@ argo-cd:
 
   configs:
     cm:
-
       oidc.config: |
         name: Keycloak
         issuer: https://auth.teknoir.cloud/auth/realms/master

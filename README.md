@@ -26,7 +26,7 @@ Secrets are managed manually. Generate them before deploying:
 ### 2. Deploy
 
 ```sh
-./scripts/deploy-argocd.sh
+./scripts/deploy-argo.sh
 kubectl apply -f teknoir-cloud-app-of-apps.yaml
 ```
 
@@ -65,19 +65,3 @@ Restart oauth2-proxy deployment to pick up new secret and scope changes:
 ```bash
 kubectl -n teknoir-auth rollout restart deploy/oauth2-proxy
 ```
-
-## Domain Cascading
-
-You can change the entire environment domain by setting `global.domain` in `charts/infra/values.yaml` or via CLI:
-
-```sh
-helm template infra ./charts/infra --set global.domain=my-new-domain.com
-```
-
-## Layout
-
-- `charts/infra`: umbrella chart combining all components.
-- `charts/teknoir-gateway`: Istio Gateway and Cert-manager Certificate templates.
-- `charts/auth`: Keycloak and OAuth2-proxy configuration.
-- `charts/harbor`: Harbor configuration.
-- `scripts/`: helper scripts for secret generation and deployment.
