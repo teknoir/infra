@@ -1,6 +1,6 @@
 
 namespace: teknoir-system
-domain: "teknoir.cloud"
+domain: "teknoir.airgapped"
 
 # Istio integration configuration
 istio:
@@ -14,14 +14,14 @@ argo-cd:
   global:
     # -- Default domain used by all components
     ## Used for ingresses, certificates, SSO, notifications, etc.
-    domain: argocd.teknoir.cloud
+    domain: argocd.teknoir.airgapped
 
 
   configs:
     cm:
       oidc.config: |
         name: Keycloak
-        issuer: https://auth.teknoir.cloud/auth/realms/master
+        issuer: https://auth.teknoir.airgapped/auth/realms/master
         clientID: argocd
         clientSecret: $argocd-oidc-secret:oidc.auth.clientSecret
         requestedScopes: ["openid", "profile", "email", "groups"]
@@ -36,4 +36,11 @@ argo-cd:
   server:
     extraArgs:
       - --insecure
+
+  # Default redis image lives on public.ecr.aws, which is not mirrored by the
+  # air-gapped Harbor (only docker.io/ghcr.io/gcr.io/quay.io/registry.k8s.io).
+  # Pull it from docker.io so the containerd mirror rewrite applies.
+  redis:
+    image:
+      repository: docker.io/library/redis
 

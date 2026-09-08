@@ -28,9 +28,9 @@ spec:
     namespace: teknoir-system
     server: https://kubernetes.default.svc
   source:
-    path: charts/app-of-apps
-    repoURL: https://github.com/teknoir/platform-applications-gitops
-    targetRevision: teknoir-cloud
+    repoURL: harbor.teknoir.airgapped/teknoir
+    chart: app-of-apps
+    targetRevision: 0.0.1
   sources: []
   project: default
   syncPolicy:

@@ -1,41 +1,31 @@
-#!/bin/sh
+#!/usr/bin/env bash
 set -e
 
 # Colors
 YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
-#MANIFESTS
-LETSENCRYPT_SECRET_MANIFEST_PATH=manifest-letsencrypt-dns-account-key.yaml
-GODADDY_SECRET_MANIFEST_PATH=manifest-godaddy-secret.yaml
-OAUTH2_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-secret.yaml
-KEYCLOAK_DB_SECRET_MANIFEST_PATH=manifest-keycloak-db-secret.yaml
-OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
-GCR_SECRET_MANIFEST_PATH=manifest-gcr-json-key-secret.yaml
-GHCR_SECRET_MANIFEST_PATH=manifest-ghcr-token-secret.yaml
-HARBOR_SECRET_MANIFEST_PATH=manifest-harbor-secret.yaml
-BACKSTAGE_KEYCLOAK_MANIFEST_PATH=manifest-backstage-keycloak-secret.yaml
-BACKSTAGE_SECRETS_MANIFEST_PATH=manifest-backstage-secrets.yaml
-ARGOCD_KEYCLOAK_MANIFEST_PATH=manifest-argocd-keycloak-secret.yaml
-TEKNOIR_GITHUB_MANIFEST_PATH=manifest-teknoir-github-secret.yaml
+TEKNOIR_HOST="${TEKNOIR_HOST:-teknoir@teknoir.airgapped}"
 
-# Check for missing manifest files
+# Secret manifests are generated under .secrets/ (gitignored) by scripts/gen-*.sh
+SECRETS_DIR=".secrets"
+
+# MANIFESTS: local secret manifests copied to the K3s auto-deploy directory
+SECRET_MANIFESTS=(
+  manifest-harbor-secret.yaml
+  manifest-keycloak-db-secret.yaml
+  manifest-oauth2-proxy-secret.yaml
+  manifest-oauth2-proxy-redis-secret.yaml
+  manifest-argocd-keycloak-secret.yaml
+  manifest-teknoir-ca-secret.yaml
+  manifest-wildcard-tls-secret.yaml
+  manifest-argocd-harbor-repo-secret.yaml
+)
+
 MISSING=0
-for manifest in \
-  "${LETSENCRYPT_SECRET_MANIFEST_PATH}" \
-  "${GODADDY_SECRET_MANIFEST_PATH}" \
-  "${OAUTH2_SECRET_MANIFEST_PATH}" \
-  "${KEYCLOAK_DB_SECRET_MANIFEST_PATH}" \
-  "${OAUTH2_REDIS_SECRET_MANIFEST_PATH}" \
-  "${GCR_SECRET_MANIFEST_PATH}" \
-  "${GHCR_SECRET_MANIFEST_PATH}" \
-  "${HARBOR_SECRET_MANIFEST_PATH}" \
-  "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}" \
-  "${BACKSTAGE_SECRETS_MANIFEST_PATH}" \
-  "${ARGOCD_KEYCLOAK_MANIFEST_PATH}" \
-  "${TEKNOIR_GITHUB_MANIFEST_PATH}"; do
-  if [ ! -f "${manifest}" ]; then
-    printf "${YELLOW}WARNING: Missing secret manifest: %s${NC}\n" "${manifest}" >&2
+for manifest in "${SECRET_MANIFESTS[@]}"; do
+  if [ ! -f "${SECRETS_DIR}/${manifest}" ]; then
+    printf "${YELLOW}WARNING: Missing secret manifest: %s${NC}\n" "${SECRETS_DIR}/${manifest}" >&2
     MISSING=$((MISSING + 1))
   fi
 done
@@ -44,75 +34,16 @@ if [ "${MISSING}" -gt 0 ]; then
   echo ""
 fi
 
-# SECRETS
-if [ -f "${LETSENCRYPT_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-letsencrypt-secret.yaml >/dev/null" \
-    < "${LETSENCRYPT_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${GODADDY_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-godaddy-secret.yaml >/dev/null" \
-    < "${GODADDY_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${OAUTH2_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-oauth2-proxy-secret.yaml >/dev/null" \
-    < "${OAUTH2_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${KEYCLOAK_DB_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-keycloak-db-secret.yaml >/dev/null" \
-    < "${KEYCLOAK_DB_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${OAUTH2_REDIS_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-oauth2-proxy-redis-secret.yaml >/dev/null" \
-    < "${OAUTH2_REDIS_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${GCR_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-gcr-json-key-secret.yaml >/dev/null" \
-    < "${GCR_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${GHCR_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-ghcr-json-key-secret.yaml >/dev/null" \
-    < "${GHCR_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${HARBOR_SECRET_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-harbor-secret.yaml >/dev/null" \
-    < "${HARBOR_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-backstage-keycloak-secrets.yaml >/dev/null" \
-    < "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}"
-fi
-
-if [ -f "${BACKSTAGE_SECRETS_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-backstage-secrets.yaml >/dev/null" \
-    < "${BACKSTAGE_SECRETS_MANIFEST_PATH}"
-fi
-
-if [ -f "${ARGOCD_KEYCLOAK_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-argocd-keycloak-secrets.yaml >/dev/null" \
-    < "${ARGOCD_KEYCLOAK_MANIFEST_PATH}"
-fi
-
-if [ -f "${TEKNOIR_GITHUB_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-github-secrets.yaml >/dev/null" \
-    < "${TEKNOIR_GITHUB_MANIFEST_PATH}"
-fi
+for manifest in "${SECRET_MANIFESTS[@]}"; do
+  if [ -f "${SECRETS_DIR}/${manifest}" ]; then
+    dest="${manifest#manifest-}"
+    case "${dest}" in
+      teknoir-*) ;;
+      *) dest="teknoir-${dest}" ;;
+    esac
+    echo "Deploying ${SECRETS_DIR}/${manifest} to ${TEKNOIR_HOST}:/opt/k3s/server/manifests/${dest}"
+    ssh "${TEKNOIR_HOST}" \
+      "sudo tee /opt/k3s/server/manifests/${dest} >/dev/null" \
+      < "${SECRETS_DIR}/${manifest}"
+  fi
+done

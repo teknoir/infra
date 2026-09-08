@@ -1,0 +1,25 @@
+# Extra images that `helm template` does not reveal (sidecars, injected images,
+# runtime-only pulls). One image reference per line; `#` starts a comment.
+# Merged and deduplicated with the template-extracted list by collect-images.sh.
+
+# Istio sidecar proxy — injected by istiod at pod creation, never appears in
+# rendered chart output.
+docker.io/istio/proxyv2:1.29.2
+
+# K3s sandbox (pause) container.
+docker.io/rancher/mirrored-pause:3.6
+
+# Generic init/debug helper used by several charts' init containers.
+docker.io/library/busybox:1.36.1
+
+# Redis backing oauth2-proxy sessions (auth chart).
+docker.io/redis:7.2-alpine
+
+# Keycloak Postgres database (auth chart).
+docker.io/postgres:16
+
+# NOTE: harbor trivy adapter pulls its vulnerability database (trivy-db) from
+# ghcr.io/aquasecurity/trivy-db at scan time. That is an OCI *artifact*, not a
+# runnable image; mirror it manually with
+#   crane cp ghcr.io/aquasecurity/trivy-db:2 harbor.teknoir.airgapped/ghcr/aquasecurity/trivy-db:2
+# or disable scanning / accept stale DB in the air gap.

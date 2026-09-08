@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MANIFEST_FILE="manifest-oauth2-proxy-secret.yaml"
+SECRETS_DIR=".secrets"
+MANIFEST_FILE="${SECRETS_DIR}/manifest-oauth2-proxy-secret.yaml"
 NAMESPACE="teknoir-auth"
 SECRET_NAME="oauth2-proxy-secret"
+
+mkdir -p "${SECRETS_DIR}"
 
 cookie_secret="${1:-}"
 if [ -z "${cookie_secret}" ]; then

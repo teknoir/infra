@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MANIFEST_FILE="manifest-keycloak-db-secret.yaml"
+SECRETS_DIR=".secrets"
+MANIFEST_FILE="${SECRETS_DIR}/manifest-keycloak-db-secret.yaml"
 NAMESPACE="teknoir-auth"
 SECRET_NAME="keycloak-db-secret"
+
+mkdir -p "${SECRETS_DIR}"
 DB_USERNAME="${1:-keycloak}"
 DB_PASSWORD="${2:-}"
 

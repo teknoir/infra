@@ -5,9 +5,12 @@
 
 set -e
 
-# Define the output file
-OUTPUT_FILE="manifest-argocd-keycloak-secret.yaml"
+# Define the output file (under .secrets/, gitignored)
+SECRETS_DIR=".secrets"
+OUTPUT_FILE="${SECRETS_DIR}/manifest-argocd-keycloak-secret.yaml"
 NAMESPACE="teknoir-system"
+
+mkdir -p "${SECRETS_DIR}"
 
 echo "=========================================================="
 echo " Generating Argo CD OIDC Secret Manifest"

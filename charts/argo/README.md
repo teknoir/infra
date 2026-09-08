@@ -45,7 +45,7 @@ Argo CD is deployed behind the Istio ingress gateway.
     Apply the generated secret to your cluster:
 
     ```bash
-    kubectl apply -f manifest-argocd-keycloak-secret.yaml
+    kubectl apply -f .secrets/manifest-argocd-keycloak-secret.yaml
     ```
 
 3.  **Deploy Argo CD:**

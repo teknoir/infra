@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MANIFEST_FILE="manifest-harbor-secret.yaml"
+SECRETS_DIR=".secrets"
+MANIFEST_FILE="${SECRETS_DIR}/manifest-harbor-secret.yaml"
 NAMESPACE="teknoir-system"
 SECRET_NAME="harbor-secret"
+
+mkdir -p "${SECRETS_DIR}"
 
 # Random string generator function
 gen_rand() {
