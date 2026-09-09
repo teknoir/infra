@@ -30,7 +30,11 @@ CA_CRT_OUT="teknoir-root-ca.crt"
 
 CA_SECRET_NAME="teknoir-root-ca"
 CA_NAMESPACE="cert-manager"
-WILDCARD_SECRET_NAME="teknoir-local-wildcard-tls"
+# The Istio gateway derives its TLS credentialName from the domain
+# (charts/istio/templates/gateway.yaml: "<domain-with-dots-as-dashes>-wildcard-tls").
+# Keep this secret name in lock-step so the ingressgateway can find its cert;
+# otherwise the 443 listener has no certificate and resets the TLS handshake.
+WILDCARD_SECRET_NAME="$(echo "${DOMAIN}" | tr '.' '-')-wildcard-tls"
 WILDCARD_NAMESPACE="istio-system"
 
 b64() {

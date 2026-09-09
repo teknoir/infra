@@ -47,13 +47,20 @@ Generated secrets exist only on the operator laptop / USB — never in git.
 
 | Script | Manifest | Secret (namespace) | Input |
 |---|---|---|---|
-| `gen-local-ca-secret.sh` | `manifest-teknoir-ca-secret.yaml`, `manifest-wildcard-tls-secret.yaml` (+ `teknoir-root-ca.crt`) | `teknoir-root-ca` (`cert-manager`), `teknoir-local-wildcard-tls` (`istio-system`) | none — CA (10y) reused from `.secrets/ca/`, wildcard (1y) re-issued |
+| `gen-local-ca-secret.sh` | `manifest-teknoir-ca-secret.yaml`, `manifest-wildcard-tls-secret.yaml` (+ `teknoir-root-ca.crt`) | `teknoir-root-ca` (`cert-manager`), `teknoir-airgapped-wildcard-tls` (`istio-system`) | none — CA (10y) reused from `.secrets/ca/`, wildcard (1y) re-issued |
 | `gen-harbor-secrets.sh` | `manifest-harbor-secret.yaml` | `harbor-secret` (`teknoir-system`) | none — random; prints the admin password |
 | `gen-keycloak-db-secret.sh` | `manifest-keycloak-db-secret.yaml` | `keycloak-db-secret` (`teknoir-auth`) | optional `[username] [password]` args |
-| `gen-oauth2-proxy-secrets.sh` | `manifest-oauth2-proxy-secret.yaml` | `oauth2-proxy-secret` (`teknoir-auth`) | prompts for the Keycloak `teknoir` client secret |
+| `gen-oauth2-proxy-secrets.sh` | `manifest-oauth2-proxy-secret.yaml` | `oauth2-proxy-secret` (`teknoir-auth`) | prompts for the Keycloak `teknoir` client secret — run **after** the client exists in Keycloak |
 | `gen-oauth2-proxy-redis-secret.sh` | `manifest-oauth2-proxy-redis-secret.yaml` | `oauth2-proxy-redis-secret` (`teknoir-auth`) | optional password arg |
-| `gen-argocd-keycloak-secrets.sh` | `manifest-argocd-keycloak-secret.yaml` | `argocd-oidc-secret` (`teknoir-system`) | prompts for the Keycloak `argocd` client secret |
+| `gen-argocd-keycloak-secrets.sh` | `manifest-argocd-keycloak-secret.yaml` | `argocd-oidc-secret` (`teknoir-system`) | prompts for the Keycloak `argocd` client secret — run **after** the client exists in Keycloak |
 | `gen-argocd-harbor-repo-secret.sh` | `manifest-argocd-harbor-repo-secret.yaml` | `argocd-harbor-repo` (`teknoir-system`) | `airgap/.secrets/robot-argocd.env` (from `push-to-harbor.sh`); admin fallback |
+
+`gen-oauth2-proxy-secrets.sh` and `gen-argocd-keycloak-secrets.sh` prompt for a
+Keycloak client secret, which only exists after Keycloak is deployed and the
+`teknoir` / `argocd` clients have been created manually. Run them as part of the
+Keycloak configuration steps (§8 in
+[docs/AIRGAP-BOOTSTRAP.md](docs/AIRGAP-BOOTSTRAP.md)), not during initial secret
+generation.
 
 `argocd-harbor-repo` is an ArgoCD `repo-creds` secret
 (`enableOCI: "true"`, `url: harbor.teknoir.airgapped/teknoir`) — it should carry

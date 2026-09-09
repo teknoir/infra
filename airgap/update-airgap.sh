@@ -8,7 +8,7 @@
 # controller). The controller re-applies the change; ArgoCD then syncs the new
 # chart versions from Harbor. Chart-only updates need nothing else.
 #
-# Usage: airgap/update-airgap.sh [--host user@host] [--bundle DIR] [--dry-run] <new-target-revision>
+# Usage: airgap/update-airgap.sh [--host user@host] [--ssh-key FILE] [--bundle DIR] [--dry-run] <new-target-revision>
 #        airgap/update-airgap.sh --from-bundle [--bundle DIR] [--dry-run]
 set -euo pipefail
 
@@ -26,6 +26,8 @@ Options:
   --from-bundle  instead of patching, re-copy the bundle's app-of-apps.yaml
                  (delegates to deploy-app-of-apps.sh)
   --host H       ssh target (default: ${TEKNOIR_HOST})
+  --ssh-key FILE ssh identity file, e.g. .secrets/teknoir.airgapped.id_rsa
+                 (default: \$SSH_KEY, else auto-detected [${SSH_KEY:-none}])
   --bundle DIR   bundle directory (default: $(bundle_dir))
   --dry-run      print actions without mutating the node
   -h, --help     show this help
@@ -39,6 +41,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --from-bundle) FROM_BUNDLE=1 ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
+    --ssh-key) SSH_KEY="$2"; shift ;;
     --bundle) BUNDLE_DIR="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -52,6 +55,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_cmd ssh
+apply_ssh_key
 
 MANIFEST_ON_NODE="${K3S_DATA_DIR}/server/manifests/teknoir-app-of-apps.yaml"
 

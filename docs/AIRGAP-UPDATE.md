@@ -166,7 +166,7 @@ itself is down (reboot, image GC, disaster recovery).
 ## 6. Certificate renewal
 
 No manual action in the steady state: cert-manager renews
-`teknoir-local-wildcard-tls` from the `teknoir-ca` `ClusterIssuer`. Only the
+`teknoir-airgapped-wildcard-tls` from the `teknoir-ca` `ClusterIssuer`. Only the
 Root CA itself (10-year validity, `.secrets/ca/` on the connected workstation)
 would ever need re-issuing — that is a re-run of
 `scripts/gen-local-ca-secret.sh` plus a redeploy of the CA/wildcard secrets and

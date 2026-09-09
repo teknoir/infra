@@ -11,6 +11,14 @@ istio:
 argo-cd:
   namespaceOverride: "teknoir-system"
 
+  # NOTE: The Teknoir Root CA is added to ArgoCD's TLS trust store
+  # (configs.tls.certificates -> argocd-tls-certs-cm) at render time, keyed by the
+  # Harbor host, so the repo-server can `helm registry login` to the in-cluster
+  # Harbor OCI registry without "x509: certificate signed by unknown authority".
+  # It is injected via `helm template --set-file` (scripts/deploy-argo.sh and
+  # airgap/lib.sh:helm_template_chart) rather than hardcoded here, because
+  # teknoir-root-ca.crt is generated per-deployment and gitignored.
+
   global:
     # -- Default domain used by all components
     ## Used for ingresses, certificates, SSO, notifications, etc.

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # make-bundle.sh — build the full air-gap bundle (connected side).
 # Orchestrates collect-charts.sh, collect-images.sh and render-bootstrap.sh,
-# copies the bootstrap secret manifests + pinned tools, and writes
-# bundle-manifest.yaml with a sha256 checksum for every file.
+# copies the bootstrap secret manifests + pinned tools, embeds the air-gapped
+# side's operational scripts (airgap/ runtime + scripts/ secret helpers), and
+# writes bundle-manifest.yaml with a sha256 checksum for every file.
 #
 # Usage: airgap/make-bundle.sh [--dry-run] [--diff [OLD_MANIFEST]] [--bundle-dir DIR]
 set -euo pipefail
@@ -18,6 +19,7 @@ Builds the §4.3 bundle layout:
     bundle-manifest.yaml
     bootstrap/{images,manifests,secrets,k3s}/
     charts/  images/  tools/  k3s/
+    airgap/  scripts/
 
 Options:
   --dry-run              print planned actions, download/write nothing
@@ -69,19 +71,19 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   pass_args+=(--dry-run)
 fi
 
-log "step 1/7: collecting charts"
+log "step 1/8: collecting charts"
 "${AIRGAP_DIR}/collect-charts.sh" "${pass_args[@]}" --bundle-dir "${BUNDLE}"
 
-log "step 2/7: collecting images"
+log "step 2/8: collecting images"
 "${AIRGAP_DIR}/collect-images.sh" "${pass_args[@]}" --bundle-dir "${BUNDLE}"
 
-log "step 3/7: rendering bootstrap manifests"
+log "step 3/8: rendering bootstrap manifests"
 "${AIRGAP_DIR}/render-bootstrap.sh" "${pass_args[@]}" --bundle-dir "${BUNDLE}"
 
 # ---------------------------------------------------------------------------
 # 4. bootstrap secret manifests (produced by scripts/gen-*.sh, gitignored)
 # ---------------------------------------------------------------------------
-log "step 4/7: copying secret manifests"
+log "step 4/8: copying secret manifests"
 SECRET_MANIFESTS=(
   manifest-teknoir-ca-secret.yaml
   manifest-wildcard-tls-secret.yaml
@@ -111,7 +113,7 @@ fi
 # ---------------------------------------------------------------------------
 # 5. pinned tools (crane + helm for each TOOL_PLATFORM)
 # ---------------------------------------------------------------------------
-log "step 5/7: downloading pinned tools (crane ${CRANE_VERSION}, helm ${HELM_VERSION})"
+log "step 5/8: downloading pinned tools (crane ${CRANE_VERSION}, helm ${HELM_VERSION})"
 TOOLS_OUT="${BUNDLE}/tools"
 
 crane_url() {
@@ -151,7 +153,7 @@ done
 # ---------------------------------------------------------------------------
 # 6. pinned K3s install artifacts (offline node install — docs/AIRGAP-HOST-SETUP.md)
 # ---------------------------------------------------------------------------
-log "step 6/7: downloading pinned K3s artifacts (${K3S_VERSION}, ${K3S_ARCH})"
+log "step 6/8: downloading pinned K3s artifacts (${K3S_VERSION}, ${K3S_ARCH})"
 K3S_OUT="${BUNDLE}/k3s"
 K3S_RELEASE_BASE="https://github.com/k3s-io/k3s/releases/download/${K3S_VERSION}"
 K3S_IMAGES_TAR="k3s-airgap-images-${K3S_ARCH}.tar.zst"
@@ -200,9 +202,58 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 7. bundle-manifest.yaml (+ optional --diff)
+# 7. operational scripts (air-gapped side)
+#    Embed the scripts the air-gapped side runs so the bundle is self-contained
+#    once copied to the node (docs/AIRGAP-HOST-SETUP.md §8.1 / upload-bundle.sh).
+#    Only runtime + secret helpers travel; build-only steps that need internet
+#    (make/collect/render/verify) are intentionally excluded.
 # ---------------------------------------------------------------------------
-log "step 7/7: writing bundle-manifest.yaml"
+log "step 7/8: copying operational scripts"
+
+# airgap/ runtime tooling (+ shared lib.sh / versions.env) run against the node.
+AIRGAP_RUNTIME_SCRIPTS=(
+  lib.sh
+  versions.env
+  bootstrap-airgap.sh
+  push-to-harbor.sh
+  deploy-app-of-apps.sh
+  update-airgap.sh
+  upload-bundle.sh
+)
+AIRGAP_SCRIPTS_OUT="${BUNDLE}/airgap"
+run mkdir -p "${AIRGAP_SCRIPTS_OUT}"
+for f in "${AIRGAP_RUNTIME_SCRIPTS[@]}"; do
+  if [[ -f "${AIRGAP_DIR}/${f}" ]]; then
+    run cp "${AIRGAP_DIR}/${f}" "${AIRGAP_SCRIPTS_OUT}/${f}"
+  else
+    warn "airgap script missing (not copied into bundle): ${AIRGAP_DIR}/${f}"
+  fi
+done
+
+# scripts/ secret generators + deployers (initial secrets on the connected
+# workstation; re-run on the LAN laptop for the §6/§8 rotations). bootstrap_*.sh
+# are gitignored, machine-generated helpers and are never bundled.
+SCRIPTS_OUT="${BUNDLE}/scripts"
+run mkdir -p "${SCRIPTS_OUT}"
+shopt -s nullglob
+repo_scripts=("${REPO_ROOT}/scripts/"*.sh)
+shopt -u nullglob
+for f in "${repo_scripts[@]}"; do
+  base="$(basename "${f}")"
+  case "${base}" in bootstrap_*.sh) continue ;; esac
+  run cp "${f}" "${SCRIPTS_OUT}/${base}"
+done
+
+# Keep the copied entry points executable (cp usually preserves the +x bit;
+# this is a belt-and-braces safety net, skipped in dry-run).
+if [[ "${DRY_RUN}" != "1" ]]; then
+  chmod +x "${AIRGAP_SCRIPTS_OUT}/"*.sh "${SCRIPTS_OUT}/"*.sh 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 8. bundle-manifest.yaml (+ optional --diff)
+# ---------------------------------------------------------------------------
+log "step 8/8: writing bundle-manifest.yaml"
 MANIFEST="${BUNDLE}/bundle-manifest.yaml"
 
 if [[ "${DRY_RUN}" == "1" ]]; then

@@ -46,8 +46,13 @@ syncs the GitOps tier (auth, cert-manager, monitoring, controllers) from
 
 * SSH access to the node with passwordless `sudo`
   (default target `teknoir@teknoir.airgapped`, override with `TEKNOIR_HOST` or `--host`).
-  The SSH key pair is **generated externally** and kept under `.secrets/`; use
-  the private key explicitly, e.g.:
+  The node only accepts **publickey** authentication; the SSH key pair is
+  **generated externally** and kept under `.secrets/`. All `airgap/*.sh`
+  scripts and `scripts/deploy-secrets.sh` / `scripts/deploy-argo.sh`
+  **auto-detect** `.secrets/teknoir.airgapped.id_rsa` and pass it as the
+  identity file; a key elsewhere is given explicitly via `SSH_KEY=FILE` (env)
+  or `--ssh-key FILE` (airgap scripts). Without a usable key, ssh fails with
+  `Permission denied (publickey)`. For manual sessions use the key explicitly:
 
   ```sh
   ssh teknoir@teknoir.airgapped -i .secrets/teknoir.airgapped.id_rsa
@@ -91,22 +96,27 @@ operator laptop / USB. `make-bundle.sh` copies them from `.secrets/` into
 ./scripts/gen-local-ca-secret.sh
 ./scripts/gen-harbor-secrets.sh                 # note the printed admin password
 ./scripts/gen-keycloak-db-secret.sh
-./scripts/gen-oauth2-proxy-secrets.sh           # prompts for a Keycloak client secret (see note)
 ./scripts/gen-oauth2-proxy-redis-secret.sh
-./scripts/gen-argocd-keycloak-secrets.sh        # prompts for a Keycloak client secret (see note)
 ./scripts/gen-argocd-harbor-repo-secret.sh      # admin fallback on first run (see note)
 ```
 
 | Script | Manifest | Secret (namespace) |
 |---|---|---|
 | `gen-local-ca-secret.sh` | `manifest-teknoir-ca-secret.yaml` | `teknoir-root-ca` (`cert-manager`) |
-| `gen-local-ca-secret.sh` | `manifest-wildcard-tls-secret.yaml` | `teknoir-local-wildcard-tls` (`istio-system`) |
+| `gen-local-ca-secret.sh` | `manifest-wildcard-tls-secret.yaml` | `teknoir-airgapped-wildcard-tls` (`istio-system`) |
 | `gen-harbor-secrets.sh` | `manifest-harbor-secret.yaml` | `harbor-secret` (`teknoir-system`) |
 | `gen-keycloak-db-secret.sh` | `manifest-keycloak-db-secret.yaml` | `keycloak-db-secret` (`teknoir-auth`) |
-| `gen-oauth2-proxy-secrets.sh` | `manifest-oauth2-proxy-secret.yaml` | `oauth2-proxy-secret` (`teknoir-auth`) |
 | `gen-oauth2-proxy-redis-secret.sh` | `manifest-oauth2-proxy-redis-secret.yaml` | `oauth2-proxy-redis-secret` (`teknoir-auth`) |
-| `gen-argocd-keycloak-secrets.sh` | `manifest-argocd-keycloak-secret.yaml` | `argocd-oidc-secret` (`teknoir-system`) |
 | `gen-argocd-harbor-repo-secret.sh` | `manifest-argocd-harbor-repo-secret.yaml` | `argocd-harbor-repo` (`teknoir-system`) |
+
+Two more generators require a **Keycloak client secret** and are therefore run
+later, after Keycloak is deployed by the GitOps tier and the OIDC clients have
+been created manually (§8):
+
+| Script | Manifest | Secret (namespace) | Run in |
+|---|---|---|---|
+| `gen-argocd-keycloak-secrets.sh` | `manifest-argocd-keycloak-secret.yaml` | `argocd-oidc-secret` (`teknoir-system`) | §8.1 |
+| `gen-oauth2-proxy-secrets.sh` | `manifest-oauth2-proxy-secret.yaml` | `oauth2-proxy-secret` (`teknoir-auth`) | §8.3 |
 
 Notes:
 
@@ -120,9 +130,12 @@ Notes:
   (backed by the `teknoir-root-ca` secret) takes over wildcard-cert renewal
   in place (same `secretName`).
 * **Keycloak client secrets are not available yet** at first bootstrap
-  (Keycloak is GitOps-tier). Enter a placeholder when
-  `gen-oauth2-proxy-secrets.sh` / `gen-argocd-keycloak-secrets.sh` prompt; you
-  will regenerate and redeploy these secrets after creating the clients in §8.
+  (Keycloak is GitOps-tier), so `gen-oauth2-proxy-secrets.sh` and
+  `gen-argocd-keycloak-secrets.sh` are deliberately **not** run here — you run
+  them after creating the clients in Keycloak (§8). Until then it is expected
+  that ArgoCD OIDC login is unavailable (the local `admin` account still works)
+  and the `oauth2-proxy` deployment in `teknoir-auth` stays unhealthy waiting
+  for `oauth2-proxy-secret`.
 * **`gen-argocd-harbor-repo-secret.sh`** prefers the `robot$argocd` credential
   written by `airgap/push-to-harbor.sh` to `airgap/.secrets/robot-argocd.env`.
   That file does not exist yet, so the first run falls back to the Harbor
@@ -143,7 +156,7 @@ pause, busybox, redis, postgres) are listed in `airgap/images-extra.txt`.
 ./airgap/verify-offline.sh              # offline-readiness gate (see below)
 ```
 
-`make-bundle.sh` orchestrates seven steps and produces
+`make-bundle.sh` orchestrates eight steps and produces
 `bundle/teknoir-airgap-bundle-<version>/`:
 
 ```
@@ -157,7 +170,9 @@ teknoir-airgap-bundle-<version>/
 ├── charts/                       # <chart>-<version>.tgz for every GitOps chart (deps vendored)
 ├── images/                       # workload images as OCI layouts (crane), digest-deduplicated
 ├── tools/                        # pinned crane + helm binaries (linux-amd64, darwin-arm64)
-└── k3s/                          # offline K3s install: k3s binary, install.sh, airgap-images tarball (see AIRGAP-HOST-SETUP.md)
+├── k3s/                          # offline K3s install: k3s binary, install.sh, airgap-images tarball (see AIRGAP-HOST-SETUP.md)
+├── airgap/                       # runtime tooling run against the node: bootstrap-airgap.sh, push-to-harbor.sh, deploy-app-of-apps.sh, update-airgap.sh, upload-bundle.sh (+ lib.sh, versions.env)
+└── scripts/                      # secret generators + deployers (gen-*.sh, deploy-secrets.sh, …) for §3/§6/§8
 ```
 
 The individual steps can also be run standalone (each supports `--dry-run` and
@@ -180,10 +195,19 @@ templates every chart, and fails on any rendered reference to
 
 ## 5. Transfer via USB
 
-Copy the **infra repo checkout including `bundle/`** to the USB drive and then
-onto the LAN laptop — the laptop needs both the `airgap/` scripts and the
-bundle (plus `scripts/gen-argocd-harbor-repo-secret.sh` and
-`scripts/deploy-secrets.sh` for §6).
+The bundle is **self-contained**: step 7 of `make-bundle.sh` embeds the
+air-gapped side's operational scripts under `bundle/…/airgap/` (the runtime
+tooling: `bootstrap-airgap.sh`, `push-to-harbor.sh`, `deploy-app-of-apps.sh`,
+`update-airgap.sh`, `upload-bundle.sh`, plus `lib.sh`/`versions.env`) and
+`bundle/…/scripts/` (the `gen-*.sh` generators and `deploy-secrets.sh`). So
+copying just the **bundle directory** to the USB drive and then onto the LAN
+laptop is enough — no separate repo checkout is required to run §6/§8. Run the
+embedded scripts from inside the bundle, e.g.
+`cd teknoir-airgap-bundle-<version> && ./airgap/bootstrap-airgap.sh --bundle .`.
+
+> The build-only steps (`make-bundle.sh`, `collect-*.sh`, `render-bootstrap.sh`,
+> `verify-offline.sh`) need internet and are **not** bundled; re-run them from a
+> repo checkout on the connected workstation.
 
 Verify integrity after the copy using the checksum manifest:
 
@@ -197,15 +221,22 @@ awk '/^  - path: /{p=$3} /^    sha256: /{print $2 "  " p}' bundle-manifest.yaml 
 ### 6.1 Bootstrap the node
 
 ```sh
-./airgap/bootstrap-airgap.sh [--host teknoir@teknoir.airgapped] [--node-ip IP] [--dry-run]
+./airgap/bootstrap-airgap.sh [--host teknoir@teknoir.airgapped] [--ssh-key FILE] [--node-ip IP] [--dry-run]
 ```
+
+The node's SSH private key is auto-detected at `.secrets/teknoir.airgapped.id_rsa`
+(see §2); pass `--ssh-key FILE` (or set `SSH_KEY`) if it lives elsewhere. The
+script preflights the SSH connection and aborts with a hint if publickey
+authentication fails.
 
 Over SSH this: installs the Root CA (`/etc/rancher/k3s/teknoir-root-ca.crt` +
 system trust), installs the K3s registry mirrors
 (`/etc/rancher/k3s/registries.yaml` — all five upstream registries rewritten to
 `https://harbor.teknoir.airgapped`), writes the `/etc/hosts` marker block on the
 node, copies the bootstrap image tarballs to `/opt/k3s/agent/images/`, restarts
-K3s (re-importing the tarballs), deploys all secret manifests plus the
+K3s (re-importing the tarballs), **waits until every bootstrap image is actually
+present in containerd** (K3s imports the tarballs asynchronously, *after* the
+node reports `Ready`), deploys all secret manifests plus the
 `coredns-custom` ConfigMap, and then lands the ordered bootstrap manifests in
 `/opt/k3s/server/manifests/` — waiting for health between tiers:
 
@@ -216,6 +247,33 @@ K3s (re-importing the tarballs), deploys all secret manifests plus the
 
 The node IP defaults to `NODE_IP` in `airgap/versions.env` (`192.168.5.181`); if
 that is unset it is auto-detected over SSH. Pass `--node-ip` to override either.
+
+> **`imagePullPolicy: IfNotPresent` (air-gap requirement).** The Istio gateways
+> (ingress/ingress-public/egress) and every injected sidecar are rendered with
+> `imagePullPolicy: IfNotPresent`, forced by `chart_template_args` in
+> `airgap/lib.sh` (`--set global.imagePullPolicy=IfNotPresent` +
+> `--set istio-*gateway.imagePullPolicy=IfNotPresent`) and mirrored in the
+> GitOps `charts/istio/values.yaml`. Without an explicit policy the gateway pods
+> run a placeholder container `image: auto` (which the API server treats as
+> `:latest`) and default it to `imagePullPolicy: Always`; Istio then copies that
+> `Always` into the injected `istio-proxy` container, so the gateways try to pull
+> `docker.io/istio/proxyv2` from Harbor on *every* start — Harbor is down/empty
+> during bootstrap, so that pull is refused and the pod is stuck in
+> `ImagePullBackOff` **even though the image is already imported into
+> containerd** (`sudo k3s ctr -n k8s.io images ls | grep istio/proxyv2`). With
+> `IfNotPresent` the already-present local image is used and no registry is
+> contacted.
+>
+> To recover a cluster that was bootstrapped from a pre-fix bundle: re-copy the
+> regenerated manifest and let the gateways restart with the new policy:
+>
+> ```sh
+> ./airgap/bootstrap-airgap.sh --update   # re-applies 00-teknoir-istio.yaml
+> # then force the stuck gateway pods to re-read the (now IfNotPresent) spec:
+> ssh teknoir@teknoir.airgapped sudo k3s kubectl -n istio-system \
+>   rollout restart deploy/istio-egressgateway deploy/istio-ingressgateway \
+>   deploy/istio-ingressgateway-public
+> ```
 
 ### 6.2 Populate Harbor
 
@@ -280,7 +338,10 @@ and `https://argocd.teknoir.airgapped` load with a trusted certificate.
 
 Keycloak arrives with the GitOps `auth` chart at
 `https://auth.teknoir.airgapped/auth/` (realm `master`). Log in with the Keycloak
-admin credential, then create the OIDC clients:
+admin credential, then create the OIDC clients. This is also where the two
+deferred secret generators from §3 (`gen-argocd-keycloak-secrets.sh`,
+`gen-oauth2-proxy-secrets.sh`) are finally run — each client section below ends
+with its generate/deploy/restart step.
 
 ### 8.1 `argocd` client
 
@@ -333,12 +394,37 @@ The registry/API path is unaffected by the auth mode.
 
 ### 8.3 `teknoir` client (oauth2-proxy)
 
-The `auth` chart's oauth2-proxy protects the remaining UIs. Create a `teknoir`
-client (confidential, standard flow, service account roles ON) with redirect
-URI `https://teknoir.airgapped/oauth2/callback`, add a `teknoir` client scope with
-an Audience mapper (included audience `teknoir`, add to access token), and
-assign the service-account client roles `manage-users`, `query-users`,
-`view-users`. Then:
+The `auth` chart's oauth2-proxy protects the remaining UIs.
+
+**Create the client** (realm `master` → **Clients** → **Create client**):
+
+* Client ID: `teknoir` (or change the oauth2-proxy client id to match)
+* Client type: OpenID Connect
+* Client authentication: **ON** (this is "confidential")
+* Standard flow: **ON**
+* Service accounts roles: **ON**
+* Valid redirect URI: `https://teknoir.airgapped/oauth2/callback`
+* Web origins: `https://teknoir.airgapped`
+
+**Add the audience client scope** (**Client scopes** menu):
+
+* Create (or reuse) a client scope named `teknoir`, Type: `Default`
+* On the scope's **Mappers** tab, **Configure a new mapper**:
+  * Mapper type: **Audience**
+  * Included Client Audience: `teknoir`
+  * Add to access token: **ON**
+* Assign the scope to the `teknoir` client (**Clients** → `teknoir` →
+  **Client scopes** → **Add client scope**, as `Default`) if it is not already
+  attached
+
+**Assign service-account roles** (**Clients** → `teknoir` →
+**Service account roles** → **Assign role**, filter by clients):
+
+* `manage-users`, `query-users`, `view-users`
+
+**Feed the client secret to oauth2-proxy:** copy the client secret from the
+client's **Credentials** tab, then generate + deploy the secret and restart
+oauth2-proxy to pick up the new secret and scope changes:
 
 ```sh
 ./scripts/gen-oauth2-proxy-secrets.sh         # paste the client secret
@@ -355,6 +441,7 @@ that talks TLS to the gateway:
 |---|---|
 | Node containerd (image pulls via mirrors) | `/etc/rancher/k3s/registries.yaml` → `ca_file: /etc/rancher/k3s/teknoir-root-ca.crt` (installed by `bootstrap-airgap.sh`) |
 | Node OS trust store | `/usr/local/share/ca-certificates/` + `update-ca-certificates` (installed by `bootstrap-airgap.sh`) |
+| ArgoCD repo-server (Harbor OCI `helm registry login`) | `argocd-tls-certs-cm` keyed by `harbor.teknoir.airgapped`, populated from the argo-cd chart's `configs.tls.certificates` — injected at render time via `--set-file` by `scripts/deploy-argo.sh` and `airgap/render-bootstrap.sh`. Without it the repo-server fails with `x509: certificate signed by unknown authority` and `app-of-apps` stays `Unknown`. |
 | LAN-side scripts (`push-to-harbor.sh`) | automatic (`--cacert` / `SSL_CERT_FILE` from the bundle) |
 | Operator laptops / browsers | import `teknoir-root-ca.crt` into the OS keychain / browser trust store |
 | Harbor OIDC "Verify Certificate" | works because the in-cluster trust chain covers `auth.teknoir.airgapped` |

@@ -67,14 +67,27 @@ done
 
 CURL_TLS=()
 HELM_TLS=()
+CRANE_TLS=()
 if [[ "${INSECURE}" == "1" ]]; then
   CURL_TLS+=(--insecure)
   HELM_TLS+=(--insecure-skip-tls-verify)
+  CRANE_TLS+=(--insecure)
 elif [[ -n "${CA_FILE}" ]]; then
   CURL_TLS+=(--cacert "${CA_FILE}")
   HELM_TLS+=(--ca-file "${CA_FILE}")
-  # crane has no CA flag; it honors SSL_CERT_FILE
+  # crane (go-containerregistry) has no CA flag. On Linux Go's crypto/x509
+  # honors SSL_CERT_FILE, so point it at the teknoir CA. On macOS Go defers TLS
+  # verification to Security.framework and ignores SSL_CERT_FILE entirely
+  # (crypto/x509/root_unix.go excludes darwin), so the CA cannot be fed to crane
+  # that way — the push would fail with 'certificate is not trusted'. Fall back
+  # to --insecure for crane only: the Harbor endpoint identity is still pinned by
+  # the CA-verified curl health check and helm login above, so crane then talks
+  # to the already-authenticated same host.
   export SSL_CERT_FILE="${CA_FILE}"
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    warn "macOS: crane cannot consume ${CA_FILE} (Go ignores SSL_CERT_FILE on darwin); using --insecure for crane only (endpoint already verified via CA-pinned curl/helm)"
+    CRANE_TLS+=(--insecure)
+  fi
 else
   die "teknoir-root-ca.crt not found (bundle or repo root) — use --insecure to override"
 fi
@@ -125,9 +138,14 @@ api() {
 }
 
 api_status() {
-  # api_status <method> <path> — print only the http status code
+  # api_status <method> <path> — print only the http status code.
+  # Use curl's -I for HEAD: -X HEAD makes curl expect a body per Content-Length
+  # that a HEAD response never sends, so it exits 18 (partial file), which under
+  # `set -euo pipefail` would abort the whole script on the first project check.
+  local method="$1" method_args=(-X "$1")
+  [[ "${method}" == "HEAD" ]] && method_args=(-I)
   curl -s -o /dev/null -w '%{http_code}' "${CURL_TLS[@]}" \
-    -u "admin:${HARBOR_ADMIN_PASSWORD}" -X "$1" "${API}$2"
+    -u "admin:${HARBOR_ADMIN_PASSWORD}" "${method_args[@]}" "${API}$2"
 }
 
 log "checking Harbor availability at ${API}"
@@ -242,7 +260,7 @@ rewrite_ref() {
 }
 
 log "crane auth login ${HARBOR_HOST}"
-crane auth login "${HARBOR_HOST}" --username admin --password "${HARBOR_ADMIN_PASSWORD}"
+crane auth login ${CRANE_TLS[@]+"${CRANE_TLS[@]}"} "${HARBOR_HOST}" --username admin --password "${HARBOR_ADMIN_PASSWORD}"
 
 INDEX_FILE="${BUNDLE}/images/images.txt"
 [[ -f "${INDEX_FILE}" ]] || die "missing ${INDEX_FILE} (run collect-images.sh)"
@@ -259,7 +277,7 @@ while read -r ref name; do
     continue
   fi
   log "crane push ${ref} -> ${target}"
-  crane push "${layout}" "${target}"
+  crane push ${CRANE_TLS[@]+"${CRANE_TLS[@]}"} "${layout}" "${target}"
 done < "${INDEX_FILE}"
 
 log "push-to-harbor complete — next: deploy-app-of-apps.sh"

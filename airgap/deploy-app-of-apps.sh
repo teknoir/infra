@@ -4,7 +4,8 @@
 # applies it; ArgoCD then adopts istio + harbor and syncs the GitOps tier
 # from oci://harbor.teknoir.airgapped/teknoir.
 #
-# Usage: airgap/deploy-app-of-apps.sh [--bundle DIR] [--host user@host] [--dry-run]
+# Usage: airgap/deploy-app-of-apps.sh [--bundle DIR] [--host user@host]
+#                                     [--ssh-key FILE] [--dry-run]
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -16,6 +17,8 @@ Usage: $(basename "$0") [options]
 Options:
   --bundle DIR   bundle directory (default: $(bundle_dir))
   --host H       ssh target (default: ${TEKNOIR_HOST})
+  --ssh-key FILE ssh identity file, e.g. .secrets/teknoir.airgapped.id_rsa
+                 (default: \$SSH_KEY, else auto-detected [${SSH_KEY:-none}])
   --dry-run      print actions without mutating the node
   -h, --help     show this help
 EOF
@@ -25,6 +28,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --bundle) BUNDLE_DIR="$2"; shift ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
+    --ssh-key) SSH_KEY="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -33,6 +37,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_cmd ssh
+apply_ssh_key
 
 BUNDLE="$(bundle_dir)"
 SRC="${BUNDLE}/bootstrap/manifests/app-of-apps.yaml"

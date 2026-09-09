@@ -27,13 +27,13 @@ Argo CD is deployed behind the Istio ingress gateway.
         2. Save, then go to the **Mappers** tab for the new `groups` scope and click **Configure a new mapper** -> **Group Membership**.
         3. Name the mapper `groups`, set **Token Claim Name** to `groups`, turn OFF **Full group path**, and turn ON **Add to ID token**, **Add to access token**, and **Add to userinfo**.
         4. Go to your `argocd` client, navigate to **Client Scopes**, and ensure the `groups` scope is assigned (add it as `Default` or `Optional` if missing).
-4.  **Secret Generation**: You must generate the Keycloak client secret before deploying.
+4.  **Secret Generation**: The Keycloak client secret can only be generated **after** Keycloak is deployed and the `argocd` client has been created (steps above) — Keycloak issues the client secret on client creation.
 
 
 ## Setup Instructions
 
-1.  **Generate the OIDC Secret:**
-    Run the secret generation script from the root of the project to create the Kubernetes manifest for the Keycloak client secret:
+1.  **Generate the OIDC Secret** (after the Keycloak client exists):
+    Copy the client secret from the `argocd` client's **Credentials** tab in Keycloak, then run the secret generation script from the root of the project to create the Kubernetes manifest:
 
     ```bash
     ./scripts/gen-argocd-keycloak-secrets.sh
@@ -53,6 +53,12 @@ Argo CD is deployed behind the Istio ingress gateway.
 
     ```bash
     ./scripts/deploy-argo.sh
+    ```
+
+    If Argo CD was already running before the secret existed (e.g., during the air-gapped bootstrap), restart the server to pick up the new secret instead:
+
+    ```bash
+    kubectl -n teknoir-system rollout restart deploy -l app.kubernetes.io/name=argocd-server
     ```
 
 ## Configuration

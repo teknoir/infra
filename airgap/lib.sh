@@ -78,10 +78,28 @@ chart_namespace() {
 chart_template_args() {
   case "$1" in
     istio)
-      echo "--set global.domain=${TEKNOIR_DOMAIN}"
+      # imagePullPolicy=IfNotPresent is mandatory for the air gap: the gateway
+      # pods run a placeholder container (image: auto) which the API server would
+      # otherwise default to imagePullPolicy: Always (auto == :latest). Istio
+      # captures that Always into the injected istio-proxy override, so the
+      # gateways try to pull docker.io/istio/proxyv2 from Harbor on every start —
+      # which is down/unreachable during bootstrap → ImagePullBackOff, even
+      # though the image is already imported into containerd. Setting an explicit
+      # policy on each gateway (local .imagePullPolicy) plus global (injected
+      # sidecars everywhere) keeps the mesh fully offline.
+      echo "--set global.domain=${TEKNOIR_DOMAIN}" \
+           "--set global.imagePullPolicy=IfNotPresent" \
+           "--set istio-ingressgateway.imagePullPolicy=IfNotPresent" \
+           "--set istio-ingressgateway-public.imagePullPolicy=IfNotPresent" \
+           "--set istio-egressgateway.imagePullPolicy=IfNotPresent"
       ;;
     harbor)
-      echo "--set domain=${TEKNOIR_DOMAIN} --set hostname=harbor.${TEKNOIR_DOMAIN}"
+      # externalURL feeds Harbor core's EXT_ENDPOINT, which builds the registry
+      # token realm advertised in /v2/'s Www-Authenticate header. Left empty it
+      # emits a schemeless realm (harbor.host/service/token) that helm/oras
+      # reject ("unsupported scheme"), so it must carry the https:// scheme.
+      echo "--set domain=${TEKNOIR_DOMAIN} --set hostname=harbor.${TEKNOIR_DOMAIN}" \
+           "--set harbor.externalURL=${HARBOR_URL}"
       ;;
     argo)
       echo "--set domain=${TEKNOIR_DOMAIN} --set argo-cd.global.domain=argocd.${TEKNOIR_DOMAIN}"
@@ -99,11 +117,22 @@ chart_template_args() {
 helm_template_chart() {
   local name="$1" dir="$2" args
   args="$(chart_template_args "${name}")"
+  # ArgoCD's repo-server does its own TLS to Harbor (helm registry login) and
+  # ignores the node's containerd/OS trust; without the Teknoir Root CA in its
+  # argocd-tls-certs-cm it fails OCI login with "x509: certificate signed by
+  # unknown authority", leaving app-of-apps Unknown. Inject the CA (keyed by the
+  # Harbor host) into that ConfigMap via the argo-cd chart's configs.tls.certificates.
+  local ca_args=()
+  if [[ "${name}" == "argo" && -f "${REPO_ROOT}/teknoir-root-ca.crt" ]]; then
+    local ca_key="${HARBOR_HOST//./\\.}"
+    ca_args=(--set-file "argo-cd.configs.tls.certificates.${ca_key}=${REPO_ROOT}/teknoir-root-ca.crt")
+  fi
   # shellcheck disable=SC2086
   helm template "${name}" "${dir}" \
     --namespace "$(chart_namespace "${name}")" \
     --include-crds \
     --kube-version "${KUBE_VERSION:-1.33.0}" \
+    ${ca_args[@]+"${ca_args[@]}"} \
     ${args}
 }
 
@@ -134,6 +163,37 @@ sha256_file() {
 # SSH helpers (LAN side). Honor DRY_RUN.
 # ---------------------------------------------------------------------------
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10)
+
+# Optional SSH identity file. Set SSH_KEY (env or --ssh-key in the scripts that
+# support it) to authenticate every ssh/rsync invocation with an explicit key,
+# e.g. SSH_KEY=.secrets/teknoir.airgapped.id_rsa. Left empty, the default key
+# .secrets/teknoir.airgapped.id_rsa is auto-detected (repo checkout or bundle
+# run from the bundle root); otherwise ssh falls back to its own key
+# resolution / agent. The node only accepts publickey auth, so without a
+# usable key every ssh fails with "Permission denied (publickey)".
+SSH_KEY="${SSH_KEY:-}"
+if [[ -z "${SSH_KEY}" ]]; then
+  for _candidate in \
+    "${REPO_ROOT}/.secrets/teknoir.airgapped.id_rsa" \
+    "${PWD}/.secrets/teknoir.airgapped.id_rsa"; do
+    if [[ -f "${_candidate}" ]]; then
+      SSH_KEY="${_candidate}"
+      break
+    fi
+  done
+  unset _candidate
+fi
+
+# Fold $SSH_KEY into SSH_OPTS (idempotent). Called at source time and again by
+# scripts that accept --ssh-key after argument parsing.
+apply_ssh_key() {
+  if [[ -n "${SSH_KEY}" && " ${SSH_OPTS[*]} " != *" -i ${SSH_KEY} "* ]]; then
+    [[ -f "${SSH_KEY}" ]] || die "ssh key not found: ${SSH_KEY}"
+    SSH_OPTS+=(-i "${SSH_KEY}")
+    export SSH_KEY  # propagate to delegated airgap scripts
+  fi
+}
+apply_ssh_key
 
 ssh_run() {
   # ssh_run <remote command...>

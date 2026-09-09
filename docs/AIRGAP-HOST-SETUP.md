@@ -25,10 +25,14 @@ are unchanged.
 ```
 [connected workstation]         [USB]          [teknoir@teknoir.airgapped (K3s node)]
 Debian 13 DVD-1 ISO  ───────────► USB ──► install Debian 13 offline
-make-bundle.sh (incl. k3s/) ────► USB ──► host prep + OS/K3s tuning
-                                          install K3s offline (INSTALL_K3S_SKIP_DOWNLOAD)
-                                          ──► node Ready, ready for bootstrap-airgap.sh
+make-bundle.sh (incl. k3s/) ──┬─► USB ──► host prep + OS/K3s tuning
+                              └─► rsync ► install K3s offline (INSTALL_K3S_SKIP_DOWNLOAD)
+    (airgap/upload-bundle.sh, LAN ssh)    ──► node Ready, ready for bootstrap-airgap.sh
 ```
+
+The DVD-1 ISO always travels on USB (the node has no OS yet). The **bundle** can
+travel on the same USB **or**, once the node is installed and SSH-reachable, be
+pushed over the LAN with `airgap/upload-bundle.sh` (rsync over ssh — §8.1).
 
 After this runbook the node is a healthy single-node K3s cluster with traefik
 disabled and `data-dir: /opt/k3s`, and the operator has a working kubeconfig.
@@ -70,8 +74,27 @@ and copied to USB.
    > The exact `install.sh` bytes used on the node are captured in
    > `bundle-manifest.yaml`, so the unpinned installer is pinned in practice.
 
-3. **A USB drive** large enough for the DVD-1 ISO **and** the bundle (plus the
-   `airgap/` scripts, per [AIRGAP-BOOTSTRAP.md](AIRGAP-BOOTSTRAP.md) §5).
+   The bundle is **self-contained**: alongside `k3s/` it also embeds the
+   air-gapped side's operational scripts under `airgap/` (runtime tooling —
+   `bootstrap-airgap.sh`, `push-to-harbor.sh`, `deploy-app-of-apps.sh`,
+   `update-airgap.sh`, `upload-bundle.sh`, plus `lib.sh`/`versions.env`) and
+   `scripts/` (the `gen-*.sh` secret generators + `deploy-secrets.sh`), and the
+   bootstrap secret manifests under `bootstrap/secrets/`. So the same transfer
+   that carries the install artifacts also carries every script and secret the
+   runbooks expect — nothing extra needs to be copied next to the bundle. (The
+   internet-only build steps — `make-bundle.sh`, `collect-*.sh`,
+   `render-bootstrap.sh`, `verify-offline.sh` — are intentionally **not**
+   bundled.)
+
+3. **A USB drive** large enough for the DVD-1 ISO **and** the bundle (the bundle
+   already embeds the `airgap/` + `scripts/` tooling — see §2 and
+   [AIRGAP-BOOTSTRAP.md](AIRGAP-BOOTSTRAP.md) §5).
+
+   > The DVD-1 ISO must arrive on USB (the node has no OS yet). The **bundle**,
+   > however, can be delivered either on the same USB or — once the node is
+   > installed and SSH-reachable on the LAN — pushed over rsync with
+   > `airgap/upload-bundle.sh` (§8.1). rsync runs over ssh on the LAN, so it does
+   > not break the air gap.
 
 ## 3. Install Debian 13 (trixie) — offline
 
@@ -240,7 +263,7 @@ Cloud-init `packages:` — installed here from the DVD apt source (§4):
 
 ```sh
 sudo apt-get install -y \
-  htop curl wget git gpg \
+  htop curl wget git gpg rsync \
   zsh zsh-autosuggestions zsh-syntax-highlighting \
   network-manager linux-headers-amd64
 ```
@@ -254,6 +277,13 @@ sudo apt-get install -y zsh-theme-powerlevel9k || true
 Why: these match the cloud-init package set minus the GPU toolchain.
 `zsh-theme-powerlevel9k` is a theme and may not be on DVD-1 — the zsh config in
 §5.6 tolerates its absence.
+
+> **`rsync` enables the fast LAN upload path.** `airgap/upload-bundle.sh` (§8.1)
+> prefers `rsync` over ssh but needs `rsync` on **both** ends; without it on the
+> node the helper still works, falling back to streaming a gzip'd `tar` over ssh
+> (slower, no incremental sync). Installing `rsync` here from the DVD keeps the
+> efficient rsync path available. `tar` and `ssh` are already present from the
+> base install, so the fallback needs nothing extra.
 
 ### 5.5 MOTD
 
@@ -389,11 +419,45 @@ Rationale:
 
 ## 8. Install K3s — offline
 
-Using the bundle's `k3s/` directory (§2), transferred via USB to the node.
+### 8.1 Transfer the bundle to the node
+
+The on-node install below reads from the bundle's `k3s/` directory (§2). Get the
+bundle onto the node one of two ways:
+
+* **USB** (fully offline) — copy the bundle directory from the USB drive to the
+  node, e.g. into the `teknoir` user's home.
+* **LAN rsync** (when the node is already SSH-reachable) — from the operator
+  laptop, use the helper. It rsyncs over ssh on the LAN (not an internet fetch),
+  so it stays within the air gap:
+
+  ```sh
+  # operator laptop, from the infra repo checkout
+  ./airgap/upload-bundle.sh
+  # the key at .secrets/teknoir.airgapped.id_rsa is auto-detected; a key
+  # elsewhere: --ssh-key FILE (or SSH_KEY=FILE ./airgap/upload-bundle.sh)
+  # preview with --dry-run; upload a specific bundle with --bundle DIR
+  ```
+
+  This mirrors `bundle/teknoir-airgap-bundle-<version>/` into the `teknoir`
+  user's home (override the parent dir with `--dest`), so the install artifacts
+  land at `~/teknoir-airgap-bundle-<version>/k3s/` on the node. The ssh target
+  (`teknoir@teknoir.airgapped`) and bundle version default from
+  `airgap/versions.env`; the same `SSH_KEY` auto-detection / override is
+  honored by the other airgap scripts (e.g. `bootstrap-airgap.sh`).
+
+  Because the bundle is self-contained (§2), the upload also delivers the
+  embedded `airgap/` runtime scripts, the `scripts/` secret generators, and the
+  `bootstrap/secrets/` manifests to the node in one shot — so everything the
+  bootstrap runbook runs is present on the target, not just the K3s install
+  files.
+
+### 8.2 Install K3s from the bundle
+
 K3s is installed **without any download** (`INSTALL_K3S_SKIP_DOWNLOAD=true`):
 
 ```sh
-# from the bundle's k3s/ directory on the node:
+# from the bundle's k3s/ directory on the node
+# (e.g. cd ~/teknoir-airgap-bundle-<version>/k3s):
 
 # 1. the K3s binary
 sudo install -m 0755 k3s /usr/local/bin/k3s

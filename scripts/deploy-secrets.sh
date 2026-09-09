@@ -10,6 +10,17 @@ TEKNOIR_HOST="${TEKNOIR_HOST:-teknoir@teknoir.airgapped}"
 # Secret manifests are generated under .secrets/ (gitignored) by scripts/gen-*.sh
 SECRETS_DIR=".secrets"
 
+# SSH identity: use $SSH_KEY if set, else auto-detect the node key in .secrets/
+# (the node only accepts publickey auth).
+SSH_KEY="${SSH_KEY:-}"
+if [ -z "${SSH_KEY}" ] && [ -f "${SECRETS_DIR}/teknoir.airgapped.id_rsa" ]; then
+  SSH_KEY="${SECRETS_DIR}/teknoir.airgapped.id_rsa"
+fi
+SSH_OPTS=()
+if [ -n "${SSH_KEY}" ]; then
+  SSH_OPTS+=(-i "${SSH_KEY}")
+fi
+
 # MANIFESTS: local secret manifests copied to the K3s auto-deploy directory
 SECRET_MANIFESTS=(
   manifest-harbor-secret.yaml
@@ -42,7 +53,7 @@ for manifest in "${SECRET_MANIFESTS[@]}"; do
       *) dest="teknoir-${dest}" ;;
     esac
     echo "Deploying ${SECRETS_DIR}/${manifest} to ${TEKNOIR_HOST}:/opt/k3s/server/manifests/${dest}"
-    ssh "${TEKNOIR_HOST}" \
+    ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
       "sudo tee /opt/k3s/server/manifests/${dest} >/dev/null" \
       < "${SECRETS_DIR}/${manifest}"
   fi

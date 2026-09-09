@@ -8,7 +8,8 @@
 #   with health waits between the tiers.
 #
 # Usage: airgap/bootstrap-airgap.sh [--bundle DIR] [--host user@host]
-#                                   [--node-ip IP] [--update] [--dry-run]
+#                                   [--ssh-key FILE] [--node-ip IP]
+#                                   [--update] [--dry-run]
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -20,6 +21,8 @@ Usage: $(basename "$0") [options]
 Options:
   --bundle DIR     bundle directory (default: $(bundle_dir))
   --host H         ssh target (default: ${TEKNOIR_HOST})
+  --ssh-key FILE   ssh identity file, e.g. .secrets/teknoir.airgapped.id_rsa
+                   (default: \$SSH_KEY, else auto-detected [${SSH_KEY:-none}])
   --node-ip IP     node IP for /etc/hosts + coredns-custom
                    (default: NODE_IP from versions.env [${NODE_IP:-unset}], else auto-detect over ssh)
   --update         update mode: only re-copy image tarballs + re-apply manifests
@@ -40,6 +43,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --bundle) BUNDLE_DIR="$2"; shift ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
+    --ssh-key) SSH_KEY="$2"; shift ;;
     --node-ip) NODE_IP="$2"; shift ;;
     --update) UPDATE_MODE=1 ;;
     --dry-run) DRY_RUN=1 ;;
@@ -50,6 +54,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 require_cmd ssh
+apply_ssh_key
+
+# Preflight: fail early with a clear hint instead of a mid-run
+# "Permission denied (publickey)" (the node only accepts publickey auth).
+if [[ "${DRY_RUN}" != "1" ]] && ! ssh "${SSH_OPTS[@]}" -o BatchMode=yes "${TEKNOIR_HOST}" true 2>/dev/null; then
+  die "cannot ssh to ${TEKNOIR_HOST}${SSH_KEY:+ with key ${SSH_KEY}} — provide the node's private key via --ssh-key FILE or SSH_KEY=FILE (e.g. .secrets/teknoir.airgapped.id_rsa, auto-detected when present)"
+fi
 
 BUNDLE="$(bundle_dir)"
 K3S_MANIFESTS_DIR="${K3S_DATA_DIR}/server/manifests"
@@ -105,6 +116,39 @@ wait_ready() {
   log "${desc}: ready"
 }
 
+wait_images_imported() {
+  # wait_images_imported <image-ref...>
+  #
+  # k3s imports agent/images/*.tar ASYNCHRONOUSLY, after the node already
+  # reports Ready. Deploying the istio tier before proxyv2 finished importing
+  # makes the injected gateway pods (image: auto) fall through to a registry
+  # pull; during bootstrap Harbor is not up yet, so that pull is refused and the
+  # gateways get stuck in ImagePullBackOff. Block until every expected bootstrap
+  # image is present in containerd's k8s.io namespace.
+  local expected=("$@")
+  (( ${#expected[@]} > 0 )) || return 0
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] wait for ${#expected[@]} bootstrap images to import into containerd"
+    return 0
+  fi
+  log "waiting for ${#expected[@]} bootstrap images to import into containerd ..."
+  local deadline=$(( $(date +%s) + 900 ))
+  local present ref missing
+  while :; do
+    present="$(ssh_query "sudo k3s ctr -n k8s.io images ls -q" 2>/dev/null || true)"
+    missing=()
+    for ref in "${expected[@]}"; do
+      grep -qxF -- "${ref}" <<<"${present}" || missing+=("${ref}")
+    done
+    (( ${#missing[@]} == 0 )) && break
+    if (( $(date +%s) > deadline )); then
+      die "timed out waiting for bootstrap images to import: ${missing[*]}"
+    fi
+    sleep 10
+  done
+  log "all bootstrap images imported"
+}
+
 # ---------------------------------------------------------------------------
 # 1. Node preparation (skipped in --update mode)
 # ---------------------------------------------------------------------------
@@ -147,9 +191,24 @@ for t in "${tarballs[@]}"; do
   ssh_sudo_write "${t}" "${K3S_IMAGES_DIR}/$(basename "${t}")" 0644
 done
 
+# Expected image refs (RepoTags read from each docker-archive tarball) so we can
+# wait for k3s to finish importing them before deploying manifests that consume
+# them (see wait_images_imported). Tarballs without a parseable RepoTag are
+# simply not waited on.
+expected_images=()
+while IFS= read -r _ref; do
+  [[ -n "${_ref}" ]] && expected_images+=("${_ref}")
+done < <(
+  for t in "${tarballs[@]}"; do
+    tar -xOf "${t}" manifest.json 2>/dev/null || true
+  done | tr ',' '\n' | sed -n 's/.*"RepoTags":\["\([^"]*\)".*/\1/p'
+)
+unset _ref
+
 log "restarting k3s to re-import images and pick up registries.yaml"
 ssh_run "sudo systemctl restart k3s"
 wait_ready "k3s node Ready" "wait --for=condition=Ready node --all --timeout=60s"
+wait_images_imported "${expected_images[@]}"
 
 # ---------------------------------------------------------------------------
 # 3. Secrets + coredns-custom -> server manifests dir
@@ -195,8 +254,12 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   log "[dry-run] verify harbor pods have istio-proxy containers"
 else
   log "verifying harbor pods carry istio-proxy sidecars"
+  # Istio 1.29+ injects the sidecar as a native (Kubernetes) sidecar, i.e. an
+  # initContainer with restartPolicy: Always — so istio-proxy shows up under
+  # .spec.initContainers, not .spec.containers. Check both to stay compatible
+  # with legacy (container) and native (initContainer) sidecar injection.
   pods_without_sidecar="$(remote_kubectl_query \
-    "-n teknoir-system get pods -l app=harbor -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.spec.containers[*].name}{\"\\n\"}{end}'" \
+    "-n teknoir-system get pods -l app=harbor -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.spec.containers[*].name}{\" \"}{.spec.initContainers[*].name}{\"\\n\"}{end}'" \
     | awk '!/istio-proxy/{print $1}')"
   if [[ -n "${pods_without_sidecar}" ]]; then
     die "harbor pods missing istio-proxy sidecar (STRICT mTLS will fail): ${pods_without_sidecar}"
