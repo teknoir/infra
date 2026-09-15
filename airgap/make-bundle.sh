@@ -93,6 +93,8 @@ SECRET_MANIFESTS=(
   manifest-oauth2-proxy-redis-secret.yaml
   manifest-argocd-keycloak-secret.yaml
   manifest-argocd-harbor-repo-secret.yaml
+  manifest-teknoir-auth-ca-bundle-secret.yaml
+  manifest-teknoir-system-ca-bundle-secret.yaml
 )
 SECRETS_SRC="${REPO_ROOT}/.secrets"   # scripts/gen-*.sh write manifests here (gitignored)
 SECRETS_OUT="${BUNDLE}/bootstrap/secrets"
@@ -219,6 +221,8 @@ AIRGAP_RUNTIME_SCRIPTS=(
   deploy-app-of-apps.sh
   update-airgap.sh
   upload-bundle.sh
+  install-k3s.sh
+  extract-kubeconfig.sh
 )
 AIRGAP_SCRIPTS_OUT="${BUNDLE}/airgap"
 run mkdir -p "${AIRGAP_SCRIPTS_OUT}"

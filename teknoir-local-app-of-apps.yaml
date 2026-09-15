@@ -30,7 +30,7 @@ spec:
   source:
     repoURL: harbor.teknoir.airgapped/teknoir
     chart: app-of-apps
-    targetRevision: 0.0.1
+    targetRevision: 0.0.2
   sources: []
   project: default
   syncPolicy:

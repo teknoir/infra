@@ -77,7 +77,8 @@ and copied to USB.
    The bundle is **self-contained**: alongside `k3s/` it also embeds the
    air-gapped side's operational scripts under `airgap/` (runtime tooling —
    `bootstrap-airgap.sh`, `push-to-harbor.sh`, `deploy-app-of-apps.sh`,
-   `update-airgap.sh`, `upload-bundle.sh`, plus `lib.sh`/`versions.env`) and
+   `update-airgap.sh`, `upload-bundle.sh`, `install-k3s.sh`,
+   `extract-kubeconfig.sh`, plus `lib.sh`/`versions.env`) and
    `scripts/` (the `gen-*.sh` secret generators + `deploy-secrets.sh`), and the
    bootstrap secret manifests under `bootstrap/secrets/`. So the same transfer
    that carries the install artifacts also carries every script and secret the
@@ -386,14 +387,8 @@ consuming inotify instances; the Debian default is easily exhausted, causing
 
 ## 7. K3s configuration (before install)
 
-Write the K3s config **before** the first start so K3s comes up with the right
-data dir, disabled components, and TLS SAN:
-
-```sh
-sudo mkdir -p /etc/rancher/k3s
-```
-
-`/etc/rancher/k3s/config.yaml`:
+The K3s config is written **before** the first start by `airgap/install-k3s.sh`
+(§8.2), which produces `/etc/rancher/k3s/config.yaml`:
 
 ```yaml
 kubelet-arg:
@@ -404,6 +399,11 @@ disable:
 tls-san:
   - "teknoir.airgapped"
 ```
+
+`install-k3s.sh` writes this file before installing anything (pass
+`--skip-config` to keep an existing config; `--domain`/`--data-dir` override the
+defaults). The values are pinned in `airgap/versions.env` (`TEKNOIR_DOMAIN`,
+`K3S_DATA_DIR`).
 
 Rationale:
 
@@ -453,12 +453,25 @@ bundle onto the node one of two ways:
 
 ### 8.2 Install K3s from the bundle
 
-K3s is installed **without any download** (`INSTALL_K3S_SKIP_DOWNLOAD=true`):
+`airgap/install-k3s.sh` (shipped in the bundle, §2) performs the whole offline
+install in one step — it writes the §7 config, installs the binary, stages K3s'
+airgap images, runs the bundled installer with downloads disabled, and waits for
+the node to become Ready:
 
 ```sh
-# from the bundle's k3s/ directory on the node
-# (e.g. cd ~/teknoir-airgap-bundle-<version>/k3s):
+# on the node, from the bundle directory
+cd ~/teknoir-airgap-bundle-<version>
+./airgap/install-k3s.sh
 
+# the script re-execs itself under sudo (passwordless per §5.1). Preview with:
+# ./airgap/install-k3s.sh --dry-run
+# keep an existing config: --skip-config; skip the Ready wait: --no-verify
+```
+
+K3s is installed **without any download** (`INSTALL_K3S_SKIP_DOWNLOAD=true`).
+Under the hood the script runs the equivalent of:
+
+```sh
 # 1. the K3s binary
 sudo install -m 0755 k3s /usr/local/bin/k3s
 
@@ -472,7 +485,8 @@ sudo cp k3s-airgap-images-*.tar.zst /opt/k3s/agent/images/
 sudo INSTALL_K3S_SKIP_DOWNLOAD=true ./install.sh
 ```
 
-Verify:
+`install-k3s.sh` then verifies the install itself (or pass `--no-verify` to skip
+and check manually):
 
 ```sh
 sudo systemctl status k3s --no-pager
@@ -483,27 +497,32 @@ sudo k3s kubectl describe node | grep -i '  pods' # capacity/allocatable pods: 2
 
 ## 9. Extract the kubeconfig for remote management
 
-Copy the node kubeconfig to the operator laptop and point it at the node
-instead of `127.0.0.1`:
+`airgap/extract-kubeconfig.sh` (shipped in the bundle, §2) pulls the node
+kubeconfig over ssh, rewrites the loopback server to the node IP, renames the
+cluster/user/context from `default` to a unique name, and imports it into your
+multi-context kubeconfig:
 
 ```sh
-# on the node — show the kubeconfig (server is https://127.0.0.1:6443)
-sudo cat /etc/rancher/k3s/k3s.yaml
+# operator laptop, from the infra repo checkout (or the bundle's airgap/)
+./airgap/extract-kubeconfig.sh
+
+# the context is named teknoir-airgapped; switch to it with:
+kubectl config use-context teknoir-airgapped
+kubectl get nodes
 ```
 
-On the operator laptop, save it and replace the loopback address with the node
-IP (or `teknoir.airgapped`):
+The script automates the old manual steps (read `/etc/rancher/k3s/k3s.yaml`,
+replace `127.0.0.1` with the node IP, save it) and additionally:
 
-```sh
-# replace 127.0.0.1 with the node IP … (node static IP; NODE_IP in airgap/versions.env)
-sed 's/127.0.0.1/192.168.5.181/' k3s.yaml > ~/.kube/teknoir.yaml
-# … or with teknoir.airgapped (needs the §7 tls-san AND the laptop /etc/hosts
-#    entry from AIRGAP-BOOTSTRAP.md §2)
-# sed 's/127.0.0.1/teknoir.airgapped/' k3s.yaml > ~/.kube/teknoir.yaml
+* imports the result into `~/.kube/config` by default — merging into an existing
+  multi-context kubeconfig and leaving the current context untouched;
+* renames the cluster/user/context from K3s' `default` to a unique
+  `teknoir-airgapped` name, so it never collides with other clusters in the file;
+* writes a standalone file instead with `--output ~/.kube/teknoir.yaml`.
 
-chmod 600 ~/.kube/teknoir.yaml
-kubectl --kubeconfig ~/.kube/teknoir.yaml get nodes
-```
+Options: `--node-ip IP` (default from `NODE_IP` in `airgap/versions.env`, else
+auto-detected over ssh), `--server https://teknoir.airgapped:6443` to use the
+hostname, `--context NAME` to change the name, and `--dry-run` to preview.
 
 Why the `tls-san`: without `teknoir.airgapped` in the API server certificate (§7),
 TLS validation fails when the kubeconfig server is `teknoir.airgapped`; using the

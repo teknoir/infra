@@ -91,7 +91,8 @@ chart_template_args() {
            "--set global.imagePullPolicy=IfNotPresent" \
            "--set istio-ingressgateway.imagePullPolicy=IfNotPresent" \
            "--set istio-ingressgateway-public.imagePullPolicy=IfNotPresent" \
-           "--set istio-egressgateway.imagePullPolicy=IfNotPresent"
+           "--set istio-egressgateway.imagePullPolicy=IfNotPresent" \
+           "--set certificate.enabled=false"
       ;;
     harbor)
       # externalURL feeds Harbor core's EXT_ENDPOINT, which builds the registry
@@ -104,8 +105,21 @@ chart_template_args() {
     argo)
       echo "--set domain=${TEKNOIR_DOMAIN} --set argo-cd.global.domain=argocd.${TEKNOIR_DOMAIN}"
       ;;
-    auth|monitoring|app-of-apps|cert-manager|*-controller)
+    cert-manager)
+      # The cert-manager CRDs are bootstrap-owned (rendered into
+      # 05-teknoir-certmanager-crds.yaml). The chart's GitOps default is
+      # cert-manager.crds.enabled=false, but the bootstrap render path must
+      # force them back on so a fresh install gets the CRDs.
+      echo "--set domain=${TEKNOIR_DOMAIN} --set global.domain=${TEKNOIR_DOMAIN}" \
+           "--set cert-manager.crds.enabled=true"
+      ;;
+    auth|monitoring|app-of-apps|*-controller)
       echo "--set domain=${TEKNOIR_DOMAIN} --set global.domain=${TEKNOIR_DOMAIN}"
+      ;;
+    backstage)
+      # Backstage templates key the public domain off config.domain (baseUrl,
+      # jwks issuer/uri, VirtualService host) rather than domain/global.domain.
+      echo "--set config.domain=${TEKNOIR_DOMAIN}"
       ;;
     *)
       echo ""
@@ -117,15 +131,35 @@ chart_template_args() {
 helm_template_chart() {
   local name="$1" dir="$2" args
   args="$(chart_template_args "${name}")"
-  # ArgoCD's repo-server does its own TLS to Harbor (helm registry login) and
-  # ignores the node's containerd/OS trust; without the Teknoir Root CA in its
-  # argocd-tls-certs-cm it fails OCI login with "x509: certificate signed by
-  # unknown authority", leaving app-of-apps Unknown. Inject the CA (keyed by the
-  # Harbor host) into that ConfigMap via the argo-cd chart's configs.tls.certificates.
+  # ArgoCD needs the Teknoir Root CA in TWO independent trust paths, both injected
+  # here at render time (teknoir-root-ca.crt is generated per-deployment and
+  # gitignored, so it cannot be hardcoded in values.yaml):
+  #   1. repo-server -> Harbor OCI login verifies Harbor's TLS with argocd-tls-certs-cm
+  #      (configs.tls.certificates, keyed by the Harbor host). Missing it fails
+  #      `helm registry login` with x509 unknown authority, leaving app-of-apps Unknown.
+  #   2. argocd-server -> Keycloak OIDC discovery
+  #      (https://auth.<domain>/.../.well-known/openid-configuration) verifies with
+  #      the oidc.config `rootCA` field. It does NOT consult argocd-tls-certs-cm or
+  #      the node OS trust for this call, so the CA is embedded into oidc.config,
+  #      whose base lives in charts/argo/files/oidc.config.
   local ca_args=()
-  if [[ "${name}" == "argo" && -f "${REPO_ROOT}/teknoir-root-ca.crt" ]]; then
-    local ca_key="${HARBOR_HOST//./\\.}"
-    ca_args=(--set-file "argo-cd.configs.tls.certificates.${ca_key}=${REPO_ROOT}/teknoir-root-ca.crt")
+  local oidc_tmp=""
+  if [[ "${name}" == "argo" ]]; then
+    local oidc_base="${REPO_ROOT}/charts/argo/files/oidc.config"
+    if [[ -f "${REPO_ROOT}/teknoir-root-ca.crt" ]]; then
+      local ca_key="${HARBOR_HOST//./\\.}"
+      ca_args=(--set-file "argo-cd.configs.tls.certificates.${ca_key}=${REPO_ROOT}/teknoir-root-ca.crt")
+      oidc_tmp="$(mktemp)"
+      {
+        cat "${oidc_base}"
+        echo "rootCA: |"
+        sed 's/^/  /' "${REPO_ROOT}/teknoir-root-ca.crt"
+      } > "${oidc_tmp}"
+      ca_args+=(--set-file "argo-cd.configs.cm.oidc\.config=${oidc_tmp}")
+    else
+      warn "teknoir-root-ca.crt not found — ArgoCD OIDC will lack rootCA; Keycloak login may fail with x509 unknown authority"
+      ca_args=(--set-file "argo-cd.configs.cm.oidc\.config=${oidc_base}")
+    fi
   fi
   # shellcheck disable=SC2086
   helm template "${name}" "${dir}" \
@@ -134,6 +168,9 @@ helm_template_chart() {
     --kube-version "${KUBE_VERSION:-1.33.0}" \
     ${ca_args[@]+"${ca_args[@]}"} \
     ${args}
+  local rc=$?
+  [[ -n "${oidc_tmp}" ]] && rm -f "${oidc_tmp}"
+  return $rc
 }
 
 # Ensure a chart's dependencies are vendored (charts/*.tgz present).

@@ -104,6 +104,8 @@ operator laptop / USB. `make-bundle.sh` copies them from `.secrets/` into
 |---|---|---|
 | `gen-local-ca-secret.sh` | `manifest-teknoir-ca-secret.yaml` | `teknoir-root-ca` (`cert-manager`) |
 | `gen-local-ca-secret.sh` | `manifest-wildcard-tls-secret.yaml` | `teknoir-airgapped-wildcard-tls` (`istio-system`) |
+| `gen-local-ca-secret.sh` | `manifest-teknoir-auth-ca-bundle-secret.yaml` | `teknoir-root-ca-bundle` (`teknoir-auth`) |
+| `gen-local-ca-secret.sh` | `manifest-teknoir-system-ca-bundle-secret.yaml` | `teknoir-root-ca-bundle` (`teknoir-system`) |
 | `gen-harbor-secrets.sh` | `manifest-harbor-secret.yaml` | `harbor-secret` (`teknoir-system`) |
 | `gen-keycloak-db-secret.sh` | `manifest-keycloak-db-secret.yaml` | `keycloak-db-secret` (`teknoir-auth`) |
 | `gen-oauth2-proxy-redis-secret.sh` | `manifest-oauth2-proxy-redis-secret.yaml` | `oauth2-proxy-redis-secret` (`teknoir-auth`) |
@@ -128,7 +130,12 @@ Notes:
   bundle, the node's containerd trust config, and your browsers (see §9).
   Once the GitOps tier runs, the cert-manager `ClusterIssuer` `teknoir-ca`
   (backed by the `teknoir-root-ca` secret) takes over wildcard-cert renewal
-  in place (same `secretName`).
+  in place (same `secretName`). It additionally emits an opaque `ca.crt`-only
+  `teknoir-root-ca-bundle` secret into `teknoir-auth` and `teknoir-system` so
+  oauth2-proxy and Harbor can trust Keycloak's TLS for their native OIDC — the
+  GitOps charts reference these by name (auth `oauth2Proxy.oidc.caSecretName`,
+  harbor `harbor.caBundleSecretName`) instead of embedding the PEM, keeping this
+  generator the single source of truth for the CA.
 * **Keycloak client secrets are not available yet** at first bootstrap
   (Keycloak is GitOps-tier), so `gen-oauth2-proxy-secrets.sh` and
   `gen-argocd-keycloak-secrets.sh` are deliberately **not** run here — you run
@@ -171,7 +178,7 @@ teknoir-airgap-bundle-<version>/
 ├── images/                       # workload images as OCI layouts (crane), digest-deduplicated
 ├── tools/                        # pinned crane + helm binaries (linux-amd64, darwin-arm64)
 ├── k3s/                          # offline K3s install: k3s binary, install.sh, airgap-images tarball (see AIRGAP-HOST-SETUP.md)
-├── airgap/                       # runtime tooling run against the node: bootstrap-airgap.sh, push-to-harbor.sh, deploy-app-of-apps.sh, update-airgap.sh, upload-bundle.sh (+ lib.sh, versions.env)
+├── airgap/                       # runtime tooling: bootstrap-airgap.sh, push-to-harbor.sh, deploy-app-of-apps.sh, update-airgap.sh, upload-bundle.sh, install-k3s.sh, extract-kubeconfig.sh (+ lib.sh, versions.env)
 └── scripts/                      # secret generators + deployers (gen-*.sh, deploy-secrets.sh, …) for §3/§6/§8
 ```
 
@@ -198,7 +205,8 @@ templates every chart, and fails on any rendered reference to
 The bundle is **self-contained**: step 7 of `make-bundle.sh` embeds the
 air-gapped side's operational scripts under `bundle/…/airgap/` (the runtime
 tooling: `bootstrap-airgap.sh`, `push-to-harbor.sh`, `deploy-app-of-apps.sh`,
-`update-airgap.sh`, `upload-bundle.sh`, plus `lib.sh`/`versions.env`) and
+`update-airgap.sh`, `upload-bundle.sh`, `install-k3s.sh`,
+`extract-kubeconfig.sh`, plus `lib.sh`/`versions.env`) and
 `bundle/…/scripts/` (the `gen-*.sh` generators and `deploy-secrets.sh`). So
 copying just the **bundle directory** to the USB drive and then onto the LAN
 laptop is enough — no separate repo checkout is required to run §6/§8. Run the
@@ -367,6 +375,10 @@ ssh teknoir@teknoir.airgapped sudo k3s kubectl -n teknoir-system rollout restart
 * Client authentication: ON (confidential), Standard flow: ON
 * Valid redirect URIs: `https://harbor.teknoir.airgapped/*`
 * Base URL: `https://harbor.teknoir.airgapped`
+* Add a `groups` client scope with a Group Membership mapper (token claim
+  `groups`, full group path OFF) and assign it to the client — Harbor maps the
+  Keycloak `admin` group to the Harbor admin role via this claim (the
+  `OIDC Admin Group` setting below). Reuse the scope created in §8.1.
 
 Copy the client secret from the **Credentials** tab, then in the Harbor UI
 (logged in as `admin`) go to **Configuration → Authentication**:
@@ -462,6 +474,85 @@ name resolution is solved twice, for two different resolvers:
 
 Both are installed by `bootstrap-airgap.sh`; both must stay in place. The
 laptop additionally needs its own `/etc/hosts` entries (§2).
+
+## 11. Troubleshooting: ArgoCD UI cannot execute resource actions
+
+**Symptom** — every *mutating* action in the ArgoCD UI (sync, restart, delete,
+any resource action) fails with
+
+```
+Unable to execute resource action: Request has been terminated
+Possible causes: the network is offline, Origin is not allowed by
+Access-Control-Allow-Origin, the page is being unloaded, etc.
+```
+
+while read-only pages keep working. The browser network tab shows the API call
+leaving for a **different origin**:
+
+```
+Request URL: https://teknoir.airgapped/oauth2/start?rd=https%3A%2F%2Fargocd.teknoir.airgapped%2Fapi%2Fv1%2Fapplications%2Fharbor%2Fresource%2Factions%2Fv2
+Referer:     https://argocd.teknoir.airgapped/
+```
+
+**Cause** — two independent problems stacked on top of each other:
+
+1. *The gateway masked the real error.* The `auth` chart installs the
+   gateway-level oauth2-proxy `EnvoyFilter` (`oauth2-proxy-ext-authz` in
+   `istio-system`): an `ext_authz` filter plus a **lua** filter whose
+   `envoy_on_response` turns any `401`/`403` into a `302` to
+   `https://<domain>/oauth2/start`. ArgoCD is meant to bypass oauth2-proxy
+   entirely (it does native Keycloak OIDC), but the `argocd.<domain>:443`
+   vhost only disabled `ext_authz` — **not** the lua filter (the
+   `harbor.<domain>:443` vhost disables both). So ArgoCD's own `401`/`403` API
+   responses were rewritten into a cross-origin redirect; `fetch()` from
+   `https://argocd.<domain>` cannot follow that, and the UI reports the
+   generic "Request has been terminated" / CORS message. The oauth2-proxy
+   cookie is host-only for the apex domain, so the filter's "has session"
+   early-return never triggered on the ArgoCD host.
+2. *The underlying `403` is ArgoCD RBAC.* `charts/argo/values.yaml` sets
+   `policy.default: role:readonly` and maps `g, admin, role:admin`. A user who
+   logs in through Keycloak **without** a `groups` claim containing `admin` is
+   read-only: browsing works, every mutating call is `PermissionDenied`.
+
+**Fix (chart)** — `auth` ≥ `0.0.7` disables the lua filter on the
+`argocd.<domain>` (and `auth.<domain>`) vhost, and the lua rewrite now only
+applies to real top-level browser navigations (`sec-fetch-mode: navigate`, or
+an HTML `Accept` when that header is absent). XHR/`fetch` calls and API clients
+(`curl`, `argocd` CLI) always receive the true status code. Roll it out per
+[AIRGAP-UPDATE.md](AIRGAP-UPDATE.md) §2 — the pins (`auth 0.0.7`,
+`app-of-apps 0.0.2`) are already in `airgap/versions.env`:
+
+```sh
+./airgap/make-bundle.sh --diff && ./airgap/verify-offline.sh   # connected workstation
+HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh           # LAN laptop
+./scripts/gen-argocd-harbor-repo-secret.sh && ./scripts/deploy-secrets.sh
+./airgap/update-airgap.sh 0.0.2
+```
+
+Verify from the LAN laptop — an unauthenticated API call must answer `401`,
+never `302`:
+
+```sh
+curl --cacert teknoir-root-ca.crt -sS -o /dev/null -D - -X POST \
+  https://argocd.teknoir.airgapped/api/v1/applications/harbor/resource/actions/v2 | head -1
+```
+
+**Fix (permissions)** — make the logged-in user an ArgoCD admin:
+
+* In Keycloak, confirm the `groups` client scope from §8.1 is assigned to the
+  `argocd` client and its Group Membership mapper writes claim `groups` with
+  *Full group path* OFF and *Add to ID token* ON.
+* Confirm the user is a member of the Keycloak group `admin` (or
+  `argocd-admins`), then log out and back in so a fresh ID token is issued.
+* Cross-check the denial server-side:
+
+  ```sh
+  ssh teknoir@teknoir.airgapped sudo k3s kubectl -n teknoir-system \
+    logs deploy/argo-argocd-server | grep -i "permission denied"
+  ```
+
+With both fixes in place a genuinely unauthorised user now gets ArgoCD's own
+`permission denied` message instead of the misleading terminated-request error.
 
 ## Next
 

@@ -223,7 +223,20 @@ chmod 700 "${AIRGAP_DIR}/.secrets"
   printf "HARBOR_ROBOT_TOKEN='%s'\n" "${robot_token}"
 } > "${ROBOT_ENV_FILE}"
 chmod 600 "${ROBOT_ENV_FILE}"
-log "robot credential written: ${ROBOT_ENV_FILE} (feed scripts/gen-argocd-harbor-repo-secret.sh)"
+log "robot credential written: ${ROBOT_ENV_FILE}"
+
+# The robot token is what ArgoCD's repo-server uses to pull charts from Harbor.
+# Rotating it changes the token, which immediately invalidates the
+# argocd-harbor-repo secret already in the cluster until it is regenerated from
+# this file and redeployed — so make that requirement loud before the push runs.
+if [[ -n "${existing_id}" ]]; then
+  warn "robot account ${ROBOT_FULL_NAME} was ROTATED — its token changed"
+  warn "the ArgoCD secret 'argocd-harbor-repo' is now STALE; regenerate + redeploy it:"
+else
+  warn "robot account ${ROBOT_FULL_NAME} was created — generate the ArgoCD repo secret before first deploy:"
+fi
+log "  ./scripts/gen-argocd-harbor-repo-secret.sh"
+log "  ./scripts/deploy-secrets.sh"
 
 # ---------------------------------------------------------------------------
 # 3. Charts -> oci://harbor/teknoir
@@ -280,4 +293,7 @@ while read -r ref name; do
   crane push ${CRANE_TLS[@]+"${CRANE_TLS[@]}"} "${layout}" "${target}"
 done < "${INDEX_FILE}"
 
-log "push-to-harbor complete — next: deploy-app-of-apps.sh"
+log "push-to-harbor complete"
+warn "remember: regenerate + redeploy the ArgoCD repo secret before ArgoCD syncs:"
+log "  ./scripts/gen-argocd-harbor-repo-secret.sh && ./scripts/deploy-secrets.sh"
+log "then: ./airgap/deploy-app-of-apps.sh"

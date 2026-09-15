@@ -21,7 +21,8 @@ if [ -n "${SSH_KEY}" ]; then
   SSH_OPTS+=(-i "${SSH_KEY}")
 fi
 
-# MANIFESTS: local secret manifests copied to the K3s auto-deploy directory
+# SECRET_MANIFESTS: local secret manifests. Read-only secrets are copied to the
+# K3s auto-deploy directory; the wildcard TLS secret is one-shot applied instead.
 SECRET_MANIFESTS=(
   manifest-harbor-secret.yaml
   manifest-keycloak-db-secret.yaml
@@ -31,6 +32,8 @@ SECRET_MANIFESTS=(
   manifest-teknoir-ca-secret.yaml
   manifest-wildcard-tls-secret.yaml
   manifest-argocd-harbor-repo-secret.yaml
+  manifest-teknoir-auth-ca-bundle-secret.yaml
+  manifest-teknoir-system-ca-bundle-secret.yaml
 )
 
 MISSING=0
@@ -45,7 +48,21 @@ if [ "${MISSING}" -gt 0 ]; then
   echo ""
 fi
 
+# cert-manager owns the wildcard TLS secret: it must NOT live in the K3s
+# auto-deploy dir, otherwise K3s would re-apply the static placeholder on every
+# reboot and fight cert-manager's renewed cert. Apply it one-shot instead;
+# every other secret is read-only and stays K3s-owned in the manifests dir.
+WILDCARD_MANIFEST="manifest-wildcard-tls-secret.yaml"
+
+if [ -f "${SECRETS_DIR}/${WILDCARD_MANIFEST}" ]; then
+  echo "Applying ${SECRETS_DIR}/${WILDCARD_MANIFEST} to cluster (one-shot; cert-manager owns it)"
+  ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
+    "sudo k3s kubectl apply -f -" \
+    < "${SECRETS_DIR}/${WILDCARD_MANIFEST}"
+fi
+
 for manifest in "${SECRET_MANIFESTS[@]}"; do
+  [ "${manifest}" = "${WILDCARD_MANIFEST}" ] && continue
   if [ -f "${SECRETS_DIR}/${manifest}" ]; then
     dest="${manifest#manifest-}"
     case "${dest}" in

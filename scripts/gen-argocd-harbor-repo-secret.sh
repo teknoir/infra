@@ -51,6 +51,11 @@ else
   fi
 fi
 
+PREV_PASSWORD=""
+if [ -f "${MANIFEST_FILE}" ]; then
+  PREV_PASSWORD=$(sed -n 's/^  password: "\(.*\)"$/\1/p' "${MANIFEST_FILE}" | head -n 1)
+fi
+
 cat > "${MANIFEST_FILE}" <<EOF
 ---
 apiVersion: v1
@@ -73,5 +78,15 @@ echo "Wrote manifest to ${MANIFEST_FILE}"
 echo "Repo URL: ${HARBOR_URL}"
 echo "Username: ${USERNAME}"
 echo ""
+
+if [ -n "${PREV_PASSWORD}" ] && [ "${PREV_PASSWORD}" != "${PASSWORD}" ]; then
+  printf "${YELLOW}NOTICE: the Harbor credential CHANGED (robot token rotated).${NC}\n" >&2
+  printf "${YELLOW}The generated secret differs from the previous manifest — redeploy it now:${NC}\n" >&2
+  echo ""
+elif [ -n "${PREV_PASSWORD}" ]; then
+  echo "Credential unchanged from the previous manifest."
+  echo ""
+fi
+
 echo "Next steps:"
 echo "  - Deploy the secret with: scripts/deploy-secrets.sh"

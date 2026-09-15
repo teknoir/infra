@@ -47,7 +47,7 @@ Generated secrets exist only on the operator laptop / USB — never in git.
 
 | Script | Manifest | Secret (namespace) | Input |
 |---|---|---|---|
-| `gen-local-ca-secret.sh` | `manifest-teknoir-ca-secret.yaml`, `manifest-wildcard-tls-secret.yaml` (+ `teknoir-root-ca.crt`) | `teknoir-root-ca` (`cert-manager`), `teknoir-airgapped-wildcard-tls` (`istio-system`) | none — CA (10y) reused from `.secrets/ca/`, wildcard (1y) re-issued |
+| `gen-local-ca-secret.sh` | `manifest-teknoir-ca-secret.yaml`, `manifest-wildcard-tls-secret.yaml`, `manifest-teknoir-auth-ca-bundle-secret.yaml`, `manifest-teknoir-system-ca-bundle-secret.yaml` (+ `teknoir-root-ca.crt`) | `teknoir-root-ca` (`cert-manager`), `teknoir-airgapped-wildcard-tls` (`istio-system`), `teknoir-root-ca-bundle` (`teknoir-auth`, `teknoir-system`) | none — CA (10y) reused from `.secrets/ca/`, wildcard (1y) re-issued |
 | `gen-harbor-secrets.sh` | `manifest-harbor-secret.yaml` | `harbor-secret` (`teknoir-system`) | none — random; prints the admin password |
 | `gen-keycloak-db-secret.sh` | `manifest-keycloak-db-secret.yaml` | `keycloak-db-secret` (`teknoir-auth`) | optional `[username] [password]` args |
 | `gen-oauth2-proxy-secrets.sh` | `manifest-oauth2-proxy-secret.yaml` | `oauth2-proxy-secret` (`teknoir-auth`) | prompts for the Keycloak `teknoir` client secret — run **after** the client exists in Keycloak |

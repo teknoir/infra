@@ -2,10 +2,12 @@
 # bootstrap-airgap.sh — first-time bootstrap of the air-gapped K3s node
 # (LAN-laptop side, everything over ssh to $TEKNOIR_HOST).
 #
-# Flow (plan §4.4):
+# Flow:
 #   CA + registries.yaml + /etc/hosts + bootstrap image tarballs -> restart k3s
-#   secrets + coredns-custom.yaml -> ordered bootstrap manifests (istio -> argo -> harbor)
-#   with health waits between the tiers.
+#   static single-owner manifests (namespaces, CRDs, argo, read-only secrets,
+#   app-of-apps, coredns-custom) -> K3s server manifests dir (K3s owns them)
+#   adopted resources (wildcard TLS secret, istio, harbor) -> one-shot
+#   `kubectl apply` over ssh, with health waits, so K3s never re-applies them.
 #
 # Usage: airgap/bootstrap-airgap.sh [--bundle DIR] [--host user@host]
 #                                   [--ssh-key FILE] [--node-ip IP]
@@ -73,6 +75,23 @@ COREDNS_FILE="${BUNDLE}/bootstrap/k3s/coredns-custom.yaml"
 [[ -f "${CA_FILE}" ]] || die "missing ${CA_FILE}"
 [[ -f "${REGISTRIES_FILE}" ]] || die "missing ${REGISTRIES_FILE}"
 [[ -f "${COREDNS_FILE}" ]] || die "missing ${COREDNS_FILE}"
+
+# Rendered bootstrap outputs (relative to the bundle):
+#   manifests/ — K3s-owned static resources (copied into the manifests dir)
+#   apply/     — one-shot adopted resources (kubectl apply, never in manifests dir)
+#   secrets/   — secret manifests (read-only -> manifests dir, wildcard -> one-shot)
+MANIFESTS_SRC="${BUNDLE}/bootstrap/manifests"
+APPLY_SRC="${BUNDLE}/bootstrap/apply"
+SECRETS_SRC="${BUNDLE}/bootstrap/secrets"
+
+NAMESPACES_FILE="${MANIFESTS_SRC}/00-teknoir-namespaces.yaml"
+ISTIO_CRDS_FILE="${MANIFESTS_SRC}/00-teknoir-istio-crds.yaml"
+CERTMANAGER_CRDS_FILE="${MANIFESTS_SRC}/05-teknoir-certmanager-crds.yaml"
+ARGO_FILE="${MANIFESTS_SRC}/10-teknoir-argo.yaml"
+APP_OF_APPS_FILE="${MANIFESTS_SRC}/app-of-apps.yaml"
+ISTIO_APPLY_FILE="${APPLY_SRC}/istio.yaml"
+HARBOR_APPLY_FILE="${APPLY_SRC}/harbor.yaml"
+WILDCARD_SECRET_FILE="${SECRETS_SRC}/manifest-wildcard-tls-secret.yaml"
 
 # ---------------------------------------------------------------------------
 # Node IP (auto-detected unless --node-ip / NODE_IP given)
@@ -211,16 +230,32 @@ wait_ready "k3s node Ready" "wait --for=condition=Ready node --all --timeout=60s
 wait_images_imported "${expected_images[@]}"
 
 # ---------------------------------------------------------------------------
-# 3. Secrets + coredns-custom -> server manifests dir
+# 3. Static single-owner manifests -> K3s server manifests dir
+#    (K3s owns these: namespaces, CRDs, ArgoCD, read-only secrets, app-of-apps,
+#    coredns-custom). Adopted resources (istio, harbor, wildcard secret) are
+#    deliberately NOT placed here — they are one-shot applied in §4.
 # ---------------------------------------------------------------------------
-log "copying bootstrap secrets + coredns-custom.yaml to ${K3S_MANIFESTS_DIR}/"
+log "copying static bootstrap manifests to ${K3S_MANIFESTS_DIR}/"
+
+# Untracked, K3s-owned bootstrap tier: namespaces first, then CRDs, ArgoCD,
+# then app-of-apps (its Application references ArgoCD's CRDs from 10-teknoir-argo.yaml).
+for f in "${NAMESPACES_FILE}" "${ISTIO_CRDS_FILE}" "${CERTMANAGER_CRDS_FILE}" \
+         "${ARGO_FILE}" "${APP_OF_APPS_FILE}"; do
+  [[ -f "${f}" ]] || die "missing ${f}"
+  ssh_sudo_write "${f}" "${K3S_MANIFESTS_DIR}/$(basename "${f}")" 0644
+done
+
+# Read-only secrets (all except the cert-manager-owned wildcard TLS secret,
+# which is one-shot applied in §4) stay K3s-owned in the manifests dir. Their
+# namespaces are created first by 00-teknoir-namespaces.yaml above.
 shopt -s nullglob
-secret_files=("${BUNDLE}/bootstrap/secrets/"*.yaml)
+secret_files=("${SECRETS_SRC}/"*.yaml)
 shopt -u nullglob
 if [[ ${#secret_files[@]} -eq 0 ]]; then
-  warn "no secret manifests in ${BUNDLE}/bootstrap/secrets/ — first bootstrap will fail without them"
+  warn "no secret manifests in ${SECRETS_SRC} — first bootstrap will fail without them"
 fi
 for s in "${secret_files[@]}"; do
+  [[ "$(basename "${s}")" == "manifest-wildcard-tls-secret.yaml" ]] && continue
   ssh_sudo_write "${s}" "${K3S_MANIFESTS_DIR}/$(basename "${s}")" 0600
 done
 
@@ -229,24 +264,51 @@ sed "s/__NODE_IP__/${NODE_IP}/g" "${COREDNS_FILE}" > "${coredns_rendered}"
 ssh_sudo_write "${coredns_rendered}" "${K3S_MANIFESTS_DIR}/teknoir-coredns-custom.yaml" 0644
 
 # ---------------------------------------------------------------------------
-# 4. Ordered bootstrap manifests with health waits between tiers
+# 4. One-shot handover: adopted resources applied once over ssh, never by K3s
 # ---------------------------------------------------------------------------
-MANIFESTS_SRC="${BUNDLE}/bootstrap/manifests"
+# These resources are applied with `kubectl apply -f -` (streamed via stdin, no
+# temp files on the node) so they never land in the manifests dir and K3s never
+# re-applies them. The istio/harbor resources carry ArgoCD v3 tracking-ids and
+# are adopted by their ArgoCD Applications; the wildcard secret is adopted by
+# cert-manager.
 
-log "tier 1/3: istio (00-teknoir-istio.yaml)"
-[[ -f "${MANIFESTS_SRC}/00-teknoir-istio.yaml" ]] || die "missing ${MANIFESTS_SRC}/00-teknoir-istio.yaml"
-ssh_sudo_write "${MANIFESTS_SRC}/00-teknoir-istio.yaml" "${K3S_MANIFESTS_DIR}/00-teknoir-istio.yaml" 0644
+apply_once() {
+  # apply_once <local-manifest> — stream a manifest to the node and
+  # `kubectl apply -f -` it (one-shot; leaves no temp file on the node).
+  local src="$1"
+  [[ -f "${src}" ]] || die "missing ${src}"
+  log "one-shot apply: $(basename "${src}")"
+  remote_kubectl apply -f - < "${src}"
+}
+
+# a. Namespaces must exist before any secret/CR apply. K3s applies the manifests
+#    dir asynchronously (sorted by filename), so 00-teknoir-namespaces.yaml is
+#    first — wait for each one before proceeding.
+for ns in istio-system teknoir-system cert-manager teknoir-auth; do
+  wait_ready "namespace ${ns}" "get namespace ${ns}"
+done
+
+# b. Wildcard TLS secret (bootstrap placeholder; cert-manager replaces it on
+#    first issuance).
+apply_once "${WILDCARD_SECRET_FILE}"
+
+# c. Istio CRDs must be Established before istio CRs can be applied.
+wait_ready "istio CRDs Established" "wait --for=condition=Established crd/virtualservices.networking.istio.io --timeout=60s"
+
+# d. Istio resources (adopted by the `istio` ArgoCD Application).
+apply_once "${ISTIO_APPLY_FILE}"
+
+# e. Istio control plane + ingress gateway ready.
 wait_ready "istiod" "-n istio-system rollout status deployment/istiod --timeout=30s"
 wait_ready "istio-ingressgateway" "-n istio-system rollout status deployment/istio-ingressgateway --timeout=30s"
 
-log "tier 2/3: argocd (10-teknoir-argo.yaml)"
-[[ -f "${MANIFESTS_SRC}/10-teknoir-argo.yaml" ]] || die "missing ${MANIFESTS_SRC}/10-teknoir-argo.yaml"
-ssh_sudo_write "${MANIFESTS_SRC}/10-teknoir-argo.yaml" "${K3S_MANIFESTS_DIR}/10-teknoir-argo.yaml" 0644
+# f. ArgoCD server ready (10-teknoir-argo.yaml is K3s-applied from §3).
 wait_ready "argocd server" "-n teknoir-system wait --for=condition=Available deployment -l app.kubernetes.io/name=argocd-server --timeout=30s"
 
-log "tier 3/3: harbor (20-teknoir-harbor.yaml)"
-[[ -f "${MANIFESTS_SRC}/20-teknoir-harbor.yaml" ]] || die "missing ${MANIFESTS_SRC}/20-teknoir-harbor.yaml"
-ssh_sudo_write "${MANIFESTS_SRC}/20-teknoir-harbor.yaml" "${K3S_MANIFESTS_DIR}/20-teknoir-harbor.yaml" 0644
+# g. Harbor resources (adopted by the `harbor` ArgoCD Application).
+apply_once "${HARBOR_APPLY_FILE}"
+
+# h. Harbor pods ready.
 wait_ready "harbor pods" "-n teknoir-system wait --for=condition=Ready pod -l app=harbor --timeout=30s"
 
 # STRICT mTLS sanity: every harbor pod must carry an istio-proxy sidecar
@@ -267,4 +329,4 @@ else
   log "all harbor pods have istio-proxy sidecars"
 fi
 
-log "bootstrap complete — next: push-to-harbor.sh, then deploy-app-of-apps.sh"
+log "bootstrap complete — app-of-apps.yaml is K3s-managed; next: push-to-harbor.sh"

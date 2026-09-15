@@ -37,6 +37,16 @@ CA_NAMESPACE="cert-manager"
 WILDCARD_SECRET_NAME="$(echo "${DOMAIN}" | tr '.' '-')-wildcard-tls"
 WILDCARD_NAMESPACE="istio-system"
 
+# Opaque ca.crt-only bundle secrets, replicated into every namespace that needs
+# to trust the Teknoir Local Root CA for outbound TLS: oauth2-proxy's native
+# OIDC (teknoir-auth) and Harbor's native OIDC (teknoir-system) call Keycloak
+# over the Istio wildcard cert signed by this CA. The consuming charts reference
+# these secrets by name (auth: oauth2Proxy.oidc.caSecretName; harbor:
+# harbor.caBundleSecretName) instead of embedding the PEM, keeping this script
+# the single source of truth for the CA.
+CA_BUNDLE_SECRET_NAME="teknoir-root-ca-bundle"
+CA_BUNDLE_NAMESPACES=("teknoir-auth" "teknoir-system")
+
 b64() {
   base64 < "$1" | tr -d '\n'
 }
@@ -124,10 +134,32 @@ data:
   ca.crt: ${CA_CRT_B64}
 EOF
 
+# ca.crt-only bundle secrets for the consumer namespaces (single source of
+# truth for the CA; the auth/harbor charts reference these by name).
+CA_BUNDLE_MANIFEST_FILES=()
+for ns in "${CA_BUNDLE_NAMESPACES[@]}"; do
+  bundle_manifest="${SECRETS_DIR}/manifest-${ns}-ca-bundle-secret.yaml"
+  cat > "${bundle_manifest}" <<EOF
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${CA_BUNDLE_SECRET_NAME}
+  namespace: ${ns}
+type: Opaque
+data:
+  ca.crt: ${CA_CRT_B64}
+EOF
+  CA_BUNDLE_MANIFEST_FILES+=("${bundle_manifest}")
+done
+
 cp "${CA_CRT_FILE}" "${CA_CRT_OUT}"
 
 echo "Wrote manifest to ${CA_MANIFEST_FILE}"
 echo "Wrote manifest to ${WILDCARD_MANIFEST_FILE}"
+for f in "${CA_BUNDLE_MANIFEST_FILES[@]}"; do
+  echo "Wrote manifest to ${f}"
+done
 echo "Wrote CA certificate to ${CA_CRT_OUT}"
 echo ""
 echo "Next steps:"

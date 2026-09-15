@@ -27,12 +27,83 @@ argo-cd:
 
   configs:
     cm:
-      oidc.config: |
-        name: Keycloak
-        issuer: https://auth.teknoir.airgapped/auth/realms/master
-        clientID: argocd
-        clientSecret: $argocd-oidc-secret:oidc.auth.clientSecret
-        requestedScopes: ["openid", "profile", "email", "groups"]
+      # NOTE: oidc.config (Keycloak SSO) is injected at render time from
+      # charts/argo/files/oidc.config so the Teknoir Root CA can be embedded as
+      # `rootCA`. argocd-server does OIDC discovery against Keycloak
+      # (https://auth.teknoir.airgapped/.../.well-known/openid-configuration)
+      # with its OWN TLS trust — it does NOT consult the node OS trust store nor
+      # argocd-tls-certs-cm (that ConfigMap is repo-server-only, for Harbor OCI
+      # login). Without rootCA the login fails with "x509: certificate signed by
+      # unknown authority". It is injected via `helm template --set-file`
+      # (scripts/deploy-argo.sh and airgap/lib.sh:helm_template_chart) rather
+      # than hardcoded here, because teknoir-root-ca.crt is generated
+      # per-deployment and gitignored.
+
+      # Resource exclusions. ArgoCD will not discover/track/sync/prune these
+      # kinds. This key REPLACES the argo-cd subchart's default list entirely,
+      # so the full upstream default list is reproduced below plus the CRD entry.
+      # CRDs (istio + cert-manager) are bootstrap-owned (K3s manifests dir) and
+      # must never be managed/pruned by an ArgoCD Application.
+      resource.exclusions: |
+        ### Network resources created by the Kubernetes control plane and excluded to reduce the number of watched events and UI clutter
+        - apiGroups:
+          - ''
+          - discovery.k8s.io
+          kinds:
+          - Endpoints
+          - EndpointSlice
+        ### Internal Kubernetes resources excluded reduce the number of watched events
+        - apiGroups:
+          - coordination.k8s.io
+          kinds:
+          - Lease
+        ### Internal Kubernetes Authz/Authn resources excluded reduce the number of watched events
+        - apiGroups:
+          - authentication.k8s.io
+          - authorization.k8s.io
+          kinds:
+          - SelfSubjectReview
+          - TokenReview
+          - LocalSubjectAccessReview
+          - SelfSubjectAccessReview
+          - SelfSubjectRulesReview
+          - SubjectAccessReview
+        ### Intermediate Certificate Request excluded reduce the number of watched events
+        - apiGroups:
+          - certificates.k8s.io
+          kinds:
+          - CertificateSigningRequest
+        - apiGroups:
+          - cert-manager.io
+          kinds:
+          - CertificateRequest
+        ### Cilium internal resources excluded reduce the number of watched events and UI Clutter
+        - apiGroups:
+          - cilium.io
+          kinds:
+          - CiliumIdentity
+          - CiliumEndpoint
+          - CiliumEndpointSlice
+        ### Kyverno intermediate and reporting resources excluded reduce the number of watched events and improve performance
+        - apiGroups:
+          - kyverno.io
+          - reports.kyverno.io
+          - wgpolicyk8s.io
+          kinds:
+          - PolicyReport
+          - ClusterPolicyReport
+          - EphemeralReport
+          - ClusterEphemeralReport
+          - AdmissionReport
+          - ClusterAdmissionReport
+          - BackgroundScanReport
+          - ClusterBackgroundScanReport
+          - UpdateRequest
+        ### CustomResourceDefinitions are bootstrap-owned and must never be ArgoCD-managed
+        - apiGroups:
+          - apiextensions.k8s.io
+          kinds:
+          - CustomResourceDefinition
 
     rbac:
       policy.default: role:readonly
