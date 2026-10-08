@@ -14,6 +14,9 @@
 # data is untouched, that no Teknoir Addon remains except teknoir-argo (M7),
 # and that K3s's own addons are untouched. The safety net: an object of a
 # later name re-created, or a Secret deleted, while migrate runs stops it.
+# M7a: migrate --argo refuses without a Synced/Healthy argo Application or
+# with unprotected argoproj CRDs, then detaches teknoir-argo without
+# restarting the ArgoCD pod.
 #
 # Usage: airgap/test/k3d/migrate-test.sh [--keep]
 #   --keep   leave the cluster and temp dir for inspection
@@ -397,6 +400,51 @@ check "the baseline is logged as names and counts, never UIDs" bash -c "
   grep -q 'migrate: baseline: .* object(s) of .* Addon(s)' '${WORK}/out/net1.log' && grep -qE 'baseline counts: .*crds=[0-9]+ .*namespaces=[0-9]+ .*secrets/teknoir-system=[0-9]+' '${WORK}/out/net1.log' &&
   ! grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' '${WORK}/out/net1.log' '${WORK}/out/net3.log'"
 check "the safety-net runs printed no secret value" bash -c "! grep -q 'dummy-' '${WORK}/out/net1.log' '${WORK}/out/net2.log' '${WORK}/out/net3.log'"
+
+say "M7a: migrate --argo detaches teknoir-argo once the argo Application runs ArgoCD"
+wait_until "the ArgoCD stand-in pod Running" 180 bash -c "[[ \$(kubectl --context ${CTX} -n teknoir-system get pods -l app.kubernetes.io/part-of=argocd -o jsonpath='{.items[*].status.phase}') == Running ]]"
+argo_pods() { K -n teknoir-system get pods -l app.kubernetes.io/part-of=argocd -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.uid}{"\n"}{end}' | sort; }
+argo_pods > "${WORK}/out/argo-pods.txt"
+if node_fn cmd_migrate --argo > "${WORK}/out/argo1.log" 2>&1; then bad "--argo without the argo Application is refused"; else
+  check "--argo without the argo Application is refused (app-of-apps 0.0.5)" grep -q 'there is no Application teknoir-system/argo.*0.0.5' "${WORK}/out/argo1.log"
+fi
+printf 'apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata: {name: argo, namespace: teknoir-system}\nspec: {destination: {namespace: teknoir-system}}\n' | K apply -f - >/dev/null
+K -n teknoir-system patch applications.argoproj.io argo --type=merge -p '{"status":{"sync":{"status":"Synced"},"health":{"status":"Progressing"}}}' >/dev/null
+if node_fn cmd_migrate --argo > "${WORK}/out/argo2.log" 2>&1; then bad "--argo with argo not Healthy is refused"; else
+  check "--argo with argo Synced/Progressing is refused" grep -q 'is Synced/Progressing (sync/health), not Synced/Healthy' "${WORK}/out/argo2.log"
+fi
+K -n teknoir-system patch applications.argoproj.io argo --type=merge -p '{"status":{"health":{"status":"Healthy"}}}' >/dev/null
+K annotate crd appprojects.argoproj.io argocd.argoproj.io/sync-options=Prune=false --overwrite >/dev/null
+if node_fn cmd_migrate --argo > "${WORK}/out/argo3.log" 2>&1; then bad "--argo with an unprotected argoproj CRD is refused"; else
+  check "--argo with an unprotected argoproj CRD is refused, naming it" grep -q 'without Prune=false,Delete=false: appprojects.argoproj.io' "${WORK}/out/argo3.log"
+fi
+check "the refusals changed nothing" bash -c "[[ -e '${MAN}/teknoir-argo.yaml' && ! -e '${MAN}/teknoir-argo.yaml.skip' ]] && kubectl --context ${CTX} -n kube-system get addons.k3s.cattle.io teknoir-argo -o name >/dev/null"
+K annotate crd appprojects.argoproj.io argocd.argoproj.io/sync-options=ServerSideApply=true,Prune=false,Delete=false --overwrite >/dev/null
+# ArgoCD's adoption, as far as this test can show it: tracking annotations on all but argocd-cm
+for o in crd/applications.argoproj.io crd/appprojects.argoproj.io; do
+  K annotate "${o}" "argocd.argoproj.io/tracking-id=argo:apiextensions.k8s.io/CustomResourceDefinition:/${o#crd/}" --overwrite >/dev/null
+done
+K -n teknoir-system annotate deploy argocd-server argocd.argoproj.io/tracking-id=argo:apps/Deployment:teknoir-system/argocd-server --overwrite >/dev/null
+node_fn cmd_migrate --argo --dry-run > "${WORK}/out/argo-dry.log" 2>&1 || { bad "--argo --dry-run exits 0"; cat "${WORK}/out/argo-dry.log"; }
+check "--argo --dry-run plans teknoir-argo only and changes nothing" bash -c "
+  [[ \$(grep -c '\[dry-run\] [^ ]*: would' '${WORK}/out/argo-dry.log') == 1 ]] && grep -q '\[dry-run\] teknoir-argo: would create teknoir-argo.yaml.skip' '${WORK}/out/argo-dry.log' &&
+  [[ -e '${MAN}/teknoir-argo.yaml' ]] && kubectl --context ${CTX} -n kube-system get addons.k3s.cattle.io teknoir-argo -o name >/dev/null"
+if MIGRATE_ARGO_SETTLE=5 node_fn cmd_migrate --argo > "${WORK}/out/argo4.log" 2>&1; then ok "--argo exits 0"; else bad "--argo exits 0"; cat "${WORK}/out/argo4.log"; fi
+check "--argo: no Teknoir Addon left" test -z "$(teknoir_addons)"
+check "--argo: K3s's own Addons untouched" diff -q "${WORK}/out/other-addons.txt" <(other_addons)
+check "--argo: teknoir-argo.yaml retired, guarded by .skip" bash -c "[[ ! -e '${MAN}/teknoir-argo.yaml' && -e '${MAN}/teknoir-argo.yaml.skip' ]] && cmp -s '${FIX}/teknoir-argo.yaml' \$(find '${RETIRED_ROOT}' -name teknoir-argo.yaml)"
+check "--argo: no object carries a K3s label of teknoir-argo" bash -c "[[ -z \$(kubectl --context ${CTX} get crd,configmaps,deployments -A -l objectset.rio.cattle.io/hash -o jsonpath='{range .items[*]}{.metadata.annotations.objectset\.rio\.cattle\.io/owner-name}{\"\\n\"}{end}' | grep teknoir-argo) ]]"
+check "--argo: the ArgoCD pod kept its UID" diff -q "${WORK}/out/argo-pods.txt" <(argo_pods)
+check "--argo: every baseline object exists with the same UID" baseline_kept
+check "--argo: the object outside the argo Application is reported, not deleted" bash -c "grep -q 'not in the Application argo and now have no owner.*ConfigMap.v1. teknoir-system/argocd-cm' '${WORK}/out/argo4.log' && kubectl --context ${CTX} -n teknoir-system get cm argocd-cm -o name >/dev/null"
+restart_k3s
+check "after restart: no Teknoir Addon re-appears" test -z "$(teknoir_addons)"
+check "after restart: every baseline object exists with the same UID" baseline_kept
+node_fn cmd_migrate --argo > "${WORK}/out/argo5.log" 2>&1 || { bad "--argo re-run exits 0"; cat "${WORK}/out/argo5.log"; }
+check "--argo re-run: detached already, 0 changes" bash -c "grep -q 'teknoir-argo is detached already' '${WORK}/out/argo5.log' && grep -q 'summary: 0 change' '${WORK}/out/argo5.log'"
+node_fn cmd_migrate > "${WORK}/out/migrate5.log" 2>&1 || { bad "migrate after --argo exits 0"; cat "${WORK}/out/migrate5.log"; }
+check "migrate after --argo: nothing left, no Teknoir Addon" bash -c "grep -q 'no Teknoir K3s files or Addons left' '${WORK}/out/migrate5.log' && grep -q 'Teknoir Addons left: none' '${WORK}/out/migrate5.log'"
+check "no secret value in any output" bash -c "! grep -q 'dummy-' '${WORK}/out/'*.log"
 
 say "result: ${PASS} passed, ${FAIL} failed"
 if (( FAIL > 0 )); then

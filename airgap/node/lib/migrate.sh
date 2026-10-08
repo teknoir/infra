@@ -2,13 +2,16 @@
 # shellcheck disable=SC2154,SC2016  # DRY_RUN, K3S_DATA_DIR, NODE, NODE_ROOT, TEKNOIR_DOMAIN come from common.sh and the site env; jq programs are single-quoted on purpose
 #
 # lib/migrate.sh — `teknoir-node migrate`: the one-time move of the live
-# teknoir-local off K3s auto-deploy files (docs/airgap/DESIGN.md M3, M6,
+# teknoir-local off K3s auto-deploy files (docs/airgap/DESIGN.md M3, M6, M7a,
 # I-13). TEMPORARY: delete this file once teknoir-local is migrated (M8).
 #
 #   teknoir-node migrate [--dry-run]     detach every Teknoir K3s file except
 #                                        teknoir-argo, remove the pre-fix bundle
 #                                        copies on the node, retire the Harbor
 #                                        robot once ArgoCD pulls anonymously (M3, M6)
+#   teknoir-node migrate --argo [--dry-run]
+#                                        M7a: detach teknoir-argo once the argo
+#                                        Application (app-of-apps 0.0.5) runs ArgoCD
 #   teknoir-node migrate --undo NAME     re-adopt one detached file (K3s re-applies it)
 #
 # Detach recipe, per name (never the K3s `disable:` list, which deletes objects):
@@ -28,9 +31,11 @@
 # re-created object, or any changed count, stops the run with the undo command.
 # Order: orphan Addons (file gone), legacy manifest-*-secret, teknoir-*-secret,
 # 00-teknoir-namespaces, teknoir-coredns-custom and teknoir-app-of-apps, the CRD
-# files, then any other allow-listed name. teknoir-argo is never detached here
-# (DESIGN M7a). Only allow-listed names are touched, never K3s's packaged
-# addons. Every step is idempotent: a re-run (also after a failure) resumes.
+# files, then any other allow-listed name. teknoir-argo is detached only by
+# --argo (DESIGN M7a): ArgoCD must first run from its own Application, which
+# app-of-apps enables in 0.0.5; app-of-apps 0.0.4 declares it disabled. Only
+# allow-listed names are touched, never K3s's packaged addons. Every step is
+# idempotent: a re-run (also after a failure) resumes.
 
 MIGRATE_ALLOW_RE='^(teknoir-.+|00-teknoir-.+|05-teknoir-.+|10-teknoir-.+|manifest-.+-secret|app-of-apps)$'
 MIGRATE_EXCLUDED="teknoir-argo"
@@ -38,26 +43,37 @@ MIGRATE_STRIP_PATCH='{"metadata":{"labels":{"objectset.rio.cattle.io/hash":null}
 MIGRATE_REPO_CREDS_NS="teknoir-system"
 MIGRATE_REPO_CREDS="argocd-harbor-repo"
 MIGRATE_ARGOCD_TIMEOUT="${MIGRATE_ARGOCD_TIMEOUT:-180}"
+MIGRATE_ONLY=""
 # counted in the baseline besides CRDs, Namespaces and Secrets per namespace (DESIGN M2)
 MIGRATE_COUNT_KINDS="Application.argoproj.io VirtualService.networking.istio.io Gateway.networking.istio.io DestinationRule.networking.istio.io AuthorizationPolicy.security.istio.io PeerAuthentication.security.istio.io Certificate.cert-manager.io ClusterIssuer.cert-manager.io"
+MIGRATE_ARGO_APP="argo"
+MIGRATE_ARGO_APP_NS="${MIGRATE_ARGO_APP_NS:-teknoir-system}"
+MIGRATE_ARGO_SETTLE="${MIGRATE_ARGO_SETTLE:-20}"
 
 cmd_migrate() {
   local -a undo=()
+  local argo=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run) DRY_RUN=1; shift ;;
+      --argo) argo=1; shift ;;
       --undo) [[ $# -ge 2 ]] || die "--undo needs a name"; undo+=("$2"); shift 2 ;;
       --undo=*) undo+=("${1#*=}"); shift ;;
       -h|--help) migrate_usage; return 0 ;;
       *) die "migrate: unknown argument: $1 (see: teknoir-node migrate --help)" ;;
     esac
   done
+  [[ "${argo}" == "0" || ${#undo[@]} -eq 0 ]] || die "migrate: --argo and --undo cannot be combined"
   migrate_init
   local name
   if [[ ${#undo[@]} -gt 0 ]]; then
     for name in "${undo[@]}"; do
       migrate_undo "${name}"
     done
+    return 0
+  fi
+  if [[ "${argo}" == "1" ]]; then
+    migrate_argo
     return 0
   fi
   migrate_detach_all
@@ -68,6 +84,7 @@ cmd_migrate() {
 migrate_usage() {
   cat >&2 <<'EOF'
 Usage: teknoir-node migrate [--dry-run]
+       teknoir-node migrate --argo [--dry-run]
        teknoir-node migrate --undo NAME [--undo NAME]...
 
 Detaches the Teknoir K3s auto-deploy files (DESIGN M3): .skip guard, file moved to
@@ -75,7 +92,10 @@ Detaches the Teknoir K3s auto-deploy files (DESIGN M3): .skip guard, file moved 
 object UIDs and counts compared with a baseline after every name. Then removes
 ~<user>/teknoir-airgap-bundle-* and, once ArgoCD reads the public Harbor project
 without credentials, the robot repo-creds Secret and robot$argocd (M6). Safe to
-re-run. --undo NAME puts a detached file back.
+re-run. teknoir-argo stays until --argo (M7a), which needs the Application argo
+(app-of-apps 0.0.5) Synced/Healthy and the argoproj CRDs protected
+(Prune=false,Delete=false), and checks that no ArgoCD pod restarts.
+--undo NAME puts a detached file back.
 EOF
 }
 
@@ -107,6 +127,16 @@ migrate_init() {
 
 migrate_allowed() {
   [[ "$1" =~ ${MIGRATE_ALLOW_RE} ]]
+}
+
+migrate_selected() {
+  # migrate_selected <name> — 0 when this run processes <name>: only
+  # MIGRATE_ONLY when set (--argo), else every allow-listed name but teknoir-argo
+  if [[ -n "${MIGRATE_ONLY}" ]]; then
+    [[ "$1" == "${MIGRATE_ONLY}" ]]
+  else
+    [[ "$1" != "${MIGRATE_EXCLUDED}" ]]
+  fi
 }
 
 migrate_res_served() {
@@ -291,7 +321,7 @@ migrate_inventory() {
   while IFS='|' read -r name gvks src; do
     [[ -n "${name}" ]] || continue
     migrate_allowed "${name}" || continue
-    [[ "${name}" != "${MIGRATE_EXCLUDED}" ]] || continue
+    migrate_selected "${name}" || continue
     seen["${name}"]=1
     base="-"
     file_present=0
@@ -309,7 +339,7 @@ migrate_inventory() {
     base="$(basename "${f}")"
     name="${base%.*}"
     migrate_allowed "${name}" || continue
-    [[ "${name}" != "${MIGRATE_EXCLUDED}" ]] || continue
+    migrate_selected "${name}" || continue
     [[ -z "${seen["${name}"]:-}" ]] || continue
     lines+="$(migrate_class "${name}" 1 0)|${name}|${base}|0|"$'\n'
   done
@@ -321,7 +351,11 @@ migrate_detach_all() {
   migrate_inventory
   inventory="${MIGRATE_INVENTORY}"
   if [[ -z "${inventory}" ]]; then
-    log "migrate: no Teknoir K3s files or Addons left to detach (${MIGRATE_EXCLUDED} is migrated in M7)"
+    if [[ -n "${MIGRATE_ONLY}" ]]; then
+      log "migrate: ${MIGRATE_ONLY} is detached already (no file, no Addon)"
+    else
+      log "migrate: no Teknoir K3s files or Addons left to detach (${MIGRATE_EXCLUDED} is detached by migrate --argo, DESIGN M7a)"
+    fi
   else
     log "migrate: plan ($(grep -c . <<<"${inventory}") names, in this order):"
     while IFS='|' read -r class name base addon gvks; do
@@ -426,7 +460,7 @@ migrate_report() {
   log "migrate: ${n} name(s) processed; every baseline object kept its UID, counts as in the baseline"
   left="$(kc -n kube-system get addons.k3s.cattle.io -o name)" || die "cannot list the K3s Addons"
   left="$(awk -F / -v re="${MIGRATE_ALLOW_RE}" '$NF ~ re {printf "%s ", $NF}' <<<"${left}")"
-  [[ "${left}" != "${MIGRATE_EXCLUDED} " ]] || expect="(expected: migrated in M7)"
+  [[ "${left}" != "${MIGRATE_EXCLUDED} " ]] || expect="(expected until DESIGN M7a: teknoir-node migrate --argo)"
   log "migrate: Teknoir Addons left: ${left:-none}${expect}"
   labelled="$(kc get customresourcedefinitions.apiextensions.k8s.io,namespaces -l objectset.rio.cattle.io/hash \
     -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.annotations.objectset\.rio\.cattle\.io/owner-name}{"\n"}{end}')" \
@@ -449,6 +483,9 @@ migrate_undo() {
   [[ -n "${latest}" ]] || die "--undo ${name}: no retired copy under ${MIGRATE_RETIRED_ROOT}/<UTC>/ (orphan Addons have no file to restore)"
   file="${MIGRATE_MANIFESTS}/$(basename "${latest}")"
   [[ ! -e "${file}" ]] || die "--undo ${name}: ${file} exists already"
+  if [[ "${name}" == "${MIGRATE_EXCLUDED}" ]] && in_cluster applications.argoproj.io "${MIGRATE_ARGO_APP}" "${MIGRATE_ARGO_APP_NS}"; then
+    warn "--undo ${name}: the Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP} also manages ArgoCD; with the file back, K3s and ArgoCD both own it (every k3s restart re-applies the file, selfHeal reverts it)"
+  fi
   if [[ "${DRY_RUN}" == "1" ]]; then
     log "[dry-run] would restore ${latest} to ${file} and remove ${file}.skip"
     return 0
@@ -597,4 +634,95 @@ migrate_argocd_reads_anonymously() {
   done
   warn "ArgoCD did not compare app-of-apps within ${MIGRATE_ARGOCD_TIMEOUT}s"
   return 1
+}
+
+# --- DESIGN M7a: teknoir-argo ------------------------------------------------------
+
+migrate_argo() {
+  # Detach teknoir-argo.yaml once ArgoCD runs from its own Application (argo,
+  # enabled in app-of-apps 0.0.5): the Application must be Synced/Healthy and
+  # the argoproj CRDs protected before the K3s owner goes; afterwards no
+  # ArgoCD pod may have restarted. Same recipe and baseline as the M3 pass.
+  local ns state before after untracked
+  MIGRATE_ONLY="${MIGRATE_EXCLUDED}"
+  migrate_inventory
+  if [[ -z "${MIGRATE_INVENTORY}" ]]; then
+    log "migrate --argo: ${MIGRATE_ONLY} is detached already (no file, no Addon)"
+    return 0
+  fi
+  # 1. ArgoCD runs from its own Application
+  in_cluster applications.argoproj.io "${MIGRATE_ARGO_APP}" "${MIGRATE_ARGO_APP_NS}" \
+    || die "migrate --argo: there is no Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}. ArgoCD manages itself from app-of-apps 0.0.5 (DESIGN M7a; 0.0.4 declares it disabled): run up with that bundle first. Until then ${MIGRATE_ONLY}.yaml stays ArgoCD's owner"
+  state="$(kc -n "${MIGRATE_ARGO_APP_NS}" get applications.argoproj.io "${MIGRATE_ARGO_APP}" \
+    -o jsonpath='{.status.sync.status}/{.status.health.status}')" || die "cannot read Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}"
+  [[ "${state}" == "Synced/Healthy" ]] \
+    || die "migrate --argo: Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP} is ${state} (sync/health), not Synced/Healthy; ${MIGRATE_ONLY}.yaml stays until ArgoCD has adopted itself"
+  ns="$(kc -n "${MIGRATE_ARGO_APP_NS}" get applications.argoproj.io "${MIGRATE_ARGO_APP}" -o jsonpath='{.spec.destination.namespace}')" \
+    || die "cannot read Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}"
+  ns="${ns:-${MIGRATE_ARGO_APP_NS}}"
+  log "migrate --argo: Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP} is Synced/Healthy (ArgoCD in ${ns})"
+  # 2. its CRDs survive any prune or cascade once ArgoCD is their only owner
+  migrate_argo_crds_protected || die "migrate --argo: argoproj CRD(s) without Prune=false,Delete=false: ${MIGRATE_UNPROTECTED}; the argo chart's crds.annotations must set both before ArgoCD is their only owner"
+  # 3. which pods must not restart
+  migrate_argo_pods "${ns}"
+  before="${MIGRATE_PODS}"
+  [[ -n "${before}" ]] || die "migrate --argo: no running ArgoCD pod (label app.kubernetes.io/part-of=argocd) in ${ns}"
+  log "migrate --argo: $(grep -c . <<<"${before}") running ArgoCD pod(s) recorded by UID"
+  # 4. the M3 recipe for this one name, with the baseline check
+  migrate_detach_all
+  [[ "${DRY_RUN}" != "1" ]] || return 0
+  # 5. nothing restarted, the CRDs are still protected, the Application is fine
+  log "migrate --argo: waiting ${MIGRATE_ARGO_SETTLE}s before comparing the ArgoCD pods"
+  sleep "${MIGRATE_ARGO_SETTLE}"
+  migrate_argo_pods "${ns}"
+  after="${MIGRATE_PODS}"
+  [[ "${after}" == "${before}" ]] \
+    || die "migrate --argo: the ArgoCD pods changed during the detach (gone or new: $(comm -3 <(printf '%s\n' "${before}") <(printf '%s\n' "${after}") | tr -d '\t' | cut -d '|' -f1 | tr '\n' ' ')); check ArgoCD before anything else"
+  migrate_argo_crds_protected || die "migrate --argo: argoproj CRD(s) lost Prune=false,Delete=false: ${MIGRATE_UNPROTECTED}"
+  migrate_argo_untracked
+  untracked="${MIGRATE_UNTRACKED}"
+  [[ -z "${untracked}" ]] \
+    || warn "migrate --argo: these objects of ${MIGRATE_ONLY}.yaml are not in the Application ${MIGRATE_ARGO_APP} and now have no owner (left in place; delete them by hand once you know they are unused): ${untracked}"
+  state="$(kc -n "${MIGRATE_ARGO_APP_NS}" get applications.argoproj.io "${MIGRATE_ARGO_APP}" \
+    -o jsonpath='{.status.sync.status}/{.status.health.status}')" || die "cannot read Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}"
+  [[ "${state}" == "Synced/Healthy" ]] || warn "migrate --argo: Application ${MIGRATE_ARGO_APP} is now ${state}; check it in ArgoCD"
+  log "migrate --argo: done; ArgoCD's pods kept their UIDs and ${MIGRATE_ARGO_APP} is its only owner"
+}
+
+migrate_argo_pods() {
+  # migrate_argo_pods <ns> — MIGRATE_PODS: sorted "name|uid" of the running
+  # ArgoCD pods. Not for $(...): dies.
+  local out
+  out="$(kc -n "$1" get pods -l app.kubernetes.io/part-of=argocd -o json)" || die "cannot list the ArgoCD pods in $1"
+  MIGRATE_PODS="$("${MIGRATE_JQ}" -r '.items[] | select(.status.phase == "Running") | "\(.metadata.name)|\(.metadata.uid)"' <<<"${out}" | sort)" \
+    || die "cannot parse the ArgoCD pods"
+}
+
+migrate_argo_crds_protected() {
+  # 0 when every argoproj.io CRD (at least one) carries Prune=false and
+  # Delete=false; MIGRATE_UNPROTECTED names the others. Dies on errors.
+  local out
+  out="$(kc get customresourcedefinitions.apiextensions.k8s.io -o json)" || die "cannot list the CRDs"
+  MIGRATE_UNPROTECTED="$("${MIGRATE_JQ}" -r '
+      [.items[] | select(.spec.group == "argoproj.io")] as $c
+      | if ($c | length) == 0 then "(no argoproj.io CRD found)"
+        else [$c[] | select(((.metadata.annotations["argocd.argoproj.io/sync-options"] // "") | split(",") | map(gsub("\\s"; ""))) as $o
+                            | ($o | index("Prune=false")) == null or ($o | index("Delete=false")) == null)
+                   | .metadata.name] | join(" ") end' <<<"${out}")" || die "cannot parse the CRDs"
+  [[ -z "${MIGRATE_UNPROTECTED}" ]]
+}
+
+migrate_argo_untracked() {
+  # MIGRATE_UNTRACKED: baseline objects without the argo Application's
+  # tracking annotation (ArgoCD's default annotation tracking: "<app>:...")
+  local res out
+  MIGRATE_UNTRACKED=""
+  for res in ${MIGRATE_BASE_RES}; do
+    out="$(kc get "${res}" -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"\n"}{end}')" \
+      || die "cannot list ${res}"
+    MIGRATE_UNTRACKED+="$(awk -F '|' -v r="${res}" -v app="${MIGRATE_ARGO_APP}" '
+        NR == FNR { if ($1 == r) want[$2 "|" $3] = 1; next }
+        ($1 "|" $2) in want && $3 !~ ("^([^:]*_)?" app ":") { printf "%s %s%s; ", r, ($1 == "" ? "" : $1 "/"), $2 }' \
+      <(printf '%s\n' "${MIGRATE_BASE_OBJS}") <(printf '%s\n' "${out}"))"
+  done
 }

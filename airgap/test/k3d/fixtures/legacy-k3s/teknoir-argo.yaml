@@ -53,3 +53,29 @@ metadata:
   namespace: teknoir-system
 data:
   url: https://argocd.teknoir.airgapped
+---
+# stands in for the ArgoCD workloads: migrate --argo (DESIGN M7a) must not restart their pods
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-server
+  namespace: teknoir-system
+  labels:
+    app.kubernetes.io/name: argocd-server
+    app.kubernetes.io/part-of: argocd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: argocd-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: argocd-server
+        app.kubernetes.io/part-of: argocd
+    spec:
+      containers:
+        - name: server
+          image: rancher/mirrored-pause:3.6
+          resources:
+            requests: {cpu: 1m, memory: 4Mi}
