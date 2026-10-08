@@ -60,7 +60,10 @@ nonl() {
 fetch() {
   # fetch <curl args...> — follow redirects; sets CODE and EFF (final URL)
   local out
-  out="$(curl -sS --cacert "${CACERT}" -c "${jar}" -b "${jar}" -L --max-redirs 20 \
+  # HTTP/1.1: over HTTP/2 the gateway resets the stream after ext_authz's 302
+  # (PROTOCOL_ERROR, curl exit 92; the same on staging and production), which
+  # browsers tolerate and curl does not
+  out="$(curl -sS --http1.1 --cacert "${CACERT}" -c "${jar}" -b "${jar}" -L --max-redirs 20 \
            -o "${page}" -w '%{http_code} %{url_effective}' "$@")" || return 1
   CODE="${out%% *}" EFF="${out#* }"
 }

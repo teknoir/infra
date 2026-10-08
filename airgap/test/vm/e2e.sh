@@ -45,7 +45,7 @@
 #   E2E_WORK         work dir (default ~/vmtest/e2e); LAN_HOME (default ~/vmtest/lanhome)
 #   E2E_UP_FLAGS     extra flags for every teknoir-airgap call
 #   E2E_ZERO_CHANGES_RE  regex that the E2 summary must match (default: "0 change|no change")
-#   E2E_LOGIN_URL    oauth2-proxy protected URL (default https://grafana.<domain>/)
+#   E2E_LOGIN_URL    oauth2-proxy protected URL (default https://<domain>/teknoir-system/grafana/)
 #   E2E_ADMIN_EMAIL  E1: the first admin created with admin-user (default
 #                    e2e-admin@example.com)
 #   E2E_ADMIN_USER   Keycloak user for the login checks (default: E2E_ADMIN_EMAIL
@@ -84,7 +84,7 @@ ZERO_RE="${E2E_ZERO_CHANGES_RE:-(^|[^0-9])0 change|no change|nothing changed}"
 DOMAIN="$(. "${LAN_SITE}"; printf '%s' "${TEKNOIR_DOMAIN}")"
 # shellcheck disable=SC1090
 NODE_IP="$(. "${LAN_SITE}"; printf '%s' "${NODE_IP}")"
-LOGIN_URL="${E2E_LOGIN_URL:-https://grafana.${DOMAIN}/}"
+LOGIN_URL="${E2E_LOGIN_URL:-https://${DOMAIN}/teknoir-system/grafana/}"
 AGENT_PID=""
 
 usage() { sed -n '3,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }

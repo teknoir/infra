@@ -192,8 +192,8 @@ Verification checklist:
 - [ ] `kubectl --context teknoir-local get nodes` shows the node `Ready`.
 - [ ] In a browser on the LAN host, with no certificate warning:
       `https://harbor.teknoir.airgapped`, `https://argocd.teknoir.airgapped`,
-      `https://grafana.teknoir.airgapped`,
-      `https://auth.teknoir.airgapped/realms/teknoir/account` and
+      `https://teknoir.airgapped/teknoir-system/grafana/`,
+      `https://auth.teknoir.airgapped/auth/realms/teknoir/account` and
       `https://teknoir.airgapped/` (Backstage); single sign-on works on each.
 
 ## 4. Update
