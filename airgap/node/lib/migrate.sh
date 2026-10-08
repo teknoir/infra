@@ -363,6 +363,10 @@ migrate_undo() {
     return 0
   fi
   mv -- "${latest}" "${file}" || die "cannot restore ${latest}"
+  # mv keeps the mtime, and K3s's deploy watcher skips a file whose mtime it
+  # has seen before (since its last start): a second undo of the same file
+  # would never be applied. A fresh mtime, the content stays as it was.
+  touch -- "${file}" || die "cannot touch ${file}"
   rm -f -- "${file}.skip" || die "cannot remove ${file}.skip"
   changed "restored ${file} (undo); K3s re-adopts it"
   wait_for "K3s to re-apply ${name}" 180 migrate_addon_applied "${name}" "$(sha256_file "${file}")"

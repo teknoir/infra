@@ -474,7 +474,7 @@ Recipe per name:
   (4) Delete the Addon object.
 Assert after every name: the object counts equal the baseline.
 Never use the k3s `disable:` list. It deletes the objects.
-Undo: `migrate --undo <name>` removes the .skip and restores the file. K3s then re-applies it and re-labels the objects.
+Undo: `migrate --undo <name>` removes the .skip and restores the file with a fresh mtime (content unchanged). K3s then re-applies it and re-labels the objects. The fresh mtime matters: K3s's deploy watcher skips a file whose mtime it has already seen since its last start (k3s pkg/deploy/controller.go keeps a per-path modTime map and never prunes it), so a file put back with `mv` alone is ignored after an earlier detach and undo of the same name.
 Verify:
   kubectl --context teknoir-local get addons -n kube-system   # only K3s packaged addons, plus teknoir-argo
   kubectl --context teknoir-local get crd,ns,secrets -A -l objectset.rio.cattle.io/hash --no-headers   # only K3s's own (coredns, metrics-server, ...), none of Teknoir's

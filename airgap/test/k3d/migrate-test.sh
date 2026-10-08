@@ -338,6 +338,12 @@ check "undo: the .skip guard is gone" test ! -e "${MAN}/teknoir-coredns-custom.y
 node_fn cmd_migrate > "${WORK}/out/migrate4.log" 2>&1 || bad "migrate after undo exits 0"
 assert_detached "after undo + migrate"
 
+say "a second --undo of the same file is applied too (K3s remembers the mtimes it has seen)"
+node_fn cmd_migrate --undo teknoir-coredns-custom > "${WORK}/out/undo-again.log" 2>&1 || { bad "second undo exits 0"; cat "${WORK}/out/undo-again.log"; }
+check "second undo: K3s re-adopts coredns-custom" bash -c "[[ \$(kubectl --context ${CTX} -n kube-system get cm coredns-custom -o jsonpath='{.metadata.annotations.objectset\.rio\.cattle\.io/owner-name}') == teknoir-coredns-custom ]]"
+node_fn cmd_migrate > "${WORK}/out/migrate4b.log" 2>&1 || bad "migrate after the second undo exits 0"
+check "detached again: only teknoir-argo is left" test "$(teknoir_addons)" == "teknoir-argo"
+
 say "result: ${PASS} passed, ${FAIL} failed"
 if (( FAIL > 0 )); then
   printf '  failed: %s\n' "${FAILED[@]}"
