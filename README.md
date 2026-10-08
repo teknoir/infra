@@ -1,80 +1,64 @@
 # Infra
 
-Air-gapped bootstrap of the Teknoir platform (`teknoir-local`) for a K3s node
-with no internet access. Everything — Helm charts, container images, tools —
-is built into a portable bundle on a connected workstation, carried over on
-USB, and served from the in-cluster Harbor registry.
+Airgapped installation of the Teknoir platform (`teknoir-local`, domain
+`teknoir.airgapped`) on a k3s node with no internet access. Everything the node
+needs (k3s, Helm charts, container images, tools) is built into one bundle file
+on a connected machine, carried over on a USB medium and rolled out with one
+command from a LAN host. The platform itself is GitOps: ArgoCD syncs the charts
+of `platform-applications-gitops` (branch `teknoir-local`) from the in-cluster
+Harbor registry.
 
-> The implementation is the bare minimum. It is not meant to be infinitely
-> configurable, but to provide a repeatable way to bootstrap and update the
-> platform on `teknoir@teknoir.airgapped`.
+> Infra stays thin: it only gets a node to the point where ArgoCD can pull from
+> Harbor, and keeps the node itself (k3s, trust, name resolution, Harbor
+> content) converged. Everything else is GitOps.
 
-## Architecture
+## How it works
 
-Two tiers:
-
-* **Bootstrap tier — Istio → ArgoCD → Harbor.** Installed by
-  `airgap/bootstrap-airgap.sh`: K3s auto-deploy files in
-  `/opt/k3s/server/manifests/` (namespaces, istio + cert-manager CRDs,
-  `teknoir-argo.yaml`, the root `teknoir-app-of-apps.yaml`, secrets; one file
-  per object), one-shot Istio and Harbor resources that ArgoCD then adopts,
-  and images shipped as containerd tarballs (`/opt/k3s/agent/images/`). Istio
-  comes first because *everything* — Harbor included — is exposed only through
-  the Istio ingressgateway, which terminates TLS with a pre-issued
-  `*.teknoir.airgapped` wildcard cert signed by the local Teknoir Root CA.
-* **GitOps tier — everything else.** ArgoCD pulls the `app-of-apps` chart and
-  all platform charts from `oci://harbor.teknoir.airgapped/teknoir` and syncs
-  auth (Keycloak/oauth2-proxy), cert-manager, monitoring, and the controllers.
-  ArgoCD also **adopts** the bootstrap-installed Istio and Harbor via
-  `ServerSideApply=true` Applications pinned to the same chart versions.
-
-Harbor hosts the charts (project `teknoir`, every version released once and
-immutable) and mirrors the five public registries (`dockerhub`, `ghcr`, `gcr`,
-`quay`, `k8s` — wired into containerd via `/etc/rancher/k3s/registries.yaml`).
-ArgoCD pulls with the `robot$argocd` robot account, whose credential is never
-rotated implicitly. cert-manager renews the wildcard cert from the
-`teknoir-ca` `ClusterIssuer` once the GitOps tier runs. Ownership details:
-[README_infra.md § Ownership model](README_infra.md#ownership-model).
-
-## Quick start
-
-Follow the runbooks — they are the authoritative procedures:
-
-* **First install:** [docs/AIRGAP-BOOTSTRAP.md](docs/AIRGAP-BOOTSTRAP.md)
-* **Updates & rollback:** [docs/AIRGAP-UPDATE.md](docs/AIRGAP-UPDATE.md)
-
-Condensed:
-
-```sh
-# connected workstation
-./scripts/gen-local-ca-secret.sh && ./scripts/gen-harbor-secrets.sh   # …and the other gen-*.sh
-export GITOPS_REPO_DIR=../platform-applications-gitops-teknoir-local  # branch teknoir-local
-./airgap/make-bundle.sh
-./airgap/verify-offline.sh
-
-# USB → LAN laptop
-./airgap/bootstrap-airgap.sh                       # Istio → ArgoCD → Harbor → app-of-apps
-HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh   # robot account, pinned charts, images
-./scripts/deploy-secrets.sh                        # ArgoCD uses the robot; syncs the rest
-# then: Keycloak clients + Harbor OIDC (runbook §8)
-
-# later updates (AIRGAP-UPDATE.md): push-to-harbor.sh, deploy-secrets.sh,
-# update-airgap.sh <app-of-apps version>, bootstrap-airgap.sh --update
+```
+[build machine, online]                        [LAN host]                   [node]
+airgap/build/make-bundle.sh ──► .tar + .sha256 ──► USB ──► ./teknoir-airgap up ── ssh ──► teknoir-node converge
 ```
 
-## Directory layout
+```sh
+# connected build machine: both checkouts on branch teknoir-local, clean and pushed
+airgap/build/make-bundle.sh --gitops ../platform-applications-gitops-teknoir-local
+
+# LAN host, from the USB medium
+sha256sum -c teknoir-airgap-<bundleId>.tar.sha256    # macOS: shasum -a 256 -c ...
+tar -xf teknoir-airgap-<bundleId>.tar && cd teknoir-airgap-<bundleId>
+./teknoir-airgap up        # first install and every update; safe to re-run
+./teknoir-airgap trust     # once per LAN host: name resolution and CA trust
+./teknoir-airgap status
+```
+
+`up` verifies the bundle, copies its node payload over ssh (only what the node
+lacks), runs the converge on the node as root and fetches the kubeconfig
+(context `teknoir-local`). No secret is ever in a bundle: the node creates them
+inside the cluster.
+
+## Docs
+
+| Doc | For |
+|---|---|
+| [docs/airgap/OPERATE.md](docs/airgap/OPERATE.md) | operators: first install, update, rollback, status, credentials, users, backup and restore, rotation, troubleshooting, ownership |
+| [docs/airgap/HOST-SETUP.md](docs/airgap/HOST-SETUP.md) | installing Debian 13 offline on the node, ssh access from the LAN host |
+| [docs/airgap/BUILD.md](docs/airgap/BUILD.md) | building a bundle and making a release |
+| [docs/airgap/CHANGELOG.md](docs/airgap/CHANGELOG.md) | history, incidents and the reasons behind the design |
+| [docs/airgap/DESIGN.md](docs/airgap/DESIGN.md) | the design contract of the 2026-10 redesign |
+| [README_infra.md](README_infra.md) | how the pieces fit: ownership, secrets, site config, versions |
+
+The four runbooks ship in every bundle under `docs/`.
+
+## Repository layout
 
 | Path | Purpose |
 |---|---|
-| `airgap/` | Bundle build (connected side) + install/update tooling (LAN side); see script headers for usage |
-| `airgap/versions.env` | Central version/config pinning (root app-of-apps, argo, Istio/ArgoCD/Harbor, tools, hostnames) |
-| `airgap/images-extra.txt` | Images `helm template` cannot discover (sidecars, runtime pulls) |
-| `charts/argo/` | Bootstrap ArgoCD umbrella chart (see [README_infra.md](README_infra.md)) |
-| `scripts/` | Secret generators (`gen-*.sh`) + deploy helpers (`deploy-argo.sh`, `deploy-secrets.sh`) |
-| `teknoir-local-app-of-apps.yaml` | AppProject + root Application (`oci://harbor.teknoir.airgapped/teknoir`, chart `app-of-apps`) |
-| `docs/` | Bootstrap and update runbooks |
-| `.secrets/` | Generated secret manifests (`manifest-*.yaml`), CA key material (`ca/`), and the operator SSH key — **gitignored**, never commit |
-| `teknoir-root-ca.crt` | Public Root CA cert (generated, gitignored) |
-| `bundle/` | Bundle build output (gitignored) |
-
-Infra-chart and secrets-model details: [README_infra.md](README_infra.md).
+| `airgap/teknoir-airgap` | LAN entrypoint (bash 3.2; ssh, tar and sha256sum/shasum only); copied to the bundle root |
+| `airgap/node/` | the node runner `bin/teknoir-node` and its phases in `lib/` (host, secrets, one-shot, Harbor, release, backup, migrate) |
+| `airgap/build/` | bundle build (connected machine): `make-bundle.sh` and its helpers |
+| `airgap/site/` | site configs: `teknoir-local.env` (the live node), `vmtest.env` (the test VM) |
+| `airgap/versions.env` | pinned versions: app-of-apps, k3s, tools (with sha256) |
+| `airgap/images-extra.txt` | images `helm template` cannot discover (sidecars, run-time pulls) |
+| `airgap/test/` | tests: LAN entrypoint (`test/lan/run.sh`), k3d ownership suite, VM end-to-end |
+| `docs/airgap/` | runbooks and design |
+| `dist/` | build output |

@@ -15,6 +15,12 @@ docs=("${repo}"/docs/airgap/BUILD.md "${repo}"/docs/airgap/HOST-SETUP.md "${repo
       "${repo}"/docs/airgap/CHANGELOG.md "${repo}"/README.md "${repo}"/README_infra.md)
 errors=0 uses=0
 
+# slugs FILE: the GitHub anchors of FILE's headings.
+slugs() {
+  awk '/^```/ { code = !code } !code && /^#+ / {
+         h = tolower($0); sub(/^#+ /, "", h); gsub(/[^a-z0-9 _-]/, "", h); gsub(/ /, "-", h); print h }' "$1"
+}
+
 for f in "${docs[@]}"; do
   [ -f "${f}" ] || { echo "missing doc: ${f}"; errors=$((errors + 1)); continue; }
   while IFS= read -r hit; do
@@ -40,15 +46,21 @@ for f in "${docs[@]}"; do
       esac
     done
   done < <(grep -noE '\./teknoir-airgap( [^`|)]*)?' "${f}" || true)
-  # relative links to other Markdown files
+  # relative links to other Markdown files, and their #anchors
   while IFS= read -r hit; do
     line=${hit%%:*}
-    target=${hit#*](}
-    target=${target%)}
-    target=${target%%#*}
-    case ${target} in http*|mailto:*|'') continue ;; esac
+    link=${hit#*](}
+    link=${link%)}
+    target=${link%%#*}
+    anchor=
+    case ${link} in *'#'*) anchor=${link#*#} ;; esac
+    case ${link} in http*|mailto:*) continue ;; esac
+    [ -n "${target}" ] || target=$(basename "${f}")
     if [ ! -e "$(dirname "${f}")/${target}" ]; then
       echo "${f#"${repo}"/}:${line}: broken link to ${target}"
+      errors=$((errors + 1))
+    elif [ -n "${anchor}" ] && ! slugs "$(dirname "${f}")/${target}" | grep -qx -- "${anchor}"; then
+      echo "${f#"${repo}"/}:${line}: no heading #${anchor} in ${target}"
       errors=$((errors + 1))
     fi
   done < <(grep -noE '\]\([^)]+\)' "${f}" || true)
