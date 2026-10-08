@@ -1,0 +1,126 @@
+# airgap-ci — tests of the airgap tooling (docs/airgap/DESIGN.md test plan, I-16).
+#
+#   static  shellcheck, bash 3.2, bats, node unit tests, gitleaks (airgap/test/run-static.sh)
+#   lan     LAN entrypoint tests in containers (airgap/test/lan/run.sh), when present
+#   k3d     K3s ownership suite on the live K3s version (airgap/test/k3d/run.sh)
+#           T1-T5, T4N and T9 (T9 skips until the node runner has migrate),
+#           plus the migrate implementer's own k3d test when present.
+#           T6 (ArgoCD adoption, pulls ArgoCD and istio images) runs only on a
+#           manual dispatch with run_t6, against the gitops istio chart.
+# The VM end-to-end test (airgap/test/vm/e2e.sh) needs KVM and runs on vpro only.
+#
+# Tools are pinned by version and sha256 (actions by commit SHA); the bats
+# pin lives in airgap/test/bats/bootstrap-bats.sh.
+name: airgap-ci
+
+on:
+  pull_request:
+    paths:
+      - 'airgap/**'
+      - 'docs/airgap/**'
+      - '.github/workflows/airgap-ci.yml'
+  push:
+    branches:
+      - teknoir-local
+      - 'airgap-redesign**'
+    paths:
+      - 'airgap/**'
+      - 'docs/airgap/**'
+      - '.github/workflows/airgap-ci.yml'
+  workflow_dispatch:
+    inputs:
+      run_t6:
+        description: 'Also run k3d T6 (ArgoCD adoption of the istio one-shot render)'
+        type: boolean
+        default: false
+      gitops_ref:
+        description: 'platform-applications-gitops ref with the istio chart for T6'
+        type: string
+        default: teknoir-local
+
+permissions:
+  contents: read
+
+concurrency:
+  group: airgap-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SHELLCHECK_VERSION: v0.9.0
+  # sha256 of the v0.9.0 release asset (upstream publishes no checksum file)
+  SHELLCHECK_SHA256: 700324c6dd0ebea0117591c6cc9d7350d9c7c5c287acbad7630fa17b1d4d9e2f
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  K3D_VERSION: v5.9.0
+  K3D_SHA256: 06d8f25bc3a971c4eb29e0ff08429b180402db0f4dec838c9eac427e296800a0
+  K3S_IMAGE: rancher/k3s:v1.33.5-k3s1
+
+jobs:
+  static:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0   # gitleaks scans the whole history
+      - name: Install shellcheck and gitleaks (pinned)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin" /tmp/dl && cd /tmp/dl
+          curl -fsSLo sc.tar.xz "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  sc.tar.xz" | sha256sum -c -
+          tar -xJf sc.tar.xz && install -m 0755 "shellcheck-${SHELLCHECK_VERSION}/shellcheck" "$HOME/.local/bin/shellcheck"
+          curl -fsSLo gl.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gl.tar.gz" | sha256sum -c -
+          tar -xzf gl.tar.gz gitleaks && install -m 0755 gitleaks "$HOME/.local/bin/gitleaks"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Cache the pinned bats-core
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/teknoir-airgap/bats-core-*
+          key: bats-${{ hashFiles('airgap/test/bats/bootstrap-bats.sh') }}
+      - name: Static checks, bats, unit tests, gitleaks
+        run: airgap/test/run-static.sh
+
+  lan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: LAN entrypoint tests (bash 3.2 and sshd containers)
+        if: hashFiles('airgap/test/lan/run.sh') != ''
+        run: airgap/test/lan/run.sh
+      - name: No LAN tests yet
+        if: hashFiles('airgap/test/lan/run.sh') == ''
+        run: echo "airgap/test/lan/run.sh is not in the tree yet"
+
+  k3d:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install k3d (pinned)
+        run: |
+          set -euo pipefail
+          curl -fsSLo /tmp/k3d "https://github.com/k3d-io/k3d/releases/download/${K3D_VERSION}/k3d-linux-amd64"
+          echo "${K3D_SHA256}  /tmp/k3d" | sha256sum -c -
+          sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
+          docker pull -q "${K3S_IMAGE}"
+          k3d version; kubectl version --client; jq --version
+      - name: K3s ownership suite T1-T5, T4N, T9
+        run: airgap/test/k3d/run.sh T1 T2 T3 T4 T4N T5 T9
+      - name: Migrate implementer's k3d test
+        if: hashFiles('airgap/test/k3d/migrate-test.sh') != ''
+        run: airgap/test/k3d/migrate-test.sh
+      - name: Check out the gitops repo for T6
+        if: github.event_name == 'workflow_dispatch' && inputs.run_t6
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: teknoir/platform-applications-gitops
+          ref: ${{ inputs.gitops_ref }}
+          path: gitops
+      - name: T6 ArgoCD adoption
+        if: github.event_name == 'workflow_dispatch' && inputs.run_t6
+        env:
+          T6_ISTIO_CHART: ${{ github.workspace }}/gitops/charts/istio
+        run: airgap/test/k3d/run.sh T6
