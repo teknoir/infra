@@ -18,9 +18,15 @@
 # Each image is stored once. Every tag is resolved to its digest on every build
 # (mutable tags are never trusted); the content is cached by digest in
 # ${TEKNOIR_AIRGAP_CACHE:-~/.cache/teknoir-airgap}/images/ and pulled into a
-# .tmp path that is validated (one manifest, platform, blob checksums, config
-# digest) before it is renamed into place, so an interrupted pull never leaves
-# a partial entry.
+# .tmp path that is validated before it is renamed into place, so an
+# interrupted pull never leaves a partial entry.
+#
+# What ships is validated on every build, not only after a pull: the staged
+# copy of each cache entry is checked in full (every blob's sha256 equals its
+# digest; a docker archive's config and layer members equal the registry
+# manifest's digests and its `crane digest --tarball` equals the one recorded
+# at the first pull in <entry>.digest). A corrupt cache entry is removed and
+# pulled again in the same run, so a re-run always converges.
 #
 # --images-limit N (or IMAGES_LIMIT=N): TEST ONLY. Pull only the first N
 # images of each list. The bundle is then marked incomplete (make-bundle.sh
@@ -48,6 +54,7 @@ done
 [[ -z "${LIMIT}" || "${LIMIT}" =~ ^[0-9]+$ ]] || die "--images-limit must be a number"
 [[ -d "${WORK}/renders" ]] || die "${WORK}/renders is missing (run collect-charts.sh first)"
 [[ -f "${STAGE}/node/oneshot/TIERS" ]] || die "${STAGE}/node/oneshot is missing (run render-oneshot.sh first)"
+tar --version 2>/dev/null | grep -q 'GNU tar' || die "GNU tar is required (--to-command)"
 use_build_tools "${WORK}"
 
 read -r -a PLATFORMS <<<"${IMAGE_PLATFORMS}"
@@ -157,11 +164,6 @@ resolve() {
   esac
 }
 
-config_of() {
-  # config_of <repo> <digest> — the config digest of a single-platform manifest
-  jq -r '.config.digest' "$(cached_manifest "$1" "$2")"
-}
-
 check_platform_config() {
   # check_platform_config <config.json> <what>
   local os arch
@@ -174,8 +176,8 @@ check_platform_config() {
 # --- OCI layouts ----------------------------------------------------------------------
 validate_oci_layout() {
   # validate_oci_layout <dir> <digest> <deep:0|1> — exactly one manifest with
-  # that digest, PLATFORM config, every referenced blob present (deep: and
-  # every blob's sha256 equals its name)
+  # that digest, PLATFORM config, every referenced blob present with its size
+  # (deep: and every blob's sha256 equals its name)
   local dir="$1" digest="$2" deep="$3" m b blob size want
   [[ -f "${dir}/oci-layout" && -f "${dir}/index.json" ]] || return 1
   [[ "$(jq '.manifests | length' "${dir}/index.json")" == 1 ]] || return 1
@@ -196,71 +198,139 @@ validate_oci_layout() {
 }
 
 pull_oci() {
-  # pull_oci <ref> <slug> — OCI layout of PLATFORM into the cache (by digest), then the stage
-  local ref="$1" slug="$2" repo cached tmp
+  # pull_oci <ref> <slug> — OCI layout of PLATFORM into the cache (by digest),
+  # then a copy into the stage that is validated deep before it is used; a
+  # copy that fails means a corrupt cache entry, which is replaced once
+  local ref="$1" slug="$2" repo cached tmp stage attempt
   repo="$(image_repo "${ref}")"
   cached="${IMG_CACHE}/oci/${R_PLATFORM#sha256:}"
-  if [[ -d "${cached}" ]] && ! validate_oci_layout "${cached}" "${R_PLATFORM}" 0; then
-    warn "cache entry ${cached} is invalid; pulling again"
+  stage="${OCI_OUT}/${slug}"
+  for attempt in 1 2; do
+    if [[ ! -d "${cached}" ]]; then
+      tmp="${cached}.tmp.$$"
+      [[ ! -e "${tmp}" ]] || rm_build_dir "${tmp}"
+      log "pull ${ref} (${PLATFORM} ${R_PLATFORM:7:12})"
+      crane pull --format oci "${repo}@${R_PLATFORM}" "${tmp}" || { rm_build_dir "${tmp}"; die "crane pull failed: ${ref}"; }
+      validate_oci_layout "${tmp}" "${R_PLATFORM}" 1 || { rm_build_dir "${tmp}"; die "pulled layout of ${ref} failed validation"; }
+      mv -T "${tmp}" "${cached}"
+    fi
+    rm -rf -- "${stage:?}.tmp"
+    cp -a --reflink=auto "${cached}" "${stage}.tmp"
+    if validate_oci_layout "${stage}.tmp" "${R_PLATFORM}" 1; then
+      mv -T "${stage}.tmp" "${stage}"
+      L_DIGEST="${R_PLATFORM}"
+      L_SIZE="$(du -sb "${stage}" | cut -f1)"
+      return 0
+    fi
+    rm -rf -- "${stage:?}.tmp"
+    (( attempt == 1 )) || die "${ref}: the layout fails validation right after a fresh pull"
+    warn "cache entry ${cached} (${ref}) is corrupt (a blob is missing or its size or sha256 does not match its digest); removing it and pulling again"
     rm_build_dir "${cached}"
-  fi
-  if [[ ! -d "${cached}" ]]; then
-    tmp="${cached}.tmp.$$"
-    [[ ! -e "${tmp}" ]] || rm_build_dir "${tmp}"
-    log "pull ${ref} (${PLATFORM} ${R_PLATFORM:7:12})"
-    crane pull --format oci "${repo}@${R_PLATFORM}" "${tmp}" || { rm_build_dir "${tmp}"; die "crane pull failed: ${ref}"; }
-    validate_oci_layout "${tmp}" "${R_PLATFORM}" 1 || { rm_build_dir "${tmp}"; die "pulled layout of ${ref} failed validation"; }
-    mv -T "${tmp}" "${cached}"
-  fi
-  cp -a --reflink=auto "${cached}" "${OCI_OUT}/${slug}.tmp"
-  mv -T "${OCI_OUT}/${slug}.tmp" "${OCI_OUT}/${slug}"
-  L_DIGEST="${R_PLATFORM}"
-  L_SIZE="$(du -sb "${OCI_OUT}/${slug}" | cut -f1)"
+  done
 }
 
 # --- docker archives --------------------------------------------------------------------
 validate_docker_archive() {
-  # validate_docker_archive <tar> <ref> <config-digest> — sets L_DIGEST
-  local tar="$1" ref="$2" cfg="$3" tmpd
-  tar -tf "${tar}" >/dev/null 2>&1 || return 1
+  # validate_docker_archive <tar> <ref> <manifest.json> — the archive is
+  # exactly the registry image: one image tagged <ref>; members are exactly
+  # manifest.json, the config (named by its digest) and the layers (named
+  # <hex>.tar.gz by ggcr), each once, as regular files; the config digest and
+  # the ordered layer digests equal the registry manifest's; every member's
+  # sha256 equals the digest in its name; PLATFORM config. Sets V_DIGEST
+  # (`crane digest --tarball`, the digest the node pushes).
+  local tmpd rc=0
+  V_DIGEST=""
   tmpd="$(mktemp -d)"
-  tar -xf "${tar}" -C "${tmpd}" manifest.json 2>/dev/null || { rm -rf "${tmpd}"; return 1; }
-  if [[ "$(jq 'length' "${tmpd}/manifest.json")" != 1 \
-        || "$(jq -r '.[0].RepoTags | join(",")' "${tmpd}/manifest.json")" != "${ref}" \
-        || "$(jq -r '.[0].Config' "${tmpd}/manifest.json")" != "${cfg}" ]]; then
-    rm -rf "${tmpd}"
-    return 1
-  fi
-  tar -xf "${tar}" -C "${tmpd}" "${cfg}" 2>/dev/null || { rm -rf "${tmpd}"; return 1; }
+  _validate_docker_archive "${tmpd}" "$@" || rc=$?
+  rm -rf -- "${tmpd}"
+  return "${rc}"
+}
+
+_validate_docker_archive() {
+  # _validate_docker_archive <scratch-dir> <tar> <ref> <manifest.json>
+  local tmpd="$1" tar="$2" ref="$3" manifest="$4" cfg want have
+  [[ "${tar}" == /* ]] || tar="${PWD}/${tar}"
+  cfg="$(jq -r '.config.digest' "${manifest}")" || return 1
+  tar -tf "${tar}" > "${tmpd}/members" 2>/dev/null || return 1
+  tar -xf "${tar}" -C "${tmpd}" manifest.json 2>/dev/null || return 1
+  [[ "$(jq 'length' "${tmpd}/manifest.json")" == 1 ]] || return 1
+  [[ "$(jq -r '.[0].RepoTags | join(",")' "${tmpd}/manifest.json")" == "${ref}" ]] || return 1
+  [[ "$(jq -r '.[0].Config' "${tmpd}/manifest.json")" == "${cfg}" ]] || return 1
+  # the layer list is the registry's, in order (ggcr writes <hex>.tar.gz)
+  want="$(jq -r '.layers[].digest | sub("^sha256:"; "")' "${manifest}")" || return 1
+  have="$(jq -r '.[0].Layers[] | sub("\\.tar(\\.gz)?$"; "")' "${tmpd}/manifest.json")" || return 1
+  [[ -n "${want}" && "${want}" == "${have}" ]] || return 1
+  # exactly the expected members, no duplicates
+  { echo manifest.json; echo "${cfg}"; jq -r '.[0].Layers[]' "${tmpd}/manifest.json"; } \
+    | LC_ALL=C sort -u > "${tmpd}/expected"
+  cmp -s "${tmpd}/expected" <(LC_ALL=C sort "${tmpd}/members") || return 1
+  # one pass: the sha256 of every regular-file member (non-regular members get
+  # no line and fail the count below)
+  # shellcheck disable=SC2016  # expanded by the shell tar runs per member
+  (cd "${tmpd}" && tar -xf "${tar}" --to-command='sha256sum | { read -r h _; printf "%s %s\n" "${h}" "${TAR_FILENAME}"; }') \
+    > "${tmpd}/sums" 2>/dev/null || return 1
+  [[ "$(wc -l < "${tmpd}/sums")" == "$(wc -l < "${tmpd}/expected")" ]] || return 1
+  awk -v cfg="${cfg}" '
+    $2 == "manifest.json" { next }
+    $2 == cfg { if ("sha256:" $1 != cfg) bad = 1; next }
+    { name = $2; sub(/\.tar(\.gz)?$/, "", name); if (name != $1) bad = 1 }
+    END { exit bad }
+  ' "${tmpd}/sums" || return 1
+  tar -xf "${tar}" -C "${tmpd}" "${cfg}" 2>/dev/null || return 1
   check_platform_config "${tmpd}/${cfg}" "${ref}"
-  rm -rf "${tmpd}"
-  L_DIGEST="$(crane digest --tarball "${tar}")" || return 1
+  V_DIGEST="$(crane digest --tarball "${tar}")" || return 1
+  [[ "${V_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
 }
 
 pull_docker() {
-  # pull_docker <ref> <slug> — single-platform docker archive tagged <ref>
-  local ref="$1" slug="$2" repo cfg cached tmp
+  # pull_docker <ref> <slug> — single-platform docker archive tagged <ref>,
+  # cached as <hex>-<slug>.tar plus <hex>-<slug>.tar.digest (the first pull's
+  # `crane digest --tarball`). The staged copy is validated in full and its
+  # digest must equal the recorded one; a copy that fails means a corrupt
+  # cache entry, which is replaced once.
+  local ref="$1" slug="$2" repo manifest cached tmp stage attempt recorded
   repo="$(image_repo "${ref}")"
-  cfg="$(config_of "${repo}" "${R_PLATFORM}")" || die "cannot read the config of ${ref}"
+  manifest="$(cached_manifest "${repo}" "${R_PLATFORM}")"
   cached="${IMG_CACHE}/docker/${R_PLATFORM#sha256:}-${slug}.tar"
-  if [[ -f "${cached}" ]] && ! validate_docker_archive "${cached}" "${ref}" "${cfg}"; then
-    warn "cache entry ${cached} is invalid; pulling again"
-    rm -f "${cached}"
-  fi
-  if [[ ! -f "${cached}" ]]; then
-    tmp="${cached}.tmp.$$"
-    rm -f "${tmp}"
-    log "pull ${ref} (${PLATFORM} archive ${R_PLATFORM:7:12})"
-    # by tag, so the archive carries the tag containerd imports it under; the
-    # config digest check below proves it is the image resolved above
-    crane pull --platform "${PLATFORM}" --format tarball "${ref}" "${tmp}" || { rm -f "${tmp}"; die "crane pull failed: ${ref}"; }
-    validate_docker_archive "${tmp}" "${ref}" "${cfg}" \
-      || { rm -f "${tmp}"; die "pulled archive of ${ref} failed validation (did the tag move during the build?)"; }
-    mv -f "${tmp}" "${cached}"
-  fi
-  cp --reflink=auto "${cached}" "${DOCKER_OUT}/${slug}.tar.tmp"
-  mv -f "${DOCKER_OUT}/${slug}.tar.tmp" "${DOCKER_OUT}/${slug}.tar"
-  L_SIZE="$(stat -c %s "${DOCKER_OUT}/${slug}.tar")"
+  stage="${DOCKER_OUT}/${slug}.tar"
+  for attempt in 1 2; do
+    if [[ ! -f "${cached}" ]]; then
+      rm -f "${cached}.digest"
+      tmp="${cached}.tmp.$$"
+      rm -f "${tmp}"
+      log "pull ${ref} (${PLATFORM} archive ${R_PLATFORM:7:12})"
+      # by tag, so the archive carries the tag containerd imports it under; the
+      # config and layer digest checks prove it is the image resolved above
+      crane pull --platform "${PLATFORM}" --format tarball "${ref}" "${tmp}" || { rm -f "${tmp}"; die "crane pull failed: ${ref}"; }
+      validate_docker_archive "${tmp}" "${ref}" "${manifest}" \
+        || { rm -f "${tmp}"; die "pulled archive of ${ref} failed validation (did the tag move during the build?)"; }
+      printf '%s\n' "${V_DIGEST}" > "${cached}.digest.tmp.$$"
+      mv -f "${cached}.digest.tmp.$$" "${cached}.digest"
+      mv -f "${tmp}" "${cached}"
+    fi
+    rm -f "${stage}.tmp"
+    cp --reflink=auto "${cached}" "${stage}.tmp"
+    if validate_docker_archive "${stage}.tmp" "${ref}" "${manifest}"; then
+      if [[ ! -s "${cached}.digest" ]]; then
+        # an entry from a build before digests were recorded: it just passed
+        # the full member check, so its digest becomes the reference
+        printf '%s\n' "${V_DIGEST}" > "${cached}.digest.tmp.$$"
+        mv -f "${cached}.digest.tmp.$$" "${cached}.digest"
+      fi
+      recorded="$(cat "${cached}.digest")"
+      if [[ "${recorded}" == "${V_DIGEST}" ]]; then
+        mv -f "${stage}.tmp" "${stage}"
+        L_DIGEST="${V_DIGEST}"
+        L_SIZE="$(stat -c %s "${stage}")"
+        return 0
+      fi
+      warn "${ref}: crane digest --tarball is ${V_DIGEST}, the first pull recorded ${recorded}"
+    fi
+    rm -f "${stage}.tmp"
+    (( attempt == 1 )) || die "${ref}: the archive fails validation right after a fresh pull"
+    warn "cache entry ${cached} (${ref}) is corrupt (member checksums, config/layer digests or archive digest do not match); removing it and pulling again"
+    rm -f "${cached}" "${cached}.digest"
+  done
 }
 
 # --- pull ----------------------------------------------------------------------------------

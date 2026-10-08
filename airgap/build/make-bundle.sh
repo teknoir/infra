@@ -425,7 +425,30 @@ sum_tree() {
 sum_tree "${TREE}/node" "${WORK}/node.sums"
 # blob files are named by their digest: verify them while we have the sums
 bad_blobs="$(awk '$2 ~ /^images\/[^\/]+\/blobs\/sha256\/[0-9a-f]+$/ { n = split($2, p, "/"); if (p[n] != $1) print "node/" $2 }' "${WORK}/node.sums")"
-[[ -z "${bad_blobs}" ]] || die "blob checksum mismatch (corrupt image cache?): $(tr '\n' ' ' <<<"${bad_blobs}")"
+if [[ -n "${bad_blobs}" ]]; then
+  # Backstop: collect-images.sh validated every staged layout blob by blob,
+  # so the copy or the cache changed after that. Name and drop the cache
+  # entries the bad copies came from, so the next run pulls them again.
+  exec 8> "${CACHE_DIR}/images/.lock"
+  locked=1
+  flock -n 8 || locked=0
+  for b in ${bad_blobs}; do
+    slug="${b#node/images/}"
+    slug="${slug%%/*}"
+    pd="$(jq -r --arg s "${slug}" 'select(.slug == $s) | .platformDigest' "${WORK}/images.jsonl" | head -1)"
+    entry="${CACHE_DIR}/images/oci/${pd#sha256:}"
+    if [[ ! "${pd}" =~ ^sha256:[0-9a-f]{64}$ || ! -d "${entry}" ]]; then
+      warn "blob checksum mismatch: ${b} (no cache entry found for images/${slug})"
+    elif (( locked )); then
+      rm_build_dir "${entry}"
+      warn "blob checksum mismatch: ${b}; removed its cache entry ${entry}"
+    else
+      warn "blob checksum mismatch: ${b}; another build holds the image cache lock, so remove ${entry} by hand"
+    fi
+  done
+  exec 8>&-
+  die "corrupt image blobs in the bundle (see above); re-run the build to pull them again"
+fi
 cp "${WORK}/node.sums" "${TREE}/node/SHA256SUMS"
 (cd "${TREE}/node" && sha256sum --quiet --strict -c SHA256SUMS) || die "node/SHA256SUMS does not verify"
 sum_tree "${TREE}" "${WORK}/all.sums"
