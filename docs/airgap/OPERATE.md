@@ -162,10 +162,13 @@ works with your key) and you hold a checked bundle (section 2).
 
    Sign in at `https://auth.teknoir.airgapped/realms/teknoir/account` as
    `platform-admin` with that password. Keycloak asks for a new password at
-   once. Then delete the file. `platform-admin` is in the Keycloak group
-   `admin`, which makes it an administrator in ArgoCD and Harbor.
+   once. Then delete the file. The auth chart's realm import creates
+   `platform-admin` (e-mail `platform-admin@teknoir.airgapped`) in the Keycloak
+   group `admin`, which makes it an administrator in ArgoCD and Harbor. It has
+   no Backstage user: Backstage needs the named admin of the next step.
 
-5. Create a named admin for each person, and sign in to Backstage (section 9):
+5. Create a named admin for each person, and sign in to Backstage with it
+   (section 9):
 
    ```sh
    ./teknoir-airgap admin-user --email anders.aslund@teknoir.ai --out ~/teknoir-admin.txt
@@ -246,7 +249,8 @@ cd teknoir-airgap-<older bundleId>
 ./teknoir-airgap status
 ```
 
-Read-only. Shows the bundle and site, the clock skew between the LAN host and the
+Read-only for the node and the cluster; it only refreshes the node's copy of the
+site config. Shows the bundle and site, the clock skew between the LAN host and the
 node, k3s, the nodes, the release record (deployed bundle id), the ArgoCD
 Applications and the bundle payloads on the node; when this bundle is on the
 node it adds `teknoir-node status` (Harbor, certificate expiry and more).
@@ -330,7 +334,7 @@ when you no longer need it, and never paste a credential into a chat or ticket.
 
 | Name | What |
 |---|---|
-| `platform-admin` | the initial Keycloak administrator in realm `teknoir` (group `admin`); its password must be changed at the first sign-in |
+| `platform-admin` | the initial Keycloak administrator in realm `teknoir` (group `admin`: ArgoCD, Harbor), created by the realm import; its password must be changed at the first sign-in. No Backstage user: use `admin-user` (section 9) |
 | `keycloak-admin`, `keycloak-admin-username` | the Keycloak master realm administrator (break-glass) |
 | `harbor-admin` | Harbor's local `admin` (break-glass; also `https://harbor.teknoir.airgapped/account/sign-in` when OIDC is on) |
 | `argocd-admin` | ArgoCD's local `admin` (break-glass) |
@@ -356,10 +360,21 @@ This:
   temporary password, and puts it in the group `admin`;
 - restarts Backstage's backend once, so its catalog knows the user right away
   (it otherwise reads users every 30 minutes);
-- writes the temporary password to the `--out` file (mode 0600).
+- writes the temporary password to the `--out` file (mode 0600). On the node it
+  exists only for a moment, in a root-only file under
+  `/var/lib/teknoir-airgap/tmp`, which `teknoir-airgap` copies and deletes.
 
-The address may contain letters, digits, `.`, `_` and `-`, but no `+` (the user
-name must be a valid Backstage entity name).
+The address is used in lower case. It may contain letters, digits, `.` and `-`
+around one `@`, with `.` and `-` only between letters or digits; `_` and `+` are
+refused. The user name (the address with `@` replaced by `-at-`) must be a valid
+Kubernetes and Backstage entity name of at most 63 characters, so the address
+can have at most 60.
+
+Re-running `admin-user` for the same address is safe: it leaves the User as it
+is and writes the temporary password user-controller recorded again (useless
+once that user has changed it). If the Keycloak user existed before
+user-controller saw it, there is no temporary password: the command says so and
+writes no file; set a password in Keycloak (realm `teknoir`, Users).
 
 Sign in:
 
@@ -629,7 +644,11 @@ the published default password, delete the old bundle copy in
 other secrets at mode 0644), and move any `.secrets/` and `bundle/*/bootstrap/secrets`
 copies on laptops and USB media into an encrypted backup.
 
-**M2. Backup and baseline.**
+**M2. Backup and baseline.** `backup` is the first `teknoir-airgap` command on
+the live node. Run it in a terminal: it asks you to confirm the node's ssh host
+key, asks once for `teknoir`'s sudo password (and installs
+`/etc/sudoers.d/teknoir-airgap`), copies the bundle payload (about 3 GB) and the
+site config to the node, then takes the backup. Do not run `up` before M4.
 
 ```sh
 ./teknoir-airgap backup --out /media/usb/teknoir-local-premigration
@@ -711,7 +730,7 @@ from a bundle copied there), `--forget-host-key`, `--host-key FINGERPRINT`.
 | Command | What it does |
 |---|---|
 | `./teknoir-airgap up` | Install or update (`--dry-run`, `--rollback`, `--sync-clock`, `--reapply TIER`, `--force-images`, `-- ARGS`) |
-| `./teknoir-airgap status` | Read-only report |
+| `./teknoir-airgap status` | Report (changes only the node's copy of the site config) |
 | `./teknoir-airgap verify` | Check the bundle against `MANIFEST.yaml` (no ssh) |
 | `./teknoir-airgap version` | Bundle id and versions |
 | `./teknoir-airgap kubeconfig` | Write the kubeconfig (`--context NAME`, `--kubeconfig FILE`) |
