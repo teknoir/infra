@@ -12,7 +12,8 @@
 # migrate --dry-run, migrate, k3s restarts, a re-dropped old file, a rotation,
 # --undo, and asserts that no object is lost or re-created (UIDs), that Secret
 # data is untouched, that no Teknoir Addon remains except teknoir-argo (M7),
-# and that K3s's own addons are untouched.
+# and that K3s's own addons are untouched. The safety net: an object of a
+# later name re-created, or a Secret deleted, while migrate runs stops it.
 #
 # Usage: airgap/test/k3d/migrate-test.sh [--keep]
 #   --keep   leave the cluster and temp dir for inspection
@@ -343,6 +344,59 @@ node_fn cmd_migrate --undo teknoir-coredns-custom > "${WORK}/out/undo-again.log"
 check "second undo: K3s re-adopts coredns-custom" bash -c "[[ \$(kubectl --context ${CTX} -n kube-system get cm coredns-custom -o jsonpath='{.metadata.annotations.objectset\.rio\.cattle\.io/owner-name}') == teknoir-coredns-custom ]]"
 node_fn cmd_migrate > "${WORK}/out/migrate4b.log" 2>&1 || bad "migrate after the second undo exits 0"
 check "detached again: only teknoir-argo is left" test "$(teknoir_addons)" == "teknoir-argo"
+
+say "safety net: the baseline covers every object of the run, and the counts"
+# put two names back under K3s; while migrate detaches the first, a stand-in
+# for a faulty step re-creates an object of the second
+node_fn cmd_migrate --undo teknoir-oauth2-proxy-redis-secret --undo teknoir-coredns-custom > "${WORK}/out/undo2.log" 2>&1 \
+  || { bad "undo of two names exits 0"; cat "${WORK}/out/undo2.log"; }
+recreate_when() {
+  # recreate_when <file> <ns> <configmap> — once <file> exists, delete and re-create the ConfigMap (same content, new UID)
+  local i json
+  for (( i = 0; i < 600; i++ )); do
+    if [[ -e "$1" ]]; then
+      json="$(kubectl --context "${CTX}" -n "$2" get cm "$3" -o json | jq 'del(.metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp, .metadata.managedFields)')"
+      kubectl --context "${CTX}" -n "$2" delete cm "$3" --wait=true >/dev/null
+      kubectl --context "${CTX}" create -f - >/dev/null <<<"${json}"
+      return 0
+    fi
+    sleep 0.1
+  done
+}
+recreate_when "${MAN}/teknoir-oauth2-proxy-redis-secret.yaml.skip" kube-system coredns-custom &
+watcher=$!
+if node_fn cmd_migrate > "${WORK}/out/net1.log" 2>&1; then
+  bad "a re-created object of a later name stops migrate"
+else
+  # normally caught right after the first name; if the stand-in is slow, the
+  # check after teknoir-coredns-custom catches it (its own per-name check cannot)
+  check "a re-created object of a later name stops migrate, naming it" \
+    grep -qE 'ConfigMap.v1. kube-system/coredns-custom (re-created \(new UID\)|LOST);.*stopping' "${WORK}/out/net1.log"
+fi
+wait "${watcher}" || true
+node_fn cmd_migrate > "${WORK}/out/net2.log" 2>&1 || { bad "migrate after the stop exits 0 (new baseline)"; cat "${WORK}/out/net2.log"; }
+snapshot > "${WORK}/out/baseline.txt"   # coredns-custom's new UID is the expected state now
+check "after the re-run only teknoir-argo is left" test "$(teknoir_addons)" == "teknoir-argo"
+node_fn cmd_migrate --undo teknoir-keycloak-db-secret > "${WORK}/out/undo3.log" 2>&1 || { bad "undo exits 0"; cat "${WORK}/out/undo3.log"; }
+K -n teknoir-system create secret generic tkn2-canary --from-literal=k=v >/dev/null
+( for (( i = 0; i < 600; i++ )); do
+    if [[ -e "${MAN}/teknoir-keycloak-db-secret.yaml.skip" ]]; then
+      kubectl --context "${CTX}" -n teknoir-system delete secret tkn2-canary --wait=true >/dev/null; exit 0
+    fi
+    sleep 0.1
+  done ) &
+watcher=$!
+if node_fn cmd_migrate > "${WORK}/out/net3.log" 2>&1; then
+  bad "a Secret deleted during migrate (no Addon owns it) stops migrate"
+else
+  check "a Secret deleted during migrate (no Addon owns it) stops migrate, naming the count" \
+    grep -qE 'object counts changed after teknoir-keycloak-db-secret: secrets/teknoir-system ([0-9]+) -> ' "${WORK}/out/net3.log"
+fi
+wait "${watcher}" || true
+check "the baseline is logged as names and counts, never UIDs" bash -c "
+  grep -q 'migrate: baseline: .* object(s) of .* Addon(s)' '${WORK}/out/net1.log' && grep -qE 'baseline counts: .*crds=[0-9]+ .*namespaces=[0-9]+ .*secrets/teknoir-system=[0-9]+' '${WORK}/out/net1.log' &&
+  ! grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' '${WORK}/out/net1.log' '${WORK}/out/net3.log'"
+check "the safety-net runs printed no secret value" bash -c "! grep -q 'dummy-' '${WORK}/out/net1.log' '${WORK}/out/net2.log' '${WORK}/out/net3.log'"
 
 say "result: ${PASS} passed, ${FAIL} failed"
 if (( FAIL > 0 )); then

@@ -2,12 +2,13 @@
 # shellcheck disable=SC2154,SC2016  # DRY_RUN, K3S_DATA_DIR, NODE, NODE_ROOT, TEKNOIR_DOMAIN come from common.sh and the site env; jq programs are single-quoted on purpose
 #
 # lib/migrate.sh — `teknoir-node migrate`: the one-time move of the live
-# teknoir-local off K3s auto-deploy files (docs/airgap/DESIGN.md M3, M6, I-13).
-# TEMPORARY: delete this file once teknoir-local is migrated (M8).
+# teknoir-local off K3s auto-deploy files (docs/airgap/DESIGN.md M3, M6,
+# I-13). TEMPORARY: delete this file once teknoir-local is migrated (M8).
 #
-#   teknoir-node migrate [--dry-run]     detach every Teknoir K3s file, remove the
-#                                        pre-fix bundle copies on the node, retire
-#                                        the Harbor robot once ArgoCD pulls anonymously
+#   teknoir-node migrate [--dry-run]     detach every Teknoir K3s file except
+#                                        teknoir-argo, remove the pre-fix bundle
+#                                        copies on the node, retire the Harbor
+#                                        robot once ArgoCD pulls anonymously (M3, M6)
 #   teknoir-node migrate --undo NAME     re-adopt one detached file (K3s re-applies it)
 #
 # Detach recipe, per name (never the K3s `disable:` list, which deletes objects):
@@ -18,14 +19,18 @@
 #      Addon owns: the objects of each GVK in its addon.k3s.cattle.io/gvks annotation
 #      that carry hash = sha1(id + owner-gvk + owner-name + owner-namespace);
 #   4. delete the Addon object;
-#   5. assert that every one of those objects still exists with the same UID and no
-#      K3s label, and that the CRD and Namespace counts equal the baseline. The
-#      first mismatch stops the run.
+#   5. assert that every object of that name still exists with the same UID and
+#      no K3s label.
+# Safety net (DESIGN M3, I-13): before the first change, a baseline records the
+# UID of every object of every Addon in this run, and the counts of namespaces,
+# Secrets per namespace, CRDs, Applications and the istio/cert-manager kinds of
+# DESIGN M2. After every name all of it is compared again: a lost or
+# re-created object, or any changed count, stops the run with the undo command.
 # Order: orphan Addons (file gone), legacy manifest-*-secret, teknoir-*-secret,
 # 00-teknoir-namespaces, teknoir-coredns-custom and teknoir-app-of-apps, the CRD
 # files, then any other allow-listed name. teknoir-argo is never detached here
-# (DESIGN M7a). Only allow-listed names are touched, never K3s's packaged addons.
-# Every step is idempotent: a re-run (also after a failure) resumes.
+# (DESIGN M7a). Only allow-listed names are touched, never K3s's packaged
+# addons. Every step is idempotent: a re-run (also after a failure) resumes.
 
 MIGRATE_ALLOW_RE='^(teknoir-.+|00-teknoir-.+|05-teknoir-.+|10-teknoir-.+|manifest-.+-secret|app-of-apps)$'
 MIGRATE_EXCLUDED="teknoir-argo"
@@ -33,6 +38,8 @@ MIGRATE_STRIP_PATCH='{"metadata":{"labels":{"objectset.rio.cattle.io/hash":null}
 MIGRATE_REPO_CREDS_NS="teknoir-system"
 MIGRATE_REPO_CREDS="argocd-harbor-repo"
 MIGRATE_ARGOCD_TIMEOUT="${MIGRATE_ARGOCD_TIMEOUT:-180}"
+# counted in the baseline besides CRDs, Namespaces and Secrets per namespace (DESIGN M2)
+MIGRATE_COUNT_KINDS="Application.argoproj.io VirtualService.networking.istio.io Gateway.networking.istio.io DestinationRule.networking.istio.io AuthorizationPolicy.security.istio.io PeerAuthentication.security.istio.io Certificate.cert-manager.io ClusterIssuer.cert-manager.io"
 
 cmd_migrate() {
   local -a undo=()
@@ -65,9 +72,10 @@ Usage: teknoir-node migrate [--dry-run]
 
 Detaches the Teknoir K3s auto-deploy files (DESIGN M3): .skip guard, file moved to
 <data-dir>/server/manifests-retired/<UTC>/, K3s labels stripped, Addon deleted,
-object UIDs asserted. Then removes ~<user>/teknoir-airgap-bundle-* and, once ArgoCD
-reads the public Harbor project without credentials, the robot repo-creds Secret
-and robot$argocd (M6). Safe to re-run. --undo NAME puts a detached file back.
+object UIDs and counts compared with a baseline after every name. Then removes
+~<user>/teknoir-airgap-bundle-* and, once ArgoCD reads the public Harbor project
+without credentials, the robot repo-creds Secret and robot$argocd (M6). Safe to
+re-run. --undo NAME puts a detached file back.
 EOF
 }
 
@@ -99,6 +107,13 @@ migrate_init() {
 
 migrate_allowed() {
   [[ "$1" =~ ${MIGRATE_ALLOW_RE} ]]
+}
+
+migrate_res_served() {
+  # migrate_res_served <Kind.v1.|Kind.group> — 0 when the cluster serves the kind
+  local kind="${1%%.*}" group="${1#*.}"
+  [[ "${group}" != "v1." ]] || group=""
+  grep -qxF -- "${group}/${kind}" <<<"${MIGRATE_KINDS}"
 }
 
 migrate_hash() {
@@ -149,12 +164,93 @@ migrate_objects() {
   MIGRATE_OBJS="$(sort -u <<<"${all}" | sed '/^$/d')"
 }
 
-migrate_counts() {
-  # sets MIGRATE_COUNTS to the CRD and Namespace counts (not for $(...): dies)
-  local crds nss
-  crds="$(kc get customresourcedefinitions.apiextensions.k8s.io -o name)" || die "cannot list the CRDs"
-  nss="$(kc get namespaces -o name)" || die "cannot list the namespaces"
-  MIGRATE_COUNTS="crds=$(grep -c . <<<"${crds}") namespaces=$(grep -c . <<<"${nss}")"
+migrate_list() {
+  # migrate_list <resource> — MIGRATE_LIST: "resource|namespace|name|uid" of
+  # every object of that kind (names only leave kubectl). Not for $(...): dies.
+  local out
+  out="$(kc get "$1" -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.uid}{"\n"}{end}')" \
+    || die "cannot list $1"
+  MIGRATE_LIST="$(awk -v r="$1" -F '|' 'NF >= 3 && $2 != "" {print r "|" $1 "|" $2 "|" $3}' <<<"${out}")"
+}
+
+migrate_count_key() {
+  # the baseline's name for a counted kind
+  case "$1" in
+    CustomResourceDefinition.apiextensions.k8s.io) echo "crds" ;;
+    Namespace.v1.) echo "namespaces" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+migrate_snapshot() {
+  # migrate_snapshot <resources> — MIGRATE_SNAP_OBJS: every object of those
+  # kinds and of the counted kinds ("resource|namespace|name|uid", sorted);
+  # MIGRATE_SNAP_COUNTS: sorted "key=count" lines for CRDs, Namespaces,
+  # Secrets per namespace and MIGRATE_COUNT_KINDS. Not for $(...): dies.
+  local res objs="" counts=""
+  # shellcheck disable=SC2086  # resource names, one word each
+  for res in $(printf '%s\n' CustomResourceDefinition.apiextensions.k8s.io Namespace.v1. Secret.v1. $1 ${MIGRATE_COUNT_KINDS} | sort -u); do
+    migrate_res_served "${res}" || continue
+    migrate_list "${res}"
+    objs+="${MIGRATE_LIST}"$'\n'
+    case " CustomResourceDefinition.apiextensions.k8s.io Namespace.v1. ${MIGRATE_COUNT_KINDS} " in
+      *" ${res} "*) counts+="$(migrate_count_key "${res}")=$(grep -c . <<<"${MIGRATE_LIST}" || true)"$'\n' ;;
+    esac
+    if [[ "${res}" == "Secret.v1." ]]; then
+      counts+="$(awk -F '|' 'NF {n[$2]++} END {for (k in n) print "secrets/" k "=" n[k]}' <<<"${MIGRATE_LIST}")"$'\n'
+    fi
+  done
+  MIGRATE_SNAP_OBJS="$(sed '/^$/d' <<<"${objs}" | sort -u)"
+  MIGRATE_SNAP_COUNTS="$(sed '/^$/d' <<<"${counts}" | LC_ALL=C sort -t '=' -k1,1)"
+}
+
+migrate_baseline() {
+  # Before any change: MIGRATE_BASE_OBJS (every object of every Addon in
+  # MIGRATE_INVENTORY, with its UID), MIGRATE_BASE_RES (their kinds) and
+  # MIGRATE_BASE_COUNTS; logged as names and counts. Not for $(...): dies.
+  local class name base addon gvks objs="" n_addons=0 res
+  while IFS='|' read -r class name base addon gvks; do
+    [[ -n "${name}" && "${addon}" == "1" ]] || continue
+    [[ -n "${gvks}" ]] || die "Addon ${name} has no addon.k3s.cattle.io/gvks annotation; cannot select its objects safely"
+    migrate_objects "${name}" "${gvks}"
+    [[ -z "${MIGRATE_OBJS}" ]] || objs+="${MIGRATE_OBJS}"$'\n'
+    n_addons=$((n_addons + 1))
+  done <<<"${MIGRATE_INVENTORY}"
+  MIGRATE_BASE_OBJS="$(sed '/^$/d' <<<"${objs}" | sort -u)"
+  MIGRATE_BASE_RES="$(cut -d '|' -f1 <<<"${MIGRATE_BASE_OBJS}" | sed '/^$/d' | sort -u | tr '\n' ' ')"
+  migrate_snapshot "${MIGRATE_BASE_RES}"
+  MIGRATE_BASE_COUNTS="${MIGRATE_SNAP_COUNTS}"
+  # every baseline object must be in the snapshot just taken (it was read moments ago)
+  [[ -z "$(comm -23 <(printf '%s\n' "${MIGRATE_BASE_OBJS}") <(printf '%s\n' "${MIGRATE_SNAP_OBJS}"))" ]] \
+    || die "migrate: the cluster changed while the baseline was taken; run migrate again"
+  log "migrate: baseline: $(grep -c . <<<"${MIGRATE_BASE_OBJS}" || true) object(s) of ${n_addons} Addon(s), checked by UID after every name:"
+  for res in ${MIGRATE_BASE_RES}; do
+    log "    ${res}: $(awk -F '|' -v r="${res}" '$1 == r {printf "%s%s ", ($2 == "" ? "" : $2 "/"), $3}' <<<"${MIGRATE_BASE_OBJS}")"
+  done
+  log "migrate: baseline counts: $(tr '\n' ' ' <<<"${MIGRATE_BASE_COUNTS}")"
+}
+
+migrate_check_baseline() {
+  # migrate_check_baseline <name just detached> — dies at the first lost or
+  # re-created baseline object or changed count
+  local after="$1" missing problems="" res ns oname uid changes
+  migrate_snapshot "${MIGRATE_BASE_RES}"
+  missing="$(comm -23 <(printf '%s\n' "${MIGRATE_BASE_OBJS}" | sed '/^$/d') <(printf '%s\n' "${MIGRATE_SNAP_OBJS}"))"
+  if [[ -n "${missing}" ]]; then
+    while IFS='|' read -r res ns oname uid; do
+      if awk -F '|' -v r="${res}" -v n="${ns}" -v o="${oname}" '$1 == r && $2 == n && $3 == o {f = 1} END {exit !f}' <<<"${MIGRATE_SNAP_OBJS}"; then
+        problems+=" ${res} ${ns:+${ns}/}${oname} re-created (new UID);"
+      else
+        problems+=" ${res} ${ns:+${ns}/}${oname} LOST;"
+      fi
+    done <<<"${missing}"
+    die "migrate: after ${after}:${problems} stopping. Investigate before anything else (undo: teknoir-node migrate --undo ${after}); a re-run takes a new baseline"
+  fi
+  if [[ "${MIGRATE_SNAP_COUNTS}" != "${MIGRATE_BASE_COUNTS}" ]]; then
+    changes="$(LC_ALL=C join -t '=' -a 1 -a 2 -e 0 -o 0,1.2,2.2 <(printf '%s\n' "${MIGRATE_BASE_COUNTS}") <(printf '%s\n' "${MIGRATE_SNAP_COUNTS}") \
+      | awk -F '=' '$2 != $3 {printf "%s %s -> %s; ", $1, $2, $3}')"
+    die "migrate: object counts changed after ${after}: ${changes}stopping. Investigate before anything else (undo: teknoir-node migrate --undo ${after}); a re-run takes a new baseline"
+  fi
 }
 
 migrate_class() {
@@ -221,12 +317,9 @@ migrate_inventory() {
 }
 
 migrate_detach_all() {
-  local inventory class name base addon gvks baseline n=0 last_class=""
+  local inventory class name base addon gvks n=0 last_class=""
   migrate_inventory
   inventory="${MIGRATE_INVENTORY}"
-  migrate_counts
-  baseline="${MIGRATE_COUNTS}"
-  log "migrate: baseline ${baseline}"
   if [[ -z "${inventory}" ]]; then
     log "migrate: no Teknoir K3s files or Addons left to detach (${MIGRATE_EXCLUDED} is migrated in M7)"
   else
@@ -239,17 +332,14 @@ migrate_detach_all() {
       log "    ${name} (file: ${base}, Addon: $([[ "${addon}" == "1" ]] && echo present || echo absent))"
     done <<<"${inventory}"
   fi
+  migrate_baseline
   while IFS='|' read -r class name base addon gvks; do
     [[ -n "${name}" ]] || continue
     migrate_detach "${name}" "${base}" "${addon}" "${gvks}"
     n=$((n + 1))
-    if [[ "${DRY_RUN}" != "1" ]]; then
-      migrate_counts
-      [[ "${MIGRATE_COUNTS}" == "${baseline}" ]] \
-        || die "migrate: object counts changed after ${name}: ${MIGRATE_COUNTS}, baseline ${baseline}; stopping (undo: teknoir-node migrate --undo ${name})"
-    fi
+    [[ "${DRY_RUN}" == "1" ]] || migrate_check_baseline "${name}"
   done <<<"${inventory}"
-  migrate_report "${baseline}" "${n}"
+  migrate_report "${n}"
 }
 
 migrate_detach() {
@@ -271,6 +361,7 @@ migrate_detach() {
     return 0
   fi
   log "${name}: detaching (${count} object(s))"
+  [[ -z "${objs}" ]] || awk -F '|' '{print "[teknoir-node]     " $1 " " ($2 == "" ? "" : $2 "/") $3}' <<<"${objs}" >&2
   # 1. guard: K3s skips <file>.skip's file, so no old bundle can re-create it
   if [[ ! -e "${skip}" ]]; then
     ( umask 077 && : > "${skip}" ) || die "cannot create ${skip}"
@@ -327,16 +418,16 @@ migrate_assert_objects() {
 }
 
 migrate_report() {
-  local baseline="$1" n="$2" left labelled
+  local n="$1" left labelled expect=""
   if [[ "${DRY_RUN}" == "1" ]]; then
     log "[dry-run] migrate: ${n} name(s) would be detached; nothing was changed"
     return 0
   fi
-  migrate_counts
-  log "migrate: ${n} name(s) processed; counts ${MIGRATE_COUNTS} (baseline ${baseline})"
+  log "migrate: ${n} name(s) processed; every baseline object kept its UID, counts as in the baseline"
   left="$(kc -n kube-system get addons.k3s.cattle.io -o name)" || die "cannot list the K3s Addons"
   left="$(awk -F / -v re="${MIGRATE_ALLOW_RE}" '$NF ~ re {printf "%s ", $NF}' <<<"${left}")"
-  log "migrate: Teknoir Addons left: ${left:-none}$([[ "${left}" == "${MIGRATE_EXCLUDED} " ]] && echo "(expected: migrated in M7)")"
+  [[ "${left}" != "${MIGRATE_EXCLUDED} " ]] || expect="(expected: migrated in M7)"
+  log "migrate: Teknoir Addons left: ${left:-none}${expect}"
   labelled="$(kc get customresourcedefinitions.apiextensions.k8s.io,namespaces -l objectset.rio.cattle.io/hash \
     -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.annotations.objectset\.rio\.cattle\.io/owner-name}{"\n"}{end}')" \
     || die "cannot list the K3s-labelled CRDs and namespaces"
