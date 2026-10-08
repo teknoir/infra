@@ -177,6 +177,114 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
   grep -q 'local dir="$1" cmd="$2" site="${SITE_FILE}"' "${E2E}"
 }
 
+vm_args_with_shell() {
+  # vm_args_with_shell <code> — print every line of <code> on which a vmx or
+  # vm_kc call has a quoted argument holding shell syntax (< > | ; & or $( in
+  # single quotes). vmx %q-quotes each word, so the VM gets such an argument
+  # as one literal word: `vmx 'cat > f'` runs a command named "cat > f" (exit
+  # 127). Words after the call's end (an unquoted | ; & < > or ")") are not
+  # its arguments; ${...} and $(...) in double quotes expand locally; the
+  # script of `vmx [sudo] sh|bash -c '...'` is meant for that shell.
+  local line rest i c q word
+  while IFS= read -r line; do
+    [[ "${line}" =~ (^|[[:space:]\;\&\|\(])(vmx|vm_kc)[[:space:]](.*)$ ]] || continue
+    rest="${BASH_REMATCH[3]}" q="" word=""
+    [[ "${rest}" =~ ^[[:space:]]*(sudo[[:space:]]+)?(ba)?sh[[:space:]]+-c[[:space:]] ]] && continue
+    for (( i = 0; i < ${#rest}; i++ )); do
+      c="${rest:i:1}"
+      if [[ -n "${q}" ]]; then
+        if [[ "${c}" != "${q}" ]]; then word+="${c}"; continue; fi
+        if [[ "${q}" == '"' ]]; then
+          word="$(sed -E 's/\$\{[^}]*\}//g; s/\$\([^)]*\)//g' <<<"${word}")"
+          [[ "${word}" =~ [\<\>\|\;\&] ]] && { printf '%s\n' "${line}"; break; }
+        else
+          [[ "${word}" =~ [\<\>\|\;\&\`]|\$\( ]] && { printf '%s\n' "${line}"; break; }
+        fi
+        q="" word=""
+      else
+        case "${c}" in
+          "'"|'"') q="${c}" ;;
+          '|'|';'|'&'|'<'|'>'|')') break ;;
+        esac
+      fi
+    done
+  done <<<"$1"
+}
+
+@test "e2e.sh: no vmx/vm_kc argument hides shell syntax (vmx %q-quotes every word)" {
+  # self-check of the detector: planted bad calls are found, valid ones are not
+  local planted
+  planted="$(cat <<'EOF'
+vmx 'cat > /tmp/e2e-transcript.log' < "${TRANSCRIPT}"
+x="$(vmx "sudo ls /x | wc -l")"
+vmx 'echo $(id)'
+vmx sudo sh -c 'echo $(id) > /tmp/id'
+vm_kc get pods -A -o json | jq -r '.items[] | .metadata.name'
+vmx sudo rm -rf "/var/lib/teknoir-airgap/bundles/$1" > /dev/null 2>&1 || true
+vmx sudo pkill -TERM -f 'teknoir-node converge' > /dev/null 2>&1 || true
+vmx sudo k3s ctr -n k8s.io images rm "${img}" "$(printf '%s|%s' a b)"
+EOF
+)"
+  [ "$(vm_args_with_shell "${planted}" | wc -l)" -eq 3 ]
+  # every call in e2e.sh, as bash parsed it (declare -f: no comments)
+  local hits
+  hits="$(vm_args_with_shell "$(bash -c "source '${E2E}' && declare -f")")"
+  [ -z "${hits}" ] || { echo "${hits}"; return 1; }
+}
+
+@test "e2e.sh: vm_upload writes its stdin to the VM path (0600), where vmx with a redirection fails" {
+  # shellcheck source=../vm/e2e.sh
+  source "${E2E}"
+  # vm.sh ssh <command string> -> the VM's login shell runs the string
+  VM="${BATS_TEST_TMPDIR}/vm.sh"
+  printf '#!/usr/bin/env bash\n[ "$1" = ssh ] || exit 9\ncd "%s" && exec bash -c "$2"\n' "${BATS_TEST_TMPDIR}" > "${VM}"
+  chmod +x "${VM}"
+  printf 'line one\nline two\n' > "${BATS_TEST_TMPDIR}/src"
+  mkdir -p "${BATS_TEST_TMPDIR}/up"
+  vm_upload "${BATS_TEST_TMPDIR}/up/t r.log" < "${BATS_TEST_TMPDIR}/src"
+  cmp "${BATS_TEST_TMPDIR}/src" "${BATS_TEST_TMPDIR}/up/t r.log"
+  [ "$(stat -c %a "${BATS_TEST_TMPDIR}/up/t r.log")" = 600 ]
+  # the pre-fix E7 call: the VM gets the single word 'cat > /tmp/...'
+  run -127 vmx 'cat > out.log' < "${BATS_TEST_TMPDIR}/src"
+  [ "${status}" -eq 127 ]
+  [ ! -e "${BATS_TEST_TMPDIR}/out.log" ]
+}
+
+@test "e2e.sh: added_lines (E4, E8) returns the changed lines under set -euo pipefail" {
+  # diff exits 1 when the lines differ, the expected case; it must not abort
+  run bash -c "set -euo pipefail; source '${E2E}'
+    c=\"\$(added_lines \"\$(printf 'a 1\nb 2\nc 3')\" \"\$(printf 'a 1\nb 5\nc 3\nd 1')\" | awk '{print \$1}' | tr '\n' ' ')\"
+    echo \"changed=[\${c}]\"
+    s=\"\$(added_lines x x)\"
+    echo \"same=[\${s}]\""
+  [ "${status}" -eq 0 ]
+  [ "${lines[0]}" = "changed=[b d ]" ]
+  [ "${lines[1]}" = "same=[]" ]
+}
+
+@test "e2e.sh: image_names (E3) matches pod image refs the way containerd lists them" {
+  # shellcheck source=../vm/e2e.sh
+  source "${E2E}"
+  local ref want got
+  while IFS='|' read -r ref want; do
+    got="$(image_names "${ref}" | tr '\n' ' ' | sed 's/ $//')"
+    [ "${got}" = "${want}" ] || { echo "${ref}: got '${got}', want '${want}'"; return 1; }
+  done <<'EOF'
+busybox:latest|docker.io/library/busybox:latest
+busybox|docker.io/library/busybox:latest
+rancher/mirrored-pause:3.6|docker.io/rancher/mirrored-pause:3.6
+docker.io/busybox:1.36|docker.io/library/busybox:1.36
+docker.io/alpine/k8s:1.34.11|docker.io/alpine/k8s:1.34.11
+quay.io/kiwigrid/k8s-sidecar:2.5.4|quay.io/kiwigrid/k8s-sidecar:2.5.4
+harbor.teknoir.airgapped/teknoir/x:1|harbor.teknoir.airgapped/teknoir/x:1
+ghcr.io/teknoir/backstage|ghcr.io/teknoir/backstage:latest
+localhost/foo|localhost/foo:latest
+registry:5000/foo|registry:5000/foo:latest
+ghcr.io/teknoir/backstage@sha256:abc|ghcr.io/teknoir/backstage@sha256:abc
+busybox:1.36@sha256:abc|docker.io/library/busybox:1.36@sha256:abc docker.io/library/busybox@sha256:abc docker.io/library/busybox:1.36
+EOF
+}
+
 # ---------------------------------------------------------------------------
 # kc-login.sh
 # ---------------------------------------------------------------------------

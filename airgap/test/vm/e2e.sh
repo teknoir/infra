@@ -84,9 +84,48 @@ usage() { sed -n '3,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 # ---------------------------------------------------------------------------
 need() { local t; for t in "$@"; do command -v "${t}" >/dev/null 2>&1 || tl_die "missing tool: ${t}"; done; }
 
+# vmx quotes every word with %q, so the VM runs exactly one simple command:
+# shell syntax (redirections, pipes, ;) inside one argument is NOT interpreted
+# there (harness.bats checks every call). Use vm_upload or vm_root for that.
 vmx() { "${VM}" ssh "$(printf '%q ' "$@")"; }      # one command on the VM (as teknoir)
 vm_kc() { vmx sudo k3s kubectl "$@"; }
 vm_root() { "${VM}" ssh 'sudo bash -s'; }          # a root script on stdin
+vm_upload() { "${VM}" ssh "umask 077; cat > $(printf '%q' "$1")"; }   # vm_upload <path> < file (0600, as teknoir)
+
+added_lines() {
+  # added_lines <before> <after> — the lines of <after> that are not in
+  # <before> (new or changed). diff exits 1 when anything differs, which is
+  # the expected case here, not an error (set -o pipefail).
+  { diff <(printf '%s\n' "$1") <(printf '%s\n' "$2") || (( $? == 1 )); } | sed -n 's/^> //p'
+}
+
+image_names() {
+  # image_names <ref> — the names containerd (crictl repoTags/repoDigests)
+  # lists for a pod image ref, one per line: the Docker reference
+  # normalization (no '/' -> docker.io/library/; a first component without
+  # '.' or ':' that is not localhost -> docker.io/; default tag latest), plus
+  # name@digest for a ref with both a tag and a digest.
+  local img="$1" first name dig
+  if [[ "${img}" != */* ]]; then
+    img="docker.io/library/${img}"
+  else
+    first="${img%%/*}"
+    if [[ "${first}" != *.* && "${first}" != *:* && "${first}" != localhost ]]; then
+      img="docker.io/${img}"
+    elif [[ "${first}" == docker.io || "${first}" == index.docker.io ]] && [[ "${img#*/}" != */* ]]; then
+      img="docker.io/library/${img#*/}"
+    fi
+  fi
+  if [[ "${img}" == *@* ]]; then
+    name="${img%@*}" dig="${img#*@}"
+    printf '%s\n' "${img}"
+    if [[ "${name##*/}" == *:* ]]; then printf '%s@%s\n%s\n' "${name%:*}" "${dig}" "${name}"; fi
+  elif [[ "${img##*/}" == *:* ]]; then
+    printf '%s\n' "${img}"
+  else
+    printf '%s:latest\n' "${img}"
+  fi
+}
 
 lan() {
   # lan <dir> <cmd...> — run in the LAN netns, cwd <dir>; output to the terminal and transcript
@@ -346,9 +385,7 @@ e3() {
   images="$(vmx sudo k3s crictl images -o json | jq -r '.images[] | (.repoTags[]?, .repoDigests[]?)' | sort -u)"
   bad="$(vm_kc get pods -A -o json | jq -r '.items[].spec | (.containers + (.initContainers // []))[].image' | sort -u |
          while read -r img; do
-           ref="${img}"; [[ "${ref}" == */*/* || "${ref}" == *.*/* ]] || ref="docker.io/${ref}"
-           [[ "${ref}" == */*/* || "${ref}" == *.*/* ]] || ref="docker.io/library/${ref#docker.io/}"
-           grep -qxF -- "${ref}" <<<"${images}" || grep -qxF -- "${img}" <<<"${images}" || echo "${img}"
+           grep -qxF -f <(image_names "${img}"; printf '%s\n' "${img}") <<<"${images}" || echo "${img}"
          done)"
   assert_eq "every pod image is present in containerd (imported, or pulled through the harbor.${DOMAIN} mirror)" "" "${bad}"
   assert_eq "no ErrImagePull/ImagePullBackOff events" 0 \
@@ -374,7 +411,7 @@ e4() {
   if up_in "${b}"; then pass "up with bundle B exits 0"; else fail "up with bundle B failed"; return 0; fi
   wait_apps 1800 || true
   after="$(apps_state | awk '{print $1, $4, $5}')"
-  changed="$(diff <(echo "${before}") <(echo "${after}") | awk '/^>/ {print $2}' | sort -u | tr '\n' ' ')"
+  changed="$(added_lines "${before}" "${after}" | awk '{print $1}' | sort -u | tr '\n' ' ')"
   if [[ -n "${changed}" ]]; then pass "Applications changed by B: ${changed}"; else fail "no Application changed revision with bundle B"; fi
   for app in ${changed}; do
     [[ " ${allowed} " == *" ${app} "* ]] || fail "Application ${app} changed but is not in E2E_E4_APPS (${allowed})"
@@ -493,7 +530,7 @@ e7() {
   tl_case E7 "secrets hygiene: no Secret value in the transcript or node logs; no private key in the tar"
   ensure_vm
   local res
-  vmx 'cat > /tmp/e2e-transcript.log' < "${TRANSCRIPT}"
+  vm_upload /tmp/e2e-transcript.log < "${TRANSCRIPT}"
   # The scan runs on the VM: values are read and compared there, never printed.
   res="$(vm_root <<'EOF'
 set -eu
@@ -554,7 +591,7 @@ e8() {
   if tk "${dir}" rotate oauth2-proxy-cookie; then pass "rotate oauth2-proxy-cookie exits 0"; else fail "rotate failed"; return 0; fi
   wait_apps 900 || true
   after="$(snap_secret_rvs)"
-  changed="$(diff <(echo "${before}") <(echo "${after}") | awk '/^>/ {print $2 "/" $3}' | sort -u | tr '\n' ' ')"
+  changed="$(added_lines "${before}" "${after}" | awk '{print $1 "/" $2}' | sort -u | tr '\n' ' ')"
   assert_eq "only teknoir-auth/oauth2-proxy-secret changed" "teknoir-auth/oauth2-proxy-secret " "${changed}"
   pods_after="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app.kubernetes.io/name=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
   if [[ -n "${pods_after}" && "${pods_after}" != "${pods_before}" ]]; then pass "oauth2-proxy pods were replaced"; else fail "oauth2-proxy did not roll"; fi
