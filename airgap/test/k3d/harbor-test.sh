@@ -29,7 +29,8 @@ KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tkn2-harbor.XXXXXX")"
 NODE="${WORK}/node"
-mkdir -p "${NODE}/bin" "${NODE}/charts" "${NODE}/images" "${NODE}/bootstrap-images" "${WORK}/out" "${WORK}/home" "${WORK}/tmp" "${WORK}/src"
+mkdir -p "${NODE}/bin" "${NODE}/charts" "${NODE}/images" "${NODE}/bootstrap-images" "${WORK}/out" "${WORK}/home" "${WORK}/tmp" "${WORK}/src" \
+  "${WORK}/k3s/server/manifests" "${WORK}/legacy-home"
 for t in crane helm jq; do ln -s "$(command -v "${t}")" "${NODE}/bin/${t}"; done
 
 PASS=0
@@ -42,9 +43,11 @@ check() { local d="$1"; shift; if "$@"; then ok "${d}"; else bad "${d}"; fi; }
 K() { kubectl --context "${CTX}" "$@"; }
 
 API_PID=""
+ARGO_PID=""
 cleanup() {
   local rc=$?
   [[ -z "${API_PID}" ]] || kill "${API_PID}" 2>/dev/null || true
+  [[ -z "${ARGO_PID}" ]] || kill "${ARGO_PID}" 2>/dev/null || true
   if [[ "${KEEP}" == "1" ]]; then
     echo "kept: cluster ${CLUSTER}, registry container tkn2-registry, work dir ${WORK}"
   else
@@ -63,6 +66,7 @@ harbor() {
     KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG:-${HOME}/.kube/config}" KUBECACHEDIR="${WORK}/kcache" \
     NODE_ROOT="${NODE}" TEKNOIR_DOMAIN=teknoir.airgapped \
     HARBOR_API="http://127.0.0.1:${API_PORT}/api/v2.0" HARBOR_REGISTRY="${REG}" HARBOR_HELM_OPTS="--plain-http" \
+    HARBOR_HOST="${REG}" K3S_DATA_DIR="${WORK}/k3s" MIGRATE_LEGACY_HOME="${WORK}/legacy-home" MIGRATE_ARGOCD_TIMEOUT=60 \
     HARBOR_HEALTH_TIMEOUT=30 STUB_WAIT_INTERVAL=1 DRY_RUN="${DRY_RUN:-0}" \
     "${REPO}/airgap/test/stubs/teknoir-node-stub" "$@"
 }
@@ -156,6 +160,74 @@ if harbor phase_harbor > "${WORK}/out/run6.log" 2>&1; then bad "a moved tag is r
 fi
 harbor phase_harbor --force-images > "${WORK}/out/run7.log" 2>&1 || { bad "--force-images exits 0"; cat "${WORK}/out/run7.log"; }
 check "--force-images moves the tag to the bundle's image" bash -c "grep -q 'pushed image docker.io/library/busybox:1.36.1' '${WORK}/out/run7.log' && harbor_out=\$(cat '${WORK}/out/run7.log') && [[ \$(crane config '${REG}/dockerhub/library/busybox:1.36.1' | sha256sum | cut -d' ' -f1) == \$(jq -r .config.digest '${NODE}/images/busybox/blobs/sha256/'\$(jq -r '.manifests[0].digest' '${NODE}/images/busybox/index.json' | cut -d: -f2) | cut -d: -f2) ]]"
+
+say "migrate, M6: retire the robot repo-creds Secret only once ArgoCD reads the public project"
+fake_argocd() {
+  # answers a hard refresh of app-of-apps like ArgoCD: a comparison error while
+  # ${WORK}/argocd-fail exists, Synced otherwise
+  local now st
+  while sleep 1; do
+    [[ -n "$(kubectl --context "${CTX}" -n teknoir-system get applications.argoproj.io app-of-apps -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/refresh}' 2>/dev/null)" ]] || continue
+    now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ -e "${WORK}/argocd-fail" ]]; then
+      st="{\"reconciledAt\":\"${now}\",\"sync\":{\"status\":\"Unknown\"},\"conditions\":[{\"type\":\"ComparisonError\",\"message\":\"401 unauthorized\"}]}"
+    else
+      st="{\"reconciledAt\":\"${now}\",\"sync\":{\"status\":\"Synced\"},\"conditions\":[]}"
+    fi
+    kubectl --context "${CTX}" -n teknoir-system patch applications.argoproj.io app-of-apps --type=merge \
+      -p "{\"metadata\":{\"annotations\":{\"argocd.argoproj.io/refresh\":null}},\"status\":${st}}" >/dev/null 2>&1 || true
+  done
+}
+K apply -f - >/dev/null <<'YAML'
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata: {name: applications.argoproj.io}
+spec:
+  group: argoproj.io
+  names: {plural: applications, singular: application, kind: Application, listKind: ApplicationList}
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema: {type: object, x-kubernetes-preserve-unknown-fields: true}
+YAML
+K wait --for=condition=Established crd/applications.argoproj.io --timeout=60s >/dev/null
+printf 'apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata: {name: app-of-apps, namespace: teknoir-system}\nspec: {source: {repoURL: %s/teknoir, chart: app-of-apps, targetRevision: 0.0.4}}\n' "${REG}" | K apply -f - >/dev/null
+th create "${WORK}/src/app-of-apps" >/dev/null
+sed -i 's/^version:.*/version: 0.0.4/' "${WORK}/src/app-of-apps/Chart.yaml"
+th package "${WORK}/src/app-of-apps" -d "${WORK}/src" >/dev/null
+th push "${WORK}/src/app-of-apps-0.0.4.tgz" "oci://${REG}/teknoir" --plain-http >/dev/null 2>&1
+K -n teknoir-system create secret generic argocd-harbor-repo \
+  --from-literal=type=helm --from-literal=url=harbor.teknoir.airgapped/teknoir \
+  --from-literal=username="robot\$argocd" --from-literal=password="robot-$(openssl rand -hex 8)" >/dev/null
+K -n teknoir-system label secret argocd-harbor-repo argocd.argoproj.io/secret-type=repo-creds >/dev/null
+repo_creds_hash="$(K -n teknoir-system get secret argocd-harbor-repo -o json | jq -cS .data | sha256sum)"
+curl -fsS -X POST "http://127.0.0.1:${API_PORT}/test/robot?name=argocd" >/dev/null
+fake_argocd &
+ARGO_PID=$!
+
+harbor cmd_migrate > "${WORK}/out/m1.log" 2>&1 || { bad "migrate exits 0 (nothing ready)"; cat "${WORK}/out/m1.log"; }
+check "no credential-less repository yet: robot kept, Secret kept" bash -c "grep -q 'robot: not yet: no credential-less ArgoCD repository Secret' '${WORK}/out/m1.log' && kubectl --context ${CTX} -n teknoir-system get secret argocd-harbor-repo -o name >/dev/null"
+
+K -n teknoir-system create secret generic harbor-teknoir-oci --from-literal=type=helm --from-literal=enableOCI=true \
+  --from-literal=url="oci://${REG}/teknoir" >/dev/null
+K -n teknoir-system label secret harbor-teknoir-oci argocd.argoproj.io/secret-type=repository >/dev/null
+touch "${WORK}/argocd-fail"
+if harbor cmd_migrate > "${WORK}/out/m2.log" 2>&1; then bad "ArgoCD failing without the robot stops migrate"; else
+  check "ArgoCD failing without the robot: Secret put back, migrate stops" grep -q 'the Secret was put back' "${WORK}/out/m2.log"
+fi
+check "the restored Secret has the same data" bash -c "[[ \$(kubectl --context ${CTX} -n teknoir-system get secret argocd-harbor-repo -o json | jq -cS .data | sha256sum) == '${repo_creds_hash}' ]]"
+check "robot kept while the Secret is back" bash -c "[[ \$(curl -fsS http://127.0.0.1:${API_PORT}/test/state | jq '.robots | length') == 1 ]]"
+
+rm -f "${WORK}/argocd-fail"
+harbor cmd_migrate > "${WORK}/out/m3.log" 2>&1 || { bad "migrate exits 0 (ready)"; cat "${WORK}/out/m3.log"; }
+check "ArgoCD reads anonymously: repo-creds Secret deleted" bash -c "! kubectl --context ${CTX} -n teknoir-system get secret argocd-harbor-repo -o name 2>/dev/null && grep -q 'deleted the robot repo-creds Secret' '${WORK}/out/m3.log'"
+check "then robot\$argocd deleted" bash -c "[[ \$(curl -fsS http://127.0.0.1:${API_PORT}/test/state | jq '.robots | length') == 0 ]] && grep -q 'deleted the Harbor robot account' '${WORK}/out/m3.log'"
+harbor cmd_migrate > "${WORK}/out/m4.log" 2>&1 || bad "migrate re-run exits 0"
+check "migrate re-run: 0 changes" grep -q 'summary: 0 change' "${WORK}/out/m4.log"
+check "no robot password in any migrate output" bash -c "! grep -q 'robot-[0-9a-f]\{16\}' '${WORK}/out/m1.log' '${WORK}/out/m2.log' '${WORK}/out/m3.log' '${WORK}/out/m4.log'"
 
 say "hygiene"
 check "the admin password appears in no output" bash -c "! grep -rqF -- '${PW}' '${WORK}/out'"
