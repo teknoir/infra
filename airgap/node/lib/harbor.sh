@@ -38,6 +38,8 @@ HARBOR_CHART_PROJECT="teknoir"
 HARBOR_MIRRORS="${HARBOR_MIRRORS:-docker.io=dockerhub ghcr.io=ghcr gcr.io=gcr quay.io=quay registry.k8s.io=k8s}"
 HARBOR_PLATFORM="${HARBOR_PLATFORM:-linux/amd64}"
 HARBOR_HEALTH_TIMEOUT="${HARBOR_HEALTH_TIMEOUT:-900}"
+HARBOR_PUSH_ATTEMPTS="${HARBOR_PUSH_ATTEMPTS:-4}"
+HARBOR_RETRY_DELAY="${HARBOR_RETRY_DELAY:-5}"
 HARBOR_SECRET_NS="${HARBOR_SECRET_NS:-teknoir-system}"
 HARBOR_SECRET_NAME="${HARBOR_SECRET_NAME:-harbor-secret}"
 HARBOR_CHART_MEDIA_TYPE="application/vnd.cncf.helm.chart.content.v1.tar+gzip"
@@ -255,6 +257,55 @@ harbor_healthy() {
           | length > 0 and all)' "${HARBOR_TMP}/body" >/dev/null 2>&1
 }
 
+harbor_push_retry() {
+  # harbor_push_retry <description> <landed-check> [args...] -- <push command...>
+  # Harbor answers 502/503 for a while when its pods settle, e.g. after the
+  # k3s restart of the pre-change backup. A failed push is retried once Harbor
+  # reports healthy again, HARBOR_PUSH_ATTEMPTS times in all; before each retry
+  # <landed-check> [args] says whether the failed attempt landed after all
+  # (project teknoir's tags are immutable: that push must not be repeated).
+  # The last attempt's stderr is left in ${HARBOR_TMP}/err.
+  local desc="$1" n=1 delay="${HARBOR_RETRY_DELAY}"
+  local -a check=()
+  shift
+  while [[ $# -gt 0 && "$1" != "--" ]]; do check+=("$1"); shift; done
+  [[ "${1:-}" == "--" ]] || die "harbor_push_retry: missing -- before the push command"
+  shift
+  until "$@" >/dev/null 2> "${HARBOR_TMP}/err.push"; do
+    if (( n >= HARBOR_PUSH_ATTEMPTS )); then
+      cp "${HARBOR_TMP}/err.push" "${HARBOR_TMP}/err"
+      return 1
+    fi
+    warn "${desc}: attempt ${n} of ${HARBOR_PUSH_ATTEMPTS} failed ($(tail -1 "${HARBOR_TMP}/err.push" | cut -c1-200)); retrying once Harbor is healthy"
+    sleep "${delay}"
+    wait_for "the Harbor API at ${HARBOR_API}" "${HARBOR_HEALTH_TIMEOUT}" harbor_healthy
+    if "${check[@]}"; then
+      log "${desc}: the failed attempt landed after all"
+      return 0
+    fi
+    n=$((n + 1))
+    delay=$((delay * 2))
+  done
+}
+
+harbor_chart_landed() {
+  # harbor_chart_landed <ref> <tgz> — the chart is in Harbor with this content
+  local d
+  harbor_remote_manifest "$1" || return 1
+  d="$("${HARBOR_JQ}" -r --arg mt "${HARBOR_CHART_MEDIA_TYPE}" '[.layers[]? | select(.mediaType == $mt) | .digest][0] // empty' <<<"${HARBOR_REMOTE}")"
+  [[ "${d}" == "sha256:$(sha256_file "$2")" ]]
+}
+
+harbor_image_landed() {
+  # harbor_image_landed <target> <config-digest|""> — the image is in Harbor
+  if [[ -n "$2" ]]; then
+    harbor_remote_config_digest "$1"
+    [[ "${HARBOR_REMOTE_CFG}" == "$2" ]]
+  else
+    harbor_remote_manifest "$1"
+  fi
+}
+
 harbor_login() {
   # crane (reads and image pushes) logs in to the temp DOCKER_CONFIG; it does
   # not contact the registry. helm logs in only when a chart is pushed.
@@ -463,7 +514,9 @@ harbor_push_charts() {
       continue
     fi
     harbor_helm_login
-    harbor_helm push "${tgz}" "oci://${HARBOR_REGISTRY}/${HARBOR_CHART_PROJECT}" >/dev/null 2> "${HARBOR_TMP}/err" \
+    harbor_push_retry "helm push ${name} ${version}" \
+        harbor_chart_landed "${HARBOR_REGISTRY}/${HARBOR_CHART_PROJECT}/${name}:${version}" "${tgz}" -- \
+        harbor_helm push "${tgz}" "oci://${HARBOR_REGISTRY}/${HARBOR_CHART_PROJECT}" \
       || die "helm push ${name} ${version} failed: $(tail -1 "${HARBOR_TMP}/err")"
     harbor_remote_manifest "${HARBOR_REGISTRY}/${HARBOR_CHART_PROJECT}/${name}:${version}" \
       || die "chart ${name} ${version} is not in Harbor after the push"
@@ -616,7 +669,8 @@ harbor_push_images() {
       log "[dry-run] would push ${ref} -> ${target}"
       continue
     fi
-    harbor_crane push "${src}" "${target}" >/dev/null 2> "${HARBOR_TMP}/err" \
+    harbor_push_retry "crane push ${ref}" harbor_image_landed "${target}" "${cfg}" -- \
+        harbor_crane push "${src}" "${target}" \
       || die "crane push ${ref} -> ${target} failed: $(tail -1 "${HARBOR_TMP}/err")"
     if [[ -n "${cfg}" ]]; then
       harbor_remote_config_digest "${target}"

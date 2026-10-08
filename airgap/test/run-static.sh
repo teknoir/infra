@@ -9,7 +9,8 @@
 #      flag a `! cmd` that cannot fail the test)
 #   2. the LAN entrypoint under docker bash:3.2 (macOS /bin/bash): syntax and help
 #   3. bats unit tests (airgap/test/bats/run.sh, pinned bats-core)
-#   4. the node runner's own unit tests (airgap/test/node/run.sh), when present
+#   4. the node runner's own unit tests (airgap/test/node/run.sh), when present,
+#      and the library unit tests (airgap/test/unit/*-test.sh)
 #   5. gitleaks over the history of HEAD and the working tree
 #      (config: airgap/test/gitleaks.toml)
 #
@@ -97,6 +98,12 @@ if [[ -x "${HERE}/node/run.sh" ]]; then
 else
   result SKIP "airgap/test/node/run.sh (not in the tree yet)"
 fi
+# ---------------------------------------------------------------------------
+step "library unit tests (airgap/test/unit)"
+for t in "${HERE}"/unit/*-test.sh; do
+  [[ -f "${t}" ]] || continue
+  if bash "${t}"; then result PASS "${t#"${REPO}"/}"; else result FAIL "${t#"${REPO}"/}"; fi
+done
 
 # ---------------------------------------------------------------------------
 step "gitleaks"
