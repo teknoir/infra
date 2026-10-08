@@ -258,15 +258,38 @@ ssh_query() {
 
 ssh_sudo_write() {
   # ssh_sudo_write <local-file> <remote-path> [mode]
-  local src="$1" dst="$2" mode="${3:-0644}"
+  # Writes a hidden temp file next to <remote-path> (K3s ignores dot-files and
+  # non-.yaml/.tar names) and renames it into place, so the K3s deploy
+  # controller never applies a half-written manifest (which would prune the
+  # objects missing from it) and a secret never exists with a wider mode.
+  local src="$1" dst="$2" mode="${3:-0644}" dir tmp
+  dir="$(dirname "${dst}")"
+  tmp="${dir}/.$(basename "${dst}").tmp"
   if [[ "${DRY_RUN}" == "1" ]]; then
     log "[dry-run] copy ${src} -> ${TEKNOIR_HOST}:${dst} (mode ${mode})"
     return 0
   fi
   # shellcheck disable=SC2029
   ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
-    "sudo mkdir -p '$(dirname "${dst}")' && sudo tee '${dst}' >/dev/null && sudo chmod ${mode} '${dst}'" \
+    "sudo mkdir -p '${dir}' && sudo sh -c 'umask 077 && cat > \"${tmp}\" && chmod ${mode} \"${tmp}\" && mv -f \"${tmp}\" \"${dst}\"'" \
     < "${src}"
+}
+
+remote_sha256() {
+  # remote_sha256 <remote-path> — sha256 of a file on the node, empty when it
+  # is absent or the node is unreachable. Read-only, so it runs in dry-run too.
+  ssh_query "sudo sha256sum '$1' 2>/dev/null | cut -d' ' -f1" 2>/dev/null || true
+}
+
+ssh_sync_file() {
+  # ssh_sync_file <local-file> <remote-path> [mode] — copy only when the node's
+  # copy differs. Returns 0 when the node (would have) changed, 1 when not.
+  local src="$1" dst="$2" mode="${3:-0644}"
+  if [[ "$(remote_sha256 "${dst}")" == "$(sha256_file "${src}")" ]]; then
+    return 1
+  fi
+  # Called in `if` context, where set -e is off: fail loudly, not "unchanged".
+  ssh_sudo_write "${src}" "${dst}" "${mode}" || die "copying ${src} to ${TEKNOIR_HOST}:${dst} failed"
 }
 
 remote_kubectl() {
@@ -329,9 +352,11 @@ k3s_wait_applied() {
 
 k3s_owners() {
   # k3s_owners <local-manifest> — print "<kind>/<name> <owning-addon>" for every
-  # object in <local-manifest>, as currently recorded in the cluster.
+  # object in <local-manifest> that exists in the cluster. Objects that are gone
+  # (e.g. a finished Job removed by its TTL) are skipped: removing an Addon can
+  # not garbage-collect what does not exist. `-f -` always yields a List.
   ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
-    "sudo k3s kubectl get -f - -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.annotations.objectset\\.rio\\.cattle\\.io/owner-name}{\"\\n\"}{end}'" \
+    "sudo k3s kubectl get --ignore-not-found -f - -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.annotations.objectset\\.rio\\.cattle\\.io/owner-name}{\"\\n\"}{end}'" \
     < "$1"
 }
 
@@ -349,9 +374,9 @@ k3s_retire_legacy() {
   if [[ -n "${foreign}" ]]; then
     # Owned by the legacy Addon (it was applied last): clear the canonical
     # Addon's checksum so K3s re-applies the canonical file and takes ownership.
-    log "re-applying ${canonical} so it owns: $(echo "${foreign}" | awk '{print $1}' | tr '\n' ' ')"
+    log "re-applying ${canonical} to take over $(wc -l <<<"${foreign}" | tr -d ' ') object(s) owned by: $(awk '{print ($2 == "" ? "<none>" : $2)}' <<<"${foreign}" | sort -u | tr '\n' ' ')"
     remote_kubectl "-n kube-system patch addons.k3s.cattle.io ${addon} --type merge -p '{\"spec\":{\"checksum\":\"\"}}'" >/dev/null
-    k3s_wait_applied "${addon}" "$(sha256sum < "${src}" | cut -d' ' -f1)"
+    k3s_wait_applied "${addon}" "$(sha256_file "${src}")"
     owners="$(k3s_owners "${src}")" || die "cannot read owners of the objects in ${src}; keeping ${legacy}"
     foreign="$(awk -v a="${addon}" '$2 != a' <<<"${owners}")"
     [[ -z "${foreign}" ]] || die "objects still not owned by ${addon}, keeping ${legacy}: ${foreign}"
@@ -363,16 +388,27 @@ k3s_retire_legacy() {
 k3s_deploy() {
   # k3s_deploy <local-manifest> [mode] — install <local-manifest> into the K3s
   # manifests dir under its canonical name, wait until K3s applied it, then
-  # retire legacy duplicates. Re-running with unchanged content is a no-op.
-  local src="$1" mode="${2:-0644}" name legacy
+  # retire legacy duplicates. Re-running with unchanged content is a no-op
+  # (K3s skips a file whose checksum it already applied; the rewrite also
+  # re-asserts the file mode).
+  local src="$1" mode="${2:-0644}" name legacy rc
   [[ -f "${src}" ]] || die "missing ${src}"
   name="$(k3s_canonical_name "${src}")"
   ssh_sudo_write "${src}" "${K3S_MANIFESTS_DIR}/${name}" "${mode}"
   if [[ "${DRY_RUN}" == "1" ]]; then
-    log "[dry-run] wait for Addon ${name%.yaml}, then retire legacy copies: $(k3s_legacy_names "${name}" | tr '\n' ' ')"
+    log "[dry-run] wait until K3s applied Addon ${name%.yaml}"
+    for legacy in $(k3s_legacy_names "${name}"); do
+      rc=0
+      ssh_query "sudo test -e '${K3S_MANIFESTS_DIR}/${legacy}'" 2>/dev/null || rc=$?
+      case "${rc}" in
+        0) log "[dry-run] would retire legacy manifest ${legacy} once ${name%.yaml} owns its objects" ;;
+        1) ;;
+        *) log "[dry-run] node unreachable: would retire legacy manifest ${legacy} if present" ;;
+      esac
+    done
     return 0
   fi
-  k3s_wait_applied "${name%.yaml}" "$(sha256sum < "${src}" | cut -d' ' -f1)"
+  k3s_wait_applied "${name%.yaml}" "$(sha256_file "${src}")"
   for legacy in $(k3s_legacy_names "${name}"); do
     k3s_retire_legacy "${legacy}" "${name}" "${src}"
   done

@@ -87,8 +87,8 @@ SECRETS_SRC="${BUNDLE}/bootstrap/secrets"
 NAMESPACES_FILE="${MANIFESTS_SRC}/00-teknoir-namespaces.yaml"
 ISTIO_CRDS_FILE="${MANIFESTS_SRC}/00-teknoir-istio-crds.yaml"
 CERTMANAGER_CRDS_FILE="${MANIFESTS_SRC}/05-teknoir-certmanager-crds.yaml"
-ARGO_FILE="${MANIFESTS_SRC}/10-teknoir-argo.yaml"
-APP_OF_APPS_FILE="${MANIFESTS_SRC}/app-of-apps.yaml"
+ARGO_FILE="${MANIFESTS_SRC}/teknoir-argo.yaml"
+APP_OF_APPS_FILE="${MANIFESTS_SRC}/teknoir-app-of-apps.yaml"
 ISTIO_APPLY_FILE="${APPLY_SRC}/istio.yaml"
 HARBOR_APPLY_FILE="${APPLY_SRC}/harbor.yaml"
 WILDCARD_SECRET_FILE="${SECRETS_SRC}/manifest-wildcard-tls-secret.yaml"
@@ -242,7 +242,7 @@ log "copying static bootstrap manifests to ${K3S_MANIFESTS_DIR}/"
 for f in "${NAMESPACES_FILE}" "${ISTIO_CRDS_FILE}" "${CERTMANAGER_CRDS_FILE}" \
          "${ARGO_FILE}" "${APP_OF_APPS_FILE}"; do
   [[ -f "${f}" ]] || die "missing ${f}"
-  ssh_sudo_write "${f}" "${K3S_MANIFESTS_DIR}/$(basename "${f}")" 0644
+  ssh_sudo_write "${f}" "${K3S_MANIFESTS_DIR}/$(k3s_canonical_name "${f}")" 0644
 done
 
 # Read-only secrets (all except the cert-manager-owned wildcard TLS secret,
@@ -256,7 +256,7 @@ if [[ ${#secret_files[@]} -eq 0 ]]; then
 fi
 for s in "${secret_files[@]}"; do
   [[ "$(basename "${s}")" == "manifest-wildcard-tls-secret.yaml" ]] && continue
-  ssh_sudo_write "${s}" "${K3S_MANIFESTS_DIR}/$(basename "${s}")" 0600
+  ssh_sudo_write "${s}" "${K3S_MANIFESTS_DIR}/$(k3s_canonical_name "${s}")" 0600
 done
 
 coredns_rendered="${tmpdir}/coredns-custom.yaml"

@@ -3,9 +3,9 @@
 #   <bundle>/bootstrap/manifests/00-teknoir-namespaces.yaml       (istio-system, teknoir-system, cert-manager, teknoir-auth)
 #   <bundle>/bootstrap/manifests/00-teknoir-istio-crds.yaml       (istio CRDs, untracked)
 #   <bundle>/bootstrap/manifests/05-teknoir-certmanager-crds.yaml (cert-manager CRDs, untracked)
-#   <bundle>/bootstrap/manifests/10-teknoir-argo.yaml             (infra charts/argo)
+#   <bundle>/bootstrap/manifests/teknoir-argo.yaml                (infra charts/argo)
 #   <bundle>/bootstrap/apply/harbor.yaml                          (gitops charts/harbor, one-shot apply -> adopted by ArgoCD)
-#   <bundle>/bootstrap/manifests/app-of-apps.yaml                 (copy of teknoir-local-app-of-apps.yaml)
+#   <bundle>/bootstrap/manifests/teknoir-app-of-apps.yaml         (copy of teknoir-local-app-of-apps.yaml)
 #   <bundle>/bootstrap/apply/istio.yaml                           (istio resources, one-shot apply -> adopted by ArgoCD)
 #   <bundle>/bootstrap/k3s/registries.yaml                        (K3s registry mirrors -> Harbor)
 #   <bundle>/bootstrap/k3s/coredns-custom.yaml                    (in-cluster *.teknoir.airgapped resolution)
@@ -18,6 +18,9 @@
 # resources are never tracked: the renderer adds neither the tracking-id
 # annotation nor the instance label to them, so no ArgoCD app can prune them;
 # they are split into their own untracked manifests.
+#
+# Files under manifests/ carry their K3s manifests-dir name (the canonical,
+# single-owner name; see lib.sh:k3s_canonical_name).
 #
 # Usage: airgap/render-bootstrap.sh [--dry-run] [--node-ip IP] [--bundle-dir DIR]
 set -euo pipefail
@@ -226,7 +229,7 @@ run mkdir -p "${MANIFESTS_OUT}" "${APPLY_OUT}" "${K3S_OUT}"
 NAMESPACES_OUT="${MANIFESTS_OUT}/00-teknoir-namespaces.yaml"
 ISTIO_CRDS_OUT="${MANIFESTS_OUT}/00-teknoir-istio-crds.yaml"
 CERTMANAGER_CRDS_OUT="${MANIFESTS_OUT}/05-teknoir-certmanager-crds.yaml"
-ARGO_OUT="${MANIFESTS_OUT}/10-teknoir-argo.yaml"
+ARGO_OUT="${MANIFESTS_OUT}/teknoir-argo.yaml"
 HARBOR_OUT="${APPLY_OUT}/harbor.yaml"
 ISTIO_APPLY_OUT="${APPLY_OUT}/istio.yaml"
 
@@ -250,18 +253,13 @@ render_chart_manifest "argo"      "${REPO_ROOT}/charts/argo"                "${A
 render_chart_manifest "harbor"    "${GITOPS_REPO_DIR}/charts/harbor"        "${HARBOR_OUT}" "harbor"
 
 # ---------------------------------------------------------------------------
-# app-of-apps.yaml
+# teknoir-app-of-apps.yaml (root Application)
 # ---------------------------------------------------------------------------
 APP_OF_APPS_SRC="${REPO_ROOT}/teknoir-local-app-of-apps.yaml"
-if [[ ! -f "${APP_OF_APPS_SRC}" ]]; then
-  warn "teknoir-local-app-of-apps.yaml not found, falling back to teknoir-cloud-app-of-apps.yaml"
-  APP_OF_APPS_SRC="${REPO_ROOT}/teknoir-cloud-app-of-apps.yaml"
-fi
-if [[ -f "${APP_OF_APPS_SRC}" ]]; then
-  run cp "${APP_OF_APPS_SRC}" "${MANIFESTS_OUT}/app-of-apps.yaml"
-else
-  warn "no app-of-apps manifest found in ${REPO_ROOT} — bundle will lack app-of-apps.yaml"
-fi
+[[ -f "${APP_OF_APPS_SRC}" ]] || die "missing ${APP_OF_APPS_SRC}"
+run cp "${APP_OF_APPS_SRC}" "${MANIFESTS_OUT}/teknoir-app-of-apps.yaml"
+# Drop outputs of older renders under their legacy names.
+run rm -f "${MANIFESTS_OUT}/10-teknoir-argo.yaml" "${MANIFESTS_OUT}/app-of-apps.yaml"
 
 # ---------------------------------------------------------------------------
 # K3s side-config: registries.yaml, coredns-custom.yaml, CA

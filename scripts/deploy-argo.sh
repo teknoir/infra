@@ -1,55 +1,71 @@
-#!/bin/sh
-set -e
+#!/usr/bin/env bash
+# deploy-argo.sh — render this checkout's charts/argo and install it on the
+# air-gapped node as the K3s auto-deploy manifest teknoir-argo.yaml.
+#
+# teknoir-argo.yaml is the only owner of the ArgoCD objects: the legacy
+# duplicate 10-teknoir-argo.yaml (older bootstrap) is retired once
+# teknoir-argo owns every object (airgap/lib.sh:k3s_deploy). The render is the
+# bundle's (airgap/lib.sh:helm_template_chart): teknoir.airgapped values plus
+# the Teknoir Root CA in the two trust paths ArgoCD needs —
+# argocd-tls-certs-cm (repo-server -> Harbor OCI login) and the oidc.config
+# rootCA (argocd-server -> Keycloak discovery). See charts/argo/README.md.
+#
+# The rendered manifest lives in a temp dir only (or --out FILE). Re-running
+# with an unchanged chart is a no-op. From an unpacked bundle (no charts/argo),
+# use airgap/bootstrap-airgap.sh --update, which deploys the bundle's render.
+#
+# Usage: scripts/deploy-argo.sh [--out FILE] [--host user@host]
+#                               [--ssh-key FILE] [--dry-run]
+set -euo pipefail
 
-TEKNOIR_HOST="${TEKNOIR_HOST:-teknoir@teknoir.airgapped}"
+# shellcheck source=../airgap/lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/airgap/lib.sh"
 
-# SSH identity: use $SSH_KEY if set, else auto-detect the node key in .secrets/
-# (the node only accepts publickey auth).
-SSH_KEY="${SSH_KEY:-}"
-if [ -z "${SSH_KEY}" ] && [ -f ".secrets/teknoir.airgapped.id_rsa" ]; then
-  SSH_KEY=".secrets/teknoir.airgapped.id_rsa"
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Options:
+  --out FILE      also write the rendered manifest to FILE (for inspection)
+  --host H        ssh target (default: ${TEKNOIR_HOST})
+  --ssh-key FILE  ssh identity file (default: \$SSH_KEY, else auto-detected)
+  --dry-run       render, but do not touch the node
+  -h, --help      show this help
+EOF
+}
+
+OUT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --out) OUT="$2"; shift ;;
+    --host) TEKNOIR_HOST="$2"; shift ;;
+    --ssh-key) SSH_KEY="$2"; shift ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+CHART_DIR="${REPO_ROOT}/charts/argo"
+[[ -f "${CHART_DIR}/Chart.yaml" ]] \
+  || die "${CHART_DIR} not found — from a bundle, deploy ArgoCD with airgap/bootstrap-airgap.sh --update"
+
+require_cmd helm ssh
+apply_ssh_key
+
+tmpdir="$(mktemp -d)"
+trap 'rm -rf "${tmpdir}"' EXIT
+# The basename is the K3s manifest name (k3s_canonical_name).
+rendered="${tmpdir}/teknoir-argo.yaml"
+
+helm_dep_build "${CHART_DIR}"
+helm_template_chart argo "${CHART_DIR}" > "${rendered}"
+log "rendered charts/argo: $(grep -c '^kind:' "${rendered}") objects"
+if [[ -n "${OUT}" ]]; then
+  cp "${rendered}" "${OUT}"
+  log "wrote ${OUT}"
 fi
 
-# ArgoCD needs the Teknoir Root CA in TWO independent trust paths, both injected
-# at render time (teknoir-root-ca.crt is generated per-deployment and gitignored,
-# so it cannot be hardcoded in values.yaml):
-#   1. repo-server -> Harbor OCI login (helm registry login) verifies Harbor's
-#      TLS with argocd-tls-certs-cm (configs.tls.certificates, keyed by the Harbor
-#      host), NOT the node's containerd/OS trust. Missing it fails OCI login with
-#      "x509: certificate signed by unknown authority" and app-of-apps stays Unknown.
-#   2. argocd-server -> Keycloak OIDC discovery
-#      (https://auth.teknoir.airgapped/.../.well-known/openid-configuration)
-#      verifies with the oidc.config `rootCA` field. It does NOT consult
-#      argocd-tls-certs-cm or the OS trust for this call, so the CA is embedded
-#      into oidc.config (base: charts/argo/files/oidc.config).
-CA_CRT_FILE="${CA_CRT_FILE:-teknoir-root-ca.crt}"
-HARBOR_HOST="${HARBOR_HOST:-harbor.teknoir.airgapped}"
-CA_KEY=$(echo "${HARBOR_HOST}" | sed 's/\./\\./g')
-OIDC_BASE="charts/argo/files/oidc.config"
-
-if [ -f "${CA_CRT_FILE}" ]; then
-  # Build oidc.config with the CA embedded as `rootCA` (indented under the block
-  # scalar) so argocd-server trusts Keycloak during OIDC discovery.
-  OIDC_CONFIG_FILE="$(mktemp)"
-  {
-    cat "${OIDC_BASE}"
-    echo "rootCA: |"
-    sed 's/^/  /' "${CA_CRT_FILE}"
-  } > "${OIDC_CONFIG_FILE}"
-  helm template --namespace teknoir-system --values charts/argo/values.yaml \
-    --set-file "argo-cd.configs.tls.certificates.${CA_KEY}=${CA_CRT_FILE}" \
-    --set-file "argo-cd.configs.cm.oidc\.config=${OIDC_CONFIG_FILE}" \
-    argo charts/argo --debug > teknoir-argo.yaml
-  rm -f "${OIDC_CONFIG_FILE}"
-else
-  echo "WARNING: ${CA_CRT_FILE} not found — ArgoCD will not trust Harbor's or" \
-       "Keycloak's CA; repo-server OCI login and Keycloak SSO login may fail" \
-       "with x509 unknown authority." >&2
-  helm template --namespace teknoir-system --values charts/argo/values.yaml \
-    --set-file "argo-cd.configs.cm.oidc\.config=${OIDC_BASE}" \
-    argo charts/argo --debug > teknoir-argo.yaml
-fi
-
-ssh ${SSH_KEY:+-i "${SSH_KEY}"} "${TEKNOIR_HOST}" \
-  "sudo tee /opt/k3s/server/manifests/teknoir-argo.yaml >/dev/null" \
-  < teknoir-argo.yaml
+k3s_deploy "${rendered}"
+log "deploy-argo complete"

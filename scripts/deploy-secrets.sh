@@ -10,11 +10,15 @@
 #
 # The cert-manager-owned wildcard TLS secret is NOT deployed by default: it is
 # a bootstrap placeholder that cert-manager replaces, and re-applying it would
-# overwrite the issued certificate. Use --bootstrap-wildcard only on a fresh
-# cluster.
+# overwrite the issued certificate. --bootstrap-wildcard creates it only when
+# it does not exist yet (fresh cluster), so even that is safe to re-run.
+#
+# The source is the operator's .secrets/ (the bundle copy in
+# bootstrap/secrets/ is only used by the first bootstrap, via --secrets-dir).
 #
 # Usage: scripts/deploy-secrets.sh [--only <manifest>]... [--bootstrap-wildcard]
-#                                  [--host user@host] [--ssh-key FILE] [--dry-run]
+#                                  [--secrets-dir DIR] [--host user@host]
+#                                  [--ssh-key FILE] [--dry-run]
 set -euo pipefail
 
 # shellcheck source=../airgap/lib.sh
@@ -43,8 +47,10 @@ Usage: $(basename "$0") [options]
 Options:
   --only NAME           deploy only this manifest (repeatable), e.g.
                         --only manifest-argocd-harbor-repo-secret.yaml
-  --bootstrap-wildcard  also one-shot apply ${WILDCARD_MANIFEST}
-                        (fresh cluster only; cert-manager owns it afterwards)
+  --bootstrap-wildcard  also create ${WILDCARD_MANIFEST} if the secret
+                        does not exist yet (cert-manager owns it afterwards)
+  --secrets-dir DIR     where the manifest-*.yaml files are
+                        (default: ${SECRETS_DIR})
   --host H              ssh target (default: ${TEKNOIR_HOST})
   --ssh-key FILE        ssh identity file (default: \$SSH_KEY, else auto-detected)
   --dry-run             print actions without mutating the node
@@ -58,6 +64,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --only) ONLY+=("$2"); shift ;;
     --bootstrap-wildcard) BOOTSTRAP_WILDCARD=1 ;;
+    --secrets-dir) SECRETS_DIR="$2"; shift ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
     --ssh-key) SSH_KEY="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
@@ -67,7 +74,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-require_cmd ssh sha256sum
+require_cmd ssh
 apply_ssh_key
 
 if [[ ${#ONLY[@]} -gt 0 ]]; then
@@ -90,8 +97,18 @@ done
 
 if [[ "${BOOTSTRAP_WILDCARD}" == "1" ]]; then
   [[ -f "${SECRETS_DIR}/${WILDCARD_MANIFEST}" ]] || die "missing ${SECRETS_DIR}/${WILDCARD_MANIFEST}"
-  log "one-shot apply ${WILDCARD_MANIFEST} (cert-manager takes it over)"
-  remote_kubectl apply -f - < "${SECRETS_DIR}/${WILDCARD_MANIFEST}"
+  # Create only: once it exists, cert-manager owns the content. A failed query
+  # aborts rather than counting as "absent" (that would overwrite the cert).
+  if ! existing="$(ssh_query "sudo k3s kubectl get --ignore-not-found -o name -f -" < "${SECRETS_DIR}/${WILDCARD_MANIFEST}")"; then
+    [[ "${DRY_RUN}" == "1" ]] || die "cannot check whether the wildcard TLS secret exists"
+    existing="(unknown: node unreachable)"
+  fi
+  if [[ -n "${existing}" ]]; then
+    log "wildcard TLS secret present (${existing}); cert-manager owns it, placeholder not re-applied"
+  else
+    log "creating the wildcard TLS placeholder from ${WILDCARD_MANIFEST} (cert-manager takes it over)"
+    remote_kubectl apply -f - < "${SECRETS_DIR}/${WILDCARD_MANIFEST}"
+  fi
 fi
 
 (( missing == 0 )) || warn "${missing} secret manifest(s) missing"
