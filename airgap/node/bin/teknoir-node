@@ -333,7 +333,7 @@ preflight_clock() {
 
 phase_preflight() {
   local t
-  for t in awk sed grep sort comm tar gzip base64 openssl flock sha256sum stat cmp df ip shred; do
+  for t in awk sed grep sort comm diff tar gzip base64 openssl flock sha256sum stat cmp df ip shred; do
     command -v "${t}" >/dev/null 2>&1 || die "required tool not found on the node: ${t}"
   done
   command -v "${JQ}" >/dev/null 2>&1 || die "jq not found (expected the bundled ${NODE_ROOT}/bin/jq)"
