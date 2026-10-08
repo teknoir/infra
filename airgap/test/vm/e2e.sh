@@ -53,6 +53,8 @@
 #   E2E_E6_RESTORE_CMD  E6: restore command run after the rebuild (OPERATE.md); unset = skip
 # Nothing here touches vpro's /etc/hosts, its default route, or the live env.
 set -euo pipefail
+# iptables, ip and sysctl live in the sbin dirs, which not every shell has on PATH
+PATH="${PATH}:/usr/local/sbin:/usr/sbin:/sbin"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${HERE}/../../.." && pwd)"

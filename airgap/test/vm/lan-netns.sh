@@ -29,6 +29,8 @@
 # Environment: LAN_NETNS (tklan), LAN_BRIDGE (tkvm0), LAN_IP (10.77.0.20),
 #   LAN_SITE (airgap/site/vmtest.env), LAN_HOME (~/vmtest/lanhome).
 set -euo pipefail
+# iptables, ip and sysctl live in the sbin dirs, which not every shell has on PATH
+PATH="${PATH}:/usr/local/sbin:/usr/sbin:/sbin"
 
 D="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "${D}/../../.." && pwd)"

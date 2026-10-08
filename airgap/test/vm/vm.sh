@@ -19,6 +19,8 @@
 # Every subcommand is idempotent. Requires: sudo, qemu-system-x86_64,
 # qemu-img, cloud-localds, membership of group kvm (used through `sg kvm`).
 set -euo pipefail
+# iptables, ip and sysctl live in the sbin dirs, which not every shell has on PATH
+PATH="${PATH}:/usr/local/sbin:/usr/sbin:/sbin"
 
 VM_DIR="${VM_DIR:-${HOME}/vmtest}"
 NAME="${VM_NAME:-tk-airgap}"
