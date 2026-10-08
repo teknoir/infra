@@ -336,6 +336,26 @@ check "containerd-only images pass" [ "${r}" == pass ]
 check "they are listed in a single warning" [ "$(grep -c 'not pullable from harbor' "${T}/out")" == 1 ]
 
 # ---------------------------------------------------------------------------
+echo "# backup: sqlite datastore with a brief k3s stop"
+mkdir -p "${ROOT}/opt/k3s/server/db" "${ROOT}/opt/k3s/server/tls" "${ROOT}/opt/k3s/server/cred"
+echo "sqlite" > "${ROOT}/opt/k3s/server/db/state.db"
+echo "token" > "${ROOT}/opt/k3s/server/token"
+before="$(ncalls)"
+tn backup --site test
+B="$(find "${ROOT}/var/lib/teknoir-airgap/backups" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort | tail -1)"
+check "backup takes the datastore, token and k3s config" \
+  bash -c "[ ${RC} = 0 ] && [ -f '${B}/k3s/db/state.db' ] && [ -f '${B}/k3s/server/token' ] && [ -f '${B}/k3s/etc/config.yaml' ]"
+check "k3s is stopped for the copy and started again" \
+  bash -c "tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -E '^systemctl (stop|start) k3s' | tr '\n' ' ' | grep -q 'systemctl stop k3s systemctl start k3s'"
+check "backup prints its path on stdout" grep -qx "${B}" "${T}/out"
+chmod 000 "${ROOT}/opt/k3s/server/db/state.db"
+tn backup --site test
+chmod 644 "${ROOT}/opt/k3s/server/db/state.db"
+check "a failed datastore copy fails the backup" [ "${RC}" != 0 ]
+check "k3s is running again after the failed backup" [ -f "${STUB_STATE}/k3s.active" ]
+check "no partial backup is left behind" [ -z "$(find "${ROOT}/var/lib/teknoir-airgap/backups" -name '*.partial')" ]
+
+# ---------------------------------------------------------------------------
 echo "# credentials"
 if command -v script >/dev/null 2>&1; then
   node_env script -qec "'${PAYLOAD}/bin/teknoir-node' credentials harbor-admin --site test" /dev/null > "${T}/out" 2>&1 || true
