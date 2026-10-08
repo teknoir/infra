@@ -12,7 +12,8 @@
 # (downgrade, --rollback, broken list), credentials refusing a terminal, the
 # runner interface (teknoir-airgap up's exact converge argv, --operator, the
 # break-glass flags reaching the oneshot and harbor phases as ONESHOT_REAPPLY
-# and HARBOR_FORCE_IMAGES, --reapply checked against oneshot/TIERS), and the
+# and HARBOR_FORCE_IMAGES, --reapply checked against oneshot/TIERS), the
+# preflight refusal of an unmigrated cluster (live Teknoir K3s files), and the
 # leak check. With lib/oneshot.sh and lib/harbor.sh present the real phases
 # parse the flags (only their cluster/Harbor work is replaced); without them
 # a stand-in with their interface is used.
@@ -453,6 +454,31 @@ rm -rf "${PAYLOAD}/oneshot"
 reseal
 tn converge --site test --only oneshot --reapply istio
 check "--reapply on a payload without oneshot/TIERS is a usage error" [ "${RC}" == 2 ]
+
+# ---------------------------------------------------------------------------
+echo "# preflight: an unmigrated cluster (live Teknoir K3s auto-deploy files) is refused"
+M="${ROOT}/opt/k3s/server/manifests"
+mkdir -p "${M}"
+for f in coredns.yaml local-storage.yaml teknoir-argo.yaml teknoir-app-of-apps.yaml \
+         manifest-harbor-secret.yaml teknoir-keycloak-db-secret.yaml 00-teknoir-namespaces.yaml; do
+  echo '---' > "${M}/${f}"
+done
+touch "${M}/00-teknoir-namespaces.yaml.skip"
+before="$(ncalls)"
+tn converge --site test --only preflight,backup,host
+check "converge stops in preflight and asks for migrate" \
+  bash -c "[ ${RC} = 1 ] && grep -q 'Run teknoir-airgap migrate first' '${T}/out' && ! grep -q '== backup' '${T}/out'"
+check "it names the live Teknoir files" \
+  bash -c "for n in teknoir-app-of-apps manifest-harbor-secret teknoir-keycloak-db-secret; do grep 'migrate first' '${T}/out' | grep -q \"\${n}.yaml\" || exit 1; done"
+check "K3s's own files, teknoir-argo.yaml (M7) and files with a .skip are not counted" \
+  bash -c "grep 'migrate first' '${T}/out' | grep -q '3 Teknoir file' && ! grep 'migrate first' '${T}/out' | grep -qE 'coredns|local-storage|teknoir-argo|00-teknoir-namespaces'"
+check "nothing was changed" bash -c "! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -Eq '^systemctl (stop|start|restart)|^install\.sh|images import|^kubectl .*( apply | create | patch )'"
+tn converge --site test --only preflight --dry-run
+check "dry-run reports the files and goes on" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'converge refuses this until they are detached' '${T}/out'"
+for f in teknoir-app-of-apps manifest-harbor-secret teknoir-keycloak-db-secret; do touch "${M}/${f}.yaml.skip"; done
+tn converge --site test --only preflight
+check "once every Teknoir file has its .skip, preflight passes" [ "${RC}" == 0 ]
 
 # ---------------------------------------------------------------------------
 echo "# leak check"

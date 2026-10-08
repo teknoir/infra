@@ -14,7 +14,8 @@
 # running one. Phases, in order:
 #   verify        node/SHA256SUMS (and MANIFEST.yaml's entry for it)
 #   preflight     tools, NODE_IP is local, free disk, clock skew vs the LAN
-#                 host (--lan-time), release guard (no silent downgrade)
+#                 host (--lan-time), no Teknoir K3s auto-deploy files left
+#                 (migrate first), release guard (no silent downgrade)
 #   backup        pre-change backup when a cluster exists and the bundle
 #                 differs from the deployed one (lib/backup.sh)
 #   host          k3s install/upgrade, config.yaml, registries.yaml, /etc/hosts,
@@ -336,6 +337,32 @@ preflight_clock() {
   die "the node clock is ${skew}s off the LAN host (limit ${MAX_CLOCK_SKEW}s); fix the node time or re-run with --sync-clock"
 }
 
+preflight_k3s_manifests() {
+  # Refuse a cluster that has not been migrated: K3s re-applies every
+  # auto-deploy file on each start (DESIGN T5), and this converge may restart
+  # k3s (backup, host config, CA trust), as does a reboot. A live
+  # teknoir-app-of-apps.yaml would set the root pin back to its old version,
+  # the secret files would put back the old values. `migrate` (DESIGN M3)
+  # detaches them. Same name allow-list as lib/migrate.sh; a file with its
+  # .skip guard is ignored by K3s; teknoir-argo.yaml stays until M7.
+  local dir="${HOST_ROOT}${K3S_DATA_DIR}/server/manifests" f name live=()
+  [[ -d "${dir}" ]] || return 0
+  for f in "${dir}"/*.yaml; do
+    [[ -f "${f}" ]] || continue
+    name="$(basename "${f}" .yaml)"
+    [[ "${name}" =~ ^(teknoir-.+|00-teknoir-.+|05-teknoir-.+|10-teknoir-.+|manifest-.+-secret|app-of-apps)$ ]] || continue
+    [[ "${name}" != "teknoir-argo" ]] || continue
+    [[ ! -e "${f}.skip" ]] || continue
+    live+=("${name}.yaml")
+  done
+  (( ${#live[@]} > 0 )) || return 0
+  if dry_run; then
+    warn "[dry-run] K3s still auto-deploys ${#live[@]} Teknoir file(s) in ${dir}: ${live[*]}; converge refuses this until they are detached (run teknoir-airgap migrate first)"
+    return 0
+  fi
+  die "K3s still auto-deploys ${#live[@]} Teknoir file(s) in ${dir}: ${live[*]}. Every k3s restart re-applies them (old root pin, old secret values). Run teknoir-airgap migrate first (DESIGN M3), then up again"
+}
+
 phase_preflight() {
   local t
   for t in awk sed grep sort comm diff tar gzip base64 openssl flock sha256sum stat cmp df ip shred; do
@@ -352,6 +379,7 @@ phase_preflight() {
   preflight_node_ip
   preflight_disk
   preflight_clock
+  preflight_k3s_manifests
   if cluster_up; then
     release_guard
   else
