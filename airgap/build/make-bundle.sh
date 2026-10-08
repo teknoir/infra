@@ -312,7 +312,22 @@ done
 cred_re='change-me|changeit|Harbor12345|harbor_registry_password|prom-operator'
 cred_b64_re="$(for w in change-me changeit Harbor12345 harbor_registry_password prom-operator; do
   printf '%s' "${w}" | base64 -w0 | tr -d '='; printf '|'; done | sed 's/|$//')"
-grep_hits "the plain-text config" "${cred_re}|${cred_b64_re}" "${plain_cfg[@]}"
+# the one-shot tiers are scanned without the value-checked chart-default
+# Secrets (CHART_DEFAULT_SECRETS): those carry the chart's public defaults by
+# design; any other occurrence still fails
+CRED_SCAN="${WORK}/cred-scan"
+[[ ! -e "${CRED_SCAN}" ]] || rm_build_dir "${CRED_SCAN}"
+mkdir -p "${CRED_SCAN}"
+cred_cfg=()
+for f in "${plain_cfg[@]}"; do
+  if [[ "${f}" == "${TREE}/node/oneshot/"*.yaml ]]; then
+    without_chart_default_secrets "${f}" "${CRED_SCAN}/$(basename "${f}")"
+    cred_cfg+=("${CRED_SCAN}/$(basename "${f}")")
+  else
+    cred_cfg+=("${f}")
+  fi
+done
+grep_hits "the plain-text config" "${cred_re}|${cred_b64_re}" "${cred_cfg[@]}"
 for f in "${HITS[@]}"; do gate_fail "known default credential literal in ${f#"${TREE}"/}"; done
 grep_hits "the renders" "${cred_re}|${cred_b64_re}" "${WORK}/renders"
 for f in "${HITS[@]}"; do

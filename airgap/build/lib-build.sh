@@ -616,6 +616,22 @@ chart_default_secret_ok() {
   return 0
 }
 
+without_chart_default_secrets() {
+  # without_chart_default_secrets <in.yaml> <out.yaml> — copy <in> without the
+  # documents of the Secrets that pass chart_default_secret_ok, so the literal
+  # default-credential scan does not re-flag exactly what the value-checked
+  # allow-list accepted. Every other document is kept verbatim.
+  local in="$1" out="$2" entry id ids=""
+  for entry in "${CHART_DEFAULT_SECRETS[@]}"; do
+    id="${entry%% *}"
+    chart_default_secret_ok "${id}" "${in}" && ids+="${id} "
+  done
+  if [[ -z "${ids}" ]]; then cp "${in}" "${out}"; return 0; fi
+  # shellcheck disable=SC2016  # $id is a yq variable
+  SG_IDS=" ${ids}" yq '(" " + (.metadata.namespace // "-") + "/" + (.metadata.name // "") + " ") as $id | select((.kind == "Secret" and (strenv(SG_IDS) | contains($id))) | not)' "${in}" > "${out}" \
+    || die "without_chart_default_secrets: cannot filter ${in}"
+}
+
 secret_gate_report() {
   # secret_gate_report <fail-fn> <label> <chart-repo> <yaml-file>... — run
   # secret_gate, log the allowed Secrets and pass each denied one to
