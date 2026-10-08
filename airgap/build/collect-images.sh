@@ -62,7 +62,12 @@ P_VARIANT=""
 IMG_CACHE="${CACHE_DIR}/images"
 OCI_OUT="${STAGE}/node/images"
 DOCKER_OUT="${STAGE}/node/bootstrap-images"
-mkdir -p "${IMG_CACHE}/oci" "${IMG_CACHE}/docker" "${OCI_OUT}" "${DOCKER_OUT}"
+mkdir -p "${IMG_CACHE}/oci" "${IMG_CACHE}/docker" "${IMG_CACHE}/manifests" "${OCI_OUT}" "${DOCKER_OUT}"
+# One build at a time uses the image cache; leftovers of an interrupted pull
+# (.tmp.<pid>) are never valid entries and are removed here.
+exec 9> "${IMG_CACHE}/.lock"
+flock -n 9 || die "another build holds ${IMG_CACHE}/.lock; wait for it to finish"
+find "${IMG_CACHE}/oci" "${IMG_CACHE}/docker" "${IMG_CACHE}/manifests" -maxdepth 1 -name '*.tmp.*' -exec rm -rf -- {} +
 # a fresh store on every run: nothing from an earlier build survives
 find "${OCI_OUT}" "${DOCKER_OUT}" -mindepth 1 -delete
 
