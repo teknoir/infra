@@ -448,8 +448,8 @@ site_load() {
   case "${SITE_NAME}" in
     ''|*[!A-Za-z0-9._-]*|.*) die "invalid site name '${SITE_NAME}' (from ${SITE_FILE})" ;;
   esac
-  # shellcheck disable=SC2034  # TEKNOIR_ENV, TIME_SOURCE and K3S_DATA_DIR are the node's
-  TEKNOIR_ENV='' TEKNOIR_DOMAIN='' NODE_IP='' NODE='' TEKNOIR_HOSTNAMES='' TIME_SOURCE='' K3S_DATA_DIR=''
+  # shellcheck disable=SC2034  # TEKNOIR_ENV, TIME_SOURCE, UPSTREAM_DNS and K3S_DATA_DIR are the node's
+  TEKNOIR_ENV='' TEKNOIR_DOMAIN='' NODE_IP='' NODE='' TEKNOIR_HOSTNAMES='' TIME_SOURCE='' UPSTREAM_DNS='' K3S_DATA_DIR=''
   # shellcheck source=/dev/null
   . "${SITE_FILE}" || die "cannot read ${SITE_FILE}"
   [ -z "${OPT_NODE}" ] || NODE=${OPT_NODE}

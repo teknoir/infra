@@ -11,7 +11,7 @@
 #                                        robot once ArgoCD pulls anonymously (M3, M6)
 #   teknoir-node migrate --argo [--dry-run]
 #                                        M7a: detach teknoir-argo once the argo
-#                                        Application (app-of-apps 0.0.5) runs ArgoCD
+#                                        Application (app-of-apps 0.0.4) runs ArgoCD
 #   teknoir-node migrate --undo NAME     re-adopt one detached file (K3s re-applies it)
 #
 # Detach recipe, per name (never the K3s `disable:` list, which deletes objects):
@@ -33,7 +33,8 @@
 # 00-teknoir-namespaces, teknoir-coredns-custom and teknoir-app-of-apps, the CRD
 # files, then any other allow-listed name. teknoir-argo is detached only by
 # --argo (DESIGN M7a): ArgoCD must first run from its own Application, which
-# app-of-apps enables in 0.0.5; app-of-apps 0.0.4 declares it disabled. Only
+# app-of-apps 0.0.4 enables; run migrate --argo right after that up (no k3s
+# restart in between, so K3s never re-applies its file over ArgoCD). Only
 # allow-listed names are touched, never K3s's packaged addons. Every step is
 # idempotent: a re-run (also after a failure) resumes.
 
@@ -93,7 +94,7 @@ object UIDs and counts compared with a baseline after every name. Then removes
 ~<user>/teknoir-airgap-bundle-* and, once ArgoCD reads the public Harbor project
 without credentials, the robot repo-creds Secret and robot$argocd (M6). Safe to
 re-run. teknoir-argo stays until --argo (M7a), which needs the Application argo
-(app-of-apps 0.0.5) Synced/Healthy and the argoproj CRDs protected
+(app-of-apps 0.0.4) Synced/Healthy and the argoproj CRDs protected
 (Prune=false,Delete=false), and checks that no ArgoCD pod restarts.
 --undo NAME puts a detached file back.
 EOF
@@ -640,7 +641,7 @@ migrate_argocd_reads_anonymously() {
 
 migrate_argo() {
   # Detach teknoir-argo.yaml once ArgoCD runs from its own Application (argo,
-  # enabled in app-of-apps 0.0.5): the Application must be Synced/Healthy and
+  # enabled in app-of-apps 0.0.4): the Application must be Synced/Healthy and
   # the argoproj CRDs protected before the K3s owner goes; afterwards no
   # ArgoCD pod may have restarted. Same recipe and baseline as the M3 pass.
   local ns state before after untracked
@@ -652,7 +653,7 @@ migrate_argo() {
   fi
   # 1. ArgoCD runs from its own Application
   in_cluster applications.argoproj.io "${MIGRATE_ARGO_APP}" "${MIGRATE_ARGO_APP_NS}" \
-    || die "migrate --argo: there is no Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}. ArgoCD manages itself from app-of-apps 0.0.5 (DESIGN M7a; 0.0.4 declares it disabled): run up with that bundle first. Until then ${MIGRATE_ONLY}.yaml stays ArgoCD's owner"
+    || die "migrate --argo: there is no Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}. ArgoCD manages itself from app-of-apps 0.0.4 (DESIGN M7a): run up with that bundle first. Until then ${MIGRATE_ONLY}.yaml stays ArgoCD's owner"
   state="$(kc -n "${MIGRATE_ARGO_APP_NS}" get applications.argoproj.io "${MIGRATE_ARGO_APP}" \
     -o jsonpath='{.status.sync.status}/{.status.health.status}')" || die "cannot read Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}"
   [[ "${state}" == "Synced/Healthy" ]] \

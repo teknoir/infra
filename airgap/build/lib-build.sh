@@ -659,7 +659,7 @@ secret_gate_report() {
 # executing them
 # ---------------------------------------------------------------------------
 SITE_KEYS_REQUIRED=(TEKNOIR_ENV TEKNOIR_DOMAIN NODE_IP NODE TEKNOIR_HOSTNAMES K3S_DATA_DIR)
-SITE_KEYS_OPTIONAL=(TIME_SOURCE)
+SITE_KEYS_OPTIONAL=(TIME_SOURCE UPSTREAM_DNS)
 
 site_check() {
   # site_check <file> — the file must be plain assignments the LAN host

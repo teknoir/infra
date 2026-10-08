@@ -499,6 +499,10 @@ load_site() {
   K3S_DATA_DIR="${K3S_DATA_DIR:-/opt/k3s}"
   [[ "${K3S_DATA_DIR}" == /* ]] || die "${f}: K3S_DATA_DIR must be absolute"
   TIME_SOURCE="${TIME_SOURCE:-}"
+  UPSTREAM_DNS="${UPSTREAM_DNS:-}"
+  for h in ${UPSTREAM_DNS}; do
+    [[ "${h}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "${f}: invalid UPSTREAM_DNS entry '${h}' (IPv4 addresses)"
+  done
   HARBOR_HOST="harbor.${TEKNOIR_DOMAIN}"
 }
 

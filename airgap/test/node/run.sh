@@ -121,7 +121,7 @@ new_sandbox 1
   render_template "${PAYLOAD}/templates/coredns-custom.yaml.tmpl" > "${T}/coredns.yaml"
   render_template "${PAYLOAD}/templates/registries.yaml.tmpl" > "${T}/registries.yaml"
   APP_OF_APPS_VERSION=0.0.4 render_template "${PAYLOAD}/templates/app-of-apps.yaml.tmpl" > "${T}/aoa.yaml"
-  render_template "${PAYLOAD}/templates/config.yaml.tmpl" SECRETS_ENCRYPTION= FLANNEL_IFACE= > "${T}/config-noenc.yaml"
+  render_template "${PAYLOAD}/templates/config.yaml.tmpl" SECRETS_ENCRYPTION= FLANNEL_IFACE= RESOLV_CONF= > "${T}/config-noenc.yaml"
 )
 live='teknoir.airgapped:53 {
     errors

@@ -20,6 +20,7 @@ source "${NODE_ROOT}/lib/common.sh"
 
 K3S_CONFIG_DIR="${HOST_ROOT}/etc/rancher/k3s"
 K3S_CONFIG_FILE="${K3S_CONFIG_DIR}/config.yaml"
+K3S_RESOLV_FILE="${K3S_CONFIG_DIR}/resolv.conf"
 K3S_REGISTRIES_FILE="${K3S_CONFIG_DIR}/registries.yaml"
 # The registry CA as k3s/containerd see it (registries.yaml ca_file).
 K3S_CA_FILE="${HOST_ROOT}/etc/rancher/k3s/teknoir-root-ca.crt"
@@ -38,6 +39,7 @@ TARBALL_RE='\.(tar|tar\.zst|tar\.gz|tgz|tar\.lz4|tar\.bz2|tzst)$'
 
 # Set by phase_host for the restart decision.
 HOST_FILES_CHANGED=0
+HOST_RESOLV_CHANGED=0
 K3S_JUST_STARTED=0
 declare -A _BUNDLE_SUMS=()
 
@@ -107,12 +109,50 @@ host_flannel_iface_line() {
   printf 'flannel-iface: %s' "${iface}"
 }
 
+host_system_dns() {
+  # host_system_dns - the node's non-loopback nameservers (what k3s itself
+  # would find in /etc/resolv.conf or systemd-resolved's resolv.conf)
+  awk '$1 == "nameserver" && $2 !~ /^(127\.|::1$|0\.0\.0\.0$)/ { print $2 }' \
+    "${HOST_ROOT}/etc/resolv.conf" "${HOST_ROOT}/run/systemd/resolve/resolv.conf" 2>/dev/null | awk '!seen[$0]++'
+}
+
+host_resolv_conf_line() {
+  # CoreDNS forwards unknown names to the resolvers k3s finds on the node. With
+  # only a loopback stub and no upstream (a true air gap), k3s falls back to
+  # 8.8.8.8 and every lookup it cannot answer locally waits for a timeout
+  # (seen as ArgoCD repo-server health checks taking 2 s and failing). So:
+  #   UPSTREAM_DNS in the site config  -> CoreDNS uses those servers;
+  #   a non-loopback upstream on the node -> nothing changes (k3s default);
+  #   no upstream at all -> NODE_IP, where nothing listens on port 53, so an
+  #   unknown name fails at once (ICMP port unreachable) instead of timing out.
+  local servers="" s
+  if [[ -n "${UPSTREAM_DNS:-}" ]]; then
+    servers="${UPSTREAM_DNS}"
+  elif [[ -n "$(host_system_dns)" ]]; then
+    return 0
+  else
+    servers="${NODE_IP}"
+  fi
+  ensure_work_dir
+  {
+    echo "# written by teknoir-node (host phase): CoreDNS upstream for k3s (resolv-conf)"
+    for s in ${servers}; do echo "nameserver ${s}"; done
+  } > "${WORK_DIR}/k3s-resolv.conf"
+  printf 'resolv-conf: %s' "${K3S_RESOLV_FILE#"${HOST_ROOT}"}"
+}
+
 host_node_files() {
   ensure_work_dir
-  local cfg="${WORK_DIR}/config.yaml" reg="${WORK_DIR}/registries.yaml"
+  local cfg="${WORK_DIR}/config.yaml" reg="${WORK_DIR}/registries.yaml" resolv_line
+  resolv_line="$(host_resolv_conf_line)"
+  if [[ -n "${resolv_line}" ]]; then
+    ensure_dir "${K3S_CONFIG_DIR}" 0755
+    install_file "${WORK_DIR}/k3s-resolv.conf" "${K3S_RESOLV_FILE}" 0644 "k3s CoreDNS upstream"
+    if (( FILE_CHANGED )); then HOST_FILES_CHANGED=1; HOST_RESOLV_CHANGED=1; fi
+  fi
   render_template "${NODE_ROOT}/templates/config.yaml.tmpl" \
     "SECRETS_ENCRYPTION=$(host_secrets_encryption_line)" \
-    "FLANNEL_IFACE=$(host_flannel_iface_line)" > "${cfg}"
+    "FLANNEL_IFACE=$(host_flannel_iface_line)" "RESOLV_CONF=${resolv_line}" > "${cfg}"
   render_template "${NODE_ROOT}/templates/registries.yaml.tmpl" > "${reg}"
   ensure_dir "${K3S_CONFIG_DIR}" 0755
   install_file "${cfg}" "${K3S_CONFIG_FILE}" 0600 "k3s config"
@@ -378,10 +418,11 @@ _host_sha_or_absent() {
 host_stamp_value() {
   # What the running k3s must have loaded: config.yaml, registries.yaml and
   # the registry CA (k3s may skip a ca_file that did not exist at start).
-  printf 'config=%s registries=%s ca=%s' \
+  printf 'config=%s registries=%s ca=%s resolv=%s' \
     "$(_host_sha_or_absent "${K3S_CONFIG_FILE}")" \
     "$(_host_sha_or_absent "${K3S_REGISTRIES_FILE}")" \
-    "$(_host_sha_or_absent "${K3S_CA_FILE}")"
+    "$(_host_sha_or_absent "${K3S_CA_FILE}")" \
+    "$(_host_sha_or_absent "${K3S_RESOLV_FILE}")"
 }
 
 host_restart_state() {
@@ -404,7 +445,7 @@ _host_k3s_started_after_files() {
   ts="$(systemctl show k3s -p ActiveEnterTimestamp --value 2>/dev/null)" || return 1
   [[ -n "${ts}" && "${ts}" != "n/a" ]] || return 1
   started="$(date -d "${ts}" +%s 2>/dev/null)" || return 1
-  for f in "${K3S_CONFIG_FILE}" "${K3S_REGISTRIES_FILE}" "${K3S_CA_FILE}"; do
+  for f in "${K3S_CONFIG_FILE}" "${K3S_REGISTRIES_FILE}" "${K3S_CA_FILE}" "${K3S_RESOLV_FILE}"; do
     [[ -f "${f}" ]] || continue
     m="$(stat -c %Y "${f}")"
     (( m < started )) || return 1
@@ -508,12 +549,21 @@ host_k3s_reconcile() {
       ;;
     restart)
       run systemctl restart k3s
-      changed "restarted k3s (config.yaml, registries.yaml or the registry CA changed)"
+      changed "restarted k3s (config.yaml, registries.yaml, the registry CA or the CoreDNS upstream changed)"
       K3S_JUST_STARTED=1
       ;;
   esac
   dry_run && return 0
   host_k3s_wait_ready
+  if (( HOST_RESOLV_CHANGED )) && [[ "${action}" == "restart" ]]; then
+    # CoreDNS (dnsPolicy Default) reads the node resolv-conf only when its pod
+    # is created; a k3s restart keeps the running pod
+    if kc -n kube-system delete pod -l k8s-app=kube-dns --ignore-not-found >/dev/null; then
+      changed "restarted CoreDNS for its new upstream"
+    else
+      warn "could not restart CoreDNS; it keeps its old upstream until its pod is re-created"
+    fi
+  fi
   host_write_stamp
 }
 
@@ -561,6 +611,7 @@ host_trust_ca() {
 phase_host() {
   [[ "${ROLE:-server}" == "server" ]] || die "host: role ${ROLE} is not implemented (D11)"
   HOST_FILES_CHANGED=0
+  HOST_RESOLV_CHANGED=0
   K3S_JUST_STARTED=0
   host_check_k3s_payload
   host_node_files
