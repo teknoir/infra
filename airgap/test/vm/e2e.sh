@@ -1,0 +1,631 @@
+#!/usr/bin/env bash
+# e2e.sh — airgap end-to-end test in the KVM VM (docs/airgap/DESIGN.md test plan 3, I-16).
+#
+# The node is the VM tk-airgap (vm.sh, 10.77.0.10, teknoir.airgapped, bridge
+# tkvm0, no egress); the LAN host is the network namespace tklan
+# (lan-netns.sh). Every operator command runs in the namespace exactly as the
+# runbook says (./teknoir-airgap ... from the extracted bundle), as the
+# invoking user with HOME=$LAN_HOME. Harness reads on the node go over vm.sh
+# ssh; Secret values are only ever compared ON the VM and never printed.
+#
+# Scenarios (default order; E7 runs before E6 because E6 wipes the node logs):
+#   E1  fresh bootstrap on a just-created VM: up, all Applications
+#       Synced/Healthy in 45 min, HTTPS to harbor/argocd/auth with the fetched
+#       CA, oauth2-proxy login as platform-admin            [--allow-destroy]
+#   E2  idempotency: a second up reports 0 changes; pod UIDs, k3s start time,
+#       Secret resourceVersions unchanged; Harbor receives 0 blob uploads
+#   E3  no egress from the VM or the namespace (FORWARD DROP counters grow);
+#       every running image is in containerd; no ErrImagePull
+#   E4  update to bundle B changes only the bumped Applications and records B;
+#       bundle A is refused, accepted with --rollback, and then kept
+#   E5  interrupt up during payload sync, Harbor push and tarball import; each
+#       re-run completes with no manual repair
+#   E8  rotate oauth2-proxy-cookie: only that Secret changes, oauth2-proxy
+#       rolls, login still works
+#   E7  secrets hygiene: no Secret value in the LAN transcript or node logs;
+#       no PRIVATE KEY in the bundle tar; ~/.docker, ~/.config/helm unchanged
+#   E6  node rebuild: new host key -> up prints the ssh-keygen -R fix;
+#       --forget-host-key completes; optional restore check  [--allow-destroy]
+#   E10 migration rehearsal: old-style install (E2E_OLD_SETUP), migrate, up,
+#       k3s restart: nothing lost, CRDs ArgoCD-tracked, no Teknoir K3s files,
+#       old secrets unchanged, Harbor stable                 [--allow-destroy]
+#
+# Usage: airgap/test/vm/e2e.sh [--list] [--allow-destroy] [--stop-on-fail] [E...]
+# Environment:
+#   E2E_BUNDLE       bundle A: dist/teknoir-airgap-<id>.tar (+ .tar.sha256 next to it)
+#   E2E_BUNDLE_B     bundle B for E4 (a trivial controller + app-of-apps bump)
+#   E2E_E4_APPS      Applications B may change (default "app-of-apps"; add the bumped one)
+#   E2E_OLD_SETUP    E10: command (run on vpro, VM_IP exported) that installs the
+#                    old (e9a3b7f) layout with dummy secrets on the fresh VM
+#   E2E_WORK         work dir (default ~/vmtest/e2e); LAN_HOME (default ~/vmtest/lanhome)
+#   E2E_UP_FLAGS     extra flags for every `up` (e.g. a non-interactive host-key accept)
+#   E2E_ZERO_CHANGES_RE  regex that the E2 summary must match (default: "0 change|no change")
+#   E2E_LOGIN_URL    oauth2-proxy protected URL (default https://grafana.<domain>/)
+#   E2E_ADMIN_USER   Keycloak user for the login check (default platform-admin)
+#   E2E_E6_RESTORE_CMD  E6: restore command run after the rebuild (OPERATE.md); unset = skip
+# Nothing here touches vpro's /etc/hosts, its default route, or the live env.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "${HERE}/../../.." && pwd)"
+TL_NAME=e2e
+TL_POLL=10
+# shellcheck source=../lib/testlib.sh
+source "${HERE}/../lib/testlib.sh"
+
+VM="${HERE}/vm.sh"
+NETNS="${HERE}/lan-netns.sh"
+KCLOGIN="${HERE}/kc-login.sh"
+E2E_WORK="${E2E_WORK:-${HOME}/vmtest/e2e}"
+export LAN_HOME="${LAN_HOME:-${HOME}/vmtest/lanhome}"
+export LAN_SITE="${E2E_SITE:-${REPO}/airgap/site/vmtest.env}"
+SITE_FILE="${E2E_WORK}/site/vmtest.env"
+TRANSCRIPT="${E2E_WORK}/transcript.log"
+STATE="${E2E_WORK}/state"
+ALL=(E1 E2 E3 E4 E5 E8 E7 E6 E10)
+ALLOW_DESTROY=0 STOP_ON_FAIL=0
+HARBOR_NS="${E2E_HARBOR_NS:-teknoir-system}"
+HARBOR_REGISTRY="${E2E_HARBOR_REGISTRY:-harbor-registry}"
+ADMIN_USER="${E2E_ADMIN_USER:-platform-admin}"
+ZERO_RE="${E2E_ZERO_CHANGES_RE:-(^|[^0-9])0 change|no change|nothing changed}"
+# shellcheck disable=SC1090
+DOMAIN="$(. "${LAN_SITE}"; printf '%s' "${TEKNOIR_DOMAIN}")"
+# shellcheck disable=SC1090
+NODE_IP="$(. "${LAN_SITE}"; printf '%s' "${NODE_IP}")"
+LOGIN_URL="${E2E_LOGIN_URL:-https://grafana.${DOMAIN}/}"
+AGENT_PID=""
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
+
+# ---------------------------------------------------------------------------
+# plumbing
+# ---------------------------------------------------------------------------
+need() { local t; for t in "$@"; do command -v "${t}" >/dev/null 2>&1 || tl_die "missing tool: ${t}"; done; }
+
+vmx() { "${VM}" ssh "$(printf '%q ' "$@")"; }      # one command on the VM (as teknoir)
+vm_kc() { vmx sudo k3s kubectl "$@"; }
+vm_root() { "${VM}" ssh 'sudo bash -s'; }          # a root script on stdin
+
+lan() {
+  # lan <dir> <cmd...> — run in the LAN netns, cwd <dir>; output to the terminal and transcript
+  local dir="$1" rc
+  shift
+  printf '\n$ [lan %s] %s\n' "${dir}" "$*" >> "${TRANSCRIPT}"
+  set +e
+  # shellcheck disable=SC2016  # expanded by the inner bash
+  "${NETNS}" exec -- bash -c 'cd "$1" && shift && exec "$@"' lan "${dir}" "$@" 2>&1 | tee -a "${TRANSCRIPT}"
+  rc=${PIPESTATUS[0]}
+  set -e
+  return "${rc}"
+}
+
+up_in() {
+  # up_in <bundle-dir> [flags...] — the operator's `./teknoir-airgap up`
+  local dir="$1"
+  shift
+  # shellcheck disable=SC2086  # E2E_UP_FLAGS is a flag list
+  printf 'yes\n' | lan "${dir}" ./teknoir-airgap up --site "${SITE_FILE}" ${E2E_UP_FLAGS:-} "$@"
+}
+
+start_agent() {
+  # The LAN user authenticates with the VM's key through a private agent
+  # (the equivalent of the runbook's ssh-copy-id; ~/.ssh is not touched).
+  [[ -n "${AGENT_PID}" ]] && return 0
+  eval "$(ssh-agent -s)" >/dev/null
+  AGENT_PID="${SSH_AGENT_PID}"
+  ssh-add -q "$("${VM}" key)" 2>/dev/null || tl_die "cannot add the VM key $("${VM}" key) to the agent (run vm.sh create)"
+}
+
+cleanup() {
+  local rc=$?
+  [[ -n "${AGENT_PID}" ]] && kill "${AGENT_PID}" 2>/dev/null
+  return "${rc}"
+}
+
+prepare() {
+  mkdir -p "${E2E_WORK}/bundles" "${E2E_WORK}/site" "${STATE}"
+  install -d -m 0700 "${LAN_HOME}" "${LAN_HOME}/e2e"
+  install -m 0644 "${LAN_SITE}" "${SITE_FILE}"
+  touch "${TRANSCRIPT}"
+  start_agent
+  local avail
+  avail="$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)"
+  if ! "${VM}" status 2>&1 | grep -q 'running (pid' && (( avail < 11 )); then
+    tl_warn "only ${avail} GiB available; the VM needs 10 GiB (stop other docker workloads)"
+  fi
+}
+
+ensure_vm() {
+  # ensure_vm — VM running, LAN namespace up
+  "${VM}" start
+  "${NETNS}" up
+}
+
+fresh_vm() {
+  (( ALLOW_DESTROY )) || { fail "${TL_CASE} re-creates the VM: pass --allow-destroy"; return 1; }
+  tl_log "re-creating the VM (destroy + start)"
+  "${VM}" destroy
+  "${VM}" start
+  "${NETNS}" up
+}
+
+bundle_dir() {
+  # bundle_dir <tar> — verify the .sha256 and extract once (in the netns, as
+  # the operator would); prints the extracted bundle dir
+  local tar="$1" top
+  [[ -f "${tar}" && -f "${tar}.sha256" ]] || tl_die "bundle ${tar} or ${tar}.sha256 missing"
+  top="$(tar -tf "${tar}" | head -1 | cut -d/ -f1)"
+  if [[ ! -f "${E2E_WORK}/bundles/${top}.extracted" ]]; then
+    lan "$(dirname "${tar}")" sha256sum -c "$(basename "${tar}").sha256" >&2 || tl_die "sha256 check of ${tar} failed"
+    rm -rf "${E2E_WORK:?}/bundles/${top}"
+    lan "${E2E_WORK}/bundles" tar -xf "${tar}" >&2 || tl_die "extracting ${tar} failed"
+    touch "${E2E_WORK}/bundles/${top}.extracted"
+  fi
+  printf '%s/bundles/%s' "${E2E_WORK}" "${top}"
+}
+
+bundle_id() { basename "$1" | sed 's/^teknoir-airgap-//'; }
+
+ca_file() { find "${LAN_HOME}/.teknoir-airgap" -name teknoir-root-ca.crt -print -quit 2>/dev/null; }
+
+lan_https() {
+  # lan_https <url> — HTTP status from the netns with the fetched CA
+  lan "${E2E_WORK}" curl -sS -m 20 --cacert "$(ca_file)" -o /dev/null -w '%{http_code}' "$1" 2>/dev/null | tail -c 3
+}
+
+apps_state() {
+  vm_kc -n teknoir-system get applications.argoproj.io --no-headers \
+    -o custom-columns=NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status,TARGET:.spec.source.targetRevision,REV:.status.sync.revision
+}
+apps_healthy() {
+  local s
+  s="$(apps_state 2>/dev/null)" || return 1
+  [[ -n "${s}" ]] && [[ -z "$(awk '$2 != "Synced" || $3 != "Healthy"' <<<"${s}")" ]]
+}
+wait_apps() {
+  # wait_apps <timeout> — every Application Synced/Healthy; prints the table on failure
+  if wait_until "$1" apps_healthy; then pass "every Application is Synced/Healthy"; return 0; fi
+  fail "Applications not all Synced/Healthy within $1 s:"
+  apps_state | awk '$2 != "Synced" || $3 != "Healthy"' >&2 || true
+  return 1
+}
+
+snap_pods() {
+  # pod UIDs, without Job pods (CronJobs create new ones by design)
+  vm_kc get pods -A -o json | jq -r '.items[]
+    | select([(.metadata.ownerReferences // [])[].kind] | index("Job") | not)
+    | "\(.metadata.namespace)/\(.metadata.name) \(.metadata.uid)"' | sort
+}
+snap_secret_rvs() {
+  vm_kc get secrets -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,RV:.metadata.resourceVersion | sort
+}
+k3s_since() { vmx systemctl show k3s -p ActiveEnterTimestamp --value; }
+release_record() { vm_kc -n teknoir-system get configmap teknoir-airgap-release -o json | jq -r '.data | tostring'; }
+
+harbor_blob_puts_since() {
+  local logs
+  logs="$(vm_kc -n "${HARBOR_NS}" logs "deploy/${HARBOR_REGISTRY}" --since-time="$1" 2>/dev/null)" || { echo unknown; return 0; }
+  grep -cE 'PUT /v2/[^ ]+/blobs/uploads/' <<<"${logs}" || true
+}
+
+dotdirs() {
+  # dotdirs — fingerprint of the docker/helm config dirs on the LAN host and the node
+  {
+    for d in "${LAN_HOME}/.docker" "${LAN_HOME}/.config/helm"; do
+      if [[ -d "${d}" ]]; then find "${d}" -type f -exec sha256sum {} + | sort; else echo "absent ${d}"; fi
+    done
+    vm_root <<'EOF'
+for d in /root/.docker /root/.config/helm /home/teknoir/.docker /home/teknoir/.config/helm; do
+  if [ -d "$d" ]; then find "$d" -type f -exec sha256sum {} + | sort; else echo "absent $d"; fi
+done
+EOF
+  } 2>&1
+}
+
+admin_pw_current() {
+  # the platform-admin password file in use (after a forced change: the new one)
+  if [[ -s "${LAN_HOME}/e2e/platform-admin.new" ]]; then printf '%s' "${LAN_HOME}/e2e/platform-admin.new"
+  else printf '%s' "${LAN_HOME}/e2e/platform-admin.pw"; fi
+}
+
+login_check() {
+  # login_check <description> — scripted oauth2-proxy/Keycloak login from the netns
+  if lan "${E2E_WORK}" "${KCLOGIN}" --cacert "$(ca_file)" --url "${LOGIN_URL}" --user "${ADMIN_USER}" \
+       --password-file "$(admin_pw_current)" --new-password-file "${LAN_HOME}/e2e/platform-admin.new"; then
+    pass "$1"
+  else
+    fail "$1"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# E1
+# ---------------------------------------------------------------------------
+e1() {
+  tl_case E1 "fresh bootstrap from the extracted tar in the LAN netns"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  fresh_vm || return 0
+  rm -rf "${LAN_HOME:?}/.teknoir-airgap" "${LAN_HOME}/e2e"/platform-admin.*
+  local dir
+  dir="$(bundle_dir "${E2E_BUNDLE}")"
+  dotdirs > "${STATE}/dotdirs.before"
+  if up_in "${dir}"; then pass "teknoir-airgap up exits 0 on a fresh node"; else fail "teknoir-airgap up failed"; return 0; fi
+  wait_apps 2700 || true
+  if [[ -n "$(ca_file)" ]]; then pass "the CA certificate was fetched to ${LAN_HOME}/.teknoir-airgap/<site>/"; else fail "no teknoir-root-ca.crt under ${LAN_HOME}/.teknoir-airgap"; return 0; fi
+  assert_eq "https://harbor.${DOMAIN}/api/v2.0/health with the CA" 200 "$(lan_https "https://harbor.${DOMAIN}/api/v2.0/health")"
+  assert_eq "https://argocd.${DOMAIN} with the CA" 200 "$(lan_https "https://argocd.${DOMAIN}/")"
+  assert_eq "Keycloak master realm discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/realms/master/.well-known/openid-configuration")"
+  assert_eq "Keycloak realm teknoir discovery with the CA (D2)" 200 "$(lan_https "https://auth.${DOMAIN}/realms/teknoir/.well-known/openid-configuration")"
+  local pw="${LAN_HOME}/e2e/platform-admin.pw" mode
+  if lan "${dir}" ./teknoir-airgap credentials platform-admin --out "${pw}" </dev/null; then
+    mode="$(stat -c %a "${pw}" 2>/dev/null || echo missing)"
+    assert_eq "credentials --out writes a 0600 file" 600 "${mode}"
+  else
+    fail "teknoir-airgap credentials platform-admin --out failed"; return 0
+  fi
+  login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} (forced password change handled)"
+}
+
+# ---------------------------------------------------------------------------
+# E2
+# ---------------------------------------------------------------------------
+e2() {
+  tl_case E2 "idempotency: a second up changes nothing"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  local dir pods secrets since t0 out rc puts
+  dir="$(bundle_dir "${E2E_BUNDLE}")"
+  pods="$(snap_pods)" secrets="$(snap_secret_rvs)" since="$(k3s_since)"
+  t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  set +e; out="$(up_in "${dir}")"; rc=$?; set -e
+  assert_eq "the second up exits 0" 0 "${rc}"
+  if grep -qiE "${ZERO_RE}" <<<"${out}"; then pass "the converge summary reports 0 changes"
+  else fail "the summary does not match /${ZERO_RE}/:"; tail -15 <<<"${out}" >&2; fi
+  assert_eq "pod UIDs unchanged" "${pods}" "$(snap_pods)"
+  assert_eq "k3s ActiveEnterTimestamp unchanged (no restart)" "${since}" "$(k3s_since)"
+  assert_eq "Secret resourceVersions unchanged" "${secrets}" "$(snap_secret_rvs)"
+  puts="$(harbor_blob_puts_since "${t0}")"
+  assert_eq "Harbor received 0 blob uploads" 0 "${puts}"
+}
+
+# ---------------------------------------------------------------------------
+# E3
+# ---------------------------------------------------------------------------
+forward_drops() {
+  sudo iptables -L FORWARD -v -x -n | awk '$3 == "DROP" && ($6 == "tkvm0" || $7 == "tkvm0") {s += $1} END {print s + 0}'
+}
+
+e3() {
+  tl_case E3 "no egress from the VM or the LAN namespace; all images local"
+  ensure_vm
+  local before after images bad
+  before="$(forward_drops)"
+  assert_not_cmd "VM: https://registry-1.docker.io/v2/ is unreachable" vmx curl -sS -m 5 -o /dev/null https://registry-1.docker.io/v2/
+  assert_not_cmd "VM: github.com does not resolve" vmx getent hosts github.com
+  # A host route via vpro makes the VM and the namespace actually send
+  # packets towards the internet, so the FORWARD DROP counters must grow.
+  vmx sudo ip route replace 1.1.1.1/32 via 10.77.0.1 >/dev/null
+  assert_not_cmd "VM: https://1.1.1.1 via vpro is dropped" vmx curl -sS -m 5 -o /dev/null https://1.1.1.1/
+  vmx sudo ip route del 1.1.1.1/32 >/dev/null || true
+  "${NETNS}" exec --root ip route replace 1.1.1.1/32 via 10.77.0.1
+  assert_not_cmd "netns: https://1.1.1.1 via vpro is dropped" lan "${E2E_WORK}" curl -sS -m 5 -o /dev/null https://1.1.1.1/
+  "${NETNS}" exec --root ip route del 1.1.1.1/32 || true
+  assert_not_cmd "netns: a public name does not resolve" lan "${E2E_WORK}" getent hosts github.com
+  after="$(forward_drops)"
+  if (( after > before )); then pass "vpro FORWARD DROP counters for tkvm0 grew (${before} -> ${after})"
+  else fail "FORWARD DROP counters did not grow (${before} -> ${after})"; fi
+  images="$(vmx sudo k3s crictl images -o json | jq -r '.images[] | (.repoTags[]?, .repoDigests[]?)' | sort -u)"
+  bad="$(vm_kc get pods -A -o json | jq -r '.items[].spec | (.containers + (.initContainers // []))[].image' | sort -u |
+         while read -r img; do
+           ref="${img}"; [[ "${ref}" == */*/* || "${ref}" == *.*/* ]] || ref="docker.io/${ref}"
+           [[ "${ref}" == */*/* || "${ref}" == *.*/* ]] || ref="docker.io/library/${ref#docker.io/}"
+           grep -qxF -- "${ref}" <<<"${images}" || grep -qxF -- "${img}" <<<"${images}" || echo "${img}"
+         done)"
+  assert_eq "every pod image is present in containerd (imported, or pulled through the harbor.${DOMAIN} mirror)" "" "${bad}"
+  assert_eq "no ErrImagePull/ImagePullBackOff events" 0 \
+    "$(vm_kc get events -A --no-headers 2>/dev/null | grep -cE 'ErrImagePull|ImagePullBackOff' || true)"
+  local mirrors
+  mirrors="$(vmx sudo cat /etc/rancher/k3s/registries.yaml)"
+  local r miss=""
+  for r in docker.io ghcr.io gcr.io quay.io registry.k8s.io; do grep -q "${r}" <<<"${mirrors}" || miss+="${r} "; done
+  assert_eq "registries.yaml mirrors every upstream registry to harbor.${DOMAIN}" "" "${miss}"
+}
+
+# ---------------------------------------------------------------------------
+# E4
+# ---------------------------------------------------------------------------
+e4() {
+  tl_case E4 "update to bundle B, refusal of A, rollback to A"
+  [[ -n "${E2E_BUNDLE:-}" && -n "${E2E_BUNDLE_B:-}" ]] || { skip_case "E2E_BUNDLE and E2E_BUNDLE_B required"; return 0; }
+  ensure_vm
+  local a b ida idb before after changed allowed="${E2E_E4_APPS:-app-of-apps}" app out rc
+  a="$(bundle_dir "${E2E_BUNDLE}")" b="$(bundle_dir "${E2E_BUNDLE_B}")"
+  ida="$(bundle_id "${a}")" idb="$(bundle_id "${b}")"
+  before="$(apps_state | awk '{print $1, $4, $5}')"
+  if up_in "${b}"; then pass "up with bundle B exits 0"; else fail "up with bundle B failed"; return 0; fi
+  wait_apps 1800 || true
+  after="$(apps_state | awk '{print $1, $4, $5}')"
+  changed="$(diff <(echo "${before}") <(echo "${after}") | awk '/^>/ {print $2}' | sort -u | tr '\n' ' ')"
+  if [[ -n "${changed}" ]]; then pass "Applications changed by B: ${changed}"; else fail "no Application changed revision with bundle B"; fi
+  for app in ${changed}; do
+    [[ " ${allowed} " == *" ${app} "* ]] || fail "Application ${app} changed but is not in E2E_E4_APPS (${allowed})"
+  done
+  if release_record | grep -qF -- "${idb}"; then pass "the release ConfigMap records bundle B"; else fail "the release ConfigMap does not record ${idb}"; fi
+  set +e; out="$(up_in "${a}")"; rc=$?; set -e
+  if (( rc != 0 )) && grep -qi rollback <<<"${out}"; then pass "up with the older bundle A is refused (and mentions --rollback)"
+  else fail "up with the older bundle A was not refused (rc=${rc})"; fi
+  if release_record | grep -qF -- "${idb}"; then pass "the refused run left the release record at B"; else fail "the refused run changed the release record"; fi
+  if up_in "${a}" --rollback; then pass "up --rollback with A exits 0"; else fail "up --rollback with A failed"; return 0; fi
+  wait_apps 1800 || true
+  if release_record | grep -qF -- "${ida}"; then pass "the release ConfigMap records the rollback to A"; else fail "rollback to ${ida} not recorded"; fi
+  if up_in "${a}"; then pass "a plain up with A after the rollback exits 0"; else fail "plain up with A after the rollback failed"; fi
+  if release_record | grep -qF -- "${ida}"; then pass "a plain up with A keeps A (no roll-forward)"; else fail "the release record moved away from A"; fi
+}
+
+# ---------------------------------------------------------------------------
+# E5
+# ---------------------------------------------------------------------------
+e5_prep_sync() { vmx sudo rm -rf "/var/lib/teknoir-airgap/bundles/$1"; }
+e5_prep_import() {
+  local img="${E2E_E5_IMPORT_IMAGE:-docker.io/alpine/k8s:1.34.11}"
+  vmx sudo k3s ctr -n k8s.io images rm "${img}" >/dev/null 2>&1 || true
+}
+e5_prep_push() {
+  # delete one mirrored repository in Harbor (not in project teknoir), so up
+  # has something to push; the admin password stays inside this VM script
+  vm_root <<'EOF'
+set -eu
+k() { k3s kubectl "$@"; }
+pw="$(k -n teknoir-system get secret harbor-secret -o jsonpath='{.data.HARBOR_ADMIN_PASSWORD}' | base64 -d)"
+dom="$(k -n kube-system get configmap coredns-custom -o yaml | grep -oE 'harbor\.[a-z0-9.-]+' | head -1)"
+api="https://${dom}/api/v2.0"
+cfg="$(mktemp)"; trap 'rm -f "$cfg"' EXIT
+printf 'user = "admin:%s"\n' "$pw" > "$cfg"
+proj="$(curl -sS -K "$cfg" "$api/projects?page_size=100" | python3 -c 'import json,sys; print(next(p["name"] for p in json.load(sys.stdin) if p["name"] != "teknoir"))')"
+repo="$(curl -sS -K "$cfg" "$api/projects/$proj/repositories?page_size=1" | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["name"].split("/",1)[1])')"
+enc="$(printf '%s' "$repo" | sed 's|/|%252F|g')"
+code="$(curl -sS -K "$cfg" -X DELETE -o /dev/null -w '%{http_code}' "$api/projects/$proj/repositories/$enc")"
+echo "deleted Harbor repository $proj/$repo (HTTP $code)"
+EOF
+}
+
+interrupt_up() {
+  # interrupt_up <label> <regex> <bundle-dir> — run up, kill it once its
+  # output matches <regex>, then re-run it to completion
+  local label="$1" re="$2" dir="$3" out="${E2E_WORK}/e5-$1.log" pid waited=0
+  : > "${out}"
+  setsid "$0" __up "${dir}" > "${out}" 2>&1 &
+  pid=$!
+  while kill -0 "${pid}" 2>/dev/null && ! grep -qiE "${re}" "${out}"; do
+    sleep 1; waited=$((waited + 1))
+    (( waited < ${E2E_E5_TIMEOUT:-1800} )) || break
+  done
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    fail "${label}: up finished before /${re}/ appeared; nothing was interrupted (see ${out})"
+    wait "${pid}" || true
+    return 0
+  fi
+  sleep "${E2E_E5_DELAY:-3}"
+  sudo kill -TERM -- "-${pid}" 2>/dev/null || true
+  vmx sudo pkill -TERM -f 'teknoir-node converge' >/dev/null 2>&1 || true
+  wait "${pid}" || true
+  pass "${label}: up interrupted after /${re}/ (${waited}s)"
+  if up_in "${dir}"; then pass "${label}: the re-run completes with no manual repair"; else fail "${label}: the re-run failed"; fi
+  wait_apps 1800 || true
+}
+
+e5() {
+  tl_case E5 "interruptions during payload sync, Harbor push and tarball import"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  local dir id
+  dir="$(bundle_dir "${E2E_BUNDLE}")" id="$(bundle_id "${dir}")"
+  e5_prep_sync "${id}"
+  interrupt_up "payload sync" "${E2E_E5_SYNC_RE:-sync|send|payload|transfer}" "${dir}"
+  e5_prep_push
+  interrupt_up "Harbor push" "${E2E_E5_PUSH_RE:-harbor.*(push|image)|pushing}" "${dir}"
+  e5_prep_import
+  interrupt_up "tarball import" "${E2E_E5_IMPORT_RE:-import}" "${dir}"
+}
+
+# ---------------------------------------------------------------------------
+# E6
+# ---------------------------------------------------------------------------
+harbor_projects() { lan "${E2E_WORK}" curl -sS -m 20 --cacert "$(ca_file)" "https://harbor.${DOMAIN}/api/v2.0/projects?page_size=100" | jq -r '.[].name' 2>/dev/null | sort | tr '\n' ' '; }
+
+e6() {
+  tl_case E6 "node rebuild: host-key change is reported with its fix; --forget-host-key completes"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  (( ALLOW_DESTROY )) || { skip_case "re-creates the VM: pass --allow-destroy"; return 0; }
+  local dir out rc projects=""
+  dir="$(bundle_dir "${E2E_BUNDLE}")"
+  [[ -n "$(ca_file)" ]] && projects="$(harbor_projects || true)"
+  fresh_vm || return 0
+  set +e; out="$(up_in "${dir}")"; rc=$?; set -e
+  if (( rc != 0 )); then pass "up refuses the changed host key"; else fail "up accepted a changed host key"; fi
+  if grep -q 'ssh-keygen -R' <<<"${out}"; then pass "the message prints the ssh-keygen -R fix"; else fail "no 'ssh-keygen -R' in the output"; fi
+  if grep -q -- '--forget-host-key' <<<"${out}"; then pass "the message mentions --forget-host-key"; else fail "no '--forget-host-key' in the output"; fi
+  if up_in "${dir}" --forget-host-key; then pass "up --forget-host-key bootstraps the rebuilt node"; else fail "up --forget-host-key failed"; return 0; fi
+  wait_apps 2700 || true
+  if [[ -z "${E2E_E6_RESTORE_CMD:-}" ]]; then
+    tl_warn "restore not exercised (E2E_E6_RESTORE_CMD unset; restore is the OPERATE.md procedure)"
+    return 0
+  fi
+  if bash -c "${E2E_E6_RESTORE_CMD}"; then pass "restore command exits 0"; else fail "restore command failed"; return 0; fi
+  wait_apps 1800 || true
+  assert_eq "Harbor projects are back after the restore" "${projects}" "$(harbor_projects)"
+  login_check "the pre-rebuild ${ADMIN_USER} password works again (Keycloak DB restored)"
+}
+
+# ---------------------------------------------------------------------------
+# E7
+# ---------------------------------------------------------------------------
+e7() {
+  tl_case E7 "secrets hygiene: no Secret value in the transcript or node logs; no private key in the tar"
+  ensure_vm
+  local res
+  vmx 'cat > /tmp/e2e-transcript.log' < "${TRANSCRIPT}"
+  # The scan runs on the VM: values are read and compared there, never printed.
+  res="$(vm_root <<'EOF'
+set -eu
+T=/tmp/e2e-transcript.log
+k() { k3s kubectl "$@"; }
+files="$T $(ls /var/log/teknoir-airgap/*.log 2>/dev/null | tr '\n' ' ')"
+checked=0 leaks=0
+pat="$(mktemp)" val="$(mktemp)"; trap 'rm -f "$pat" "$val" "$T"' EXIT; chmod 600 "$pat" "$val"
+for ns in $(k get ns -o jsonpath='{.items[*].metadata.name}'); do
+  case "$ns" in teknoir-*|cert-manager|istio-system) ;; *) continue ;; esac
+  for s in $(k -n "$ns" get secrets -o jsonpath='{range .items[?(@.type!="kubernetes.io/service-account-token")]}{.metadata.name}{"\n"}{end}'); do
+    case "$s" in sh.helm.release.*) continue ;; esac
+    for key in $(k -n "$ns" get secret "$s" -o json | python3 -c 'import json,sys; print("\n".join((json.load(sys.stdin).get("data") or {}).keys()))'); do
+      case "$key" in *.crt|ca.pem|*_USER|*USERNAME|username|user|KEYCLOAK_REALM|KEYCLOAK_CLIENTID) continue ;; esac
+      # probes: the longest line of the value (PEM markers dropped) and the
+      # base64 of the whole value (how `get secret -o yaml` would print it)
+      k -n "$ns" get secret "$s" -o go-template="{{index .data \"$key\" | base64decode}}" > "$val"
+      grep -v -- '-----' "$val" | awk 'length > max {max = length; l = $0} END {print l}' > "$pat"
+      [ "$(wc -c < "$pat")" -gt 13 ] || continue
+      { base64 -w0 < "$val"; echo; } >> "$pat"
+      checked=$((checked + 1))
+      # shellcheck disable=SC2086  # $files is a list
+      n=$(cat $files 2>/dev/null | grep -acFf "$pat" || true)
+      if [ "${n:-0}" -gt 0 ]; then echo "LEAK $ns/$s key=$key lines=$n"; leaks=$((leaks + 1)); fi
+    done
+  done
+done
+echo "checked=$checked leaks=$leaks"
+EOF
+)"
+  printf '%s\n' "${res}" >&2
+  if grep -q '^checked=[1-9]' <<<"${res}"; then pass "scanned $(sed -n 's/^checked=\([0-9]*\).*/\1/p' <<<"${res}") Secret values on the VM"
+  else fail "no Secret values were scanned"; fi
+  assert_eq "no Secret value appears in the LAN transcript or the node logs" 0 "$(sed -n 's/.*leaks=\([0-9]*\)$/\1/p' <<<"${res}")"
+  local t
+  for t in "${E2E_BUNDLE:-}" "${E2E_BUNDLE_B:-}"; do
+    [[ -n "${t}" ]] || continue
+    assert_eq "no 'PRIVATE KEY' anywhere in $(basename "${t}")" 0 "$(tar -xOf "${t}" | grep -ac 'PRIVATE KEY' || true)"
+  done
+  if [[ -f "${STATE}/dotdirs.before" ]]; then
+    assert_eq "docker and helm config dirs (.docker, .config/helm) unchanged on the LAN host and the node" "$(cat "${STATE}/dotdirs.before")" "$(dotdirs)"
+  else
+    assert_eq "no docker or helm config dirs on the LAN host or the node" 0 "$(dotdirs | grep -vc '^absent ' || true)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# E8
+# ---------------------------------------------------------------------------
+e8() {
+  tl_case E8 "rotate oauth2-proxy-cookie: only that Secret changes; oauth2-proxy rolls; login works"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  local dir before after changed pods_before pods_after
+  dir="$(bundle_dir "${E2E_BUNDLE}")"
+  before="$(snap_secret_rvs)"
+  pods_before="$(vm_kc -n teknoir-auth get pods -l app.kubernetes.io/name=oauth2-proxy -o jsonpath='{.items[*].metadata.uid}')"
+  if lan "${dir}" ./teknoir-airgap rotate oauth2-proxy-cookie </dev/null; then pass "rotate oauth2-proxy-cookie exits 0"; else fail "rotate failed"; return 0; fi
+  wait_apps 900 || true
+  after="$(snap_secret_rvs)"
+  changed="$(diff <(echo "${before}") <(echo "${after}") | awk '/^>/ {print $2 "/" $3}' | sort -u | tr '\n' ' ')"
+  assert_eq "only teknoir-auth/oauth2-proxy-secret changed" "teknoir-auth/oauth2-proxy-secret " "${changed}"
+  pods_after="$(vm_kc -n teknoir-auth get pods -l app.kubernetes.io/name=oauth2-proxy -o jsonpath='{.items[*].metadata.uid}')"
+  if [[ -n "${pods_after}" && "${pods_after}" != "${pods_before}" ]]; then pass "oauth2-proxy pods were replaced"; else fail "oauth2-proxy did not roll"; fi
+  login_check "login still works after the cookie-secret rotation"
+}
+
+# ---------------------------------------------------------------------------
+# E10
+# ---------------------------------------------------------------------------
+E10_SECRETS="${E2E_E10_SECRETS:-teknoir-system/harbor-secret teknoir-auth/keycloak-db-secret teknoir-auth/oauth2-proxy-secret teknoir-auth/oauth2-proxy-redis-secret teknoir-system/argocd-oidc-secret cert-manager/teknoir-root-ca teknoir-auth/teknoir-root-ca-bundle teknoir-system/teknoir-root-ca-bundle}"
+
+e10_inventory() {
+  # every object of the kinds the migration touches, by name (no values)
+  vm_kc get crd,ns -o name | sort
+  vm_kc get secrets,configmaps,virtualservices,gateways,destinationrules,authorizationpolicies,peerauthentications,certificates,clusterissuers,applications,appprojects \
+    -A --no-headers -o custom-columns=K:.kind,NS:.metadata.namespace,N:.metadata.name 2>/dev/null | sort
+}
+
+e10_secret_hashes() {
+  # sha256 of each listed Secret's data, computed on the VM (values never leave it)
+  {
+    printf 'refs="%s"\n' "${E10_SECRETS}"
+    cat <<'EOF'
+for ref in $refs; do
+  h="$(k3s kubectl -n "${ref%%/*}" get secret "${ref#*/}" -o jsonpath='{.data}' 2>/dev/null | sha256sum | cut -c1-16)"
+  echo "$ref $h"
+done
+EOF
+  } | vm_root
+}
+
+e10() {
+  tl_case E10 "migration rehearsal: old layout -> migrate -> up -> k3s restart"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  [[ -n "${E2E_OLD_SETUP:-}" ]] || { skip_case "E2E_OLD_SETUP (old-tooling install command) not set"; return 0; }
+  (( ALLOW_DESTROY )) || { skip_case "re-creates the VM: pass --allow-destroy"; return 0; }
+  fresh_vm || return 0
+  if VM_IP="${NODE_IP}" bash -c "${E2E_OLD_SETUP}"; then pass "old-style install completed"; else fail "E2E_OLD_SETUP failed"; return 0; fi
+  local dir inv0 hashes0 lost rs0 rs1 files addons
+  dir="$(bundle_dir "${E2E_BUNDLE}")"
+  inv0="$(e10_inventory)" hashes0="$(e10_secret_hashes)"
+  if lan "${dir}" ./teknoir-airgap migrate --site "${SITE_FILE}" --dry-run </dev/null; then pass "migrate --dry-run exits 0"; else fail "migrate --dry-run failed"; fi
+  assert_eq "migrate --dry-run changed nothing" "${inv0}" "$(e10_inventory)"
+  if lan "${dir}" ./teknoir-airgap migrate --site "${SITE_FILE}" </dev/null; then pass "migrate exits 0"; else fail "migrate failed"; return 0; fi
+  if up_in "${dir}"; then pass "up after migrate exits 0"; else fail "up after migrate failed"; return 0; fi
+  wait_apps 2700 || true
+  vmx sudo systemctl restart k3s
+  wait_until 300 vm_kc get --raw /readyz >/dev/null 2>&1 || fail "API not ready after the k3s restart"
+  sleep 60
+  wait_apps 1800 || true
+  lost="$(comm -23 <(echo "${inv0}") <(e10_inventory) | tr '\n' ' ')"
+  assert_eq "no object lost (every pre-migration object still exists)" "" "${lost}"
+  assert_eq "the existing platform Secrets are unchanged (adopted by name and key)" "${hashes0}" "$(e10_secret_hashes)"
+  local crd track
+  for crd in gateways.networking.istio.io certificates.cert-manager.io; do
+    track="$(vm_kc get crd "${crd}" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/tracking-id}')"
+    if [[ -n "${track}" ]]; then pass "CRD ${crd} is ArgoCD-tracked (${track})"; else fail "CRD ${crd} has no tracking-id"; fi
+  done
+  addons="$(vm_kc -n kube-system get addons.k3s.cattle.io -o name | sed 's|.*/||' |
+            grep -E '^(teknoir-.*|00-teknoir-.*|05-teknoir-.*|10-teknoir-.*|manifest-.*-secret|app-of-apps)$' | grep -vx teknoir-argo | tr '\n' ' ' || true)"
+  assert_eq "no Teknoir Addons left but teknoir-argo" "" "${addons}"
+  files="$(vmx sudo ls /opt/k3s/server/manifests | grep -E '\.ya?ml$' | grep -E '^(teknoir-|00-teknoir-|05-teknoir-|10-teknoir-|manifest-|app-of-apps)' | grep -vx teknoir-argo.yaml | tr '\n' ' ' || true)"
+  assert_eq "no Teknoir K3s files left but teknoir-argo.yaml" "" "${files}"
+  rs0="$(vm_kc -n "${HARBOR_NS}" get rs -l component=core -o name | sort)"
+  tl_log "watching harbor-core ReplicaSets for ${E2E_E10_STABLE_SECONDS:-3600}s"
+  sleep "${E2E_E10_STABLE_SECONDS:-3600}"
+  rs1="$(vm_kc -n "${HARBOR_NS}" get rs -l component=core -o name | sort)"
+  assert_eq "no new harbor-core ReplicaSet (Harbor render is stable)" "${rs0}" "${rs1}"
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+main() {
+  if [[ "${1:-}" == __up ]]; then
+    # internal: one `up` for interrupt_up (run under setsid)
+    shift; start_agent; up_in "$@"; return
+  fi
+  local -a run=()
+  while (( $# )); do
+    case "$1" in
+      --list) printf '%s\n' "${ALL[@]}"; return 0 ;;
+      --allow-destroy) ALLOW_DESTROY=1 ;;
+      --stop-on-fail) STOP_ON_FAIL=1 ;;
+      -h|--help) usage; return 0 ;;
+      E[0-9]*) [[ " ${ALL[*]} " == *" ${1^^} "* ]] || tl_die "unknown scenario $1 (see --list)"; run+=("${1^^}") ;;
+      *) tl_die "unknown argument $1 (see --help)" ;;
+    esac
+    shift
+  done
+  (( ${#run[@]} )) || run=("${ALL[@]}")
+  need sudo ip curl jq tar sha256sum ssh ssh-agent ssh-add setsid iptables stat
+  trap cleanup EXIT
+  prepare
+  local s
+  for s in "${run[@]}"; do
+    "${s,,}"
+    if (( STOP_ON_FAIL && TL_CASE_FAILED )); then tl_warn "stopping after the failed ${s}"; break; fi
+  done
+  tl_summary | tee "${E2E_WORK}/summary.txt"
+}
+
+main "$@"
