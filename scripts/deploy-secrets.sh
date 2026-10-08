@@ -18,9 +18,15 @@
 # .secrets/ (e.g. an admin-fallback ArgoCD repo secret), so it never replaces a
 # Secret that already exists.
 #
+# --retire-legacy deploys nothing: it retires the legacy duplicates on the node
+# whose canonical file is already there, checking ownership against that file
+# on the node, so no local copy of the secret is needed and its content never
+# leaves the node.
+#
 # Usage: scripts/deploy-secrets.sh [--only <manifest>]... [--bootstrap-wildcard]
 #                                  [--create-only] [--secrets-dir DIR]
 #                                  [--host user@host] [--ssh-key FILE] [--dry-run]
+#        scripts/deploy-secrets.sh --retire-legacy [--only <manifest>]... [--dry-run]
 set -euo pipefail
 
 # shellcheck source=../airgap/lib.sh
@@ -53,6 +59,9 @@ Options:
                         does not exist yet (cert-manager owns it afterwards)
   --create-only         skip manifests whose Secret already exists
                         (first bootstrap from the bundle's copies)
+  --retire-legacy       deploy nothing; retire the legacy manifest-*.yaml files
+                        on the node whose canonical teknoir-*.yaml is there and
+                        owns every object (checked on the node)
   --secrets-dir DIR     where the manifest-*.yaml files are
                         (default: ${SECRETS_DIR})
   --host H              ssh target (default: ${TEKNOIR_HOST})
@@ -65,11 +74,13 @@ EOF
 ONLY=()
 BOOTSTRAP_WILDCARD=0
 CREATE_ONLY=0
+RETIRE_LEGACY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --only) ONLY+=("$2"); shift ;;
     --bootstrap-wildcard) BOOTSTRAP_WILDCARD=1 ;;
     --create-only) CREATE_ONLY=1 ;;
+    --retire-legacy) RETIRE_LEGACY=1 ;;
     --secrets-dir) SECRETS_DIR="$2"; shift ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
     --ssh-key) SSH_KEY="$2"; shift ;;
@@ -88,6 +99,49 @@ if [[ ${#ONLY[@]} -gt 0 ]]; then
     [[ " ${SECRET_MANIFESTS[*]} " == *" ${m} "* ]] || die "--only ${m}: not a known secret manifest"
   done
   SECRET_MANIFESTS=("${ONLY[@]}")
+fi
+
+if [[ "${RETIRE_LEGACY}" == "1" ]]; then
+  [[ "${CREATE_ONLY}" == "0" && "${BOOTSTRAP_WILDCARD}" == "0" ]] \
+    || die "--retire-legacy deploys nothing; it cannot be combined with --create-only or --bootstrap-wildcard"
+  node_has() {
+    # node_has <basename> — 0 present, 1 absent; dies when the node cannot be read
+    local rc=0
+    ssh_query "sudo test -e '${K3S_MANIFESTS_DIR}/$1'" 2>/dev/null || rc=$?
+    case "${rc}" in
+      0|1) return "${rc}" ;;
+      *) die "cannot check ${K3S_MANIFESTS_DIR}/$1 on ${TEKNOIR_HOST}" ;;
+    esac
+  }
+  kept=0
+  for manifest in "${SECRET_MANIFESTS[@]}"; do
+    canonical="$(k3s_canonical_name "${manifest}")"
+    for legacy in $(k3s_legacy_names "${canonical}"); do
+      node_has "${legacy}" || continue
+      if ! node_has "${canonical}"; then
+        warn "${legacy}: no ${canonical} on the node, kept (deploy it first: scripts/deploy-secrets.sh --only ${manifest})"
+        kept=$((kept + 1))
+        continue
+      fi
+      if [[ "${DRY_RUN}" == "1" ]]; then
+        # Read-only preview of k3s_retire_legacy's ownership check.
+        owners="$(k3s_owners "node:${K3S_MANIFESTS_DIR}/${canonical}")" || owners=""
+        foreign="$(awk -v a="${canonical%.yaml}" '$2 != a' <<<"${owners}")"
+        if [[ -z "${owners}" ]]; then
+          log "[dry-run] ${legacy}: none of ${canonical}'s objects found, would be kept"
+        elif [[ -n "${foreign}" ]]; then
+          log "[dry-run] would re-apply ${canonical} (it does not own: $(awk '{print $1}' <<<"${foreign}" | tr '\n' ' '))and retire ${legacy}"
+        else
+          log "[dry-run] would retire ${legacy} (${canonical%.yaml} owns all its objects)"
+        fi
+        continue
+      fi
+      k3s_retire_legacy "${legacy}" "${canonical}"
+    done
+  done
+  (( kept == 0 )) || warn "${kept} legacy secret manifest(s) kept"
+  log "deploy-secrets --retire-legacy complete"
+  exit 0
 fi
 
 in_cluster() {

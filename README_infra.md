@@ -158,6 +158,12 @@ owns it afterwards). The first bootstrap deploys the bundle copies with
 `--secrets-dir <bundle>/bootstrap/secrets --create-only`, which never replaces
 a Secret that already exists.
 
+A legacy `manifest-<name>.yaml` is retired when its secret is deployed, which
+needs the local manifest. `./scripts/deploy-secrets.sh --retire-legacy
+[--dry-run]` deploys nothing and retires every legacy secret file whose
+canonical `teknoir-<name>.yaml` is already on the node, checking ownership
+against that file on the node, so no local copy of the secret is needed.
+
 ## Deploy helpers
 
 * `scripts/deploy-argo.sh [--out FILE] [--dry-run]` — renders this checkout's

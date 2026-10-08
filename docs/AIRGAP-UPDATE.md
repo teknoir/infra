@@ -232,3 +232,9 @@ ssh "$H" sudo k3s kubectl -n teknoir-system get applications
 # 4. One file per object: no legacy app-of-apps.yaml, 10-teknoir-argo.yaml or manifest-*.yaml
 ssh "$H" sudo ls /opt/k3s/server/manifests
 ```
+
+Item 4: `update-airgap.sh` retires `app-of-apps.yaml` and `bootstrap-airgap.sh
+--update` (or `scripts/deploy-argo.sh`) retires `10-teknoir-argo.yaml`. Legacy
+secret files (`manifest-*.yaml`, written by older tooling) are retired by
+`./scripts/deploy-secrets.sh --retire-legacy`, which needs no local copy of
+the secrets; `--dry-run` shows what it would retire.

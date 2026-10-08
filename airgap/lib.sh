@@ -509,21 +509,33 @@ k3s_wait_applied() {
 }
 
 k3s_owners() {
-  # k3s_owners <local-manifest> — print "<kind>/<name> <owning-addon>" for every
-  # object in <local-manifest> that exists in the cluster. Objects that are gone
-  # (e.g. a finished Job removed by its TTL) are skipped: removing an Addon can
-  # not garbage-collect what does not exist. `-f -` always yields a List.
-  ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
-    "sudo k3s kubectl get --ignore-not-found -f - -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.annotations.objectset\\.rio\\.cattle\\.io/owner-name}{\"\\n\"}{end}'" \
-    < "$1"
+  # k3s_owners <manifest> — print "<kind>/<name> <owning-addon>" for every
+  # object in <manifest> that exists in the cluster. <manifest> is a local
+  # file, or node:<path> for a file on the node, which is read there (a
+  # secret's content never leaves the node). Objects that are gone (e.g. a
+  # finished Job removed by its TTL) are skipped: removing an Addon can not
+  # garbage-collect what does not exist. Read from stdin (`-f -`), kubectl
+  # always yields a List, also for a single object (`-f <file>` does not).
+  local jsonpath
+  jsonpath="'{range .items[*]}{.kind}/{.metadata.name} {.metadata.annotations.objectset\\.rio\\.cattle\\.io/owner-name}{\"\\n\"}{end}'"
+  # shellcheck disable=SC2029  # client-side expansion is intended
+  if [[ "$1" == node:* ]]; then
+    ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
+      "sudo cat '${1#node:}' | sudo k3s kubectl get --ignore-not-found -f - -o jsonpath=${jsonpath}"
+  else
+    ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
+      "sudo k3s kubectl get --ignore-not-found -f - -o jsonpath=${jsonpath}" < "$1"
+  fi
 }
 
 k3s_retire_legacy() {
-  # k3s_retire_legacy <legacy-basename> <canonical-basename> <local-manifest>
+  # k3s_retire_legacy <legacy-basename> <canonical-basename> [<local-manifest>]
   # Moves a legacy duplicate out of the manifests dir, but only after every
-  # object in <local-manifest> is owned by the canonical Addon, so removing the
-  # legacy Addon can never garbage-collect live objects. Idempotent.
-  local legacy="$1" canonical="$2" src="$3" addon owners foreign
+  # object of the canonical manifest is owned by the canonical Addon, so
+  # removing the legacy Addon can never garbage-collect live objects. The
+  # objects are read from <local-manifest> (what k3s_deploy just wrote), else
+  # from the canonical file already on the node. Idempotent.
+  local legacy="$1" canonical="$2" src="${3:-node:${K3S_MANIFESTS_DIR}/$2}" addon owners foreign sum
   addon="${canonical%.yaml}"
   ssh_query "sudo test -e '${K3S_MANIFESTS_DIR}/${legacy}'" 2>/dev/null || return 0
   owners="$(k3s_owners "${src}")" || die "cannot read owners of the objects in ${src}; keeping ${legacy}"
@@ -533,8 +545,14 @@ k3s_retire_legacy() {
     # Owned by the legacy Addon (it was applied last): clear the canonical
     # Addon's checksum so K3s re-applies the canonical file and takes ownership.
     log "re-applying ${canonical} to take over $(wc -l <<<"${foreign}" | tr -d ' ') object(s) owned by: $(awk '{print ($2 == "" ? "<none>" : $2)}' <<<"${foreign}" | sort -u | tr '\n' ' ')"
+    if [[ "${src}" == node:* ]]; then
+      sum="$(remote_sha256 "${src#node:}")"
+      [[ -n "${sum}" ]] || die "cannot checksum ${src}; keeping ${legacy}"
+    else
+      sum="$(sha256_file "${src}")"
+    fi
     remote_kubectl "-n kube-system patch addons.k3s.cattle.io ${addon} --type merge -p '{\"spec\":{\"checksum\":\"\"}}'" >/dev/null
-    k3s_wait_applied "${addon}" "$(sha256_file "${src}")"
+    k3s_wait_applied "${addon}" "${sum}"
     owners="$(k3s_owners "${src}")" || die "cannot read owners of the objects in ${src}; keeping ${legacy}"
     foreign="$(awk -v a="${addon}" '$2 != a' <<<"${owners}")"
     [[ -z "${foreign}" ]] || die "objects still not owned by ${addon}, keeping ${legacy}: ${foreign}"
