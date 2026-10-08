@@ -39,7 +39,7 @@
 # Environment:
 #   E2E_BUNDLE       bundle A: dist/teknoir-airgap-<id>.tar (+ .tar.sha256 next to it)
 #   E2E_BUNDLE_B     bundle B for E4 (a trivial controller + app-of-apps bump)
-#   E2E_E4_APPS      Applications B may change (default "app-of-apps"; add the bumped one)
+#   E2E_E4_APPS      exactly the Applications B changes, e.g. "app-of-apps device-controller" (E4 needs it)
 #   E2E_OLD_SETUP    E10: command (run on vpro, VM_IP exported) that installs the
 #                    old (e9a3b7f) layout with dummy secrets on the fresh VM
 #   E2E_WORK         work dir (default ~/vmtest/e2e); LAN_HOME (default ~/vmtest/lanhome)
@@ -278,7 +278,12 @@ snap_secret_rvs() {
   vm_kc get secrets -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,RV:.metadata.resourceVersion | sort
 }
 k3s_since() { vmx systemctl show k3s -p ActiveEnterTimestamp --value; }
-release_record() { vm_kc -n teknoir-system get configmap teknoir-airgap-release -o json | jq -r '.data | tostring'; }
+release_state() {
+  # "<bundleId> <mode>" of the release record (only the current fields: the
+  # history and previous* fields would match either bundle)
+  vm_kc -n teknoir-system get configmap teknoir-airgap-release -o jsonpath='{.data.bundleId} {.data.mode}'
+}
+app_revs() { apps_state | awk '{print $1, $4, $5}'; }
 
 harbor_blob_puts_since() {
   local logs
@@ -431,29 +436,33 @@ e3() {
 e4() {
   tl_case E4 "update to bundle B, refusal of A, rollback to A"
   [[ -n "${E2E_BUNDLE:-}" && -n "${E2E_BUNDLE_B:-}" ]] || { skip_case "E2E_BUNDLE and E2E_BUNDLE_B required"; return 0; }
+  [[ -n "${E2E_E4_APPS:-}" ]] || { skip_case "E2E_E4_APPS required: the Applications bundle B changes, e.g. \"app-of-apps device-controller\""; return 0; }
   ensure_vm
-  local a b ida idb before after changed allowed="${E2E_E4_APPS:-app-of-apps}" app out rc
+  local a b ida idb before after changed want out rc
   a="$(bundle_dir "${E2E_BUNDLE}")" b="$(bundle_dir "${E2E_BUNDLE_B}")"
   ida="$(bundle_id "${a}")" idb="$(bundle_id "${b}")"
-  before="$(apps_state | awk '{print $1, $4, $5}')"
+  want="$(tr ' ' '\n' <<<"${E2E_E4_APPS}" | grep . | sort -u | tr '\n' ' ')"
+  wait_until 1800 apps_healthy || true
+  before="$(app_revs)"
   if up_in "${b}"; then pass "up with bundle B exits 0"; else fail "up with bundle B failed"; return 0; fi
   wait_apps 1800 || true
-  after="$(apps_state | awk '{print $1, $4, $5}')"
+  after="$(app_revs)"
   changed="$(added_lines "${before}" "${after}" | awk '{print $1}' | sort -u | tr '\n' ' ')"
-  if [[ -n "${changed}" ]]; then pass "Applications changed by B: ${changed}"; else fail "no Application changed revision with bundle B"; fi
-  for app in ${changed}; do
-    [[ " ${allowed} " == *" ${app} "* ]] || fail "Application ${app} changed but is not in E2E_E4_APPS (${allowed})"
-  done
-  if release_record | grep -qF -- "${idb}"; then pass "the release ConfigMap records bundle B"; else fail "the release ConfigMap does not record ${idb}"; fi
+  assert_eq "the Applications bundle B changed are exactly E2E_E4_APPS" "${want}" "${changed}"
+  assert_eq "the release record is bundle B, mode update" "${idb} update" "$(release_state)"
   set +e; out="$(up_in "${a}")"; rc=$?; set -e
   if (( rc != 0 )) && grep -qi rollback <<<"${out}"; then pass "up with the older bundle A is refused (and mentions --rollback)"
   else fail "up with the older bundle A was not refused (rc=${rc})"; fi
-  if release_record | grep -qF -- "${idb}"; then pass "the refused run left the release record at B"; else fail "the refused run changed the release record"; fi
+  assert_eq "the refused run left the release record at B" "${idb} update" "$(release_state)"
+  assert_eq "the refused run left every Application at B" "${after}" "$(app_revs)"
   if up_in "${a}" --rollback; then pass "up --rollback with A exits 0"; else fail "up --rollback with A failed"; return 0; fi
   wait_apps 1800 || true
-  if release_record | grep -qF -- "${ida}"; then pass "the release ConfigMap records the rollback to A"; else fail "rollback to ${ida} not recorded"; fi
+  assert_eq "the release record is bundle A, mode rollback" "${ida} rollback" "$(release_state)"
+  assert_eq "every Application is back at its revision before B" "${before}" "$(app_revs)"
   if up_in "${a}"; then pass "a plain up with A after the rollback exits 0"; else fail "plain up with A after the rollback failed"; fi
-  if release_record | grep -qF -- "${ida}"; then pass "a plain up with A keeps A (no roll-forward)"; else fail "the release record moved away from A"; fi
+  wait_apps 900 || true
+  assert_eq "a plain up with A keeps A in rollback mode (no roll-forward)" "${ida} rollback" "$(release_state)"
+  assert_eq "a plain up with A leaves every Application at A" "${before}" "$(app_revs)"
 }
 
 # ---------------------------------------------------------------------------
@@ -593,10 +602,20 @@ EOF
   if grep -q '^checked=[1-9]' <<<"${res}"; then pass "scanned $(sed -n 's/^checked=\([0-9]*\).*/\1/p' <<<"${res}") Secret values on the VM"
   else fail "no Secret values were scanned"; fi
   assert_eq "no Secret value appears in the LAN transcript or the node logs" 0 "$(sed -n 's/.*leaks=\([0-9]*\)$/\1/p' <<<"${res}")"
-  local t
+  # The build gate's own checks, repeated on the shipped bundle: no PEM private
+  # key header in any plain file (the bare phrase is legitimate in binaries:
+  # Go's crypto code), no "PRIVATE KEY" at all in the plain-text config.
+  # Image blobs, bootstrap images and the k3s images are upstream content.
+  local t d
   for t in "${E2E_BUNDLE:-}" "${E2E_BUNDLE_B:-}"; do
     [[ -n "${t}" ]] || continue
-    assert_eq "no 'PRIVATE KEY' anywhere in $(basename "${t}")" 0 "$(tar -xOf "${t}" | grep -ac 'PRIVATE KEY' || true)"
+    d="$(bundle_dir "${t}")"
+    assert_eq "no PEM private key header in a plain file of $(basename "${t}")" "" \
+      "$(find "${d}" -type f ! -path '*/node/images/*/blobs/*' ! -path '*/node/bootstrap-images/*' ! -name 'k3s-airgap-images-*' -print0 \
+         | xargs -0 -r grep -laE -- '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' | sed "s|^${d}/||" | tr '\n' ' ' || true)"
+    assert_eq "no 'PRIVATE KEY' in the plain-text config of $(basename "${t}")" "" \
+      "$(find "${d}/node/oneshot" "${d}/node/templates" "${d}/site" "${d}/node/site" "${d}/node/charts/pins.txt" "${d}/node/images/images.lock" -type f -print0 2>/dev/null \
+         | xargs -0 -r grep -la 'PRIVATE KEY' | sed "s|^${d}/||" | tr '\n' ' ' || true)"
   done
   if [[ -f "${STATE}/dotdirs.before" ]]; then
     assert_eq "docker and helm config dirs (.docker, .config/helm) unchanged on the LAN host and the node" "$(cat "${STATE}/dotdirs.before")" "$(dotdirs)"
