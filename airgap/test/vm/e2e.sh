@@ -649,13 +649,13 @@ e8() {
   local dir before after changed pods_before pods_after
   dir="$(bundle_dir "${E2E_BUNDLE}")"
   before="$(snap_secret_rvs)"
-  pods_before="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app.kubernetes.io/name=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
+  pods_before="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
   if tk "${dir}" rotate oauth2-proxy-cookie; then pass "rotate oauth2-proxy-cookie exits 0"; else fail "rotate failed"; return 0; fi
   wait_apps 900 || true
   after="$(snap_secret_rvs)"
   changed="$(added_lines "${before}" "${after}" | awk '{print $1 "/" $2}' | sort -u | tr '\n' ' ')"
   assert_eq "only teknoir-auth/oauth2-proxy-secret changed" "teknoir-auth/oauth2-proxy-secret " "${changed}"
-  pods_after="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app.kubernetes.io/name=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
+  pods_after="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
   if [[ -n "${pods_after}" && "${pods_after}" != "${pods_before}" ]]; then pass "oauth2-proxy pods were replaced"; else fail "oauth2-proxy did not roll"; fi
   login_check "login still works after the cookie-secret rotation"
 }
