@@ -1,0 +1,44 @@
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: teknoir-system
+spec:
+  sourceRepos:
+    - "__HARBOR_HOST__/teknoir"
+  sourceNamespaces: []
+  destinations:
+    - namespace: teknoir-system
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: argoproj.io
+      kind: AppProject
+    - group: argoproj.io
+      kind: Application
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: teknoir-system
+spec:
+  project: default
+  destination:
+    namespace: teknoir-system
+    server: https://kubernetes.default.svc
+  source:
+    repoURL: __HARBOR_HOST__/teknoir
+    chart: app-of-apps
+    targetRevision: __APP_OF_APPS_VERSION__
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      enabled: true
+    retry:
+      limit: 10
+      backoff:
+        duration: 30s
+        factor: 2
+        maxDuration: 5m

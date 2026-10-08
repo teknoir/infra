@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Stub kubectl for the teknoir-node unit tests. Records every call in
+# $STUB_CALLS. STUB_KUBECTL_MODE: refused (API down) | up (empty cluster:
+# every object absent, every diff "would change") | resourcetype (get of an
+# unknown resource type).
+printf 'kubectl %s\n' "$*" >> "${STUB_CALLS:?}"
+mode="${STUB_KUBECTL_MODE:-refused}"
+if [[ "${mode}" == "refused" ]]; then
+  echo "The connection to the server 127.0.0.1:6443 was refused - did you specify the right host or port?" >&2
+  exit 1
+fi
+a=" $* "
+if [[ "${mode}" == "resourcetype" && "${a}" == *" get "* ]]; then
+  echo 'error: the server doesn'"'"'t have a resource type "widgets"' >&2
+  exit 1
+fi
+case "${a}" in
+  *" get --raw=/readyz"*) echo ok ;;
+  *" wait --for=condition=Ready node"*) ;;
+  *" get pods -A -o json"*) cat "${STUB_STATE}/pods.json" ;;
+  *" get nodes -o json"*)
+    echo '{"items":[{"metadata":{"name":"tk","labels":{}},"status":{"addresses":[{"type":"InternalIP","address":"10.77.0.10"}]}}]}' ;;
+  *" get configmap teknoir-airgap-release"*"--ignore-not-found"*)
+    [[ -n "${STUB_RELEASE_AOA:-}" ]] && echo "configmap/teknoir-airgap-release" ;;
+  *" get configmap teknoir-airgap-release -o json"*)
+    printf '{"data":{"appOfAppsVersion":"%s","bundleId":"bundle-%s","manifestSha256":"x","mode":"%s"}}\n' \
+      "${STUB_RELEASE_AOA:-}" "${STUB_RELEASE_AOA:-}" "${STUB_RELEASE_MODE:-update}" ;;
+  *"--ignore-not-found"*) ;;
+  *" diff "*) exit 1 ;;
+  *" get crd "*) ;;
+  *" get node "*"jsonpath"*) ;;
+  *) ;;
+esac
+exit 0

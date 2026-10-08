@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub ip: the node owns ${STUB_NODE_IP:-10.77.0.10}/24.
+printf 'ip %s\n' "$*" >> "${STUB_CALLS:?}"
+if [[ "$*" == "-o -4 addr show" ]]; then
+  echo "1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever preferred_lft forever"
+  echo "2: eth0    inet ${STUB_NODE_IP:-10.77.0.10}/24 brd 10.77.0.255 scope global eth0\\       valid_lft forever preferred_lft forever"
+fi
+exit 0

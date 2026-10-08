@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+printf 'update-ca-certificates %s\n' "$*" >> "${STUB_CALLS:?}"
+echo "Updating certificates... 0 added, 0 removed; done."

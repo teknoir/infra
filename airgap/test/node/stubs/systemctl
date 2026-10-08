@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stub systemctl: k3s active state lives in $STUB_STATE/k3s.active.
+printf 'systemctl %s\n' "$*" >> "${STUB_CALLS:?}"
+st="${STUB_STATE:?}/k3s.active"
+case "$*" in
+  "is-active --quiet k3s") [[ -f "${st}" ]]; exit $? ;;
+  "is-active --quiet chrony") exit 1 ;;
+  "start k3s"|"restart k3s") date -u '+%a %Y-%m-%d %H:%M:%S UTC' > "${st}" ;;
+  "stop k3s") rm -f "${st}" ;;
+  "show k3s -p ActiveEnterTimestamp --value") if [[ -f "${st}" ]]; then cat "${st}"; else echo "n/a"; fi ;;
+  "show k3s -p ActiveState --value") if [[ -f "${st}" ]]; then echo active; else echo inactive; fi ;;
+esac
+exit 0

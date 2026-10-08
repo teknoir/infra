@@ -1,0 +1,576 @@
+#!/usr/bin/env bash
+# teknoir-node: node-side runner of the Teknoir airgap bundle (DESIGN I-05).
+#
+# Runs as root on the k3s node, from the payload the LAN host sent to
+# /var/lib/teknoir-airgap/bundles/<bundleId>/node:
+#   sudo /var/lib/teknoir-airgap/bundles/<id>/node/bin/teknoir-node converge \
+#        --site <site.env> --lan-time <epoch> --lan-user <name> \
+#        [--dry-run] [--rollback] [--sync-clock] [--reapply TIER]... [--force-images]
+# That argv is the interface teknoir-airgap `up` uses (DESIGN.md "Node runner
+# interface"); --operator is accepted as an alias of --lan-user.
+#
+# converge brings the node and the cluster to this bundle's state. Every phase
+# is idempotent, so the same command bootstraps a fresh node and updates a
+# running one. Phases, in order:
+#   verify        node/SHA256SUMS (and MANIFEST.yaml's entry for it)
+#   preflight     tools, NODE_IP is local, free disk, clock skew vs the LAN
+#                 host (--lan-time), no Teknoir K3s auto-deploy files left
+#                 (migrate first), release guard (no silent downgrade)
+#   backup        pre-change backup when a cluster exists and the bundle
+#                 differs from the deployed one (lib/backup.sh)
+#   host          k3s install/upgrade, config.yaml, registries.yaml, /etc/hosts,
+#                 chrony, bootstrap image tarballs (lib/host.sh)
+#   cluster-base  coredns-custom (NODE_IP at run time), namespaces, node label
+#   secrets       Root CA, wildcard placeholder, Harbor token TLS, CA-bundle
+#                 copies, argocd-tls-certs-cm, node CA trust (lib/secrets.sh)
+#   oneshot       one-shot tiers until ArgoCD owns them (lib/oneshot.sh)
+#   harbor        Harbor projects, charts, images (lib/harbor.sh)
+#   release       root Application pin + release record (lib/release.sh)
+#   post          wait for Synced/Healthy, live image check, payload prune
+#
+# Output never contains secret values: they live only in variables, private
+# tmpfs files and pipes, and a leak check scans the run log at exit.
+# Log: /var/log/teknoir-airgap/<UTC>-<command>.log (0600).
+# Exit codes: 0 ok, 1 error, 2 usage, 70 leak check failed, 75 lock busy.
+# shellcheck source-path=SCRIPTDIR
+# shellcheck disable=SC2016 # jq programs use $variables in single quotes
+set -euo pipefail
+umask 022
+
+NODE_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+export NODE_ROOT
+
+# shellcheck source=../lib/common.sh
+source "${NODE_ROOT}/lib/common.sh"
+# shellcheck source=../lib/host.sh
+source "${NODE_ROOT}/lib/host.sh"
+# shellcheck source=../lib/secrets.sh
+source "${NODE_ROOT}/lib/secrets.sh"
+# shellcheck source=../lib/release.sh
+source "${NODE_ROOT}/lib/release.sh"
+# shellcheck source=../lib/backup.sh
+source "${NODE_ROOT}/lib/backup.sh"
+# Phase libraries owned by other work items (I-08, I-09, I-13, admin-user).
+# A missing one only fails the command or phase that needs it.
+for _lib in oneshot harbor migrate admin; do
+  if [[ -f "${NODE_ROOT}/lib/${_lib}.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${NODE_ROOT}/lib/${_lib}.sh"
+  fi
+done
+unset _lib
+
+CONVERGE_PHASES=(verify preflight backup host cluster-base secrets oneshot harbor release post)
+MAX_CLOCK_SKEW="${MAX_CLOCK_SKEW:-30}"
+MIN_FREE_GB="${TEKNOIR_MIN_FREE_GB:-20}"
+
+usage() {
+  cat <<'EOF'
+Usage: teknoir-node <command> [options]
+
+Commands:
+  converge                 bring node + cluster to this bundle's state (idempotent)
+  status                   read-only report: k3s, release record, Applications, certificates
+  verify                   check the payload sha256s only
+  credentials NAME [--out FILE]
+                           write one credential to a 0600 file, or to a non-terminal
+                           stdout; NAME: keycloak-admin keycloak-admin-username
+                           harbor-admin argocd-admin grafana-admin
+  rotate NAME [--i-know]   replace one secret value and restart its consumers;
+                           NAME: oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service
+                           harbor-secret-key (--i-know) keycloak-db (--i-know)
+  backup [--list | --export | --stream FILE [--keep] | --recipient AGE_RECIPIENT]
+                           no option: take a full backup now; --export: passphrase-
+                           encrypt the latest backup (needs a terminal: ssh -t) into
+                           /var/lib/teknoir-airgap/exports and print its path;
+                           --stream FILE: write that export to stdout (not a terminal)
+                           and delete it; --recipient: stream the latest backup
+                           encrypted to an age public key, no terminal needed
+  migrate [...]            one-time K3s file detach of the live env (lib/migrate.sh)
+  admin-user --email ADDR --out FILE
+                           create the first platform admin (a superadmin User; its
+                           temporary password goes to FILE, 0600) (lib/admin.sh)
+  help
+
+Options:
+  --site FILE|NAME         site env (default: the only node/site/*.env of the payload)
+  --dry-run                read-only: report what would change, change nothing
+
+converge options:
+  --lan-time EPOCH         the LAN host's clock (date +%s) for the skew check
+  --lan-user NAME          operator recorded in the release record (alias: --operator)
+  --sync-clock             set the node clock from --lan-time when the skew exceeds 30s
+  --rollback               accept an app-of-apps older than the deployed one
+  --reapply TIER           re-apply a one-shot tier ArgoCD already owns (break-glass, repeatable)
+  --force-images           let the harbor phase move a mirror tag to another digest
+  --no-backup              skip the automatic pre-change backup
+  --backup                 take the pre-change backup even for an already deployed bundle
+  --wait-timeout SECONDS   post phase wait for Synced/Healthy (default 1200; 2700 on first install)
+  --only PHASE[,PHASE]     run only these phases (testing, break-glass)
+  --skip PHASE[,PHASE]     skip these phases (testing, break-glass)
+  --role server|agent      node role (agent join is not implemented yet)
+
+Phases: verify preflight backup host cluster-base secrets oneshot harbor release post
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+CMD="${1:-help}"
+shift || true
+SITE_ARG=""
+WAIT_TIMEOUT=""
+BACKUP_MODE="auto"
+ROLE="server"
+SYNC_CLOCK=0
+LAN_TIME_AT=0
+CMD_ARGS=()
+
+usage_die() { printf 'teknoir-node: %s (see teknoir-node help)\n' "$*" >&2; exit 2; }
+need_value() { [[ $# -ge 2 && -n "$2" ]] || usage_die "$1 needs a value"; }
+
+while (( $# > 0 )); do
+  case "$1" in
+    --site) need_value "$@"; SITE_ARG="$2"; shift ;;
+    --dry-run) DRY_RUN=1 ;;
+    --lan-time) need_value "$@"; LAN_TIME="$2"; LAN_TIME_AT="${SECONDS}"; shift ;;
+    --lan-user|--operator) need_value "$@"; LAN_USER="$2"; shift ;;
+    --sync-clock) SYNC_CLOCK=1 ;;
+    --rollback) ROLLBACK=1 ;;
+    --reapply) need_value "$@"; REAPPLY_TIERS="${REAPPLY_TIERS:+${REAPPLY_TIERS} }$2"; shift ;;
+    --force-images) FORCE_IMAGES=1 ;;
+    --no-backup) BACKUP_MODE="never" ;;
+    --backup) BACKUP_MODE="always" ;;
+    --wait-timeout) need_value "$@"; WAIT_TIMEOUT="$2"; shift ;;
+    --only) need_value "$@"; PHASE_ONLY="$2"; shift ;;
+    --skip) need_value "$@"; PHASE_SKIP="$2"; shift ;;
+    --role) need_value "$@"; ROLE="$2"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) CMD_ARGS+=("$1") ;;
+  esac
+  shift
+done
+
+[[ -z "${LAN_TIME}" || "${LAN_TIME}" =~ ^[0-9]+$ ]] || usage_die "--lan-time must be seconds since the epoch"
+[[ -z "${WAIT_TIMEOUT}" || "${WAIT_TIMEOUT}" =~ ^[0-9]+$ ]] || usage_die "--wait-timeout must be a number of seconds"
+[[ "${LAN_USER}" =~ ^[A-Za-z0-9._@-]*$ ]] || usage_die "--lan-user: only [A-Za-z0-9._@-]"
+[[ "${ROLE}" == "server" || "${ROLE}" == "agent" ]] || usage_die "--role must be server or agent"
+for _t in ${REAPPLY_TIERS}; do
+  [[ "${_t}" =~ ^[a-z0-9-]+$ ]] || usage_die "--reapply: invalid tier '${_t}'"
+done
+for _p in ${PHASE_ONLY//,/ } ${PHASE_SKIP//,/ }; do
+  [[ " ${CONVERGE_PHASES[*]} " == *" ${_p} "* ]] || usage_die "unknown phase '${_p}' (phases: ${CONVERGE_PHASES[*]})"
+done
+unset _t _p
+export DRY_RUN ROLLBACK REAPPLY_TIERS FORCE_IMAGES LAN_TIME LAN_USER
+
+case "${CMD}" in
+  help|-h|--help) usage; exit 0 ;;
+  converge|status|verify|credentials|rotate|backup|migrate|admin-user) ;;
+  *) usage_die "unknown command '${CMD}'" ;;
+esac
+
+if [[ "${EUID}" -ne 0 && -z "${HOST_ROOT}" ]]; then
+  printf 'teknoir-node: must run as root (sudo %s %s ...)\n' "$0" "${CMD}" >&2
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Logging, exit handling, lock
+# ---------------------------------------------------------------------------
+LOG_FILE=""
+TEE_PID=""
+
+setup_logging() {
+  # stderr (and, for commands without a data stdout, stdout) is tee'd to a
+  # 0600 log. credentials and backup keep stdout for their data.
+  local stamp suffix=""
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  dry_run && suffix="-dry-run"
+  mkdir -p "${LOG_DIR}"
+  chmod 0700 "${LOG_DIR}"
+  LOG_FILE="${LOG_DIR}/${stamp}-${CMD}${suffix}.log"
+  ( umask 077 && : >> "${LOG_FILE}" )
+  chmod 0600 "${LOG_FILE}"
+  exec 3>&2 4>&1
+  exec 2> >(tee -a "${LOG_FILE}" >&3)
+  TEE_PID=$!
+  case "${CMD}" in
+    credentials|backup) ;;
+    *) exec 1>&2 ;;
+  esac
+}
+
+on_exit() {
+  local rc=$? i
+  trap - EXIT
+  run_at_exit
+  if [[ -n "${LOG_FILE}" ]]; then
+    # Close our ends of the tee pipe and give tee a moment to drain, so the
+    # leak check sees the whole log.
+    exec 1>&4 2>&3
+    for (( i = 0; i < 50; i++ )); do
+      kill -0 "${TEE_PID}" 2>/dev/null || break
+      sleep 0.1
+    done
+    if ! leak_check "${LOG_FILE}"; then
+      rc=70
+    fi
+    if (( rc != 0 )); then
+      printf 'teknoir-node: %s failed (exit %s); log: %s\n' "${CMD}" "${rc}" "${LOG_FILE}" >&2
+    fi
+  fi
+  exit "${rc}"
+}
+trap on_exit EXIT
+
+MAIN_PID="${BASHPID}"
+on_err() {
+  # Report where an unexpected failure stopped the run (set -e). Subshells
+  # stay quiet; their caller reports. BASH_COMMAND is the unexpanded command
+  # text, so no value is printed.
+  [[ "${BASHPID}" == "${MAIN_PID}" ]] || return 0
+  printf '%s [teknoir-node] ERROR: command failed (exit %s) in %s, line %s: %s\n' \
+    "$(date -u +%H:%M:%S)" "$1" "$3" "$4" "$2" >&2
+}
+set -E
+trap 'on_err $? "${BASH_COMMAND}" "${FUNCNAME[0]:-main}" "${LINENO}"' ERR
+
+acquire_lock() {
+  # One mutating teknoir-node at a time; a second holder exits 75.
+  mkdir -p "$(dirname "${LOCK_FILE}")"
+  exec 9>"${LOCK_FILE}"
+  if ! flock -n 9; then
+    printf 'teknoir-node: another teknoir-node run holds %s; try again when it has finished\n' "${LOCK_FILE}" >&2
+    exit 75
+  fi
+}
+
+resolve_site() {
+  # --site FILE (a path) or NAME (node/site/NAME.env); default: the payload's
+  # only site file.
+  local f="${SITE_ARG}" candidates=()
+  if [[ -z "${f}" ]]; then
+    shopt -s nullglob
+    candidates=("${NODE_ROOT}"/site/*.env)
+    shopt -u nullglob
+    (( ${#candidates[@]} == 1 )) || die "pass --site FILE|NAME (the payload has ${#candidates[@]} site files)"
+    f="${candidates[0]}"
+  elif [[ "${f}" != */* && ! -f "${f}" ]]; then
+    f="${NODE_ROOT}/site/${f%.env}.env"
+  fi
+  load_site "${f}"
+}
+
+# ---------------------------------------------------------------------------
+# Phases implemented here: verify, preflight, cluster-base
+# ---------------------------------------------------------------------------
+phase_verify() {
+  local sums="${NODE_ROOT}/SHA256SUMS" listed actual extra out want got rc=0
+  [[ -f "${sums}" ]] || die "missing ${sums}: this is not a built bundle payload"
+  out="$(cd "${NODE_ROOT}" && sha256sum --quiet --strict -c SHA256SUMS 2>&1)" || rc=$?
+  (( rc == 0 )) || die "payload checksum verification failed:"$'\n'"${out}"
+  listed="$(awk '{p = substr($0, 67); sub(/^\.\//, "", p); print p}' "${sums}" | sort)"
+  actual="$(cd "${NODE_ROOT}" && find . -type f ! -path ./SHA256SUMS | sed 's|^\./||' | sort)"
+  extra="$(comm -13 <(printf '%s\n' "${listed}") <(printf '%s\n' "${actual}"))"
+  [[ -z "${extra}" ]] || die "files in the payload that SHA256SUMS does not list:"$'\n'"${extra}"
+  if [[ -n "${BUNDLE_MANIFEST:-}" ]]; then
+    want="$(grep -E 'node/SHA256SUMS' "${BUNDLE_MANIFEST}" | grep -oE '[0-9a-f]{64}' | head -1 || true)"
+    got="$(sha256_file "${sums}")"
+    if [[ -n "${want}" ]]; then
+      [[ "${want}" == "${got}" ]] || die "node/SHA256SUMS does not match MANIFEST.yaml (${BUNDLE_MANIFEST})"
+    else
+      warn "MANIFEST.yaml lists no sha256 for node/SHA256SUMS; payload verified against SHA256SUMS only"
+    fi
+  else
+    warn "no MANIFEST.yaml next to the payload; verified against node/SHA256SUMS only"
+  fi
+  log "payload verified: $(grep -c . "${sums}") files"
+}
+
+preflight_node_ip() {
+  local addrs
+  addrs="$(ip -o -4 addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1)" \
+    || die "cannot list the node's IPv4 addresses (ip -o -4 addr show)"
+  if ! grep -qxF "${NODE_IP}" <<<"${addrs}"; then
+    die "NODE_IP ${NODE_IP} (site ${SITE_FILE}) is not an address of this node (it has: $(tr '\n' ' ' <<<"${addrs}"))"
+  fi
+  log "NODE_IP ${NODE_IP} is local"
+}
+
+preflight_disk() {
+  local d="${HOST_ROOT}${K3S_DATA_DIR}" free_kb free_gb
+  while [[ ! -d "${d}" ]]; do d="$(dirname "${d}")"; done
+  free_kb="$(df -Pk "${d}" | awk 'NR == 2 {print $4}')"
+  [[ "${free_kb}" =~ ^[0-9]+$ ]] || die "cannot read free disk space of ${d}"
+  free_gb=$(( free_kb / 1024 / 1024 ))
+  (( free_gb >= MIN_FREE_GB )) || die "only ${free_gb} GiB free on ${d} (needs ${MIN_FREE_GB} GiB; TEKNOIR_MIN_FREE_GB overrides)"
+  log "disk: ${free_gb} GiB free on ${d}"
+}
+
+preflight_clock() {
+  local now lan skew abs sync=""
+  if command -v timedatectl >/dev/null 2>&1; then
+    sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  fi
+  if [[ -z "${LAN_TIME}" ]]; then
+    warn "no --lan-time given: clock skew not checked${sync:+ (NTPSynchronized=${sync})}"
+    return 0
+  fi
+  now="$(date +%s)"
+  lan=$(( LAN_TIME + SECONDS - LAN_TIME_AT ))
+  skew=$(( now - lan ))
+  abs=${skew#-}
+  if (( abs <= MAX_CLOCK_SKEW )); then
+    log "clock: ${skew}s from the LAN host${sync:+ (NTPSynchronized=${sync})}"
+    return 0
+  fi
+  if (( SYNC_CLOCK == 1 )); then
+    run date -u -s "@${lan}" >/dev/null
+    if command -v hwclock >/dev/null 2>&1; then
+      run hwclock --systohc || warn "hwclock --systohc failed (the RTC keeps the old time)"
+    fi
+    changed "node clock set from the LAN host (skew was ${skew}s)"
+    return 0
+  fi
+  die "the node clock is ${skew}s off the LAN host (limit ${MAX_CLOCK_SKEW}s); fix the node time or re-run with --sync-clock"
+}
+
+preflight_k3s_manifests() {
+  # Refuse a cluster that has not been migrated: K3s re-applies every
+  # auto-deploy file on each start (DESIGN T5), and this converge may restart
+  # k3s (backup, host config, CA trust), as does a reboot. A live
+  # teknoir-app-of-apps.yaml would set the root pin back to its old version,
+  # the secret files would put back the old values. `migrate` (DESIGN M3)
+  # detaches them. Same name allow-list as lib/migrate.sh; a file with its
+  # .skip guard is ignored by K3s; teknoir-argo.yaml stays until M7.
+  local dir="${HOST_ROOT}${K3S_DATA_DIR}/server/manifests" f name live=()
+  [[ -d "${dir}" ]] || return 0
+  for f in "${dir}"/*.yaml; do
+    [[ -f "${f}" ]] || continue
+    name="$(basename "${f}" .yaml)"
+    [[ "${name}" =~ ^(teknoir-.+|00-teknoir-.+|05-teknoir-.+|10-teknoir-.+|manifest-.+-secret|app-of-apps)$ ]] || continue
+    [[ "${name}" != "teknoir-argo" ]] || continue
+    [[ ! -e "${f}.skip" ]] || continue
+    live+=("${name}.yaml")
+  done
+  (( ${#live[@]} > 0 )) || return 0
+  if dry_run; then
+    warn "[dry-run] K3s still auto-deploys ${#live[@]} Teknoir file(s) in ${dir}: ${live[*]}; converge refuses this until they are detached (run teknoir-airgap migrate first)"
+    return 0
+  fi
+  die "K3s still auto-deploys ${#live[@]} Teknoir file(s) in ${dir}: ${live[*]}. Every k3s restart re-applies them (old root pin, old secret values). Run teknoir-airgap migrate first (DESIGN M3), then up again"
+}
+
+phase_preflight() {
+  local t
+  for t in awk sed grep sort comm diff tar gzip base64 openssl flock sha256sum stat cmp df ip shred; do
+    command -v "${t}" >/dev/null 2>&1 || die "required tool not found on the node: ${t}"
+  done
+  command -v "${JQ}" >/dev/null 2>&1 || die "jq not found (expected the bundled ${NODE_ROOT}/bin/jq)"
+  [[ "${ROLE}" == "server" ]] || die "role ${ROLE}: joining agent nodes is not implemented in this release (D11)"
+  if [[ -n "${BUNDLE_DOMAIN:-}" && "${BUNDLE_DOMAIN}" != "${TEKNOIR_DOMAIN}" ]]; then
+    die "the site domain ${TEKNOIR_DOMAIN} (${SITE_FILE}) is not this bundle's domain ${BUNDLE_DOMAIN}"
+  fi
+  if [[ -n "${BUNDLE_ENV:-}" && "${BUNDLE_ENV}" != "${TEKNOIR_ENV}" ]]; then
+    warn "site env ${TEKNOIR_ENV} differs from the bundle env ${BUNDLE_ENV} (same domain; continuing)"
+  fi
+  preflight_node_ip
+  preflight_disk
+  preflight_clock
+  preflight_k3s_manifests
+  if cluster_up; then
+    release_guard
+  else
+    log "no reachable cluster yet: release guard deferred to the release phase"
+  fi
+}
+
+base_ensure_namespaces() {
+  # Create-if-absent. The initial labels only matter until GitOps owns the
+  # namespace (sidecar injection must be on before the one-shot Harbor tier).
+  local entry ns label
+  for entry in "istio-system=" "cert-manager=" "teknoir-system=istio-injection" "teknoir-auth=istio-injection"; do
+    ns="${entry%%=*}"
+    label="${entry#*=}"
+    if in_cluster namespace "${ns}"; then
+      continue
+    fi
+    if dry_run; then
+      changed "create namespace ${ns}"
+      continue
+    fi
+    kc create namespace "${ns}" --dry-run=client -o json \
+      | "${JQ}" --arg l "${label}" 'if $l != "" then .metadata.labels[$l] = "enabled" else . end' \
+      | kc create -f - >/dev/null \
+      || die "cannot create namespace ${ns}"
+    changed "created namespace ${ns}${label:+ (${label}=enabled)}"
+  done
+}
+
+base_ensure_storage_label() {
+  # teknoir.org/storage=true marks the server node that holds the hostPath
+  # PVs (G-06 nodeAffinity). config.yaml sets it at registration; this keeps
+  # it on nodes registered before.
+  local node current
+  node="$(kc get nodes -o json | "${JQ}" -r --arg ip "${NODE_IP}" \
+    '[.items[] | select(any(.status.addresses[]?; .type == "InternalIP" and .address == $ip)) | .metadata.name][0] // ""')" \
+    || die "cannot list nodes"
+  if [[ -z "${node}" ]]; then
+    warn "no node has InternalIP ${NODE_IP}: label teknoir.org/storage not set"
+    return 0
+  fi
+  current="$(kc get node "${node}" -o 'jsonpath={.metadata.labels.teknoir\.org/storage}')" \
+    || die "cannot read node ${node}"
+  [[ "${current}" == "true" ]] && return 0
+  run kc label node "${node}" teknoir.org/storage=true --overwrite >/dev/null
+  changed "labelled node ${node} teknoir.org/storage=true"
+}
+
+phase_cluster_base() {
+  require_cluster cluster-base || return 0
+  ensure_work_dir
+  render_template "${NODE_ROOT}/templates/coredns-custom.yaml.tmpl" > "${WORK_DIR}/coredns-custom.yaml"
+  apply_ssa "${WORK_DIR}/coredns-custom.yaml"
+  base_ensure_namespaces
+  base_ensure_storage_label
+}
+
+converge_phase_inputs() {
+  # Check the break-glass flags against this payload and hand them to the
+  # phase libraries under the names those read (DESIGN.md "Node runner
+  # interface"): lib/oneshot.sh ONESHOT_REAPPLY (space-separated tiers),
+  # lib/harbor.sh HARBOR_FORCE_IMAGES (0|1). The command line wins over the
+  # environment.
+  local t tiers="" tiers_file="${NODE_ROOT}/oneshot/TIERS"
+  if [[ -n "${REAPPLY_TIERS}" ]]; then
+    phase_wanted oneshot || usage_die "--reapply needs the oneshot phase, which --only/--skip leave out"
+    [[ -f "${tiers_file}" ]] || usage_die "--reapply: this payload has no oneshot/TIERS"
+    tiers="$(sed -e 's/#.*//' "${tiers_file}" | awk 'NF {print $1}')"
+    for t in ${REAPPLY_TIERS}; do
+      grep -qxF -- "${t}" <<<"${tiers}" \
+        || usage_die "--reapply: '${t}' is not a one-shot tier of this bundle (oneshot/TIERS: $(tr '\n' ' ' <<<"${tiers}"))"
+    done
+    warn "break-glass --reapply ${REAPPLY_TIERS}: applied over ArgoCD's Application(s) in the oneshot phase"
+  fi
+  if [[ "${FORCE_IMAGES}" == "1" ]]; then
+    phase_wanted harbor || usage_die "--force-images needs the harbor phase, which --only/--skip leave out"
+    warn "break-glass --force-images: the harbor phase may move mirror tags to this bundle's digests"
+  fi
+  ONESHOT_REAPPLY="${REAPPLY_TIERS}"
+  HARBOR_FORCE_IMAGES="${FORCE_IMAGES}"
+  export ONESHOT_REAPPLY HARBOR_FORCE_IMAGES
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_converge() {
+  local p fn
+  (( ${#CMD_ARGS[@]} == 0 )) || usage_die "converge: unexpected argument(s): ${CMD_ARGS[*]}"
+  converge_phase_inputs
+  log "converge$(dry_run && printf ' (dry-run)'): bundle ${BUNDLE_ID}, app-of-apps ${APP_OF_APPS_VERSION:-?}, site ${SITE_FILE}"
+  log "env ${TEKNOIR_ENV}, domain ${TEKNOIR_DOMAIN}, node ${NODE_IP}, role ${ROLE}, operator ${LAN_USER:-?} (${SUDO_USER:-root})"
+  [[ -n "${PHASE_ONLY}${PHASE_SKIP}" ]] && warn "phase selection: only=[${PHASE_ONLY}] skip=[${PHASE_SKIP}]"
+  dry_run || ensure_dir "${STATE_DIR}" 0755   # create-only; never re-moded
+  for p in "${CONVERGE_PHASES[@]}"; do
+    if ! phase_wanted "${p}"; then
+      log "== ${p}: skipped"
+      continue
+    fi
+    fn="phase_${p//-/_}"
+    declare -F "${fn}" >/dev/null || die "phase ${p}: ${fn} is not in this payload (lib/${p}.sh missing)"
+    log "== ${p}"
+    "${fn}"
+  done
+  summary
+  if ! dry_run; then
+    {
+      printf 'bundleId=%s\n' "${BUNDLE_ID}"
+      printf 'appOfAppsVersion=%s\n' "${APP_OF_APPS_VERSION:-}"
+      printf 'finishedAt=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      printf 'changes=%s\n' "${#CHANGES[@]}"
+      printf 'log=%s\n' "${LOG_FILE}"
+    } > "${STATE_DIR}/last-converge.env"
+  fi
+}
+
+cmd_status() {
+  local k3s_ver="not installed" active="" ts
+  if [[ -x "${K3S_BIN}" ]]; then
+    k3s_ver="$("${K3S_BIN}" --version 2>/dev/null | head -1 || echo unknown)"
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    active="$(systemctl show k3s -p ActiveState --value 2>/dev/null || true)"
+    ts="$(systemctl show k3s -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+  fi
+  printf 'payload:   bundle %s, app-of-apps %s\n' "${BUNDLE_ID}" "${APP_OF_APPS_VERSION:-?}"
+  printf 'site:      %s (env %s, domain %s, node %s)\n' "${SITE_FILE}" "${TEKNOIR_ENV}" "${TEKNOIR_DOMAIN}" "${NODE_IP}"
+  printf 'k3s:       %s, %s since %s\n' "${k3s_ver}" "${active:-unknown}" "${ts:-?}"
+  printf 'restart:   %s\n' "$(host_restart_state)"
+  if command -v timedatectl >/dev/null 2>&1; then
+    printf 'time:      %s (NTPSynchronized=%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo ?)"
+  fi
+  if [[ -f "${STATE_DIR}/last-converge.env" ]]; then
+    printf 'last run:  %s\n' "$(tr '\n' ' ' < "${STATE_DIR}/last-converge.env")"
+  fi
+  if ! cluster_up; then
+    printf 'cluster:   API not reachable\n'
+    return 0
+  fi
+  release_status
+  secrets_status
+  post_application_table
+}
+
+cmd_verify() {
+  phase_verify
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+setup_logging
+log "teknoir-node ${CMD} (payload ${NODE_ROOT}, log ${LOG_FILE})"
+case "${CMD}" in
+  verify)
+    load_bundle_info
+    cmd_verify
+    exit 0
+    ;;
+esac
+
+resolve_site
+load_bundle_info
+
+case "${CMD}" in
+  converge)
+    dry_run || acquire_lock
+    cmd_converge
+    ;;
+  status)
+    cmd_status
+    ;;
+  credentials)
+    cmd_credentials ${CMD_ARGS[@]+"${CMD_ARGS[@]}"}
+    ;;
+  rotate)
+    dry_run || acquire_lock
+    cmd_rotate ${CMD_ARGS[@]+"${CMD_ARGS[@]}"}
+    ;;
+  backup)
+    acquire_lock
+    cmd_backup ${CMD_ARGS[@]+"${CMD_ARGS[@]}"}
+    ;;
+  migrate)
+    declare -F cmd_migrate >/dev/null || die "migrate: lib/migrate.sh is not in this payload"
+    dry_run || acquire_lock
+    cmd_migrate ${CMD_ARGS[@]+"${CMD_ARGS[@]}"}
+    ;;
+  admin-user)
+    declare -F cmd_admin_user >/dev/null || die "admin-user: lib/admin.sh is not in this payload"
+    dry_run || acquire_lock
+    cmd_admin_user ${CMD_ARGS[@]+"${CMD_ARGS[@]}"}
+    ;;
+esac
