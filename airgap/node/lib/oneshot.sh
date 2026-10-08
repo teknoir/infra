@@ -13,6 +13,10 @@
 #
 #   phase_oneshot [--reapply TIER]...      (or ONESHOT_REAPPLY="tier ...")
 #
+# Dry-run (DRY_RUN=1) only reads; when the cluster is not reachable yet (a
+# fresh node before the host phase installs k3s) it lists the tiers it would
+# apply.
+#
 # Inputs (node/ payload): oneshot/TIERS (tier names in order, one per line; an
 # optional second column names the namespace for objects without one, default
 # istio-system for istio, teknoir-system otherwise), oneshot/<tier>-crds.yaml
@@ -88,6 +92,11 @@ phase_oneshot() {
       || die "--reapply ${t}: not a tier in ${tiers_file} ($(awk '{printf "%s ", $1}' < <(printf '%s\n' "${lines[@]}")))"
   done
   ONESHOT_JQ="$(oneshot_tool jq)" || exit 1
+  if declare -F require_cluster >/dev/null && ! require_cluster oneshot; then
+    # dry-run before k3s is up: no tier can exist yet, so every tier would be applied
+    log "[dry-run] would apply the one-shot tiers, in order: $(awk '{printf "%s ", $1}' < <(printf '%s\n' "${lines[@]}"))(each while its Application does not exist)"
+    return 0
+  fi
   for line in "${lines[@]}"; do
     read -r tier ns _ <<<"${line}"
     [[ "${tier}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "${tiers_file}: bad tier name '${tier}'"

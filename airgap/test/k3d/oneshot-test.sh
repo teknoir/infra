@@ -7,7 +7,8 @@
 # run, waited for and removed; PostSync hook and unserved kinds left alone; a
 # tier still owned by a K3s file skipped; the tier skipped once its ArgoCD
 # Application exists; --reapply as break-glass; no change on a re-run;
-# dry-run read-only; a failed Job stops the phase and is re-created next run.
+# dry-run read-only, also with no reachable cluster (fresh node); a failed
+# Job stops the phase and is re-created next run.
 #
 # Usage: airgap/test/k3d/oneshot-test.sh [--keep]
 # Needs docker, k3d, kubectl, jq and internet access for the pause/busybox images.
@@ -34,7 +35,7 @@ bad()  { FAIL=$((FAIL + 1)); FAILED+=("$*"); printf '  FAIL %s\n' "$*"; }
 check() { local d="$1"; shift; if "$@"; then ok "${d}"; else bad "${d}"; fi; }
 K() { kubectl --context "${CTX}" "$@"; }
 node_fn() {
-  env KUBECTL="kubectl --context ${CTX}" NODE_ROOT="${NODE}" K3S_DATA_DIR="${WORK}/k3s" \
+  env KUBECTL="${KCTL:-kubectl --context ${CTX}}" NODE_ROOT="${NODE}" K3S_DATA_DIR="${WORK}/k3s" \
     TEKNOIR_DOMAIN=teknoir.airgapped ONESHOT_TIMEOUT=300 STUB_WAIT_INTERVAL=2 \
     "${REPO}/airgap/test/stubs/teknoir-node-stub" "$@"
 }
@@ -206,6 +207,14 @@ k3d cluster create "${CLUSTER}" --image "${K3S_IMAGE}" --servers 1 --agents 0 --
   --wait --timeout 180s >/dev/null
 K wait --for=condition=Ready node --all --timeout=120s >/dev/null
 K create namespace teknoir-system >/dev/null   # cluster-base creates the namespaces
+
+say "dry-run on a fresh node: the cluster is not reachable yet"
+UNREACHABLE="kubectl --context ${CTX} --server=https://127.0.0.1:9 --request-timeout=5s"
+KCTL="${UNREACHABLE}" DRY_RUN=1 node_fn phase_oneshot > "${WORK}/out/dry-nocluster.log" 2>&1 || { bad "dry-run without a reachable cluster exits 0"; cat "${WORK}/out/dry-nocluster.log"; }
+check "dry-run without a reachable cluster lists the tiers" grep -q 'would apply the one-shot tiers, in order: platform-secrets istio argo' "${WORK}/out/dry-nocluster.log"
+if KCTL="${UNREACHABLE}" node_fn phase_oneshot > "${WORK}/out/nocluster.log" 2>&1; then bad "a real run without a reachable cluster fails"; else
+  check "a real run without a reachable cluster fails" grep -q 'oneshot: the Kubernetes API is not reachable' "${WORK}/out/nocluster.log"
+fi
 
 say "first converge of the one-shot phase"
 if node_fn phase_oneshot > "${WORK}/out/run1.log" 2>&1; then ok "phase_oneshot exits 0"; else bad "phase_oneshot exits 0"; cat "${WORK}/out/run1.log"; fi

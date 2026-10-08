@@ -29,6 +29,10 @@
 # end of the phase and, after a die, by the runner's at_exit list (common.sh);
 # without at_exit, by a step chained onto the EXIT trap that keeps the exit
 # status for the runner's own handler.
+#
+# Dry-run (DRY_RUN=1) reads only: with no reachable cluster, or before the
+# one-shot tiers have created harbor-secret, or while Harbor does not answer,
+# it prints the plan from the bundle alone.
 
 HARBOR_CHART_PROJECT="teknoir"
 HARBOR_MIRRORS="${HARBOR_MIRRORS:-docker.io=dockerhub ghcr.io=ghcr gcr.io=gcr quay.io=quay registry.k8s.io=k8s}"
@@ -51,11 +55,18 @@ phase_harbor() {
       *) die "phase_harbor: unknown argument: $1" ;;
     esac
   done
+  if declare -F require_cluster >/dev/null; then
+    require_cluster harbor || { harbor_init; harbor_plan_offline "the cluster is not reachable"; return 0; }
+  fi
+  if harbor_absent_in_dry_run; then
+    harbor_plan_offline "Harbor is not installed yet (no Secret ${HARBOR_SECRET_NS}/${HARBOR_SECRET_NAME})"
+    return 0
+  fi
   harbor_session_begin
   wait_for "the Harbor API at ${HARBOR_API}" "${HARBOR_HEALTH_TIMEOUT}" harbor_healthy
   if [[ "${DRY_RUN}" == "1" ]] && ! harbor_healthy; then
-    log "[dry-run] Harbor is not reachable yet: would create the projects and push every chart and image"
     harbor_session_end
+    harbor_plan_offline "Harbor does not answer at ${HARBOR_API} yet"
     return 0
   fi
   harbor_login
@@ -81,6 +92,23 @@ harbor_init() {
   HARBOR_CRANE="$(harbor_tool crane)" || exit 1
   HARBOR_HELM="$(harbor_tool helm)" || exit 1
   HARBOR_JQ="$(harbor_tool jq)" || exit 1
+}
+
+harbor_absent_in_dry_run() {
+  # 0 in dry-run when harbor-secret does not exist yet (the one-shot tiers of
+  # this converge would create it, and Harbor with it); dies on errors
+  [[ "${DRY_RUN}" == "1" ]] || return 1
+  harbor_init
+  ! in_cluster secret "${HARBOR_SECRET_NAME}" "${HARBOR_SECRET_NS}"
+}
+
+harbor_plan_offline() {
+  # harbor_plan_offline <reason> — the dry-run plan from the bundle alone
+  local charts=0 images=0 pins="${NODE_ROOT}/charts/pins.txt"
+  [[ ! -f "${pins}" ]] || charts="$(grep -cvE '^[[:space:]]*(#|$)' "${pins}" || true)"
+  harbor_image_sources
+  [[ -z "${HARBOR_SOURCES}" ]] || images="$(grep -c . <<<"${HARBOR_SOURCES}")"
+  log "[dry-run] $1: would create the public projects ${HARBOR_CHART_PROJECT} $(harbor_mirror_projects | tr '\n' ' ')(tag immutability on ${HARBOR_CHART_PROJECT}), push ${charts} chart(s) and ${images} image(s), and delete robot\$argocd once unused"
 }
 
 harbor_session_begin() {
@@ -323,6 +351,10 @@ harbor_retire_robot() {
   # phase (teknoir-node migrate): it opens its own session then.
   local own=0 id refs
   if [[ -z "${HARBOR_TMP}" ]]; then
+    if harbor_absent_in_dry_run; then
+      log "[dry-run] robot: Harbor is not installed (no Secret ${HARBOR_SECRET_NS}/${HARBOR_SECRET_NAME}); nothing to retire"
+      return 0
+    fi
     harbor_session_begin
     own=1
   fi

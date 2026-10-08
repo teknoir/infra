@@ -9,9 +9,11 @@
 # docker archive, skipped when present (also inside a multi-arch index),
 # refused when a mirror tag moved unless --force-images; robot$argocd kept
 # while an ArgoCD Secret uses it, deleted after; a second run changes nothing;
-# dry-run makes no mutating call; a refusal exits non-zero under a
-# runner-style EXIT handler, with and without at_exit; the password never
-# appears in any output and nothing is written to $HOME or left in $TMPDIR.
+# dry-run makes no mutating call, and plans from the bundle alone before
+# harbor-secret exists or while the cluster is unreachable; a refusal exits
+# non-zero under a runner-style EXIT handler, with and without at_exit; the
+# password never appears in any output and nothing is written to $HOME or
+# left in $TMPDIR.
 #
 # Usage: airgap/test/k3d/harbor-test.sh [--keep]
 # Needs docker, k3d, kubectl, jq, crane, helm, python3, and internet access
@@ -110,6 +112,20 @@ crane pull --platform linux/amd64 docker.io/library/alpine:3.20 "${NODE}/bootstr
 echo "  RepoTags of the archive: $(tar -xOf "${NODE}/bootstrap-images/alpine_3.20.tar" manifest.json | jq -c '.[0].RepoTags')"
 
 # --- runs -------------------------------------------------------------------------------
+say "dry-run before the one-shot tiers ran (no harbor-secret), and with the cluster unreachable"
+K -n teknoir-system delete secret harbor-secret >/dev/null
+DRY_RUN=1 harbor phase_harbor > "${WORK}/out/dry-nosecret.log" 2>&1 || { bad "dry-run without harbor-secret exits 0"; cat "${WORK}/out/dry-nosecret.log"; }
+check "dry-run without harbor-secret: the plan from the bundle, no Harbor API call" bash -c "
+  grep -q 'Harbor is not installed yet (no Secret teknoir-system/harbor-secret): would create the public projects teknoir dockerhub ghcr gcr quay k8s (tag immutability on teknoir), push 1 chart(s) and 2 image(s)' '${WORK}/out/dry-nosecret.log' &&
+  ! grep -qE '^[A-Z]+ /api' '${WORK}/out/api.log'"
+UNREACHABLE="kubectl --context ${CTX} --server=https://127.0.0.1:9 --request-timeout=5s"
+KCTL="${UNREACHABLE}" DRY_RUN=1 harbor phase_harbor > "${WORK}/out/dry-nocluster.log" 2>&1 || { bad "dry-run without a reachable cluster exits 0"; cat "${WORK}/out/dry-nocluster.log"; }
+check "dry-run without a reachable cluster: the plan from the bundle" grep -q 'the cluster is not reachable: would create the public projects' "${WORK}/out/dry-nocluster.log"
+if KCTL="${UNREACHABLE}" harbor phase_harbor > "${WORK}/out/nocluster.log" 2>&1; then bad "a real run without a reachable cluster fails"; else
+  check "a real run without a reachable cluster fails" grep -q 'harbor: the Kubernetes API is not reachable' "${WORK}/out/nocluster.log"
+fi
+K -n teknoir-system create secret generic harbor-secret --from-file=HARBOR_ADMIN_PASSWORD="${WORK}/pw" >/dev/null
+
 say "dry-run before anything exists"
 DRY_RUN=1 harbor phase_harbor > "${WORK}/out/dry0.log" 2>&1 || { bad "dry-run exits 0"; cat "${WORK}/out/dry0.log"; }
 check "dry-run: no mutating API call" test "$(api_calls 'POST|PUT|DELETE')" == "0"
