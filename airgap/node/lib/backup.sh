@@ -14,7 +14,9 @@
 #
 # converge takes one automatically (phase backup) before changing a cluster
 # that runs a different bundle than this one; a re-run of the deployed bundle
-# takes none (it would rotate the useful pre-update backups out).
+# takes none (it would rotate the useful pre-update backups out), and neither
+# does a first install that has not reached the release phase yet. A database
+# without a running pod is skipped with a warning (BACKUP.info databases=).
 # `teknoir-node backup` takes one on demand; --export / --stream /
 # --recipient hand the latest one to the LAN host age-encrypted (see
 # cmd_backup). Nothing here prints secret values.
@@ -28,6 +30,7 @@ EXPORT_DIR="${STATE_DIR}/exports"
 BACKUP_KEEP="${BACKUP_KEEP:-3}"
 BACKUP_MODE="${BACKUP_MODE:-auto}"   # auto | always | never (converge --backup / --no-backup)
 BACKUP_LAST=""
+BACKUP_DBS=()
 _K3S_STOPPED_FOR_BACKUP=0
 
 # Secrets exported into every backup ("namespace name"); absent ones are
@@ -60,11 +63,16 @@ _backup_restart_k3s_if_stopped() {
 
 backup_pg() {
   # backup_pg <ns> <label-selector> <container> <shell command> <out.sql.gz>
-  local ns="$1" sel="$2" ctr="$3" cmd="$4" out="$5" pod size
-  pod="$(kc -n "${ns}" get pods -l "${sel}" --field-selector=status.phase=Running -o 'jsonpath={.items[0].metadata.name}')" \
+  # A database without a running pod (not deployed yet, or restarting) is not
+  # dumped: warned, and left out of BACKUP.info's databases list.
+  local ns="$1" sel="$2" ctr="$3" cmd="$4" out="$5" pods pod size
+  # {.items[*]}, not {.items[0]}: on an empty list the index form fails
+  # (array index out of bounds), which would read as a listing error.
+  pods="$(kc -n "${ns}" get pods -l "${sel}" --field-selector=status.phase=Running -o 'jsonpath={.items[*].metadata.name}')" \
     || die "backup: cannot list pods ${sel} in ${ns}"
+  pod="${pods%% *}"
   if [[ -z "${pod}" ]]; then
-    log "backup: no running pod ${sel} in ${ns}: not dumped"
+    warn "backup: no running pod ${sel} in ${ns}: that database is NOT in this backup"
     return 0
   fi
   log "backup: pg_dumpall ${ns}/${pod}"
@@ -72,6 +80,7 @@ backup_pg() {
     || die "backup: pg_dumpall in ${ns}/${pod} failed"
   size="$(stat -c %s "${out}")"
   (( size > 200 )) || die "backup: the dump of ${ns}/${pod} is empty"
+  BACKUP_DBS+=("$(basename "${out}" .sql.gz)")
 }
 
 backup_secrets() {
@@ -154,6 +163,7 @@ backup_take() {
   at_exit "rm -rf $(printf '%q' "${tmp}")"
   at_exit "_backup_restart_k3s_if_stopped"
   log "backup (${label}) -> ${dir}"
+  BACKUP_DBS=()
   backup_pg teknoir-system "app=harbor,component=database" database 'pg_dumpall -U postgres' "${tmp}/db/harbor.sql.gz"
   backup_pg teknoir-auth "app=keycloak-db" postgres 'pg_dumpall -U "$POSTGRES_USER"' "${tmp}/db/keycloak.sql.gz"
   backup_secrets "${tmp}/secrets/bootstrap-secrets.json"
@@ -166,6 +176,7 @@ backup_take() {
     printf 'k3s=%s\n' "$("${K3S_BIN}" --version 2>/dev/null | head -1 || true)"
     printf 'dataDir=%s\n' "${K3S_DATA_DIR}"
     printf 'domain=%s\n' "${TEKNOIR_DOMAIN}"
+    printf 'databases=%s\n' "${BACKUP_DBS[*]}"
   } > "${tmp}/BACKUP.info"
   ( cd "${tmp}" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum ) > "${WORK_DIR}/backup.sums" \
     || die "backup: cannot checksum ${tmp}"
@@ -197,6 +208,14 @@ phase_backup() {
       ;;
     auto)
       release_load_record
+      if [[ "${REC_SOURCE}" == "none" ]]; then
+        # No release record and no root Application: nothing was deployed
+        # yet (a first install, or a re-run of one interrupted before the
+        # release phase). The DBs may not even exist; the CA and the
+        # platform Secrets are create-if-absent, so a re-run keeps them.
+        log "no release deployed yet (first install): no pre-change backup (--backup forces one)"
+        return 0
+      fi
       if [[ "${REC_SOURCE}" == "configmap" && "${REC_BUNDLE}" == "${BUNDLE_ID}" && "${REC_SHA}" == "${MANIFEST_SHA256}" ]]; then
         log "bundle ${BUNDLE_ID} is already deployed: no pre-change backup (--backup forces one)"
         return 0

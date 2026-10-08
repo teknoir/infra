@@ -16,8 +16,10 @@
 #       post fails naming an Application that is not Synced/Healthy
 #   I-07 credentials --out (0600) and to a pipe; rotate oauth2-proxy-cookie
 #       changes only that key
-#   I-12 backup: pg_dumpall of harbor and keycloak through kubectl exec,
-#       Secrets export (0600), keep 3; age stream when AGE_BIN is set
+#   I-12 backup: none before the first release; without DB pods a backup
+#       completes and warns (first install interrupted, DB restarting);
+#       pg_dumpall of harbor and keycloak through kubectl exec, Secrets
+#       export (0600), keep 3; age stream when AGE_BIN is set
 #
 # Usage: airgap/test/node/k3d.sh [-v] [--keep]
 #   AGE_BIN=/path/to/age   also test `backup --recipient` (needs age-keygen next to it)
@@ -142,6 +144,15 @@ tn() {
   return 0
 }
 CLUSTER_PHASES="cluster-base,secrets,release"
+
+# ---------------------------------------------------------------------------
+echo "# I-12: no automatic backup before the first release"
+tn converge --site test --only backup --dry-run
+check "dry-run on a cluster without a release predicts no backup" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'no release deployed yet' '${T}/out' && ! grep -q 'would take a pre-change backup' '${T}/out'"
+tn converge --site test --only backup
+check "converge on a cluster without a release skips the backup" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'no release deployed yet' '${T}/out' && [ ! -d '${ROOT}/var/lib/teknoir-airgap/backups' ]"
 
 # ---------------------------------------------------------------------------
 echo "# T7: first converge of the cluster phases"
@@ -294,6 +305,20 @@ tn rotate keycloak-db --site test
 check "rotate keycloak-db is refused without --i-know" bash -c "[ ${RC} != 0 ] && grep -q 'i-know' '${T}/out'"
 
 # ---------------------------------------------------------------------------
+echo "# I-12: backup without database pods (first install interrupted, DB restarting)"
+tn converge --site test --only backup --backup
+B="$(find "${ROOT}/var/lib/teknoir-airgap/backups" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort | tail -1)"
+check "converge --backup without DB pods completes" bash -c "[ ${RC} = 0 ] && grep -q 'backup complete' '${T}/out'"
+check "both missing databases are warned about" [ "$(grep -c 'WARN: backup: no running pod' "${T}/out")" == 2 ]
+check "BACKUP.info lists no database, and no dump file exists" \
+  bash -c "grep -qx 'databases=' '${B}/BACKUP.info' && [ -z \"\$(ls -A '${B}/db')\" ]"
+manifest 0.0.5
+sleep 1
+tn converge --site test --only backup
+check "an update (other bundle) without DB pods still takes its pre-change backup" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'backup (pre-change to teknoir-local-aoa0.0.5-test)' '${T}/out' && grep -q 'backup complete' '${T}/out'"
+manifest 0.0.4
+
 echo "# I-12: backup"
 pg_pod() {
   # pg_pod <ns> <name> <container> <labels-json> <user>
