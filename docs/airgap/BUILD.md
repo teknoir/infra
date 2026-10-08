@@ -64,9 +64,14 @@ cp dist/teknoir-airgap-<bundleId>.tar dist/teknoir-airgap-<bundleId>.tar.sha256 
 ```
 
 Use an exFAT or ext4 medium. A FAT32 medium cannot hold files over 4 GB: build
-with `--split`, which cuts the tar into 3900 MB pieces; on the LAN host, join the
-pieces in name order with `cat` into `teknoir-airgap-<bundleId>.tar` before
-checking it against the `.tar.sha256`.
+with `--split`, which also writes the tar as 3900 MiB parts
+`teknoir-airgap-<bundleId>.tar.part-00`, `-01`, ... (with
+`teknoir-airgap-<bundleId>.tar.parts.sha256`). Copy the parts and the
+`.tar.sha256`; on the LAN host, join them before checking:
+
+```sh
+cat teknoir-airgap-<bundleId>.tar.part-* > teknoir-airgap-<bundleId>.tar
+```
 
 ## 4. Check a build
 

@@ -113,7 +113,7 @@ cd teknoir-airgap-<bundleId>
 ```
 
 If the bundle was split for a FAT32 medium ([BUILD.md](BUILD.md#3-copy-to-the-usb-medium)),
-join the pieces into the `.tar` first. Never edit files inside the extracted
+join the parts first: `cat teknoir-airgap-<bundleId>.tar.part-* > teknoir-airgap-<bundleId>.tar`. Never edit files inside the extracted
 bundle: `verify` and `up` refuse a bundle that differs from its `MANIFEST.yaml`.
 macOS Finder files (`.DS_Store`, `._*`) are ignored.
 
