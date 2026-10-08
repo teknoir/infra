@@ -77,7 +77,10 @@ migrate_init() {
   MIGRATE_RETIRED_ROOT="${data}/server/manifests-retired"
   MIGRATE_RETIRED="${MIGRATE_RETIRED_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)"
   [[ -d "${MIGRATE_MANIFESTS}" ]] || die "no K3s manifests dir ${MIGRATE_MANIFESTS} (K3S_DATA_DIR=${data})"
-  MIGRATE_KINDS="$(kc api-resources --no-headers)" || die "cannot list the API resources"
+  local rc=0
+  MIGRATE_KINDS="$(kc api-resources --no-headers 2>/dev/null)" || rc=$?
+  [[ -n "${MIGRATE_KINDS}" ]] || die "cannot list the API resources"
+  [[ "${rc}" == "0" ]] || warn "the API resource list is incomplete (an aggregated API is unavailable); kinds it does not serve are skipped"
   # "group/Kind" per served resource (APIVERSION is the third column from the end)
   MIGRATE_KINDS="$(awk '{v = $(NF-2); g = (index(v, "/") ? substr(v, 1, index(v, "/") - 1) : ""); print g "/" $NF}' <<<"${MIGRATE_KINDS}")"
 }
