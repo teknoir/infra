@@ -11,10 +11,20 @@
 #
 # Usage: kc-login.sh --cacert CA --url URL --user NAME --password-file FILE
 #                    [--new-password-file FILE]
-#   --new-password-file  used when Keycloak forces a password change; created
-#                        (mode 0600, random) when it does not exist, so the
-#                        caller learns the new password. After a forced change
-#                        the caller must use this file as the password.
+#   --user               the Keycloak username; for a user that
+#                        `teknoir-airgap admin-user` created this is its
+#                        e-mail address (user-controller's username)
+#   --password-file      the current password; for a new admin-user admin the
+#                        temporary one from its --out file
+#   --new-password-file  used when Keycloak forces a password change (always at
+#                        the first login of an admin-user admin: its password
+#                        is temporary); created (mode 0600, random) when it
+#                        does not exist, so the caller learns the new password.
+#                        After a forced change the caller must use this file
+#                        as the password.
+# Update Profile (Keycloak 26 asks for a missing last name, which
+# user-controller does not set) is answered with the form's own values, a
+# default name, and the e-mail address (--user when it is one).
 # Exit 0 when the final page is served by the protected host with an
 # oauth2-proxy session cookie; 1 otherwise; 2 on usage errors.
 set -euo pipefail
@@ -67,6 +77,16 @@ input_value() {
     grep -oE 'value="[^"]*"' | sed -e 's/^value="//' -e 's/"$//' || true
 }
 
+profile_email() {
+  # the e-mail address for Update Profile: the form's own value, else --user
+  # when it is an address (an admin-user admin), else a placeholder
+  local e
+  e="$(input_value email)"
+  if [[ -n "${e}" ]]; then printf '%s' "${e}"
+  elif [[ "${LOGIN_USER}" == *@* ]]; then printf '%s' "${LOGIN_USER}"
+  else printf '%s@example.invalid' "${LOGIN_USER}"; fi
+}
+
 main() {
 parse_args "$@"
 work="$(mktemp -d)"
@@ -99,9 +119,8 @@ for _ in 1 2 3 4; do
     fetch --data-urlencode "password-new@${work}/newpw" --data-urlencode "password-confirm@${work}/newpw" "${act}" \
       || { say "posting the password update failed"; exit 1; }
   elif act="$(form_action kc-update-profile-form)" && [[ -n "${act}" ]]; then
-    local_email="$(input_value email)"
     say "required action Update Profile"
-    fetch --data-urlencode "email=${local_email:-${LOGIN_USER}@example.invalid}" \
+    fetch --data-urlencode "email=$(profile_email)" \
           --data-urlencode "firstName=$(input_value firstName | grep . || echo Platform)" \
           --data-urlencode "lastName=$(input_value lastName | grep . || echo Admin)" "${act}" \
       || { say "posting the profile update failed"; exit 1; }

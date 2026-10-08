@@ -18,7 +18,7 @@ setup() {
 @test "help lists every command of the operator flow" {
   run bash "${LAN_BIN}" help
   [ "${status}" -eq 0 ]
-  for c in up status kubeconfig trust credentials backup rotate doctor migrate; do
+  for c in up status kubeconfig trust credentials admin-user backup rotate doctor migrate; do
     grep -qE "^[[:space:]]+${c}( |$)" <<<"${output}" || { echo "missing command: ${c}"; return 1; }
   done
 }
@@ -26,8 +26,24 @@ setup() {
 @test "help documents the flags the runbooks use" {
   run bash "${LAN_BIN}" help
   [ "${status}" -eq 0 ]
-  for f in --site --node --rollback --forget-host-key --out --local --dry-run; do
+  for f in --site --node --rollback --forget-host-key --host-key --out --email --local --dry-run; do
     [[ "${output}" == *"${f}"* ]] || { echo "missing flag: ${f}"; return 1; }
+  done
+}
+
+@test "every command and flag the VM e2e passes to teknoir-airgap is in its help" {
+  local e2e="${REPO_ROOT}/airgap/test/vm/e2e.sh" cmds flags c f
+  run bash "${LAN_BIN}" help
+  [ "${status}" -eq 0 ]
+  # tk "${dir}" <command> [flags], up_in "${dir}" [flags]; tk() adds --site and --host-key
+  cmds="$(grep -oE 'tk "\$\{dir\}" [a-z][a-z-]*' "${e2e}" | awk '{print $3}' | sort -u)"
+  flags="$(grep -E '(^|[[:space:];(])(tk|up_in) "\$\{' "${e2e}" | grep -oE -- '--[a-z][a-z-]*' | sort -u)"
+  [ -n "${cmds}" ] && [ -n "${flags}" ]
+  for c in ${cmds}; do
+    grep -qE "^[[:space:]]+${c}( |$)" <<<"${output}" || { echo "e2e uses a command the help does not list: ${c}"; return 1; }
+  done
+  for f in ${flags} --site --host-key; do
+    [[ "${output}" == *"${f}"* ]] || { echo "e2e uses a flag the help does not document: ${f}"; return 1; }
   done
 }
 

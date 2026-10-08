@@ -12,7 +12,9 @@
 # Scenarios (default order; E7 runs before E6 because E6 wipes the node logs):
 #   E1  fresh bootstrap on a just-created VM: up, all Applications
 #       Synced/Healthy in 45 min, HTTPS to harbor/argocd/auth with the fetched
-#       CA, oauth2-proxy login as platform-admin            [--allow-destroy]
+#       CA; the first admin from `admin-user --email --out` (0600 file), then
+#       an oauth2-proxy login as that admin, setting the new password Keycloak
+#       demands for the temporary one                        [--allow-destroy]
 #   E2  idempotency: a second up reports 0 changes; pod UIDs, k3s start time,
 #       Secret resourceVersions unchanged; Harbor receives 0 blob uploads
 #   E3  no egress from the VM or the namespace (FORWARD DROP counters grow);
@@ -43,7 +45,11 @@
 #   E2E_UP_FLAGS     extra flags for every teknoir-airgap call
 #   E2E_ZERO_CHANGES_RE  regex that the E2 summary must match (default: "0 change|no change")
 #   E2E_LOGIN_URL    oauth2-proxy protected URL (default https://grafana.<domain>/)
-#   E2E_ADMIN_USER   Keycloak user for the login check (default platform-admin)
+#   E2E_ADMIN_EMAIL  E1: the first admin created with admin-user (default
+#                    e2e-admin@example.com)
+#   E2E_ADMIN_USER   Keycloak user for the login checks (default: E2E_ADMIN_EMAIL
+#                    in lower case, the username user-controller gives the
+#                    Keycloak user it creates for the User CR)
 #   E2E_E6_RESTORE_CMD  E6: restore command run after the rebuild (OPERATE.md); unset = skip
 # Nothing here touches vpro's /etc/hosts, its default route, or the live env.
 set -euo pipefail
@@ -68,7 +74,8 @@ ALL=(E1 E2 E3 E4 E5 E8 E7 E6 E10)
 ALLOW_DESTROY=0 STOP_ON_FAIL=0
 HARBOR_NS="${E2E_HARBOR_NS:-teknoir-system}"
 HARBOR_REGISTRY="${E2E_HARBOR_REGISTRY:-harbor-registry}"
-ADMIN_USER="${E2E_ADMIN_USER:-platform-admin}"
+ADMIN_EMAIL="${E2E_ADMIN_EMAIL:-e2e-admin@example.com}"
+ADMIN_USER="${E2E_ADMIN_USER:-$(printf '%s' "${ADMIN_EMAIL}" | tr '[:upper:]' '[:lower:]')}"
 ZERO_RE="${E2E_ZERO_CHANGES_RE:-(^|[^0-9])0 change|no change|nothing changed}"
 # shellcheck disable=SC1090
 DOMAIN="$(. "${LAN_SITE}"; printf '%s' "${TEKNOIR_DOMAIN}")"
@@ -291,15 +298,17 @@ EOF
 }
 
 admin_pw_current() {
-  # the platform-admin password file in use (after a forced change: the new one)
-  if [[ -s "${LAN_HOME}/e2e/platform-admin.new" ]]; then printf '%s' "${LAN_HOME}/e2e/platform-admin.new"
-  else printf '%s' "${LAN_HOME}/e2e/platform-admin.pw"; fi
+  # the admin's password file in use: admin-user writes the temporary one to
+  # admin.pw; after the forced change at the first login, kc-login.sh has put
+  # the new one in admin.new
+  if [[ -s "${LAN_HOME}/e2e/admin.new" ]]; then printf '%s' "${LAN_HOME}/e2e/admin.new"
+  else printf '%s' "${LAN_HOME}/e2e/admin.pw"; fi
 }
 
 login_check() {
   # login_check <description> — scripted oauth2-proxy/Keycloak login from the netns
   if lan "${E2E_WORK}" "${KCLOGIN}" --cacert "$(ca_file)" --url "${LOGIN_URL}" --user "${ADMIN_USER}" \
-       --password-file "$(admin_pw_current)" --new-password-file "${LAN_HOME}/e2e/platform-admin.new"; then
+       --password-file "$(admin_pw_current)" --new-password-file "${LAN_HOME}/e2e/admin.new"; then
     pass "$1"
   else
     fail "$1"
@@ -313,7 +322,7 @@ e1() {
   tl_case E1 "fresh bootstrap from the extracted tar in the LAN netns"
   [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
   fresh_vm || return 0
-  rm -rf "${LAN_HOME:?}/.teknoir-airgap" "${LAN_HOME}/e2e"/platform-admin.*
+  rm -rf "${LAN_HOME:?}/.teknoir-airgap" "${LAN_HOME}/e2e"/admin.*
   local dir
   dir="$(bundle_dir "${E2E_BUNDLE}")"
   dotdirs > "${STATE}/dotdirs.before"
@@ -324,14 +333,17 @@ e1() {
   assert_eq "https://argocd.${DOMAIN} with the CA" 200 "$(lan_https "https://argocd.${DOMAIN}/")"
   assert_eq "Keycloak master realm discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/realms/master/.well-known/openid-configuration")"
   assert_eq "Keycloak realm teknoir discovery with the CA (D2)" 200 "$(lan_https "https://auth.${DOMAIN}/realms/teknoir/.well-known/openid-configuration")"
-  local pw="${LAN_HOME}/e2e/platform-admin.pw" mode
-  if tk "${dir}" credentials platform-admin --out "${pw}"; then
+  # the first platform admin (DESIGN C.5): a superadmin User CR, its Keycloak
+  # user (realm teknoir, group admin) and a temporary password in a 0600 file
+  local pw="${LAN_HOME}/e2e/admin.pw" mode
+  if tk "${dir}" admin-user --email "${ADMIN_EMAIL}" --out "${pw}"; then
     mode="$(stat -c %a "${pw}" 2>/dev/null || echo missing)"
-    assert_eq "credentials --out writes a 0600 file" 600 "${mode}"
+    assert_eq "admin-user --out writes the temporary password to a 0600 file" 600 "${mode}"
   else
-    fail "teknoir-airgap credentials platform-admin --out failed"; return 0
+    fail "teknoir-airgap admin-user --email ${ADMIN_EMAIL} --out failed"; return 0
   fi
-  login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} (forced password change handled)"
+  [[ -s "${pw}" ]] || { fail "admin-user wrote no temporary password to ${pw}"; return 0; }
+  login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} (the forced change of the temporary password handled)"
 }
 
 # ---------------------------------------------------------------------------

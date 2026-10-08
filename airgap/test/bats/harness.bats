@@ -314,6 +314,30 @@ EOF
   [ "$(input_value email)" = "admin@example.invalid" ]
 }
 
+@test "kc-login.sh: Update Profile uses the form's e-mail, else an address-shaped --user" {
+  # shellcheck source=../vm/kc-login.sh
+  source "${KCLOGIN}"
+  page="${BATS_TEST_TMPDIR}/page.html"
+  printf '<form id="kc-update-profile-form" action="x"><input type="text" id="email" name="email" value=""></form>\n' > "${page}"
+  LOGIN_USER=e2e-admin@example.com
+  [ "$(profile_email)" = e2e-admin@example.com ]
+  LOGIN_USER=someone
+  [ "$(profile_email)" = someone@example.invalid ]
+  printf '<form id="kc-update-profile-form" action="x"><input type="text" id="email" name="email" value="kept@example.org"></form>\n' > "${page}"
+  [ "$(profile_email)" = kept@example.org ]
+}
+
+@test "e2e.sh: the first admin comes from admin-user; the login user is its address in lower case" {
+  run bash -c "E2E_ADMIN_EMAIL=Ops.Admin@Example.COM; source '${E2E}'; printf '%s|%s' \"\${ADMIN_EMAIL}\" \"\${ADMIN_USER}\""
+  [ "${status}" -eq 0 ]
+  [ "${output}" = "Ops.Admin@Example.COM|ops.admin@example.com" ]
+  run bash -c "source '${E2E}'; printf '%s' \"\${ADMIN_USER}\""
+  [ "${output}" = e2e-admin@example.com ]
+  # E1 runs admin-user --email --out; nothing asks for the retired platform-admin credential
+  grep -q 'tk "${dir}" admin-user --email "${ADMIN_EMAIL}" --out "${pw}"' "${E2E}"
+  refute_grep -n 'platform-admin' "${E2E}" "${KCLOGIN}"
+}
+
 @test "kc-login.sh: passwords reach curl only as @file, never as an argument" {
   refute_grep -nE 'password=\$|password-new=\$|password-confirm=\$' "${KCLOGIN}"
   grep -q 'password@' "${KCLOGIN}"
