@@ -175,6 +175,7 @@ sha_init() {
 sha256_of() { "${SHA256[@]}" <"$1" | awk '{ print $1 }'; }
 
 TMPD=
+# 1 only when this run started the ssh master; only then does it close it.
 MASTER_UP=0
 SSH_OPTS=()
 NODE=
@@ -609,7 +610,7 @@ ssh_connect() {
   if [ "${OPT_FORGET_HOSTKEY}" = 1 ]; then hostkey_forget; fi
   hostkey_pinned || hostkey_pin
   if ssh "${SSH_OPTS[@]}" -O check "${NODE}" >/dev/null 2>&1; then
-    MASTER_UP=1
+    : # another teknoir-airgap run's master: use it, leave it to that run
   elif ssh "${SSH_OPTS[@]}" -o ControlMaster=yes -o ControlPersist=300 -f -N "${NODE}" \
        </dev/null >/dev/null 2>"${TMPD}/ssh-connect.err"; then
     MASTER_UP=1
@@ -1016,9 +1017,9 @@ run_runner() {   # run_runner tty|pipe SUBCOMMAND [ARGS...]: teknoir-node as roo
 print_changes() {
   local c
   if [ ${#CHANGES[@]} -eq 0 ]; then
-    log "this computer and the node needed no changes from ${PROG} itself"
+    log "${PROG} itself changed nothing (the converge reports its own changes)"
   else
-    log "changes made by ${PROG} on this side:"
+    log "${PROG} itself changed:"
     for c in "${CHANGES[@]}"; do printf '  - %s\n' "${c}" >&2; done
   fi
 }

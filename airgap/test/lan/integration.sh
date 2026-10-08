@@ -161,8 +161,12 @@ hostkey-changed)
   expect_out "host key mismatch" "names the problem"
   expect_out "ssh-keygen -R '${NODE_IP}' -f '${KH}'" "prints the exact ssh-keygen -R command"
   expect_out "./teknoir-airgap up --forget-host-key" "prints the --forget-host-key fix"
-  expect_rc 0 "up --forget-host-key --host-key NEW" "${T}" up --forget-host-key --host-key "${FP}"
+  with_tty "up --forget-host-key in a terminal, confirming the new key with yes" 0 "${T}" up --forget-host-key
+  expect_out "presents this ssh-ed25519 host key" "shows the key type"
+  expect_out "${FP}" "shows the new fingerprint"
+  expect_out "forgot the pinned host key" "forgets the old key"
   check "only the new key is pinned" test "$(grep -c "^${NODE_IP} " "${KH}")" = 1
+  expect_rc 0 "up again with the new key, no prompt" "${T}" up
   ;;
 *)
   echo "unknown phase $1" >&2
