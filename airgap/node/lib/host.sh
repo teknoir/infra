@@ -93,11 +93,26 @@ host_secrets_encryption_line() {
   fi
 }
 
+host_flannel_iface_line() {
+  # flannel picks the interface of the default route, and an airgapped node
+  # may have none ("flannel exited: failed to get default interface", k3s then
+  # restarts forever). Pin it to the interface that holds NODE_IP.
+  local iface
+  iface="$(ip -o -4 addr show 2>/dev/null | awk -v ip="${NODE_IP}" '{ split($4, a, "/"); if (a[1] == ip) { print $2; exit } }')"
+  if [[ -z "${iface}" ]]; then
+    # preflight already refuses a NODE_IP that is not local on a real node
+    warn "no local interface holds NODE_IP ${NODE_IP}: flannel keeps its default-route choice"
+    return 0
+  fi
+  printf 'flannel-iface: %s' "${iface}"
+}
+
 host_node_files() {
   ensure_work_dir
   local cfg="${WORK_DIR}/config.yaml" reg="${WORK_DIR}/registries.yaml"
   render_template "${NODE_ROOT}/templates/config.yaml.tmpl" \
-    "SECRETS_ENCRYPTION=$(host_secrets_encryption_line)" > "${cfg}"
+    "SECRETS_ENCRYPTION=$(host_secrets_encryption_line)" \
+    "FLANNEL_IFACE=$(host_flannel_iface_line)" > "${cfg}"
   render_template "${NODE_ROOT}/templates/registries.yaml.tmpl" > "${reg}"
   ensure_dir "${K3S_CONFIG_DIR}" 0755
   install_file "${cfg}" "${K3S_CONFIG_FILE}" 0600 "k3s config"

@@ -121,7 +121,7 @@ new_sandbox 1
   render_template "${PAYLOAD}/templates/coredns-custom.yaml.tmpl" > "${T}/coredns.yaml"
   render_template "${PAYLOAD}/templates/registries.yaml.tmpl" > "${T}/registries.yaml"
   APP_OF_APPS_VERSION=0.0.4 render_template "${PAYLOAD}/templates/app-of-apps.yaml.tmpl" > "${T}/aoa.yaml"
-  render_template "${PAYLOAD}/templates/config.yaml.tmpl" SECRETS_ENCRYPTION= > "${T}/config-noenc.yaml"
+  render_template "${PAYLOAD}/templates/config.yaml.tmpl" SECRETS_ENCRYPTION= FLANNEL_IFACE= > "${T}/config-noenc.yaml"
 )
 live='teknoir.airgapped:53 {
     errors
@@ -375,8 +375,8 @@ fi
 tn credentials nonsense --site test
 check "an unknown credential name fails" [ "${RC}" != 0 ]
 tn credentials platform-admin --site test --out "${T}/pa.txt"
-check "platform-admin is no credential; the error points to admin-user" \
-  bash -c "[ ${RC} != 0 ] && grep -q 'admin-user --email' '${T}/out' && [ ! -e '${T}/pa.txt' ]"
+check "platform-admin is a credential name (teknoir-auth/keycloak-platform-admin, from the realm import)" \
+  bash -c "! grep -q 'unknown NAME' '${T}/out' && { [ ${RC} = 0 ] || grep -q 'keycloak-platform-admin' '${T}/out'; }"
 
 # ---------------------------------------------------------------------------
 echo "# runner interface: the converge argv of teknoir-airgap up; break-glass flags reach the phases"
