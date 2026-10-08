@@ -28,7 +28,8 @@
 #   E6  node rebuild: new host key -> up prints the ssh-keygen -R fix;
 #       --forget-host-key completes; optional restore check  [--allow-destroy]
 #   E10 migration rehearsal: old-style install (E2E_OLD_SETUP), migrate, up,
-#       k3s restart: nothing lost, CRDs ArgoCD-tracked, no Teknoir K3s files,
+#       k3s restart: nothing lost, CRDs Synced resources of their Applications
+#       (ArgoCD 3.5 writes no tracking-id on CRDs), no Teknoir K3s files,
 #       old secrets unchanged, Harbor stable                 [--allow-destroy]
 #
 # Usage: airgap/test/vm/e2e.sh [--list] [--allow-destroy] [--stop-on-fail] [E...]
@@ -610,10 +611,14 @@ e10() {
   lost="$(LC_ALL=C comm -23 <(echo "${inv0}") <(e10_inventory) | tr '\n' ' ')"
   assert_eq "no object lost (every pre-migration object still exists)" "" "${lost}"
   assert_eq "the existing platform Secrets are unchanged (adopted by name and key)" "${hashes0}" "$(e10_secret_hashes)"
-  local crd track
-  for crd in gateways.networking.istio.io certificates.cert-manager.io; do
-    track="$(vm_kc get crd "${crd}" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/tracking-id}')"
-    if [[ -n "${track}" ]]; then pass "CRD ${crd} is ArgoCD-tracked (${track})"; else fail "CRD ${crd} has no tracking-id"; fi
+  # ArgoCD 3.5 writes no tracking-id on CRDs: a CRD is adopted when its
+  # Application lists it as a Synced resource (k3d T6)
+  local app crd st
+  for app in istio:gateways.networking.istio.io cert-manager:certificates.cert-manager.io; do
+    crd="${app#*:}" app="${app%%:*}"
+    st="$(vm_kc -n teknoir-system get applications.argoproj.io "${app}" -o json |
+          jq -r --arg n "${crd}" '.status.resources[]? | select(.kind == "CustomResourceDefinition" and .name == $n) | .status')"
+    assert_eq "CRD ${crd} is a Synced resource of Application ${app}" Synced "${st}"
   done
   addons="$(vm_kc -n kube-system get addons.k3s.cattle.io -o name | sed 's|.*/||' |
             grep -E '^(teknoir-.*|00-teknoir-.*|05-teknoir-.*|10-teknoir-.*|manifest-.*-secret|app-of-apps)$' | grep -vx teknoir-argo | tr '\n' ' ' || true)"

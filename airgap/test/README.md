@@ -59,6 +59,10 @@ objects owned by K3s manifest files:
 - T6 ArgoCD adoption;
 - T9 `teknoir-node migrate` on a fixture of the live layout.
 
+Note on T6: ArgoCD 3.5.1 writes no `argocd.argoproj.io/tracking-id` annotation on CRDs, whether it
+adopted them or created them. teknoir-local's monitoring CRDs are the same. A CRD therefore belongs
+to an app when the Application's `status.resources` lists it as Synced; T6 and E10 check that.
+
 Every kubectl call passes `--context k3d-<name>` and uses a kubeconfig in the work dir.
 Clusters are deleted afterwards (`--keep` keeps them).
 

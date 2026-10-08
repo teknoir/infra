@@ -19,7 +19,9 @@
 #   T5   a restart re-applies every file: an edit to a file-owned Secret is
 #        reverted (why secrets must not be K3s files)
 #   T6   ArgoCD adopts a one-shot server-side-applied render (field manager
-#        argocd-controller) without restarting pods; CRDs keep Prune=false;
+#        argocd-controller) without restarting pods; the CRDs become Synced
+#        resources of the Application (ArgoCD 3.5 writes no tracking-id on
+#        CRDs) and keep Prune=false;
 #        removing a CRD from a chart and deleting the Application keep objects
 #        [needs T6_ISTIO_CHART; pulls ArgoCD, istio and registry:2 images]
 #   T9   migration rehearsal: a fixture of the live teknoir-local K3s layout,
@@ -80,11 +82,13 @@ need() { local t; for t in "$@"; do command -v "${t}" >/dev/null 2>&1 || tl_die 
 kc() { kubectl --context "${CTX}" "$@"; }
 
 use_cluster() {
-  # use_cluster <name> [top] — create (or with --reuse adopt) cluster <name>.
+  # use_cluster <name> [top] [disable] — create (or with --reuse adopt) cluster <name>.
   # The work dir's manifests/ is mounted at <manifests>/teknoir, so K3s keeps
   # its own packaged files out of it; with "top" it is the manifests dir
   # itself, as on the node (T9: migrate only accepts top-level files).
+  # <disable> is the K3s --disable list (default traefik,servicelb,metrics-server).
   CLUSTER="$1" CTX="k3d-$1" SERVER="k3d-$1-server-0"
+  local disable="${3:-traefik,servicelb,metrics-server}"
   if [[ "${2:-}" == top ]]; then IN_MAN="${K3S_MANIFESTS}"; else IN_MAN="${K3S_MANIFESTS}/teknoir"; fi
   WORK="${WORK_BASE}/$1" MAN="${WORK_BASE}/$1/manifests" RETIRED="${WORK_BASE}/$1/manifests-retired"
   export KUBECONFIG="${WORK}/kubeconfig"
@@ -99,7 +103,7 @@ use_cluster() {
     mkdir -p "${MAN}" "${RETIRED}"
     tl_log "creating k3d cluster ${CLUSTER} (${K3S_IMAGE}); manifests dir ${MAN} -> ${IN_MAN}"
     k3d cluster create "${CLUSTER}" --image "${K3S_IMAGE}" --servers 1 --agents 0 --no-lb \
-      --k3s-arg '--disable=traefik,servicelb,metrics-server@server:0' \
+      --k3s-arg "--disable=${disable}@server:0" \
       --volume "${MAN}:${IN_MAN}@server:0" \
       --kubeconfig-update-default=false --kubeconfig-switch-context=false \
       --wait --timeout 300s >/dev/null
@@ -593,13 +597,17 @@ t6_ready() {
 }
 
 t6_package() {
-  # t6_package <chart dir|tgz> <outdir> — prints the path of the packaged .tgz
-  local src="$1" out="$2"
+  # t6_package <chart dir|tgz> <outdir> — prints the path of the packaged .tgz.
+  # A chart dir is copied first: dependency builds never write into the source.
+  local src="$1" out="$2" copy
   if [[ -f "${src}" ]]; then cp "${src}" "${out}/"; printf '%s/%s' "${out}" "$(basename "${src}")"; return 0; fi
-  if [[ -f "${src}/Chart.lock" || -n "$(yq '.dependencies // [] | length | select(. > 0)' "${src}/Chart.yaml")" ]]; then
-    helm dependency build "${src}" >/dev/null
+  copy="${out}/src-$(basename "${src}")"
+  rm -rf "${copy}"
+  cp -a "${src}" "${copy}"
+  if [[ -f "${copy}/Chart.lock" || -n "$(yq '.dependencies // [] | length | select(. > 0)' "${copy}/Chart.yaml")" ]]; then
+    helm dependency build "${copy}" >/dev/null
   fi
-  helm package "${src}" -d "${out}" | sed -n 's/^Successfully packaged chart and saved it to: //p'
+  helm package "${copy}" -d "${out}" | sed -n 's/^Successfully packaged chart and saved it to: //p'
 }
 
 t6_registry() {
@@ -630,7 +638,7 @@ EOF
   port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])' 2>/dev/null || echo 15000)"
   kc -n t6-registry port-forward svc/registry "${port}:5000" >/dev/null 2>&1 &
   PF_PID=$!
-  wait_until 30 curl -fsS "http://127.0.0.1:${port}/v2/" -o /dev/null || tl_die "registry port-forward not ready"
+  wait_until 30 curl -fsS "http://127.0.0.1:${port}/v2/" -o /dev/null 2>/dev/null || tl_die "registry port-forward not ready"
   T6_PUSH="oci://127.0.0.1:${port}/teknoir"
 }
 
@@ -705,7 +713,7 @@ _app_healthy_synced() {
 pods_uids() { kc -n "$1" get pods -o json | jq -r '[.items[] | "\(.metadata.name)=\(.metadata.uid)"] | sort | join(" ")'; }
 
 t6() {
-  tl_case T6 "ArgoCD adopts the one-shot SSA render (argocd-controller): no pod restarts, CRDs tracked with Prune=false"
+  tl_case T6 "ArgoCD adopts the one-shot SSA render (argocd-controller): no pod restarts, CRDs adopted with Prune=false"
   mkdir -p "${WORK}/t6"
   local istio_tgz ver crds rest crd_names n uids_before managers
   istio_tgz="$(t6_package "${T6_ISTIO_CHART}" "${WORK}/t6")"
@@ -726,26 +734,35 @@ t6() {
 
   tl_log "one-shot: server-side apply of the render as argocd-controller"
   kc create namespace istio-system --dry-run=client -o yaml | kc apply -f - >/dev/null
+  t6_secret_placeholders "${rest}"
   kc apply --server-side --field-manager=argocd-controller --force-conflicts -f "${crds}" >/dev/null
   kc wait --for=condition=Established -f "${crds}" --timeout=120s >/dev/null
   kc apply --server-side --field-manager=argocd-controller --force-conflicts -f "${rest}" >/dev/null
-  kc -n istio-system wait --for=condition=Available deploy --all --timeout=600s >/dev/null || fail "istio deployments not Available after the one-shot apply"
+  if ! kc -n istio-system wait --for=condition=Available deploy/istiod --timeout=900s >/dev/null; then
+    fail "istiod not Available after the one-shot apply"; return 0
+  fi
+  t6_reinject
+  kc -n istio-system wait --for=condition=Available deploy --all --timeout=900s >/dev/null || fail "istio deployments not Available after the one-shot apply"
   uids_before="$(pods_uids istio-system)"
 
   t6_app istio istio-system istio "${ver}"
   if wait_until 900 _app_healthy_synced istio; then pass "Application istio is Synced/Healthy"; else fail "Application istio not Synced/Healthy within 15 min"; fi
   assert_eq "no istio-system pod was restarted or replaced by the adoption (pod UIDs)" "${uids_before}" "$(pods_uids istio-system)"
-  local name track opts untracked=0 unprotected=0
+  # ArgoCD 3.5 writes no tracking-id annotation on CRDs (neither adopted nor
+  # created ones; verified here and on teknoir-local's monitoring CRDs): a
+  # CRD belongs to the app when the Application lists it as a resource.
+  local name opts untracked=0 unprotected=0 app_crds
+  app_crds="$(kc -n teknoir-system get applications.argoproj.io istio -o json |
+    jq -r '.status.resources[]? | select(.kind == "CustomResourceDefinition" and .status == "Synced") | .name' | sort)"
   while read -r name; do
     [[ -n "${name}" ]] || continue
-    track="$(kc get crd "${name}" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/tracking-id}')"
     opts="$(kc get crd "${name}" -o jsonpath='{.metadata.annotations.argocd\.argoproj\.io/sync-options}')"
-    [[ "${track}" == istio:* ]] || { untracked=$((untracked + 1)); tl_warn "CRD ${name} tracking-id=[${track}]"; }
+    grep -qxF "${name}" <<<"${app_crds}" || { untracked=$((untracked + 1)); tl_warn "CRD ${name} is not a Synced resource of Application istio"; }
     [[ "${opts}" == *Prune=false* && "${opts}" == *Delete=false* ]] || { unprotected=$((unprotected + 1)); tl_warn "CRD ${name} sync-options=[${opts}]"; }
   done <<<"${crd_names}"
-  assert_eq "every chart CRD is tracked by Application istio" 0 "${untracked}"
+  assert_eq "every chart CRD is a Synced resource of Application istio" 0 "${untracked}"
   assert_eq "every chart CRD carries Prune=false,Delete=false" 0 "${unprotected}"
-  managers="$(kc -n istio-system get deploy istiod -o json | jq -r '[.metadata.managedFields[] | select(.operation == "Apply") | .manager] | unique | join(",")')"
+  managers="$(kc -n istio-system get deploy istiod -o json --show-managed-fields | jq -r '[(.metadata.managedFields // [])[] | select(.operation == "Apply") | .manager] | unique | join(",")')"
   assert_eq "istiod: the only Apply field manager is argocd-controller" argocd-controller "${managers}"
 
   # Removing a CRD from a chart must not delete it (Prune=false), on a mini chart
@@ -767,6 +784,36 @@ t6() {
   while read -r name; do [[ -z "${name}" ]] || exists crd "${name}" || gone=$((gone + 1)); done <<<"${crd_names}"
   assert_eq "deleting Application istio leaves every istio CRD" 0 "${gone}"
   [[ -n "${PF_PID}" ]] && { kill "${PF_PID}" 2>/dev/null || true; PF_PID=""; }
+}
+
+t6_secret_placeholders() {
+  # t6_secret_placeholders <render> — stand-ins for what the node's secrets
+  # phase (I-07) creates before the one-shot tiers: every non-optional Secret
+  # a rendered Deployment mounts (istiod: teknoir-airgapped-wildcard-tls for
+  # its JWKS CA) gets a throwaway self-signed TLS Secret when absent.
+  local name d="${WORK}/t6/tls"
+  for name in $(yq -r 'select(.kind == "Deployment") | .spec.template.spec.volumes[]? | select(.secret != null and .secret.optional != true) | .secret.secretName' "$1" | grep -v -- '^---$' | sort -u || true); do
+    exists secret "${name}" istio-system && continue
+    mkdir -p "${d}"
+    ( umask 077; openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=k3d T6 throwaway test cert" \
+        -keyout "${d}/tls.key" -out "${d}/tls.crt" >/dev/null 2>&1 )
+    cp "${d}/tls.crt" "${d}/ca.crt"
+    kc -n istio-system create secret generic "${name}" --type=kubernetes.io/tls \
+      --from-file="${d}/ca.crt" --from-file="${d}/tls.crt" --from-file="${d}/tls.key" >/dev/null
+    rm -rf "${d}"
+    tl_log "created the placeholder Secret istio-system/${name} (the node's secrets phase does this)"
+  done
+}
+
+t6_reinject() {
+  # Gateway pods created before istiod's injection webhook served keep the
+  # unresolved image "auto" (ErrImagePull) until they are re-created.
+  local pods
+  pods="$(kc -n istio-system get pods -o json | jq -r '.items[] | select(any(.spec.containers[]; .image == "auto")) | .metadata.name')"
+  [[ -n "${pods}" ]] || return 0
+  tl_warn "$(wc -l <<<"${pods}") istio pod(s) were created before the injection webhook served (image \"auto\"); re-creating them. The one-shot istio tier (I-08) must handle this ordering (wait for istiod, then restart the gateways)."
+  # shellcheck disable=SC2086  # one pod name per word
+  kc -n istio-system delete pod ${pods} --wait=false >/dev/null
 }
 
 t6_crd_chart() {
@@ -1112,7 +1159,9 @@ main() {
     finish_cluster
   fi
   if [[ " ${tests[*]} " == *" T6 "* ]]; then
-    if t6_ready; then use_cluster "${PREFIX}-t6"; t6; finish_cluster
+    # metrics-server stays: ArgoCD reports istio's HPAs Degraded without metrics;
+    # servicelb too: the gateways' LoadBalancer Services are Progressing without it
+    if t6_ready; then use_cluster "${PREFIX}-t6" sub traefik; t6; finish_cluster
     else tl_case T6 "ArgoCD adoption of the one-shot render"; skip_case "${T6_WHY}"; fi
   fi
   if [[ " ${tests[*]} " == *" T9 "* ]]; then
