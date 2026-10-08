@@ -40,7 +40,7 @@ set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib-build.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-build.sh"
 
-usage() { sed -n '2,38p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { usage_from_header "${BASH_SOURCE[0]}"; }
 
 GITOPS="" SITE_ARG="teknoir-local" OUT_DIR="${INFRA_ROOT}/dist"
 ALLOW_DIRTY=0 IMAGES_LIMIT_ARG="${IMAGES_LIMIT:-}" SPLIT=0 KEEP_STAGING=0 DRY_RUN=0

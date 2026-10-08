@@ -460,3 +460,8 @@ site_get() {
     END { print val }
   ' "$1"
 }
+
+usage_from_header() {
+  # usage_from_header <script> — the script's leading comment block as help text
+  awk 'NR == 1 { next } /^#/ { if ($0 ~ /^# shellcheck/) next; sub(/^# ?/, ""); print; next } { exit }' "$1"
+}

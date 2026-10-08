@@ -25,7 +25,7 @@ set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib-build.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-build.sh"
 
-usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { usage_from_header "${BASH_SOURCE[0]}"; }
 
 STAGE="" WORK="" SITE=""
 while [[ $# -gt 0 ]]; do
