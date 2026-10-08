@@ -13,7 +13,11 @@
 #       placeholder verifies against the CA
 #   I-10 downgrade refused, --rollback accepted and recorded, the next plain
 #       run with the rolled-back bundle keeps it; broken versions refused;
-#       post fails naming an Application that is not Synced/Healthy
+#       post fails naming an Application that is not Synced/Healthy, and
+#       treats a stale status as not ready (compared with the old pin, a
+#       running sync, another chart revision, or - after this run's pin - no
+#       reconcile since); release requests a root refresh, and with a
+#       stand-in ArgoCD answering it, release + post pass
 #   I-07 credentials --out (0600) and to a pipe, a user name passes the leak
 #       check; rotate oauth2-proxy-cookie changes only that key; rotate
 #       keycloak-db --i-know against a postgres stand-in (new password works,
@@ -25,10 +29,12 @@
 #
 # Usage: airgap/test/node/k3d.sh [-v] [--keep]
 #   AGE_BIN=/path/to/age   also test `backup --recipient` (needs age-keygen next to it)
+#   TEKNOIR_NODE_SRC=DIR   test another airgap/node tree
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$(cd "${HERE}/../../node" && pwd)"
+# TEKNOIR_NODE_SRC: another airgap/node tree to test instead of this checkout's.
+SRC="$(cd "${TEKNOIR_NODE_SRC:-${HERE}/../../node}" && pwd)"
 NAME="${K3D_NAME:-tknode}"
 CTX="k3d-${NAME}"
 IMAGE="${K3S_IMAGE:-rancher/k3s:v1.33.5-k3s1}"
@@ -258,11 +264,66 @@ check "rolling forward to 0.0.4 again is an update" \
   [ "$(k -n teknoir-system get cm teknoir-airgap-release -o 'jsonpath={.data.mode} {.data.previousAppOfAppsVersion}')" == "update 0.0.3" ]
 
 echo "# I-10: post"
-k -n teknoir-system patch applications.argoproj.io app-of-apps --type merge \
-  -p '{"status":{"sync":{"status":"Synced","revision":"0.0.4"},"health":{"status":"Healthy"}}}' >/dev/null
+root_status() {
+  # root_status <compared rev> <synced rev> <operation phase> <reconciledAt> -
+  # set the root's status as ArgoCD would (no controller runs here).
+  local src
+  src="$(k -n teknoir-system get applications.argoproj.io app-of-apps -o json | jq -c --arg r "$1" '.spec.source | .targetRevision = $r')"
+  k -n teknoir-system patch applications.argoproj.io app-of-apps --type merge -p "$(jq -cn --argjson s "${src}" \
+    --arg rev "$2" --arg op "$3" --arg at "$4" \
+    '{status: {sync: {status: "Synced", revision: $rev, comparedTo: {source: $s}},
+               health: {status: "Healthy"}, operationState: {phase: $op}, reconciledAt: $at}}')" >/dev/null
+}
+fake_argocd_refresh() {
+  # Plays ArgoCD for the root: once the refresh annotation appears, reconcile
+  # one second later (status for the current spec, reconciledAt now) and
+  # consume the annotation.
+  local src
+  for _ in $(seq 1 120); do
+    if [ -n "$(k -n teknoir-system get applications.argoproj.io app-of-apps -o 'jsonpath={.metadata.annotations.argocd\.argoproj\.io/refresh}')" ]; then
+      sleep 1
+      src="$(k -n teknoir-system get applications.argoproj.io app-of-apps -o json | jq -c '.spec.source')"
+      k -n teknoir-system patch applications.argoproj.io app-of-apps --type merge -p "$(jq -cn --argjson s "${src}" \
+        --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{metadata: {annotations: {"argocd.argoproj.io/refresh": null}},
+          status: {reconciledAt: $now, sync: {status: "Synced", revision: $s.targetRevision, comparedTo: {source: $s}},
+                   health: {status: "Healthy"}, operationState: {phase: "Succeeded"}}}')" >/dev/null
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+OLD_TS="2020-01-01T00:00:00Z"
+root_status 0.0.3 0.0.3 Succeeded "${OLD_TS}"
+tn converge --site test --only post --wait-timeout 3
+check "a stale root status (compared with the old pin) is not ready" \
+  bash -c "[ ${RC} != 0 ] && grep -qF 'not Synced/Healthy at this release: app-of-apps (status not computed for the current spec yet (compared: 0.0.3)' '${T}/out'"
+root_status 0.0.4 0.0.4 Running "${OLD_TS}"
+tn converge --site test --only post --wait-timeout 3
+check "a running sync operation is not ready" bash -c "[ ${RC} != 0 ] && grep -qF 'app-of-apps (sync operation Running' '${T}/out'"
+root_status 0.0.4 0.0.3 Succeeded "${OLD_TS}"
+tn converge --site test --only post --wait-timeout 3
+check "a chart revision other than the pin is not ready" \
+  bash -c "[ ${RC} != 0 ] && grep -qF 'app-of-apps (synced revision 0.0.3, pinned 0.0.4' '${T}/out'"
+root_status 0.0.4 0.0.4 Succeeded "${OLD_TS}"
 tn converge --site test --only post --wait-timeout 5
-check "post passes when every Application is Synced/Healthy" [ "${RC}" == 0 ]
-cat <<'EOF' | k apply -f - >/dev/null
+check "post passes when every Application is Synced/Healthy at its current spec" [ "${RC}" == 0 ]
+k -n teknoir-system annotate applications.argoproj.io app-of-apps argocd.argoproj.io/refresh- >/dev/null
+tn converge --site test --only release,post --wait-timeout 4
+check "release asks ArgoCD to refresh the root" \
+  [ "$(k -n teknoir-system get applications.argoproj.io app-of-apps -o 'jsonpath={.metadata.annotations.argocd\.argoproj\.io/refresh}')" == normal ]
+check "after this run's pin, a root not reconciled since is not ready" \
+  bash -c "[ ${RC} != 0 ] && grep -qF 'app-of-apps (not reconciled since this run pinned it)' '${T}/out'"
+k -n teknoir-system annotate applications.argoproj.io app-of-apps argocd.argoproj.io/refresh- >/dev/null
+fake_argocd_refresh &
+FAKE_PID=$!
+tn converge --site test --only release,post --wait-timeout 60
+FAKE_RC=0
+wait "${FAKE_PID}" || FAKE_RC=$?
+check "release + post pass once ArgoCD has reconciled the root after the pin" \
+  bash -c "[ ${RC} = 0 ] && [ ${FAKE_RC} = 0 ] && grep -q 'every Application is Synced/Healthy at its current spec' '${T}/out'"
+cat <<'APP' | k apply -f - >/dev/null
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata: {name: broken, namespace: teknoir-system}
@@ -271,10 +332,10 @@ status:
   sync: {status: OutOfSync}
   health: {status: Degraded}
   operationState: {phase: Failed, message: "one or more objects failed to apply"}
-EOF
+APP
 tn converge --site test --only post --wait-timeout 3
 check "post fails and names the failing Application" \
-  bash -c "[ ${RC} != 0 ] && grep -q 'not Synced/Healthy: broken' '${T}/out' && grep -q 'broken: Failed one or more objects failed to apply' '${T}/out'"
+  bash -c "[ ${RC} != 0 ] && grep -qF 'not Synced/Healthy at this release: broken (OutOfSync/Degraded' '${T}/out' && grep -qF 'broken: OutOfSync/Degraded | Failed one or more objects failed to apply' '${T}/out'"
 k -n teknoir-system delete applications.argoproj.io broken >/dev/null
 
 echo "# status"

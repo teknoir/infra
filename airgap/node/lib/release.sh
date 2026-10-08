@@ -9,9 +9,19 @@
 #   Guard: versions in the broken list are always refused; a version older
 #   than the deployed one only with --rollback (which is recorded, so the
 #   next plain converge with that bundle is not a downgrade any more).
-# post: wait until every Application is Synced/Healthy (report per app on
-#   timeout), check every running image is re-pullable (Harbor) or present
-#   (containerd), and prune old bundle payloads (keep current + previous).
+# post: wait until every Application is Synced/Healthy at its current spec
+#   (report per app on timeout), check every running image is re-pullable
+#   (Harbor) or present (containerd), and prune old bundle payloads (keep
+#   current + previous).
+#   Synced/Healthy alone is not enough: right after the pin changes, ArgoCD
+#   still shows the old revision's status until it has compared again (and
+#   the children go through the same window after the root syncs). An
+#   Application counts as ready only when its status was computed for its
+#   current spec (status.sync.comparedTo equals spec.source[s]; for a chart
+#   pinned to an exact version, status.sync.revision is that version), no
+#   sync operation is running, and - for the root, when this run applied the
+#   pin - status.reconciledAt is later than the pin. The release phase asks
+#   ArgoCD to refresh the root right after the pin, so that wait is seconds.
 # shellcheck source-path=SCRIPTDIR
 # shellcheck disable=SC2016 # jq programs use $variables in single quotes
 # shellcheck source=common.sh
@@ -31,6 +41,31 @@ POST_WAIT_DEFAULT=1200
 POST_WAIT_FIRST_INSTALL=2700
 POST_POLL="${POST_POLL:-15}"
 BUNDLES_KEEP_PREVIOUS=1
+# Epoch second just before this run applied the root pin (0: not this run).
+RELEASE_PIN_AT=0
+
+# jq: why($root; $pinAt) is "" for a ready Application, else the reasons.
+RELEASE_JQ_READY='
+def exactver: test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$");
+def epoch: (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0);
+def nilempty: if . == [] or . == {} then null else . end;
+def why($root; $pinAt):
+  (.spec.source // null) as $src
+  | [ (if (.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy"
+       then "\(.status.sync.status // "Unknown")/\(.status.health.status // "Unknown")" else empty end),
+      (if ((.status.operationState.phase // "") | IN("Running", "Terminating"))
+       then "sync operation \(.status.operationState.phase)" else empty end),
+      (if ($src | nilempty) != (.status.sync.comparedTo.source // null | nilempty)
+          or (.spec.sources // null | nilempty) != (.status.sync.comparedTo.sources // null | nilempty)
+       then "status not computed for the current spec yet (compared: \(.status.sync.comparedTo.source.targetRevision // "nothing"))"
+       else empty end),
+      (if ($src.chart // "") != "" and (($src.targetRevision // "") | exactver)
+          and (.status.sync.revision // "") != $src.targetRevision
+       then "synced revision \(.status.sync.revision // "none"), pinned \($src.targetRevision)" else empty end),
+      (if .metadata.name == $root and $pinAt > 0 and ((.status.reconciledAt // "") | epoch) <= $pinAt
+       then "not reconciled since this run pinned it" else empty end)
+    ] | join("; ");
+'
 
 # Filled by release_load_record.
 REC_SOURCE=""          # configmap | application | none
@@ -160,8 +195,25 @@ phase_release() {
   ensure_work_dir
   f="${WORK_DIR}/app-of-apps.yaml"
   render_template "${NODE_ROOT}/templates/app-of-apps.yaml.tmpl" > "${f}"
+  dry_run || RELEASE_PIN_AT="$(date +%s)"
   apply_ssa "${f}" teknoir-bootstrap "root AppProject default + Application ${ROOT_APP} at ${APP_OF_APPS_VERSION}"
+  dry_run || release_request_refresh
   release_record
+}
+
+release_request_refresh() {
+  # Ask ArgoCD to compare the root now, in a later second than the pin:
+  # status.reconciledAt has second resolution, and post requires the root's
+  # to be later than RELEASE_PIN_AT. Not recorded as a change: a request
+  # ArgoCD consumes (and removes); the pin itself is reported by apply_ssa.
+  while (( $(date +%s) <= RELEASE_PIN_AT )); do
+    sleep 0.2
+  done
+  if kc -n "${RELEASE_NS}" annotate "${APP_CRD}" "${ROOT_APP}" argocd.argoproj.io/refresh=normal --overwrite >/dev/null 2>&1; then
+    log "requested an ArgoCD refresh of ${ROOT_APP}"
+  else
+    warn "could not request a refresh of ${ROOT_APP}; post waits for ArgoCD's next periodic reconcile"
+  fi
 }
 
 release_status() {
@@ -184,8 +236,8 @@ _release_applications_json() {
 }
 
 post_application_table() {
-  # Name, sync, health, revision; plus the last operation message of every
-  # Application that is not Synced/Healthy.
+  # Name, sync, health, revision; plus, for every Application that is not
+  # ready (see RELEASE_JQ_READY), why and its last operation message.
   local json
   if ! crd_established "${APP_CRD}"; then
     printf 'apps:      ArgoCD is not installed\n'
@@ -198,19 +250,21 @@ post_application_table() {
     [.metadata.name, (.status.sync.status // "Unknown"), (.status.health.status // "Unknown"), rev] | @tsv' <<<"${json}" \
     | awk -F'\t' 'BEGIN {printf "%-26s %-10s %-12s %s\n", "APPLICATION", "SYNC", "HEALTH", "REVISION"}
                   {printf "%-26s %-10s %-12s %s\n", $1, $2, $3, $4}'
-  "${JQ}" -r '
-    .items[] | select((.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy") |
-    "  \(.metadata.name): \((.status.operationState.phase // "no operation")) \((.status.operationState.message // (.status.conditions // [] | map(.message) | join("; ")) // "") | .[0:300])"' <<<"${json}"
+  "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
+    .items[] | why($root; $pinAt) as $w | select($w != "") |
+    "  \(.metadata.name): \($w) | \((.status.operationState.phase // "no operation")) \((.status.operationState.message // (.status.conditions // [] | map(.message) | join("; ")) // "") | .[0:300])"' <<<"${json}"
 }
 
 _release_post_not_ready() {
-  # Names of Applications not Synced/Healthy (all names when none exist).
-  "${JQ}" -r 'if (.items | length) == 0 then "(no Applications yet)" else
-    .items[] | select((.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy") | .metadata.name end' <<<"$1"
+  # "name<TAB>reasons" of every Application that is not ready (one line when
+  # none exist yet).
+  "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
+    if (.items | length) == 0 then "(no Applications yet)\twaiting for ArgoCD to create them" else
+    .items[] | why($root; $pinAt) as $w | select($w != "") | "\(.metadata.name)\t\($w)" end' <<<"$1"
 }
 
 post_wait_applications() {
-  local timeout json bad last_report=0 refreshed=0 deadline
+  local timeout json bad names last_report=0 refreshed=0 deadline
   if ! crd_established "${APP_CRD}"; then
     dry_run && { log "[dry-run] ArgoCD is not installed yet: post would wait for the Applications"; return 0; }
     die "post: CRD ${APP_CRD} is not Established"
@@ -228,15 +282,16 @@ post_wait_applications() {
     bad="$(_release_post_not_ready "${json}")"
     if [[ -z "${bad}" ]]; then
       post_application_table >&2
-      log "every Application is Synced/Healthy"
+      log "every Application is Synced/Healthy at its current spec"
       return 0
     fi
+    names="$(cut -f1 <<<"${bad}" | tr '\n' ' ')"
     if dry_run; then
       post_application_table >&2
-      log "[dry-run] would wait up to ${timeout}s for: $(tr '\n' ' ' <<<"${bad}")"
+      log "[dry-run] would wait up to ${timeout}s for: ${names}"
       return 0
     fi
-    if (( refreshed == 0 )) && grep -qxF "${ROOT_APP}" <<<"${bad}"; then
+    if (( refreshed == 0 )) && cut -f1 <<<"${bad}" | grep -qxF "${ROOT_APP}"; then
       # Ask ArgoCD to re-read the root chart now (the harbor phase may just
       # have pushed it) instead of waiting for the next poll.
       kc -n "${RELEASE_NS}" annotate "${APP_CRD}" "${ROOT_APP}" argocd.argoproj.io/refresh=normal --overwrite >/dev/null 2>&1 \
@@ -245,10 +300,10 @@ post_wait_applications() {
     fi
     if (( SECONDS >= deadline )); then
       post_application_table >&2
-      die "post: after ${timeout}s these Applications are not Synced/Healthy: $(tr '\n' ' ' <<<"${bad}")"
+      die "post: after ${timeout}s these Applications are not Synced/Healthy at this release: $(awk -F'\t' '{printf "%s (%s) ", $1, $2}' <<<"${bad}")"
     fi
     if (( SECONDS - last_report >= 60 )); then
-      log "waiting for Synced/Healthy ($(( deadline - SECONDS ))s left): $(tr '\n' ' ' <<<"${bad}")"
+      log "waiting for Synced/Healthy ($(( deadline - SECONDS ))s left): ${names}"
       last_report=${SECONDS}
     fi
     sleep "${POST_POLL}"
