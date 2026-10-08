@@ -576,6 +576,46 @@ secret_gate() {
   [[ -z "${out}" ]] || LC_ALL=C sort -u <<<"${out}"
 }
 
+# Secrets a pinned chart always renders from its own public defaults, never
+# from a site secret. Each is allowed only while EVERY key it carries matches
+# its rule: sha256:<hex> (the value hashes to the chart's published default, so
+# the literal never appears here), empty, or re:<ERE> (a credential-free value).
+# Harbor 1.18.3 renders its internal-database password and Trivy's settings
+# with no existingSecret option (docs/airgap/DESIGN.md, implementation notes);
+# rotating the internal DB password is a follow-up.
+CHART_DEFAULT_SECRETS=(
+  "teknoir-system/harbor-core POSTGRESQL_PASSWORD=sha256:00810cf8b94d6fcb9c5de484d3bec4187620b3e2876e59aab90d852fe0f18fb6"
+  "teknoir-system/harbor-database POSTGRES_PASSWORD=sha256:00810cf8b94d6fcb9c5de484d3bec4187620b3e2876e59aab90d852fe0f18fb6"
+  "teknoir-system/harbor-trivy gitHubToken=empty redisURL=re:^redis://harbor-redis:6379/[0-9]+([?]idle_timeout_seconds=[0-9]+)?$"
+)
+
+chart_default_secret_ok() {
+  # chart_default_secret_ok <ns>/<name> <yaml-file>... — 0 when the Secret is
+  # listed in CHART_DEFAULT_SECRETS and every key matches its rule. Values stay
+  # in local variables; nothing is printed.
+  local id="$1" entry rules="" key spec value keys
+  shift
+  for entry in "${CHART_DEFAULT_SECRETS[@]}"; do
+    [[ "${entry%% *}" == "${id}" ]] && rules=" ${entry#* } "
+  done
+  [[ -n "${rules}" ]] || return 1
+  keys="$(SG_NS="${id%%/*}" SG_NAME="${id#*/}" yq -r 'select(.kind == "Secret" and .metadata.name == env(SG_NAME) and (.metadata.namespace // "-") == env(SG_NS)) | ((.data // {}) + (.stringData // {})) | keys | .[]' "$@" 2>/dev/null)" || return 1
+  [[ -n "${keys}" ]] || return 1
+  while IFS= read -r key; do
+    spec="${rules#* "${key}"=}"
+    [[ "${spec}" != "${rules}" ]] || return 1        # a key without a rule
+    spec="${spec%% *}"
+    value="$(SG_NS="${id%%/*}" SG_NAME="${id#*/}" SG_KEY="${key}" yq -r 'select(.kind == "Secret" and .metadata.name == env(SG_NAME) and (.metadata.namespace // "-") == env(SG_NS)) | (.stringData[env(SG_KEY)] // ((.data[env(SG_KEY)] // "") | @base64d))' "$@" 2>/dev/null)" || return 1
+    case "${spec}" in
+      empty)    [[ -z "${value}" ]] || return 1 ;;
+      sha256:*) [[ "$(printf '%s' "${value}" | sha256sum | cut -d' ' -f1)" == "${spec#sha256:}" ]] || return 1 ;;
+      re:*)     [[ "${value}" =~ ${spec#re:} ]] || return 1 ;;
+      *)        return 1 ;;
+    esac
+  done <<<"${keys}"
+  return 0
+}
+
 secret_gate_report() {
   # secret_gate_report <fail-fn> <label> <chart-repo> <yaml-file>... — run
   # secret_gate, log the allowed Secrets and pass each denied one to
@@ -587,7 +627,13 @@ secret_gate_report() {
   while read -r verdict id why; do
     case "${verdict}" in
       allow) log "${label}: ${id}: ${why}" ;;
-      *) "${fail}" "${label}: ${id}: ${why}" ;;
+      *)
+        if chart_default_secret_ok "${id}" "$@"; then
+          log "${label}: ${id}: chart-default Secret (every key matches its public default; CHART_DEFAULT_SECRETS)"
+        else
+          "${fail}" "${label}: ${id}: ${why}"
+        fi
+        ;;
     esac
   done <<<"${verdicts}"
 }
