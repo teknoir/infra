@@ -3,7 +3,8 @@
 #   static  shellcheck, bash 3.2, bats, node unit tests, gitleaks (airgap/test/run-static.sh)
 #   lan     LAN entrypoint tests in containers (airgap/test/lan/run.sh), when present
 #   k3d     K3s ownership suite on the live K3s version (airgap/test/k3d/run.sh)
-#           T1-T5, T4N and T9 (T9 skips until the node runner has migrate),
+#           T1-T5, T4N and T9 (T9 skips until the node runner has migrate
+#           and the secrets phase),
 #           plus the migrate implementer's own k3d test when present.
 #           T6 (ArgoCD adoption, pulls ArgoCD and istio images) runs only on a
 #           manual dispatch with run_t6, against the gitops istio chart.

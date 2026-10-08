@@ -69,7 +69,8 @@ objects owned by K3s manifest files:
 - T4N why the strip step is needed;
 - T5 a restart reverts edits;
 - T6 ArgoCD adoption;
-- T9 `teknoir-node migrate` on a fixture of the live layout.
+- T9 `teknoir-node migrate`, then converge's cluster phases twice and across a restart, on a
+  fixture of the live layout.
 
 Note on T6: ArgoCD 3.5.1 writes no `argocd.argoproj.io/tracking-id` annotation on CRDs, whether it
 adopted them or created them. teknoir-local's monitoring CRDs are the same. A CRD therefore belongs
@@ -78,8 +79,12 @@ to an app when the Application's `status.resources` lists it as Synced; T6 and E
 Every kubectl call passes `--context k3d-<name>` and uses a kubeconfig in the work dir.
 Clusters are deleted afterwards (`--keep` keeps them).
 
-T9 runs the real `teknoir-node migrate` as a normal user through the runner's test sandbox
-(`TEKNOIR_HOST_ROOT`). Lock, log and state are kept in the work dir.
+T9 runs the real `teknoir-node migrate` and `teknoir-node converge --only
+verify,preflight,cluster-base,secrets` as a normal user through the runner's test sandbox
+(`TEKNOIR_HOST_ROOT`). Lock, log and state are kept in the work dir. The fixture's root CA is a
+real throwaway CA (generated into the work dir, 0600), so the secrets phase can read it and sign
+the gateway placeholder as on the live node. T9 does not check CRD adoption by ArgoCD (no
+ArgoCD runs in the fixture); T6 and E10 do.
 
 ## VM end to end (vpro)
 

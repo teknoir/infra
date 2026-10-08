@@ -151,5 +151,5 @@ stage_payload() {
     : > "${n}/images/images.lock"
   fi
   (cd "${n}" && rm -f SHA256SUMS &&
-    find . -type f | sed 's|^\./||' | LC_ALL=C sort | xargs -d '\n' sha256sum > SHA256SUMS)
+    find . -type f ! -path ./SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | xargs -d '\n' sha256sum > SHA256SUMS)
 }

@@ -24,10 +24,15 @@
 #        CRDs) and keep Prune=false;
 #        removing a CRD from a chart and deleting the Application keep objects
 #        [needs T6_ISTIO_CHART; pulls ArgoCD, istio and registry:2 images]
-#   T9   migration rehearsal: a fixture of the live teknoir-local K3s layout,
-#        then `teknoir-node migrate` (dry-run, run, re-run, --undo), then a
-#        restart: nothing lost, no Teknoir Addons left but teknoir-argo
-#        [needs airgap/node/bin/teknoir-node with the migrate command]
+#   T9   migration rehearsal: a fixture of the live teknoir-local K3s layout
+#        (with a real throwaway root CA); converge refuses it before
+#        migrate; `teknoir-node migrate` (dry-run, run, re-run); then the
+#        cluster phases of `teknoir-node converge` twice (the second
+#        reports 0 changes; existing Secrets keep their resourceVersions);
+#        a restart; converge again; --undo and re-migrate: nothing lost, no
+#        Teknoir Addons left but teknoir-argo, nothing re-created. CRD
+#        adoption by ArgoCD is T6's and E10's (the fixture runs no ArgoCD)
+#        [needs airgap/node/bin/teknoir-node with migrate and converge]
 #
 # T1-T5 and T4N share one cluster; T6 and T9 each get a fresh cluster, because
 # both install the same CRD names (istio, argoproj) by different means.
@@ -880,6 +885,7 @@ t9_node_bin() { printf '%s/bin/teknoir-node' "${T9_NODE_DIR:-${REPO}/airgap/node
 t9_ready() {
   [[ -x "$(t9_node_bin)" ]] || { T9_WHY="$(t9_node_bin) not found (node runner not implemented yet)"; return 1; }
   grep -q 'cmd_migrate' "${T9_NODE_DIR:-${REPO}/airgap/node}"/lib/*.sh 2>/dev/null || { T9_WHY="no cmd_migrate in the node lib (I-13 not implemented yet)"; return 1; }
+  grep -q '^phase_secrets()' "${T9_NODE_DIR:-${REPO}/airgap/node}"/lib/*.sh 2>/dev/null || { T9_WHY="no phase_secrets in the node lib (I-07 not implemented yet)"; return 1; }
 }
 
 legacy_name() {
@@ -892,12 +898,25 @@ legacy_name() {
 
 dummy() { head -c 24 /dev/urandom | base64 | tr -d '/+=\n'; }
 
+t9_ca() {
+  # t9_ca — a real, throwaway root CA (work dir, 0600) for the fixture's
+  # cert-manager/teknoir-root-ca: converge's secrets phase reads it and signs
+  # the gateway placeholder with it, as on the live node (pre-redesign CA)
+  local d="${WORK}/t9/ca"
+  [[ -s "${d}/tls.crt" ]] && return 0
+  ( umask 077 && mkdir -p "${d}" &&
+    openssl req -x509 -newkey rsa:2048 -nodes -keyout "${d}/tls.key" -out "${d}/tls.crt" -days 3650 \
+      -subj "/O=Teknoir/CN=T9 fixture root CA" -addext "basicConstraints=critical,CA:TRUE" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null ) || tl_die "openssl: cannot create the T9 fixture CA"
+}
+
 t9_secret_doc() {
   # t9_secret_doc <ns/name> <type>
   local ns="${1%%/*}" name="${1#*/}" type="$2"
   printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: %s\n  namespace: %s\ntype: %s\nstringData:\n' "${name}" "${ns}" "${type}"
   if [[ "${type}" == kubernetes.io/tls ]]; then
-    printf '  tls.crt: dummy-%s\n  tls.key: dummy-%s\n' "$(dummy)" "$(dummy)"
+    printf '  tls.crt: |\n'; sed 's/^/    /' "${WORK}/t9/ca/tls.crt"
+    printf '  tls.key: |\n'; sed 's/^/    /' "${WORK}/t9/ca/tls.key"
   else
     printf '  value: dummy-%s\n' "$(dummy)"
   fi
@@ -906,6 +925,7 @@ t9_secret_doc() {
 t9_fixture() {
   local f name ns rest type n
   local gen="${WORK}/t9/gen.yaml"
+  t9_ca
   # phase 1: namespaces, CRDs, ArgoCD stand-in under its old name
   # (no pipelines into put_manifest here: T9_INVENTORY must grow in this shell)
   : > "${gen}"
@@ -996,15 +1016,16 @@ spec:
 EOF
 }
 
-t9_snapshot() {
-  # uid and resourceVersion of every fixture object, one per line
+t9_objsnap() {
+  # t9_objsnap "<resource name [namespace]>"... — uid/resourceVersion of each, one per line
   local o res name ns
-  for o in "${T9_INVENTORY[@]}"; do
+  for o in "$@"; do
     read -r res name ns <<<"${o}"
     printf '%s %s\n' "${o}" "$(kc get "${res}" "${name}" ${ns:+-n "${ns}"} --ignore-not-found \
       -o jsonpath='{.metadata.uid}/{.metadata.resourceVersion}')"
   done
 }
+t9_snapshot() { t9_objsnap "${T9_INVENTORY[@]}"; }   # every fixture object
 t9_uids() { t9_snapshot | sed -E 's|/[0-9]+$||'; }
 
 t9_teknoir_addons() { kc -n kube-system get addons.k3s.cattle.io -o name | sed 's|.*/||' | grep -E "${TEKNOIR_ADDON_RE}" | sort || true; }
@@ -1015,8 +1036,9 @@ t9_node() {
   # t9_node <args...> — the real node runner against this cluster, as
   # non-root: TEKNOIR_HOST_ROOT (the runner's test sandbox, which also allows
   # non-root) prefixes host paths; lock, log, state and the legacy bundle
-  # home are kept in the work dir as well.
-  env KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG}" \
+  # home are kept in the work dir as well. The disk floor is lowered for CI
+  # runners (the preflight checks 20 GiB on a real node).
+  env KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG}" TEKNOIR_MIN_FREE_GB=1 \
     TEKNOIR_HOST_ROOT="${WORK}/t9/root" TEKNOIR_LOCK_FILE="${WORK}/t9/teknoir-airgap.lock" \
     TEKNOIR_LOG_DIR="${WORK}/t9/log" STATE_DIR="${WORK}/t9/state" MIGRATE_LEGACY_HOME="${WORK}/t9/home" \
     "${WORK}/t9/payload/node/bin/teknoir-node" "$@"
@@ -1030,8 +1052,14 @@ t9_stage() {
   mkdir -p "${WORK}/t9/payload" "${WORK}/t9/log" "${WORK}/t9/state" "${WORK}/t9/home" "${k3s}/server" \
     "${WORK}/t9/root${k3s}/server"
   cp -a "${src}" "${WORK}/t9/payload/node"
+  # the bundle's app-of-apps pin (the preflight's release guard reads it):
+  # newer than the fixture's root Application (0.0.3)
+  if [[ ! -f "${WORK}/t9/payload/node/charts/pins.txt" ]]; then
+    mkdir -p "${WORK}/t9/payload/node/charts"
+    echo "app-of-apps 0.0.4" > "${WORK}/t9/payload/node/charts/pins.txt"
+  fi
   (cd "${WORK}/t9/payload/node" && rm -f SHA256SUMS &&
-    find . -type f | sed 's|^\./||' | LC_ALL=C sort | xargs -d '\n' sha256sum > SHA256SUMS)
+    find . -type f ! -path ./SHA256SUMS | sed 's|^\./||' | LC_ALL=C sort | xargs -d '\n' sha256sum > SHA256SUMS)
   # The k3d manifests dir and a sibling retired dir, reachable as
   # K3S_DATA_DIR and as HOST_ROOT + K3S_DATA_DIR (whichever the code uses).
   ln -sfn "${MAN}" "${k3s}/server/manifests"
@@ -1049,12 +1077,43 @@ K3S_DATA_DIR=${k3s}
 EOF
 }
 
+# The cluster phases of converge that touch the fixture's objects (DESIGN
+# T9: migrate, then converge, then restart). oneshot, harbor, release and
+# post need the built bundle, ArgoCD and Harbor: the VM rehearsal E10 runs them.
+T9_CONVERGE_PHASES="verify,preflight,cluster-base,secrets"
+# what the secrets phase creates (create-if-absent) or reconciles next to the fixture
+T9_CONVERGED=("secret teknoir-airgapped-wildcard-tls istio-system" "secret harbor-token-service teknoir-system"
+              "configmap argocd-tls-certs-cm teknoir-system")
+
+t9_converge() {
+  # t9_converge — run those phases once; output in T9_OUT, exit code in T9_RC
+  set +e
+  T9_OUT="$(t9_node converge --only "${T9_CONVERGE_PHASES}" --site "${WORK}/t9/site.env" --lan-time "$(date +%s)" 2>&1)"
+  T9_RC=$?
+  set -e
+}
+
+t9_converge_ok() {
+  # t9_converge_ok <when> — converge exits 0 (else its output tail is shown)
+  t9_converge
+  assert_eq "$1: converge (${T9_CONVERGE_PHASES}) exits 0" 0 "${T9_RC}"
+  (( T9_RC == 0 )) || printf '%s\n' "${T9_OUT}" | tail -20 >&2
+}
+
+t9_untouched() {
+  # the snapshot lines (stdin) of the fixture objects converge must not
+  # change: all but coredns-custom (NODE_IP at run time) and the CA-bundle
+  # copies (they gain ca.crt)
+  grep -vE '^(configmap coredns-custom kube-system|secret teknoir-root-ca-bundle teknoir-(auth|system)) ' || true
+}
+
 t9() {
-  tl_case T9 "migration rehearsal: legacy K3s layout -> teknoir-node migrate -> restart: nothing lost, no Teknoir Addons"
+  tl_case T9 "migration rehearsal: legacy K3s layout -> migrate -> converge -> restart: nothing lost, no Teknoir Addons"
   mkdir -p "${WORK}/t9"
   t9_fixture
   t9_stage
   local base_snap base_others base_files base_addons out rc name missing=0 left post_snap
+  local migrated conv1 conv1_new conv_new bundle
   base_snap="$(t9_snapshot)"
   base_others="$(t9_other_addons)"
   base_files="$(t9_files)"
@@ -1065,6 +1124,14 @@ t9() {
     [[ "$(meta_of secret "${rest#*/}" "${rest%%/*}" | jq -r .owner)" == "${f}" ]] || wrong=$((wrong + 1))
   done <<<"${T9_SECRETS}"
   assert_eq "fixture: every secret is owned by its canonical Addon (as on teknoir-local)" 0 "${wrong}"
+
+  # converge refuses a cluster whose Teknoir K3s files are still deployed
+  t9_converge
+  if (( T9_RC != 0 )) && grep -qE 'ERROR: .*migrate' <<<"${T9_OUT}"; then pass "converge before migrate is refused, and its error names migrate"
+  else fail "converge before migrate was not refused (rc=${T9_RC})"; printf '%s\n' "${T9_OUT}" | tail -10 >&2; fi
+  assert_eq "the refused converge changed no object" "${base_snap}" "$(t9_snapshot)"
+  assert_eq "the refused converge changed no manifests-dir file" "${base_files}" "$(t9_files)"
+  assert_eq "the refused converge created none of its objects" "" "$(t9_objsnap "${T9_CONVERGED[@]}" | awk '$NF != "" && NF > 3')"
 
   set +e; out="$(t9_node migrate --site "${WORK}/t9/site.env" --dry-run 2>&1)"; rc=$?; set -e
   assert_eq "migrate --dry-run exits 0" 0 "${rc}"
@@ -1086,12 +1153,41 @@ t9() {
   assert_eq "a second migrate exits 0 (idempotent)" 0 "${rc}"
   t9_assert_detached "after a second migrate" "${base_snap}" "${base_others}"
 
+  # converge on the migrated cluster: it adopts what exists, by name
+  migrated="$(t9_snapshot)"
+  t9_converge_ok "after migrate"
+  t9_assert_detached "after converge" "${base_snap}" "${base_others}"
+  assert_eq "converge kept every existing platform Secret, CRD, namespace and the root Application (resourceVersions)" \
+    "$(t9_untouched <<<"${migrated}")" "$(t9_untouched <<<"$(t9_snapshot)")"
+  conv1="$(t9_snapshot)" conv1_new="$(t9_objsnap "${T9_CONVERGED[@]}")"
+  assert_eq "converge created the gateway placeholder, the Harbor token TLS and argocd-tls-certs-cm" "" \
+    "$(awk 'NF < 4 || $4 == ""' <<<"${conv1_new}")"
+  if kc -n kube-system get configmap coredns-custom -o jsonpath='{.data.teknoir\.server}' | grep -q '127\.0\.0\.1 harbor\.teknoir\.airgapped'; then
+    pass "coredns-custom resolves harbor.<domain> to the site's NODE_IP"
+  else fail "coredns-custom has no NODE_IP entry for harbor.<domain>"; fi
+  for name in teknoir-auth teknoir-system; do
+    bundle="$(kc -n "${name}" get secret teknoir-root-ca-bundle -o jsonpath='{.data.ca\.crt}' | base64 -d | sha256sum | cut -c1-16)"
+    assert_eq "${name}/teknoir-root-ca-bundle ca.crt is the existing CA's certificate (sha256)" \
+      "$(sha256sum < "${WORK}/t9/ca/tls.crt" | cut -c1-16)" "${bundle}"
+  done
+  t9_converge_ok "second run"
+  if grep -q 'summary: 0 changes' <<<"${T9_OUT}"; then pass "second run: converge reports 0 changes"
+  else fail "second run: converge does not report 0 changes:"; grep -A12 'summary' <<<"${T9_OUT}" >&2 || true; fi
+  assert_eq "second run: no fixture object changed (uids, resourceVersions)" "${conv1}" "$(t9_snapshot)"
+  assert_eq "second run: the objects converge created are unchanged" "${conv1_new}" "$(t9_objsnap "${T9_CONVERGED[@]}")"
+  t9_assert_detached "after a second converge" "${base_snap}" "${base_others}"
+
   # an old bundle re-adds a legacy file next to its .skip, with another value
-  post_snap="$(t9_snapshot)"
+  post_snap="$(t9_snapshot)" conv_new="$(t9_objsnap "${T9_CONVERGED[@]}")"
   t9_secret_doc teknoir-system/harbor-secret Opaque | put_manifest manifest-harbor-secret
   restart_k3s
   t9_assert_detached "after a k3s restart" "${base_snap}" "${base_others}"
-  assert_eq "after a k3s restart: no detached object changed (resourceVersions)" "${post_snap}" "$(t9_snapshot)"
+  assert_eq "after a k3s restart: no detached or converged object changed (resourceVersions)" "${post_snap}" "$(t9_snapshot)"
+  assert_eq "after a k3s restart: the objects converge created are unchanged" "${conv_new}" "$(t9_objsnap "${T9_CONVERGED[@]}")"
+  t9_converge_ok "after the restart"
+  if grep -q 'summary: 0 changes' <<<"${T9_OUT}"; then pass "after the restart: converge reports 0 changes (a guarded old file is ignored)"
+  else fail "after the restart: converge does not report 0 changes:"; grep -A12 'summary' <<<"${T9_OUT}" >&2 || true; fi
+  assert_eq "after the restart: converge changed no object" "${post_snap}" "$(t9_snapshot)"
   rm -f "${MAN}/manifest-harbor-secret.yaml"
 
   # --undo re-adopts one name; migrate detaches it again
@@ -1147,7 +1243,7 @@ main() {
     shift
   done
   (( ${#tests[@]} )) || tests=("${ALL_TESTS[@]}")
-  need docker k3d kubectl jq sha256sum base64
+  need docker k3d kubectl jq sha256sum base64 openssl
   mkdir -p "${WORK_BASE}"
   trap cleanup EXIT
 
