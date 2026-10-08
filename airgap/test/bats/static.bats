@@ -56,9 +56,18 @@ airgap_scripts() {
 }
 
 @test "no private key material anywhere in the repo" {
+  # a PEM private-key header followed within 3 lines by a base64 body line;
+  # headers without a body (documentation examples) do not count. The build
+  # gate's planted fixtures are excluded (gitleaks.toml allowlists them too).
   local hits
-  hits="$(cd "${REPO_ROOT}" && grep -rlE -- '-----BEGIN ([A-Z]+ )?PRIVATE KEY-----' \
-            --exclude-dir=.git --exclude-dir=.work . 2>/dev/null | grep -vE '\.bats$' || true)"
+  hits="$(cd "${REPO_ROOT}" && git ls-files --cached --others --exclude-standard |
+    grep -vE '^airgap/test/build/fixtures/' | while IFS= read -r f; do
+      [ -f "${f}" ] || continue
+      awk -v f="${f}" '
+        /-----BEGIN ([A-Z]+ )?PRIVATE KEY-----/ { h = NR; next }
+        h && NR - h <= 3 && /^[[:space:]#]*[A-Za-z0-9+\/=]{16,}[[:space:]]*$/ { print f ":" h; h = 0 }
+      ' "${f}" 2>/dev/null
+    done)"
   [ -z "${hits}" ] || { echo "${hits}"; return 1; }
 }
 

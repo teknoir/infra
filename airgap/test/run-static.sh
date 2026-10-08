@@ -8,7 +8,8 @@
 #   2. the LAN entrypoint under docker bash:3.2 (macOS /bin/bash): syntax and help
 #   3. bats unit tests (airgap/test/bats/run.sh, pinned bats-core)
 #   4. the node runner's own unit tests (airgap/test/node/run.sh), when present
-#   5. gitleaks over the git history and the working tree
+#   5. gitleaks over the history of HEAD and the working tree
+#      (config: airgap/test/gitleaks.toml)
 #
 # Usage: airgap/test/run-static.sh [--no-docker] [--no-gitleaks]
 # Steps whose tool is missing are reported as SKIP locally and fail in CI
@@ -98,7 +99,11 @@ if (( ! GITLEAKS )); then
 elif ! command -v gitleaks >/dev/null; then
   missing gitleaks gitleaks
 else
-  if gitleaks git --redact --no-banner --log-level warn . && gitleaks dir --redact --no-banner --log-level warn .; then
+  # history reachable from HEAD (all worktrees share one object store, so
+  # the default --all would scan other branches too) and the working tree;
+  # airgap/test/gitleaks.toml = default rules + narrow allowlists
+  gl=(--config "${HERE}/gitleaks.toml" --redact --no-banner --log-level warn)
+  if gitleaks git "${gl[@]}" --log-opts=HEAD . && gitleaks dir "${gl[@]}" .; then
     result PASS "gitleaks (history and working tree)"
   else
     result FAIL gitleaks
