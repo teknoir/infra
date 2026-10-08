@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Stub k3s binary (copied to <root>/usr/local/bin/k3s by the stub install.sh).
+printf 'k3s %s\n' "$*" >> "${STUB_CALLS:?}"
+case "${1:-}" in
+  --version) echo "k3s version ${STUB_K3S_VERSION:-v1.33.5+k3s1} (stub)"; echo "go version go1.24 (stub)"; exit 0 ;;
+  kubectl) shift; exec kubectl "$@" ;;
+  ctr)
+    shift
+    [[ "${1:-}" == "-n" ]] && shift 2
+    case "${1:-} ${2:-}" in
+      "images ls") cat "${STUB_STATE:?}/ctr-images" 2>/dev/null; exit 0 ;;
+      "images import") tar -xOf "$3" manifest.json | jq -r '.[].RepoTags[]' >> "${STUB_STATE}/ctr-images"; exit 0 ;;
+      "images label") exit 0 ;;
+    esac
+    ;;
+esac
+exit 0
