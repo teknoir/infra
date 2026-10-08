@@ -168,9 +168,16 @@ oneshot_scope_map() {
   disc="$(awk '{v = $(NF-2); g = (index(v, "/") ? substr(v, 1, index(v, "/") - 1) : ""); print g "/" $NF " " $(NF-1)}' <<<"${resources}" \
     | "${ONESHOT_JQ}" -Rcn '[inputs | split(" ") | {(.[0]): (.[1] == "true")}] | add // {}')" \
     || die "cannot parse the API resources"
-  ONESHOT_SCOPE="$("${ONESHOT_JQ}" -cn --argjson d "${disc}" --argjson c "${crds_json}" \
-    '$d + ([$c[] | {("\(.spec.group)/\(.spec.names.kind)"): (.spec.scope == "Namespaced")}] | add // {})')" \
-    || die "cannot build the scope map"
+  # through files, not --argjson: one argv string is capped at 128 KiB
+  # (MAX_ARG_STRLEN) and istio's 14 CRDs alone are ~800 KiB
+  local tmp
+  tmp="$(mktemp -d)" || die "cannot create a temp dir"
+  printf '%s' "${disc}" > "${tmp}/disc.json"
+  printf '%s' "${crds_json}" > "${tmp}/crds.json"
+  ONESHOT_SCOPE="$("${ONESHOT_JQ}" -cn --slurpfile d "${tmp}/disc.json" --slurpfile c "${tmp}/crds.json" \
+    '$d[0] + ([$c[0][] | {("\(.spec.group)/\(.spec.names.kind)"): (.spec.scope == "Namespaced")}] | add // {})')" \
+    || { rm -rf "${tmp}"; die "cannot build the scope map"; }
+  rm -rf "${tmp}"
 }
 
 oneshot_crds_established() {

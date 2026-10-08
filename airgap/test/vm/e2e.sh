@@ -9,7 +9,8 @@
 # invoking user with HOME=$LAN_HOME. Harness reads on the node go over vm.sh
 # ssh; Secret values are only ever compared ON the VM and never printed.
 #
-# Scenarios (default order; E7 runs before E6 because E6 wipes the node logs):
+# Scenarios (default order; E7 runs before E6 because E6 wipes the node logs;
+# E0 = resume `up` on the existing VM, a debug aid run only when named):
 #   E1  fresh bootstrap on a just-created VM: up, all Applications
 #       Synced/Healthy in 45 min, HTTPS to harbor/argocd/auth with the fetched
 #       CA; the first admin from `admin-user --email --out` (0600 file), then
@@ -351,6 +352,19 @@ e1() {
 # ---------------------------------------------------------------------------
 # E2
 # ---------------------------------------------------------------------------
+e0() {
+  # E0 (debug aid, not in the default run): `up` on the EXISTING VM, which
+  # resumes a failed converge; use it to iterate on a fix without re-creating
+  # the VM, then confirm with a full E1.
+  tl_case E0 "resume: up on the existing VM"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  local dir rc
+  dir="$(bundle_dir "${E2E_BUNDLE}")"
+  set +e; up_in "${dir}"; rc=$?; set -e
+  assert_eq "up exits 0" 0 "${rc}"
+}
+
 e2() {
   tl_case E2 "idempotency: a second up changes nothing"
   [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
@@ -698,7 +712,7 @@ main() {
       --allow-destroy) ALLOW_DESTROY=1 ;;
       --stop-on-fail) STOP_ON_FAIL=1 ;;
       -h|--help) usage; return 0 ;;
-      E[0-9]*) [[ " ${ALL[*]} " == *" ${1^^} "* ]] || tl_die "unknown scenario $1 (see --list)"; run+=("${1^^}") ;;
+      E[0-9]*) [[ " ${ALL[*]} E0 " == *" ${1^^} "* ]] || tl_die "unknown scenario $1 (see --list)"; run+=("${1^^}") ;;
       *) tl_die "unknown argument $1 (see --help)" ;;
     esac
     shift
