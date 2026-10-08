@@ -297,8 +297,8 @@ C. FIRST INSTALL ONLY (fresh hardware)
    2. On the LAN host: ssh-copy-id -i ~/.ssh/id_ed25519.pub teknoir@192.168.5.181
    3. ./teknoir-airgap up   (asks once for the sudo password)
    4. ./teknoir-airgap trust
-   5. ./teknoir-airgap credentials platform-admin --out ~/teknoir-platform-admin.txt   (file mode 0600, never shown on screen)
-   Then log in at https://auth.teknoir.airgapped. Keycloak forces a password change for the platform-admin user, which the realm import created in group admin. Add the other human users.
+   5. ./teknoir-airgap admin-user --email <your address> --out ~/teknoir-admin.txt   (the temporary password goes to a 0600 file, never to the screen)
+   This is the first admin path (see "How it maps onto the redesign"): a superadmin User CR, which user-controller turns into a Keycloak user of realm `teknoir`, put into group admin. There is no platform-admin user and no keycloak-platform-admin Secret. Then sign in at https://teknoir.airgapped; Keycloak forces a password change. Add the other human users.
    That is 5 operator steps after the OS install. The Keycloak clients, scopes, groups and Harbor OIDC are created by GitOps, so BOOTSTRAP §8 disappears.
 
 D. UPDATE
@@ -346,7 +346,7 @@ OWNERSHIP AFTER BOOTSTRAP: every object has exactly one owner. There are zero Te
    - By the platform-secrets chart's ensure Job: every random secret.
      - The specs live in gitops charts/platform-secrets/values.yaml.
      - The bootstrap applies that chart once, before Harbor. ArgoCD runs the same Job as a Sync hook afterwards, so a new secret is a gitops change only.
-     - The Secrets: harbor-secret, keycloak-db-secret, keycloak-admin, keycloak-platform-admin, the oauth2-proxy-secret client and cookie, oauth2-proxy-redis-secret, the argocd and harbor OIDC client secrets, and backstage-keycloak-secrets.
+     - The Secrets: harbor-secret, keycloak-db-secret, keycloak-admin, keycloak-client-secrets, the oauth2-proxy-secret client and cookie, oauth2-proxy-redis-secret, the argocd and harbor OIDC client secrets, and backstage-keycloak-secrets.
    - The generated Secrets carry no ArgoCD tracking, so no Application can prune them. They are not K3s files, so no restart reverts a rotation.
 
 4. One-shot apply, then adopted by ArgoCD.
@@ -359,7 +359,7 @@ OWNERSHIP AFTER BOOTSTRAP: every object has exactly one owner. There are zero Te
    - istio: vendored CRDs annotated Prune=false,Delete=false.
    - cert-manager: vendored CRDs annotated Prune=false,Delete=false, the ClusterIssuer teknoir-ca and the wildcard Certificate, which moves here from the istio chart.
    - harbor: ignoreDifferences plus RespectIgnoreDifferences for the htpasswd Secret and the checksum annotations, and a PostSync OIDC-config Job.
-   - auth: Keycloak admin from a Secret, and realm-as-code through a keycloak-config-cli Job (clients, scopes, mappers, the admin group, the initial platform-admin user).
+   - auth: Keycloak admin from a Secret, and realm-as-code through a keycloak-config-cli Job (clients, scopes, mappers, the admin group). The first human admin comes from `teknoir-airgap admin-user`, not from the realm import.
    - monitoring, the controllers and backstage.
    - platform-secrets.
    - argo: ArgoCD self-managed once the CA is mounted from a Secret instead of rendered in.
@@ -484,7 +484,7 @@ M4. CONVERGE WITH THE NEW BUNDLE: ./teknoir-airgap up
 Expected effects:
 - Node files are re-asserted: chrony, registries.yaml, CA, hosts and the tarball prune of the stale v2.15.2/busybox/dex images.
 - The node creates harbor-token-service TLS.
-- The platform-secrets Job creates only Secrets that are missing (keycloak-platform-admin, the backstage secrets) and leaves every existing one untouched. Verify with metadata.resourceVersion before and after.
+- The platform-secrets Job creates only Secrets that are missing (keycloak-client-secrets, the backstage secrets) and leaves every existing one untouched. Verify with metadata.resourceVersion before and after.
 - Harbor: charts and images are pushed, and the teknoir project becomes public.
 - The root app-of-apps is pinned to 0.0.4.
 - ArgoCD then:
@@ -592,7 +592,7 @@ Scenarios. Each asserts and prints a pass/fail summary.
     - https://harbor.teknoir.airgapped/api/v2.0/health
     - https://argocd.teknoir.airgapped (200)
     - https://auth.teknoir.airgapped/realms/master/.well-known/openid-configuration
-  - The oauth2-proxy login with platform-admin must work (password via `credentials --out`, a scripted form login with curl).
+  - The oauth2-proxy login with the first admin must work (`admin-user --email ... --out FILE`, then a scripted form login with curl that sets the new password).
   - Optional: run chromium in the netns for a screenshot.
 - E2 idempotency: run `up` again.
   - The converge summary reports 0 changes.
@@ -829,7 +829,7 @@ Every Application gets syncPolicy.retry (limit 10; backoff 30s, factor 2, max 5m
 - depends on: -
 - files: charts/platform-secrets/Chart.yaml, charts/platform-secrets/values.yaml, charts/platform-secrets/files/ensure-secrets.sh, charts/platform-secrets/templates/{configmap,job,rbac}.yaml
 
-values.secrets is a list of {namespace, name, type, labels, keys: {KEY: {random: {length, charset}} | {copyFrom: ns/name/key} | {value}}}. It covers harbor-secret (HARBOR_ADMIN_PASSWORD, secretKey of 16 chars, REGISTRY_HTTP_SECRET, JOBSERVICE_SECRET, core secret, CSRF), keycloak-db-secret, keycloak-admin, keycloak-platform-admin, oauth2-proxy-secret (client-secret, cookie-secret of 32 bytes), oauth2-proxy-redis-secret, the argocd and harbor OIDC client secrets, and backstage-keycloak-secrets (coordinate with the backstage design in progress). It uses the existing live names and keys so they are adopted. ensure-secrets.sh is POSIX sh using kubectl and /dev/urandom only. It creates a Secret only when absent and never patches an existing value; it adds missing keys to an existing Secret only with an explicit addMissingKeys flag. It never prints a value. The Job runs as an ArgoCD Sync hook (BeforeHookCreation, wave -10) with a ServiceAccount whose Role may only get/create the listed Secrets. Its image is a mirrored, version-pinned image with sh and kubectl, which also goes into the bootstrap tarballs.
+values.secrets is a list of {namespace, name, type, labels, keys: {KEY: {random: {length, charset}} | {copyFrom: ns/name/key} | {value}}}. It covers harbor-secret (HARBOR_ADMIN_PASSWORD, secretKey of 16 chars, REGISTRY_HTTP_SECRET, JOBSERVICE_SECRET, core secret, CSRF), keycloak-db-secret, keycloak-admin, keycloak-client-secrets, oauth2-proxy-secret (client-secret, cookie-secret of 32 bytes), oauth2-proxy-redis-secret, the argocd and harbor OIDC client secrets, and backstage-keycloak-secrets (coordinate with the backstage design in progress). It uses the existing live names and keys so they are adopted. ensure-secrets.sh is POSIX sh using kubectl and /dev/urandom only. It creates a Secret only when absent and never patches an existing value; it adds missing keys to an existing Secret only with an explicit addMissingKeys flag. It never prints a value. The Job runs as an ArgoCD Sync hook (BeforeHookCreation, wave -10) with a ServiceAccount whose Role may only get/create the listed Secrets. Its image is a mirrored, version-pinned image with sh and kubectl, which also goes into the bootstrap tarballs.
 
 **Test:** k3d: install; delete one Secret and re-sync, and only it is re-created; the existing Secrets' data hashes are unchanged across 3 syncs; the Job logs contain none of the values; RBAC denies reading an unlisted Secret.
 
@@ -838,9 +838,9 @@ values.secrets is a list of {namespace, name, type, labels, keys: {KEY: {random:
 - depends on: G-04
 - files: charts/auth/values.yaml, charts/auth/templates/keycloak-config-job.yaml (new), charts/auth/files/realm/*.yaml (new), charts/auth/Chart.yaml
 
-KC_BOOTSTRAP_ADMIN_PASSWORD comes through valueFrom keycloak-admin, removing change-me. Add a PostSync keycloak-config-cli Job (mirrored image, version-pinned to the Keycloak major) that imports the realm config from files/realm with $(env:...) substitution of the client secrets from platform-secrets. The config covers the clients teknoir (oauth2-proxy), argocd, harbor and backstage, the client scopes and group mappers, group admin, service-account roles, and user platform-admin in group admin with requiredActions UPDATE_PASSWORD and its initial password from keycloak-platform-admin. For teknoir-local, generate the initial files from a read-only kcadm export of the live realm, so the first import changes nothing. Pin keycloak-theme to an immutable tag with IfNotPresent (G-09). Moving to a dedicated realm is an open decision.
+KC_BOOTSTRAP_ADMIN_PASSWORD comes through valueFrom keycloak-admin, removing change-me. Add a PostSync keycloak-config-cli Job (mirrored image, version-pinned to the Keycloak major) that imports the realm config from files/realm with $(env:...) substitution of the client secrets from platform-secrets. The config covers the clients teknoir (oauth2-proxy), argocd, harbor and backstage, the client scopes and group mappers, group admin and service-account roles. No human user is imported: the first admin comes from `teknoir-airgap admin-user` (user-controller creates the Keycloak user with a temporary password). For teknoir-local, generate the initial files from a read-only kcadm export of the live realm, so the first import changes nothing. Pin keycloak-theme to an immutable tag with IfNotPresent (G-09). Moving to a dedicated realm is an open decision.
 
-**Test:** k3d or VM fresh install: a client-credentials token for each client works; the platform-admin login forces a password change; a second import produces no changes (keycloak-config-cli reports no diff). The render test has no literal passwords.
+**Test:** k3d or VM fresh install: a client-credentials token for each client works; the first admin's login (admin-user) forces a password change; a second import produces no changes (keycloak-config-cli reports no diff). The render test has no literal passwords.
 
 ### G-06 — harbor: deterministic token cert, OIDC config Job, PV nodeAffinity
 - repo: platform-applications-gitops (branch teknoir-local)
@@ -849,7 +849,7 @@ KC_BOOTSTRAP_ADMIN_PASSWORD comes through valueFrom keycloak-admin, removing cha
 
 Set core.secretName: harbor-token-service (created by I-07). Feed database.internal.password and the registry credentials from harbor-secret where the 1.18.3 chart allows it; otherwise rely on the G-03 ignoreDifferences for the htpasswd. Add a PostSync Job (mirrored curl+jq image) that reads the admin password and the OIDC client secret from Secrets, GETs /api/v2.0/configurations, and PUTs only the keys that differ (auth_mode oidc_auth, endpoint https://auth.<domain>/..., client id and secret, groups claim, admin group 'admin', verify cert with the CA bundle mounted); it never switches auth_mode once non-admin users exist. Give the hostPath PVs nodeAffinity on label teknoir.org/storage=true, which I-06 sets on the server node. Do the same for the auth keycloak-postgres PV in G-05.
 
-**Test:** Two consecutive helm template renders produce byte-identical core Secret and Deployment annotations (apart from the htpasswd, which is ignored). On the VM, the OIDC login to Harbor works through the platform-admin; re-running the Job PUTs nothing.
+**Test:** Two consecutive helm template renders produce byte-identical core Secret and Deployment annotations (apart from the htpasswd, which is ignored). On the VM, the OIDC login to Harbor works for the first admin (admin-user, group admin); re-running the Job PUTs nothing.
 
 ### G-07 — ArgoCD self-managed: move charts/argo to gitops, CA by Secret mount, protected CRDs
 - repo: platform-applications-gitops (branch teknoir-local) + infra

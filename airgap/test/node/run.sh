@@ -365,6 +365,9 @@ else
 fi
 tn credentials nonsense --site test
 check "an unknown credential name fails" [ "${RC}" != 0 ]
+tn credentials platform-admin --site test --out "${T}/pa.txt"
+check "platform-admin is no credential; the error points to admin-user" \
+  bash -c "[ ${RC} != 0 ] && grep -q 'admin-user --email' '${T}/out' && [ ! -e '${T}/pa.txt' ]"
 
 # ---------------------------------------------------------------------------
 echo "# leak check"

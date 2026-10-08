@@ -41,7 +41,6 @@ BACKUP_SECRETS=(
   "teknoir-system harbor-token-service"
   "teknoir-auth keycloak-db-secret"
   "teknoir-auth keycloak-admin"
-  "teknoir-auth keycloak-platform-admin"
   "teknoir-auth keycloak-client-secrets"
   "teknoir-auth oauth2-proxy-secret"
   "teknoir-auth oauth2-proxy-redis-secret"

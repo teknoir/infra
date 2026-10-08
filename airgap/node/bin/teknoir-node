@@ -71,7 +71,7 @@ Commands:
   credentials NAME [--out FILE]
                            write one credential to a 0600 file, or to a non-terminal
                            stdout; NAME: keycloak-admin keycloak-admin-username
-                           harbor-admin argocd-admin grafana-admin platform-admin
+                           harbor-admin argocd-admin grafana-admin
   rotate NAME [--i-know]   replace one secret value and restart its consumers;
                            NAME: oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service
                            harbor-secret-key (--i-know) keycloak-db (--i-know)
@@ -83,7 +83,9 @@ Commands:
                            and delete it; --recipient: stream the latest backup
                            encrypted to an age public key, no terminal needed
   migrate [...]            one-time K3s file detach of the live env (lib/migrate.sh)
-  admin-user --email ADDR  create the first platform admin (lib/admin.sh)
+  admin-user --email ADDR --out FILE
+                           create the first platform admin (a superadmin User; its
+                           temporary password goes to FILE, 0600) (lib/admin.sh)
   help
 
 Options:
