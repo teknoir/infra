@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # run.sh — K3s ownership suite (docs/airgap/DESIGN.md, test plan section 2).
 #
 # Proves, on the live K3s version, which K3s actions delete objects and which
@@ -43,7 +44,6 @@
 #   T6_ARGO_CHART    ArgoCD chart dir or .tgz; default: upstream argo-cd
 #                    ${T6_ARGOCD_CHART_VERSION:-10.4.0} (what infra charts/argo pins)
 #   T9_NODE_DIR      node payload dir, default <repo>/airgap/node
-#   T9_SUDO=1        run teknoir-node through `sudo -n` if it refuses non-root
 #
 # Every kubectl call passes --context k3d-<name> and a kubeconfig in the work
 # dir; the default kubeconfig is never modified.
@@ -59,7 +59,8 @@ K3S_IMAGE="${K3S_IMAGE:-rancher/k3s:v1.33.5-k3s1}"
 PREFIX="${K3D_CLUSTER:-k3sown}"
 WORK_BASE="${K3D_WORK:-${TMPDIR:-/tmp}/teknoir-airgap-k3d}"
 QUIET="${K3D_QUIET:-35}"
-IN_MAN=/var/lib/rancher/k3s/server/manifests/teknoir
+K3S_MANIFESTS=/var/lib/rancher/k3s/server/manifests
+IN_MAN="${K3S_MANIFESTS}/teknoir"   # set per cluster by use_cluster
 KEEP=0 REUSE=0
 ALL_TESTS=(T1 T2 T3 T4 T4N T5 T6 T9)
 # Names of the Teknoir files and Addons on the live node (I-13 allow-list).
@@ -69,7 +70,7 @@ TEKNOIR_ADDON_RE='^(teknoir-.*|00-teknoir-.*|05-teknoir-.*|10-teknoir-.*|manifes
 CLUSTER="" CTX="" SERVER="" WORK="" MAN="" RETIRED=""
 declare -a CREATED_CLUSTERS=()
 
-usage() { sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
+usage() { sed -n '3,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # cluster lifecycle
@@ -79,8 +80,12 @@ need() { local t; for t in "$@"; do command -v "${t}" >/dev/null 2>&1 || tl_die 
 kc() { kubectl --context "${CTX}" "$@"; }
 
 use_cluster() {
-  # use_cluster <name> — create (or with --reuse adopt) cluster <name>
+  # use_cluster <name> [top] — create (or with --reuse adopt) cluster <name>.
+  # The work dir's manifests/ is mounted at <manifests>/teknoir, so K3s keeps
+  # its own packaged files out of it; with "top" it is the manifests dir
+  # itself, as on the node (T9: migrate only accepts top-level files).
   CLUSTER="$1" CTX="k3d-$1" SERVER="k3d-$1-server-0"
+  if [[ "${2:-}" == top ]]; then IN_MAN="${K3S_MANIFESTS}"; else IN_MAN="${K3S_MANIFESTS}/teknoir"; fi
   WORK="${WORK_BASE}/$1" MAN="${WORK_BASE}/$1/manifests" RETIRED="${WORK_BASE}/$1/manifests-retired"
   export KUBECONFIG="${WORK}/kubeconfig"
   local exists
@@ -105,7 +110,7 @@ use_cluster() {
   wait_until 180 kc get --raw /readyz >/dev/null 2>&1 || tl_die "API of ${CLUSTER} not ready"
   local want got
   want="${K3S_IMAGE##*:}"; want="${want/-k3s/+k3s}"
-  got="$(kc version -o json | jq -r .serverVersion.gitVersion)"
+  got="$(kc version -o json 2>/dev/null | jq -r .serverVersion.gitVersion)"
   [[ "${got}" == "${want}" ]] || tl_die "server version ${got}, expected ${want}"
   # The sentinel tells restart_k3s when K3s has re-applied its files.
   if [[ ! -f "${MAN}/zz-k3d-sentinel.yaml" ]]; then
@@ -123,10 +128,14 @@ EOF
 }
 
 drop_cluster() {
-  local c="$1"
-  (( KEEP )) && { tl_log "keeping cluster ${c} (--keep); kubeconfig ${WORK_BASE}/${c}/kubeconfig"; return 0; }
+  local c="$1" d="${WORK_BASE:?}/$1"
+  (( KEEP )) && { tl_log "keeping cluster ${c} (--keep); kubeconfig ${d}/kubeconfig"; return 0; }
   k3d cluster delete "${c}" >/dev/null 2>&1 || tl_warn "k3d cluster delete ${c} failed"
-  rm -rf "${WORK_BASE:?}/${c}"
+  if ! rm -rf "${d}" 2>/dev/null; then
+    # K3s wrote its packaged manifests (as root) into a top-level mount
+    docker run --rm --entrypoint /bin/sh -v "${d}:/w" "${K3S_IMAGE}" -c 'rm -rf /w/manifests' >/dev/null 2>&1 || true
+    rm -rf "${d}" || tl_warn "could not remove ${d}"
+  fi
 }
 
 cleanup() {
@@ -216,7 +225,7 @@ objset_labelled() {
 }
 
 crd_yaml() {
-  # crd_yaml <plural> <group> <Kind> — a minimal CRD document
+  # crd_yaml <plural> <group> <Kind> [version] — a minimal CRD document (version default v1)
   cat <<EOF
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
@@ -227,7 +236,7 @@ spec:
   names: {kind: $3, plural: $1, singular: $(tr '[:upper:]' '[:lower:]' <<<"$3")}
   scope: Namespaced
   versions:
-  - name: v1
+  - name: ${4:-v1}
     served: true
     storage: true
     schema:
@@ -705,7 +714,7 @@ t6() {
   helm template istio "${istio_tgz}" --namespace istio-system --include-crds > "${WORK}/t6/render.yaml"
   yq 'select(.kind == "CustomResourceDefinition")' "${WORK}/t6/render.yaml" > "${crds}"
   yq 'select(.kind != "CustomResourceDefinition" and .kind != null)' "${WORK}/t6/render.yaml" > "${rest}"
-  crd_names="$(yq -r 'select(.kind == "CustomResourceDefinition") | .metadata.name' "${WORK}/t6/render.yaml" | grep -v -- '^---$' | sort)"
+  crd_names="$(yq -r 'select(.kind == "CustomResourceDefinition") | .metadata.name' "${WORK}/t6/render.yaml" | grep -v -- '^---$' | sort || true)"
   n="$(grep -c . <<<"${crd_names}" || true)"
   if (( n == 0 )); then fail "istio chart ${ver} renders no CRDs; T6 needs the G-01 chart (>= 0.0.3)"; return 0; fi
   pass "istio ${ver} renders ${n} CRDs"
@@ -782,14 +791,30 @@ t6_crd_chart() {
 # teknoir-argo, 9 canonical teknoir-*-secret files, 8 legacy
 # manifest-*-secret duplicates, and 3 orphan Addons (10-teknoir-argo,
 # app-of-apps, manifest-argocd-harbor-repo-secret). Values are random dummies.
-ISTIO_CRDS="authorizationpolicies.security.istio.io destinationrules.networking.istio.io envoyfilters.networking.istio.io
-gateways.networking.istio.io peerauthentications.security.istio.io proxyconfigs.networking.istio.io
-requestauthentications.security.istio.io serviceentries.networking.istio.io sidecars.networking.istio.io
-telemetries.telemetry.istio.io virtualservices.networking.istio.io wasmplugins.extensions.istio.io
-workloadentries.networking.istio.io workloadgroups.networking.istio.io"
-CERTMANAGER_CRDS="certificaterequests.cert-manager.io certificates.cert-manager.io challenges.acme.cert-manager.io
-clusterissuers.cert-manager.io issuers.cert-manager.io orders.acme.cert-manager.io"
-ARGO_CRDS="applications.argoproj.io applicationsets.argoproj.io appprojects.argoproj.io"
+# "<crd name> <Kind>" (the live names; the fixture schemas are minimal)
+ISTIO_CRDS="authorizationpolicies.security.istio.io AuthorizationPolicy
+destinationrules.networking.istio.io DestinationRule
+envoyfilters.networking.istio.io EnvoyFilter
+gateways.networking.istio.io Gateway
+peerauthentications.security.istio.io PeerAuthentication
+proxyconfigs.networking.istio.io ProxyConfig
+requestauthentications.security.istio.io RequestAuthentication
+serviceentries.networking.istio.io ServiceEntry
+sidecars.networking.istio.io Sidecar
+telemetries.telemetry.istio.io Telemetry
+virtualservices.networking.istio.io VirtualService
+wasmplugins.extensions.istio.io WasmPlugin
+workloadentries.networking.istio.io WorkloadEntry
+workloadgroups.networking.istio.io WorkloadGroup"
+CERTMANAGER_CRDS="certificaterequests.cert-manager.io CertificateRequest
+certificates.cert-manager.io Certificate
+challenges.acme.cert-manager.io Challenge
+clusterissuers.cert-manager.io ClusterIssuer
+issuers.cert-manager.io Issuer
+orders.acme.cert-manager.io Order"
+ARGO_CRDS="applications.argoproj.io Application
+applicationsets.argoproj.io ApplicationSet
+appprojects.argoproj.io AppProject"
 # canonical file name -> namespace/secret (type)
 T9_SECRETS="teknoir-argocd-harbor-repo-secret teknoir-system/argocd-harbor-repo Opaque
 teknoir-argocd-keycloak-secret teknoir-system/argocd-oidc-secret Opaque
@@ -885,25 +910,23 @@ EOF
 }
 
 t9_crds() {
-  # t9_crds <file> <crd names>
-  local file="$1" crd plural group kind gen="${WORK}/t9/gen-crds.yaml"
+  # t9_crds <file> <"crd Kind" lines>
+  local file="$1" crd kind gen="${WORK}/t9/gen-crds.yaml"
   : > "${gen}"
-  for crd in $2; do
-    plural="${crd%%.*}" group="${crd#*.}"
-    kind="$(tr '[:lower:]' '[:upper:]' <<<"${plural:0:1}")${plural:1}"
-    { printf -- '---\n'; crd_yaml "${plural}" "${group}" "${kind%s}"; } >> "${gen}"
+  while read -r crd kind; do
+    [[ -n "${crd}" ]] || continue
+    { printf -- '---\n'; crd_yaml "${crd%%.*}" "${crd#*.}" "${kind}"; } >> "${gen}"
     T9_INVENTORY+=("crd ${crd}")
-  done
+  done <<<"$2"
   put_manifest "${file}" < "${gen}"
 }
 
 t9_argo_doc() {
-  local crd plural
-  for crd in ${ARGO_CRDS}; do
-    plural="${crd%%.*}"
+  local crd kind
+  while read -r crd kind; do
     printf -- '---\n'
-    crd_yaml "${plural}" argoproj.io "$(tr '[:lower:]' '[:upper:]' <<<"${plural:0:1}")${plural:1:-1}"
-  done
+    crd_yaml "${crd%%.*}" "${crd#*.}" "${kind}" v1alpha1
+  done <<<"${ARGO_CRDS}"
   printf -- '---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: argocd-cm\n  namespace: teknoir-system\ndata:\n  url: https://argocd.teknoir.airgapped\n'
 }
 
@@ -941,14 +964,14 @@ t9_teknoir_addons() { kc -n kube-system get addons.k3s.cattle.io -o name | sed '
 t9_other_addons() { kc -n kube-system get addons.k3s.cattle.io -o name | sed 's|.*/||' | grep -vE "${TEKNOIR_ADDON_RE}" | sort || true; }
 t9_files() { (cd "${MAN}" && find . -maxdepth 1 -type f | sed 's|^\./||' | sort); }
 
-T9_RUNNER=()
 t9_node() {
-  # t9_node <args...> — the node runner against this cluster, as non-root
-  # (test hooks TEKNOIR_ALLOW_NONROOT, TEKNOIR_LOCK_FILE, TEKNOIR_LOG_DIR,
-  # STATE_DIR) or through sudo -n with T9_SUDO=1
-  "${T9_RUNNER[@]}" env KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG}" \
-    TEKNOIR_ALLOW_NONROOT=1 TEKNOIR_LOCK_FILE="${WORK}/t9/teknoir-airgap.lock" \
-    TEKNOIR_LOG_DIR="${WORK}/t9/log" STATE_DIR="${WORK}/t9/state" \
+  # t9_node <args...> — the real node runner against this cluster, as
+  # non-root: TEKNOIR_HOST_ROOT (the runner's test sandbox, which also allows
+  # non-root) prefixes host paths; lock, log, state and the legacy bundle
+  # home are kept in the work dir as well.
+  env KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG}" \
+    TEKNOIR_HOST_ROOT="${WORK}/t9/root" TEKNOIR_LOCK_FILE="${WORK}/t9/teknoir-airgap.lock" \
+    TEKNOIR_LOG_DIR="${WORK}/t9/log" STATE_DIR="${WORK}/t9/state" MIGRATE_LEGACY_HOME="${WORK}/t9/home" \
     "${WORK}/t9/payload/node/bin/teknoir-node" "$@"
 }
 
@@ -957,11 +980,18 @@ t9_stage() {
   # site file whose K3S_DATA_DIR maps onto the k3d manifests dir
   local src="${T9_NODE_DIR:-${REPO}/airgap/node}" k3s="${WORK}/t9/k3s"
   rm -rf "${WORK}/t9/payload"
-  mkdir -p "${WORK}/t9/payload" "${WORK}/t9/log" "${WORK}/t9/state" "${k3s}/server"
+  mkdir -p "${WORK}/t9/payload" "${WORK}/t9/log" "${WORK}/t9/state" "${WORK}/t9/home" "${k3s}/server" \
+    "${WORK}/t9/root${k3s}/server"
   cp -a "${src}" "${WORK}/t9/payload/node"
   (cd "${WORK}/t9/payload/node" && rm -f SHA256SUMS &&
     find . -type f | sed 's|^\./||' | LC_ALL=C sort | xargs -d '\n' sha256sum > SHA256SUMS)
+  # The k3d manifests dir and a sibling retired dir, reachable as
+  # K3S_DATA_DIR and as HOST_ROOT + K3S_DATA_DIR (whichever the code uses).
   ln -sfn "${MAN}" "${k3s}/server/manifests"
+  ln -sfn "${MAN}" "${WORK}/t9/root${k3s}/server/manifests"
+  mkdir -p "${WORK}/t9/retired"
+  ln -sfn "${WORK}/t9/retired" "${k3s}/server/manifests-retired"
+  ln -sfn "${WORK}/t9/retired" "${WORK}/t9/root${k3s}/server/manifests-retired"
   cat > "${WORK}/t9/site.env" <<EOF
 TEKNOIR_ENV=k3d
 TEKNOIR_DOMAIN=teknoir.airgapped
@@ -989,19 +1019,9 @@ t9() {
   done <<<"${T9_SECRETS}"
   assert_eq "fixture: every secret is owned by its canonical Addon (as on teknoir-local)" 0 "${wrong}"
 
-  T9_RUNNER=()
   set +e; out="$(t9_node migrate --site "${WORK}/t9/site.env" --dry-run 2>&1)"; rc=$?; set -e
-  if (( rc != 0 )) && grep -qiE 'root|permission denied' <<<"${out}"; then
-    if [[ "${T9_SUDO:-0}" == 1 ]]; then
-      T9_RUNNER=(sudo -n)
-      set +e; out="$(t9_node migrate --site "${WORK}/t9/site.env" --dry-run 2>&1)"; rc=$?; set -e
-    else
-      skip_case "teknoir-node refuses to run as non-root (honour TEKNOIR_ALLOW_NONROOT for tests, or set T9_SUDO=1)"
-      printf '%s\n' "${out}" | tail -5 >&2
-      return 0
-    fi
-  fi
   assert_eq "migrate --dry-run exits 0" 0 "${rc}"
+  (( rc == 0 )) || printf '%s\n' "${out}" | tail -20 >&2
   for name in $(t9_teknoir_addons | grep -vx teknoir-argo); do
     grep -qF -- "${name}" <<<"${out}" || { missing=$((missing + 1)); tl_warn "dry-run does not mention ${name}"; }
   done
@@ -1059,7 +1079,7 @@ t9_assert_detached() {
     [[ -f "${MAN}/${name}.yaml.skip" ]] || { noskip=$((noskip + 1)); tl_warn "no ${name}.yaml.skip"; }
   done
   assert_eq "${when}: every retired name has a .skip guard" 0 "${noskip}"
-  stray="$(t9_files | grep -E '\.ya?ml$' | sed -E 's/\.ya?ml$//' | grep -E "${TEKNOIR_ADDON_RE}" | grep -vx -e teknoir-argo -e manifest-harbor-secret | tr '\n' ' ')"
+  stray="$(t9_files | grep -E '\.ya?ml$' | sed -E 's/\.ya?ml$//' | grep -E "${TEKNOIR_ADDON_RE}" | grep -vx -e teknoir-argo -e manifest-harbor-secret | tr '\n' ' ' || true)"
   assert_eq "${when}: no Teknoir *.yaml left in the manifests dir but teknoir-argo.yaml" "" "${stray}"
 }
 
@@ -1096,10 +1116,11 @@ main() {
     else tl_case T6 "ArgoCD adoption of the one-shot render"; skip_case "${T6_WHY}"; fi
   fi
   if [[ " ${tests[*]} " == *" T9 "* ]]; then
-    if t9_ready; then use_cluster "${PREFIX}-t9"; t9; finish_cluster
+    if t9_ready; then use_cluster "${PREFIX}-t9" top; t9; finish_cluster
     else tl_case T9 "migration rehearsal on the legacy fixture"; skip_case "${T9_WHY}"; fi
   fi
   tl_summary
 }
 
-main "$@"
+# Sourcing (unit tests) defines the functions without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck source-path=SCRIPTDIR
 # e2e.sh — airgap end-to-end test in the KVM VM (docs/airgap/DESIGN.md test plan 3, I-16).
 #
 # The node is the VM tk-airgap (vm.sh, 10.77.0.10, teknoir.airgapped, bridge
@@ -38,7 +39,7 @@
 #   E2E_OLD_SETUP    E10: command (run on vpro, VM_IP exported) that installs the
 #                    old (e9a3b7f) layout with dummy secrets on the fresh VM
 #   E2E_WORK         work dir (default ~/vmtest/e2e); LAN_HOME (default ~/vmtest/lanhome)
-#   E2E_UP_FLAGS     extra flags for every `up` (e.g. a non-interactive host-key accept)
+#   E2E_UP_FLAGS     extra flags for every teknoir-airgap call
 #   E2E_ZERO_CHANGES_RE  regex that the E2 summary must match (default: "0 change|no change")
 #   E2E_LOGIN_URL    oauth2-proxy protected URL (default https://grafana.<domain>/)
 #   E2E_ADMIN_USER   Keycloak user for the login check (default platform-admin)
@@ -75,7 +76,7 @@ NODE_IP="$(. "${LAN_SITE}"; printf '%s' "${NODE_IP}")"
 LOGIN_URL="${E2E_LOGIN_URL:-https://grafana.${DOMAIN}/}"
 AGENT_PID=""
 
-usage() { sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
+usage() { sed -n '3,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 
 # ---------------------------------------------------------------------------
 # plumbing
@@ -99,20 +100,42 @@ lan() {
   return "${rc}"
 }
 
+vm_host_fp() {
+  # the VM's ed25519 host-key fingerprint, read the way the runbook tells the
+  # operator to (ssh-keygen -lf on the node console)
+  vmx ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}'
+}
+
+host_pinned() { [[ -n "$(find "${LAN_HOME}/.teknoir-airgap" -name known_hosts -size +0c 2>/dev/null)" ]]; }
+
+tk() {
+  # tk <bundle-dir> <command> [args...] — the operator's ./teknoir-airgap,
+  # ALWAYS with the vmtest site (without --site the bundle's own site file
+  # would name the real teknoir-local node). While no host key is pinned,
+  # the first-use confirmation is given with --host-key and the VM's
+  # fingerprint (no terminal here). stdin is /dev/null.
+  local dir="$1" cmd="$2"
+  local -a hk=()
+  shift 2
+  if ! host_pinned && [[ " $* " != *" --host-key "* ]]; then hk=(--host-key "$(vm_host_fp)"); fi
+  # shellcheck disable=SC2086  # E2E_UP_FLAGS is a flag list
+  lan "${dir}" ./teknoir-airgap "${cmd}" --site "${SITE_FILE}" ${hk[@]+"${hk[@]}"} ${E2E_UP_FLAGS:-} "$@" </dev/null
+}
+
 up_in() {
   # up_in <bundle-dir> [flags...] — the operator's `./teknoir-airgap up`
   local dir="$1"
   shift
-  # shellcheck disable=SC2086  # E2E_UP_FLAGS is a flag list
-  printf 'yes\n' | lan "${dir}" ./teknoir-airgap up --site "${SITE_FILE}" ${E2E_UP_FLAGS:-} "$@"
+  tk "${dir}" up "$@"
 }
 
 start_agent() {
   # The LAN user authenticates with the VM's key through a private agent
   # (the equivalent of the runbook's ssh-copy-id; ~/.ssh is not touched).
-  [[ -n "${AGENT_PID}" ]] && return 0
+  [[ -n "${AGENT_PID}" || -n "${E2E_AGENT_SOCK:-}" ]] && return 0
   eval "$(ssh-agent -s)" >/dev/null
   AGENT_PID="${SSH_AGENT_PID}"
+  export E2E_AGENT_SOCK="${SSH_AUTH_SOCK}"   # children (E5's __up) reuse this agent
   ssh-add -q "$("${VM}" key)" 2>/dev/null || tl_die "cannot add the VM key $("${VM}" key) to the agent (run vm.sh create)"
 }
 
@@ -257,7 +280,7 @@ e1() {
   assert_eq "Keycloak master realm discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/realms/master/.well-known/openid-configuration")"
   assert_eq "Keycloak realm teknoir discovery with the CA (D2)" 200 "$(lan_https "https://auth.${DOMAIN}/realms/teknoir/.well-known/openid-configuration")"
   local pw="${LAN_HOME}/e2e/platform-admin.pw" mode
-  if lan "${dir}" ./teknoir-airgap credentials platform-admin --out "${pw}" </dev/null; then
+  if tk "${dir}" credentials platform-admin --out "${pw}"; then
     mode="$(stat -c %a "${pw}" 2>/dev/null || echo missing)"
     assert_eq "credentials --out writes a 0600 file" 600 "${mode}"
   else
@@ -445,7 +468,7 @@ e6() {
   if (( rc != 0 )); then pass "up refuses the changed host key"; else fail "up accepted a changed host key"; fi
   if grep -q 'ssh-keygen -R' <<<"${out}"; then pass "the message prints the ssh-keygen -R fix"; else fail "no 'ssh-keygen -R' in the output"; fi
   if grep -q -- '--forget-host-key' <<<"${out}"; then pass "the message mentions --forget-host-key"; else fail "no '--forget-host-key' in the output"; fi
-  if up_in "${dir}" --forget-host-key; then pass "up --forget-host-key bootstraps the rebuilt node"; else fail "up --forget-host-key failed"; return 0; fi
+  if up_in "${dir}" --forget-host-key --host-key "$(vm_host_fp)"; then pass "up --forget-host-key bootstraps the rebuilt node"; else fail "up --forget-host-key failed"; return 0; fi
   wait_apps 2700 || true
   if [[ -z "${E2E_E6_RESTORE_CMD:-}" ]]; then
     tl_warn "restore not exercised (E2E_E6_RESTORE_CMD unset; restore is the OPERATE.md procedure)"
@@ -521,13 +544,13 @@ e8() {
   local dir before after changed pods_before pods_after
   dir="$(bundle_dir "${E2E_BUNDLE}")"
   before="$(snap_secret_rvs)"
-  pods_before="$(vm_kc -n teknoir-auth get pods -l app.kubernetes.io/name=oauth2-proxy -o jsonpath='{.items[*].metadata.uid}')"
-  if lan "${dir}" ./teknoir-airgap rotate oauth2-proxy-cookie </dev/null; then pass "rotate oauth2-proxy-cookie exits 0"; else fail "rotate failed"; return 0; fi
+  pods_before="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app.kubernetes.io/name=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
+  if tk "${dir}" rotate oauth2-proxy-cookie; then pass "rotate oauth2-proxy-cookie exits 0"; else fail "rotate failed"; return 0; fi
   wait_apps 900 || true
   after="$(snap_secret_rvs)"
   changed="$(diff <(echo "${before}") <(echo "${after}") | awk '/^>/ {print $2 "/" $3}' | sort -u | tr '\n' ' ')"
   assert_eq "only teknoir-auth/oauth2-proxy-secret changed" "teknoir-auth/oauth2-proxy-secret " "${changed}"
-  pods_after="$(vm_kc -n teknoir-auth get pods -l app.kubernetes.io/name=oauth2-proxy -o jsonpath='{.items[*].metadata.uid}')"
+  pods_after="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app.kubernetes.io/name=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
   if [[ -n "${pods_after}" && "${pods_after}" != "${pods_before}" ]]; then pass "oauth2-proxy pods were replaced"; else fail "oauth2-proxy did not roll"; fi
   login_check "login still works after the cookie-secret rotation"
 }
@@ -538,10 +561,12 @@ e8() {
 E10_SECRETS="${E2E_E10_SECRETS:-teknoir-system/harbor-secret teknoir-auth/keycloak-db-secret teknoir-auth/oauth2-proxy-secret teknoir-auth/oauth2-proxy-redis-secret teknoir-system/argocd-oidc-secret cert-manager/teknoir-root-ca teknoir-auth/teknoir-root-ca-bundle teknoir-system/teknoir-root-ca-bundle}"
 
 e10_inventory() {
-  # every object of the kinds the migration touches, by name (no values)
-  vm_kc get crd,ns -o name | sort
-  vm_kc get secrets,configmaps,virtualservices,gateways,destinationrules,authorizationpolicies,peerauthentications,certificates,clusterissuers,applications,appprojects \
-    -A --no-headers -o custom-columns=K:.kind,NS:.metadata.namespace,N:.metadata.name 2>/dev/null | sort
+  # every object of the kinds the migration touches, by name (no values), sorted for comm
+  {
+    vm_kc get crd,ns -o name
+    vm_kc get secrets,configmaps,virtualservices,gateways,destinationrules,authorizationpolicies,peerauthentications,certificates,clusterissuers,applications,appprojects \
+      -A --no-headers -o custom-columns=K:.kind,NS:.metadata.namespace,N:.metadata.name 2>/dev/null
+  } | LC_ALL=C sort
 }
 
 e10_secret_hashes() {
@@ -563,20 +588,21 @@ e10() {
   [[ -n "${E2E_OLD_SETUP:-}" ]] || { skip_case "E2E_OLD_SETUP (old-tooling install command) not set"; return 0; }
   (( ALLOW_DESTROY )) || { skip_case "re-creates the VM: pass --allow-destroy"; return 0; }
   fresh_vm || return 0
+  rm -rf "${LAN_HOME:?}/.teknoir-airgap"
   if VM_IP="${NODE_IP}" bash -c "${E2E_OLD_SETUP}"; then pass "old-style install completed"; else fail "E2E_OLD_SETUP failed"; return 0; fi
   local dir inv0 hashes0 lost rs0 rs1 files addons
   dir="$(bundle_dir "${E2E_BUNDLE}")"
   inv0="$(e10_inventory)" hashes0="$(e10_secret_hashes)"
-  if lan "${dir}" ./teknoir-airgap migrate --site "${SITE_FILE}" --dry-run </dev/null; then pass "migrate --dry-run exits 0"; else fail "migrate --dry-run failed"; fi
+  if tk "${dir}" migrate --dry-run; then pass "migrate --dry-run exits 0"; else fail "migrate --dry-run failed"; fi
   assert_eq "migrate --dry-run changed nothing" "${inv0}" "$(e10_inventory)"
-  if lan "${dir}" ./teknoir-airgap migrate --site "${SITE_FILE}" </dev/null; then pass "migrate exits 0"; else fail "migrate failed"; return 0; fi
+  if tk "${dir}" migrate; then pass "migrate exits 0"; else fail "migrate failed"; return 0; fi
   if up_in "${dir}"; then pass "up after migrate exits 0"; else fail "up after migrate failed"; return 0; fi
   wait_apps 2700 || true
   vmx sudo systemctl restart k3s
   wait_until 300 vm_kc get --raw /readyz >/dev/null 2>&1 || fail "API not ready after the k3s restart"
   sleep 60
   wait_apps 1800 || true
-  lost="$(comm -23 <(echo "${inv0}") <(e10_inventory) | tr '\n' ' ')"
+  lost="$(LC_ALL=C comm -23 <(echo "${inv0}") <(e10_inventory) | tr '\n' ' ')"
   assert_eq "no object lost (every pre-migration object still exists)" "" "${lost}"
   assert_eq "the existing platform Secrets are unchanged (adopted by name and key)" "${hashes0}" "$(e10_secret_hashes)"
   local crd track
@@ -628,4 +654,5 @@ main() {
   tl_summary | tee "${E2E_WORK}/summary.txt"
 }
 
-main "$@"
+# Sourcing (unit tests) defines the functions without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

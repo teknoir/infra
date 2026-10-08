@@ -20,6 +20,11 @@
 set -euo pipefail
 
 CACERT="" URL="" LOGIN_USER="" PWFILE="" NEWPWFILE=""
+work="" jar="" page="" CODE="" EFF=""
+
+say() { printf '[kc-login] %s\n' "$*" >&2; }
+
+parse_args() {
 while (( $# )); do
   case "$1" in
     --cacert) CACERT="$2"; shift ;;
@@ -33,13 +38,7 @@ while (( $# )); do
   shift
 done
 [[ -f "${CACERT}" && -n "${URL}" && -n "${LOGIN_USER}" && -f "${PWFILE}" ]] || { echo "kc-login: --cacert, --url, --user and --password-file are required" >&2; exit 2; }
-
-say() { printf '[kc-login] %s\n' "$*" >&2; }
-work="$(mktemp -d)"
-trap 'rm -rf "${work}"' EXIT
-chmod 700 "${work}"
-jar="${work}/jar" page="${work}/page.html"
-CODE="" EFF=""
+}
 
 nonl() {
   # nonl <src> <dst> — copy a secret file without its trailing newline(s)
@@ -68,6 +67,12 @@ input_value() {
     grep -oE 'value="[^"]*"' | sed -e 's/^value="//' -e 's/"$//' || true
 }
 
+main() {
+parse_args "$@"
+work="$(mktemp -d)"
+trap 'rm -rf "${work}"' EXIT
+chmod 700 "${work}"
+jar="${work}/jar" page="${work}/page.html"
 origin="$(sed -E 's|^(https?://[^/]+).*|\1|' <<<"${URL}")"
 nonl "${PWFILE}" "${work}/pw"
 
@@ -116,3 +121,7 @@ if [[ "${final_host}" != auth.* ]] && (( CODE >= 200 && CODE < 400 )) && grep -q
 fi
 say "login failed: HTTP ${CODE} at $(sed -E 's|\?.*||' <<<"${EFF}")"
 exit 1
+}
+
+# Sourcing (unit tests) defines the functions without running anything.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi
