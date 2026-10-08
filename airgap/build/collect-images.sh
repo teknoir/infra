@@ -1,0 +1,362 @@
+#!/usr/bin/env bash
+# collect-images.sh — pull every image the bundle needs, single-platform and
+# digest-locked (I-02):
+#
+#   bootstrap tier  everything the one-shot tiers render (<stage>/node/oneshot)
+#                   plus BOOTSTRAP_EXTRA_IMAGES -> <stage>/node/bootstrap-images/<slug>.tar
+#                   (single-platform docker archives: the node imports them into
+#                   containerd before Harbor exists, and pushes them to Harbor)
+#   all others      every image of every rendered Application (<work>/renders)
+#                   plus airgap/images-extra.txt -> <stage>/node/images/<slug>/
+#                   (one OCI layout per image with exactly one manifest)
+#   lock            <stage>/node/images/images.lock: "<ref>@sha256:<digest> <slug>"
+#                   for EVERY image, sorted. <digest> is what the node pushes and
+#                   Harbor then serves: the upstream linux/amd64 manifest for an
+#                   OCI layout, `crane digest --tarball` for a docker archive.
+#                   <slug> is images/<slug>/ or bootstrap-images/<slug>.tar.
+#
+# Each image is stored once. Every tag is resolved to its digest on every build
+# (mutable tags are never trusted); the content is cached by digest in
+# ${TEKNOIR_AIRGAP_CACHE:-~/.cache/teknoir-airgap}/images/ and pulled into a
+# .tmp path that is validated before it is renamed into place, so an
+# interrupted pull never leaves a partial entry.
+#
+# What ships is validated on every build, not only after a pull: the staged
+# copy of each cache entry is checked in full (every blob's sha256 equals its
+# digest; a docker archive's config and layer members equal the registry
+# manifest's digests and its `crane digest --tarball` equals the one recorded
+# at the first pull in <entry>.digest). A corrupt cache entry is removed and
+# pulled again in the same run, so a re-run always converges.
+#
+# --images-limit N (or IMAGES_LIMIT=N): TEST ONLY. Pull only the first N
+# images of each list. The bundle is then marked incomplete (make-bundle.sh
+# adds "-incomplete" to the bundle id and the completeness gate only warns).
+#
+# Usage: collect-images.sh --stage DIR --work DIR [--images-limit N]
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib-build.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-build.sh"
+
+usage() { usage_from_header "${BASH_SOURCE[0]}"; }
+
+STAGE="" WORK="" LIMIT="${IMAGES_LIMIT:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stage) STAGE="${2:?}"; shift ;;
+    --work) WORK="${2:?}"; shift ;;
+    --images-limit) LIMIT="${2:?}"; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: $1 (see --help)" ;;
+  esac
+  shift
+done
+[[ -n "${STAGE}" && -n "${WORK}" ]] || { usage; exit 2; }
+[[ -z "${LIMIT}" || "${LIMIT}" =~ ^[0-9]+$ ]] || die "--images-limit must be a number"
+[[ -d "${WORK}/renders" ]] || die "${WORK}/renders is missing (run collect-charts.sh first)"
+[[ -f "${STAGE}/node/oneshot/TIERS" ]] || die "${STAGE}/node/oneshot is missing (run render-oneshot.sh first)"
+tar --version 2>/dev/null | grep -q 'GNU tar' || die "GNU tar is required (--to-command)"
+use_build_tools "${WORK}"
+
+read -r -a PLATFORMS <<<"${IMAGE_PLATFORMS}"
+(( ${#PLATFORMS[@]} == 1 )) || die "IMAGE_PLATFORMS='${IMAGE_PLATFORMS}': exactly one platform is supported for now"
+PLATFORM="${PLATFORMS[0]}"
+P_OS="${PLATFORM%%/*}"
+P_ARCH="${PLATFORM#*/}"
+P_ARCH="${P_ARCH%%/*}"
+P_VARIANT=""
+[[ "${PLATFORM}" == */*/* ]] && P_VARIANT="${PLATFORM##*/}"
+
+IMG_CACHE="${CACHE_DIR}/images"
+OCI_OUT="${STAGE}/node/images"
+DOCKER_OUT="${STAGE}/node/bootstrap-images"
+mkdir -p "${IMG_CACHE}/oci" "${IMG_CACHE}/docker" "${IMG_CACHE}/manifests" "${OCI_OUT}" "${DOCKER_OUT}"
+# One build at a time uses the image cache; leftovers of an interrupted pull
+# (.tmp.<pid>) are never valid entries and are removed here.
+exec 9> "${IMG_CACHE}/.lock"
+flock -n 9 || die "another build holds ${IMG_CACHE}/.lock; wait for it to finish"
+find "${IMG_CACHE}/oci" "${IMG_CACHE}/docker" "${IMG_CACHE}/manifests" -maxdepth 1 -name '*.tmp.*' -exec rm -rf -- {} +
+# a fresh store on every run: nothing from an earlier build survives
+find "${OCI_OUT}" "${DOCKER_OUT}" -mindepth 1 -delete
+
+# --- image lists -----------------------------------------------------------------
+step "image lists"
+{
+  cat "${STAGE}/node/oneshot/"*.yaml | extract_images
+  # shellcheck disable=SC2086  # a whitespace-separated list
+  printf '%s\n' ${BOOTSTRAP_EXTRA_IMAGES} | while read -r r; do normalize_image "${r}"; done
+} | sed '/^$/d' | LC_ALL=C sort -u > "${WORK}/images.bootstrap"
+{
+  cat "${WORK}/renders/"*.yaml | extract_images
+  image_list_file "${AIRGAP_DIR}/images-extra.txt"
+} | sed '/^$/d' | LC_ALL=C sort -u > "${WORK}/images.rendered"
+LC_ALL=C sort -u "${WORK}/images.bootstrap" "${WORK}/images.rendered" > "${WORK}/images.required"
+LC_ALL=C comm -23 "${WORK}/images.required" "${WORK}/images.bootstrap" > "${WORK}/images.regular"
+log "$(wc -l < "${WORK}/images.required") images: $(wc -l < "${WORK}/images.bootstrap") bootstrap tier, $(wc -l < "${WORK}/images.regular") others"
+
+# Bootstrap images are imported by name, so they need a tag
+while read -r ref; do
+  [[ -n "$(image_tag "${ref}")" ]] || die "bootstrap image ${ref} has no tag: containerd imports archives by tag name"
+done < "${WORK}/images.bootstrap"
+
+# Teknoir images on mutable tags (D8: warn for now; G-09 turns this into an error)
+while read -r ref; do
+  if is_teknoir_image "${ref}" && ! is_immutable_tag "${ref}"; then
+    warn "mutable Teknoir image tag (D8, pinned by digest in images.lock only): ${ref}"
+  fi
+done < "${WORK}/images.required"
+
+INCOMPLETE=0
+if [[ -n "${LIMIT}" ]]; then
+  warn "TEST ONLY: --images-limit ${LIMIT}: pulling only the first ${LIMIT} images of each list; the bundle is INCOMPLETE"
+  head -n "${LIMIT}" "${WORK}/images.bootstrap" > "${WORK}/images.bootstrap.pull"
+  head -n "${LIMIT}" "${WORK}/images.regular" > "${WORK}/images.regular.pull"
+  INCOMPLETE=1
+else
+  cp "${WORK}/images.bootstrap" "${WORK}/images.bootstrap.pull"
+  cp "${WORK}/images.regular" "${WORK}/images.regular.pull"
+fi
+echo "${INCOMPLETE}" > "${WORK}/images.incomplete"
+
+# --- resolve ------------------------------------------------------------------------
+cached_manifest() {
+  # cached_manifest <repo> <digest> — path of the raw manifest (immutable for
+  # a digest), fetched once and kept in <cache>/manifests/<hex>.json
+  local repo="$1" digest="$2" f tmp
+  f="${IMG_CACHE}/manifests/${digest#sha256:}.json"
+  if [[ -f "${f}" && "sha256:$(sha256_file "${f}")" == "${digest}" ]]; then
+    echo "${f}"
+    return 0
+  fi
+  mkdir -p "${IMG_CACHE}/manifests"
+  tmp="${f}.tmp.$$"
+  crane manifest "${repo}@${digest}" > "${tmp}" || { rm -f "${tmp}"; die "cannot fetch the manifest ${repo}@${digest}"; }
+  [[ "sha256:$(sha256_file "${tmp}")" == "${digest}" ]] || { rm -f "${tmp}"; die "${repo}@${digest}: the registry returned a manifest with another digest"; }
+  mv -f "${tmp}" "${f}"
+  echo "${f}"
+}
+
+resolve() {
+  # resolve <ref> — sets R_INDEX (top-level digest; the index for multi-arch
+  # images) and R_PLATFORM (the manifest digest for PLATFORM). The tag is
+  # resolved with a HEAD request (crane digest), which registries do not
+  # count against pull rate limits; manifests are cached by digest.
+  local ref="$1" repo top m mt
+  repo="$(image_repo "${ref}")"
+  if [[ "${ref}" == *@sha256:* ]]; then
+    top="${ref##*@}"
+  else
+    top="$(crane digest "${ref}")" || die "cannot resolve ${ref} (crane digest failed)"
+  fi
+  [[ "${top}" =~ ^sha256:[0-9a-f]{64}$ ]] || die "${ref}: unexpected digest '${top}'"
+  m="$(cached_manifest "${repo}" "${top}")"
+  mt="$(jq -r '.mediaType // (if .manifests then "index" else "manifest" end)' "${m}")"
+  R_INDEX="${top}"
+  case "${mt}" in
+    *index*|*manifest.list*)
+      R_PLATFORM="$(jq -r --arg os "${P_OS}" --arg arch "${P_ARCH}" --arg v "${P_VARIANT}" '
+        [.manifests[] | select(.platform.os == $os and .platform.architecture == $arch
+                               and ($v == "" or .platform.variant == $v))][0].digest // ""' "${m}")"
+      [[ -n "${R_PLATFORM}" ]] || die "${ref} has no ${PLATFORM} image (index ${top})"
+      ;;
+    *)
+      R_PLATFORM="${top}"
+      ;;
+  esac
+}
+
+check_platform_config() {
+  # check_platform_config <config.json> <what>
+  local os arch
+  os="$(jq -r '.os // ""' "$1")"
+  arch="$(jq -r '.architecture // ""' "$1")"
+  [[ "${os}" == "${P_OS}" && "${arch}" == "${P_ARCH}" ]] \
+    || die "$2 is ${os}/${arch}, not ${PLATFORM}"
+}
+
+# --- OCI layouts ----------------------------------------------------------------------
+validate_oci_layout() {
+  # validate_oci_layout <dir> <digest> <deep:0|1> — exactly one manifest with
+  # that digest, PLATFORM config, every referenced blob present with its size
+  # (deep: and every blob's sha256 equals its name)
+  local dir="$1" digest="$2" deep="$3" m b blob size want
+  [[ -f "${dir}/oci-layout" && -f "${dir}/index.json" ]] || return 1
+  [[ "$(jq '.manifests | length' "${dir}/index.json")" == 1 ]] || return 1
+  [[ "$(jq -r '.manifests[0].digest' "${dir}/index.json")" == "${digest}" ]] || return 1
+  m="${dir}/blobs/sha256/${digest#sha256:}"
+  [[ -f "${m}" && "$(sha256_file "${m}")" == "${digest#sha256:}" ]] || return 1
+  jq -e '.layers and .config' "${m}" >/dev/null || return 1
+  while read -r b size; do
+    blob="${dir}/blobs/sha256/${b#sha256:}"
+    [[ -f "${blob}" ]] || return 1
+    [[ "$(stat -c %s "${blob}")" == "${size}" ]] || return 1
+    if (( deep )); then
+      want="${b#sha256:}"
+      [[ "$(sha256_file "${blob}")" == "${want}" ]] || return 1
+    fi
+  done < <(jq -r '.config.digest + " " + (.config.size|tostring), (.layers[] | .digest + " " + (.size|tostring))' "${m}")
+  check_platform_config "${dir}/blobs/sha256/$(jq -r '.config.digest | sub("^sha256:"; "")' "${m}")" "${digest}"
+}
+
+pull_oci() {
+  # pull_oci <ref> <slug> — OCI layout of PLATFORM into the cache (by digest),
+  # then a copy into the stage that is validated deep before it is used; a
+  # copy that fails means a corrupt cache entry, which is replaced once
+  local ref="$1" slug="$2" repo cached tmp stage attempt
+  repo="$(image_repo "${ref}")"
+  cached="${IMG_CACHE}/oci/${R_PLATFORM#sha256:}"
+  stage="${OCI_OUT}/${slug}"
+  for attempt in 1 2; do
+    if [[ ! -d "${cached}" ]]; then
+      tmp="${cached}.tmp.$$"
+      [[ ! -e "${tmp}" ]] || rm_build_dir "${tmp}"
+      log "pull ${ref} (${PLATFORM} ${R_PLATFORM:7:12})"
+      crane pull --format oci "${repo}@${R_PLATFORM}" "${tmp}" || { rm_build_dir "${tmp}"; die "crane pull failed: ${ref}"; }
+      validate_oci_layout "${tmp}" "${R_PLATFORM}" 1 || { rm_build_dir "${tmp}"; die "pulled layout of ${ref} failed validation"; }
+      mv -T "${tmp}" "${cached}"
+    fi
+    rm -rf -- "${stage:?}.tmp"
+    cp -a --reflink=auto "${cached}" "${stage}.tmp"
+    if validate_oci_layout "${stage}.tmp" "${R_PLATFORM}" 1; then
+      mv -T "${stage}.tmp" "${stage}"
+      L_DIGEST="${R_PLATFORM}"
+      L_SIZE="$(du -sb "${stage}" | cut -f1)"
+      return 0
+    fi
+    rm -rf -- "${stage:?}.tmp"
+    (( attempt == 1 )) || die "${ref}: the layout fails validation right after a fresh pull"
+    warn "cache entry ${cached} (${ref}) is corrupt (a blob is missing or its size or sha256 does not match its digest); removing it and pulling again"
+    rm_build_dir "${cached}"
+  done
+}
+
+# --- docker archives --------------------------------------------------------------------
+validate_docker_archive() {
+  # validate_docker_archive <tar> <ref> <manifest.json> — the archive is
+  # exactly the registry image: one image tagged <ref>; members are exactly
+  # manifest.json, the config (named by its digest) and the layers (named
+  # <hex>.tar.gz by ggcr), each once, as regular files; the config digest and
+  # the ordered layer digests equal the registry manifest's; every member's
+  # sha256 equals the digest in its name; PLATFORM config. Sets V_DIGEST
+  # (`crane digest --tarball`, the digest the node pushes).
+  local tmpd rc=0
+  V_DIGEST=""
+  tmpd="$(mktemp -d)"
+  _validate_docker_archive "${tmpd}" "$@" || rc=$?
+  rm -rf -- "${tmpd}"
+  return "${rc}"
+}
+
+_validate_docker_archive() {
+  # _validate_docker_archive <scratch-dir> <tar> <ref> <manifest.json>
+  local tmpd="$1" tar="$2" ref="$3" manifest="$4" cfg want have
+  [[ "${tar}" == /* ]] || tar="${PWD}/${tar}"
+  cfg="$(jq -r '.config.digest' "${manifest}")" || return 1
+  tar -tf "${tar}" > "${tmpd}/members" 2>/dev/null || return 1
+  tar -xf "${tar}" -C "${tmpd}" manifest.json 2>/dev/null || return 1
+  [[ "$(jq 'length' "${tmpd}/manifest.json")" == 1 ]] || return 1
+  [[ "$(jq -r '.[0].RepoTags | join(",")' "${tmpd}/manifest.json")" == "${ref}" ]] || return 1
+  [[ "$(jq -r '.[0].Config' "${tmpd}/manifest.json")" == "${cfg}" ]] || return 1
+  # the layer list is the registry's, in order (ggcr writes <hex>.tar.gz)
+  want="$(jq -r '.layers[].digest | sub("^sha256:"; "")' "${manifest}")" || return 1
+  have="$(jq -r '.[0].Layers[] | sub("\\.tar(\\.gz)?$"; "")' "${tmpd}/manifest.json")" || return 1
+  [[ -n "${want}" && "${want}" == "${have}" ]] || return 1
+  # exactly the expected members, no duplicates
+  { echo manifest.json; echo "${cfg}"; jq -r '.[0].Layers[]' "${tmpd}/manifest.json"; } \
+    | LC_ALL=C sort -u > "${tmpd}/expected"
+  cmp -s "${tmpd}/expected" <(LC_ALL=C sort "${tmpd}/members") || return 1
+  # one pass: the sha256 of every regular-file member (non-regular members get
+  # no line and fail the count below)
+  # shellcheck disable=SC2016  # expanded by the shell tar runs per member
+  (cd "${tmpd}" && tar -xf "${tar}" --to-command='sha256sum | { read -r h _; printf "%s %s\n" "${h}" "${TAR_FILENAME}"; }') \
+    > "${tmpd}/sums" 2>/dev/null || return 1
+  [[ "$(wc -l < "${tmpd}/sums")" == "$(wc -l < "${tmpd}/expected")" ]] || return 1
+  awk -v cfg="${cfg}" '
+    $2 == "manifest.json" { next }
+    $2 == cfg { if ("sha256:" $1 != cfg) bad = 1; next }
+    { name = $2; sub(/\.tar(\.gz)?$/, "", name); if (name != $1) bad = 1 }
+    END { exit bad }
+  ' "${tmpd}/sums" || return 1
+  tar -xf "${tar}" -C "${tmpd}" "${cfg}" 2>/dev/null || return 1
+  check_platform_config "${tmpd}/${cfg}" "${ref}"
+  V_DIGEST="$(crane digest --tarball "${tar}")" || return 1
+  [[ "${V_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+}
+
+pull_docker() {
+  # pull_docker <ref> <slug> — single-platform docker archive tagged <ref>,
+  # cached as <hex>-<slug>.tar plus <hex>-<slug>.tar.digest (the first pull's
+  # `crane digest --tarball`). The staged copy is validated in full and its
+  # digest must equal the recorded one; a copy that fails means a corrupt
+  # cache entry, which is replaced once.
+  local ref="$1" slug="$2" repo manifest cached tmp stage attempt recorded
+  repo="$(image_repo "${ref}")"
+  manifest="$(cached_manifest "${repo}" "${R_PLATFORM}")"
+  cached="${IMG_CACHE}/docker/${R_PLATFORM#sha256:}-${slug}.tar"
+  stage="${DOCKER_OUT}/${slug}.tar"
+  for attempt in 1 2; do
+    if [[ ! -f "${cached}" ]]; then
+      rm -f "${cached}.digest"
+      tmp="${cached}.tmp.$$"
+      rm -f "${tmp}"
+      log "pull ${ref} (${PLATFORM} archive ${R_PLATFORM:7:12})"
+      # by tag, so the archive carries the tag containerd imports it under; the
+      # config and layer digest checks prove it is the image resolved above
+      crane pull --platform "${PLATFORM}" --format tarball "${ref}" "${tmp}" || { rm -f "${tmp}"; die "crane pull failed: ${ref}"; }
+      validate_docker_archive "${tmp}" "${ref}" "${manifest}" \
+        || { rm -f "${tmp}"; die "pulled archive of ${ref} failed validation (did the tag move during the build?)"; }
+      printf '%s\n' "${V_DIGEST}" > "${cached}.digest.tmp.$$"
+      mv -f "${cached}.digest.tmp.$$" "${cached}.digest"
+      mv -f "${tmp}" "${cached}"
+    fi
+    rm -f "${stage}.tmp"
+    cp --reflink=auto "${cached}" "${stage}.tmp"
+    if validate_docker_archive "${stage}.tmp" "${ref}" "${manifest}"; then
+      if [[ ! -s "${cached}.digest" ]]; then
+        # an entry from a build before digests were recorded: it just passed
+        # the full member check, so its digest becomes the reference
+        printf '%s\n' "${V_DIGEST}" > "${cached}.digest.tmp.$$"
+        mv -f "${cached}.digest.tmp.$$" "${cached}.digest"
+      fi
+      recorded="$(cat "${cached}.digest")"
+      if [[ "${recorded}" == "${V_DIGEST}" ]]; then
+        mv -f "${stage}.tmp" "${stage}"
+        L_DIGEST="${V_DIGEST}"
+        L_SIZE="$(stat -c %s "${stage}")"
+        return 0
+      fi
+      warn "${ref}: crane digest --tarball is ${V_DIGEST}, the first pull recorded ${recorded}"
+    fi
+    rm -f "${stage}.tmp"
+    (( attempt == 1 )) || die "${ref}: the archive fails validation right after a fresh pull"
+    warn "cache entry ${cached} (${ref}) is corrupt (member checksums, config/layer digests or archive digest do not match); removing it and pulling again"
+    rm -f "${cached}" "${cached}.digest"
+  done
+}
+
+# --- pull ----------------------------------------------------------------------------------
+step "pulling images (${PLATFORM})"
+: > "${WORK}/images.jsonl"
+pull_list() {
+  # pull_list <list> <oci|docker-archive> <bootstrap:true|false>
+  local list="$1" format="$2" bootstrap="$3" ref slug
+  while read -r ref; do
+    [[ -n "${ref}" ]] || continue
+    slug="$(image_slug "${ref}")"
+    resolve "${ref}"
+    L_DIGEST="" L_SIZE=0
+    if [[ "${format}" == oci ]]; then pull_oci "${ref}" "${slug}"; else pull_docker "${ref}" "${slug}"; fi
+    jq -cn --arg ref "${ref}" --arg slug "${slug}" --arg format "${format}" --argjson bootstrap "${bootstrap}" \
+       --arg digest "${L_DIGEST}" --arg platformDigest "${R_PLATFORM}" --arg indexDigest "${R_INDEX}" \
+       --argjson size "${L_SIZE}" \
+       '{ref: $ref, slug: $slug, format: $format, bootstrap: $bootstrap, digest: $digest,
+         platformDigest: $platformDigest, indexDigest: $indexDigest, size: $size}' >> "${WORK}/images.jsonl"
+  done < "${list}"
+}
+pull_list "${WORK}/images.bootstrap.pull" docker-archive true
+pull_list "${WORK}/images.regular.pull" oci false
+
+# --- lock --------------------------------------------------------------------------------------
+jq -r '.ref + "@" + .digest + " " + .slug' "${WORK}/images.jsonl" | LC_ALL=C sort > "${OCI_OUT}/images.lock"
+# slugs must be unique across both stores
+[[ -z "$(jq -r .slug "${WORK}/images.jsonl" | sort | uniq -d)" ]] || die "two images map to the same slug"
+log "images.lock: $(wc -l < "${OCI_OUT}/images.lock") images, $(du -sh "${OCI_OUT}" | cut -f1) OCI layouts, $(du -sh "${DOCKER_OUT}" | cut -f1) bootstrap archives"

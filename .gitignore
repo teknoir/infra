@@ -11,3 +11,7 @@ teknoir-argo.yaml
 *.tgz
 infra_.yaml
 *.pem
+# airgap bundle build output (airgap/build/make-bundle.sh) and its staging dirs;
+# the download cache lives in ~/.cache/teknoir-airgap
+/dist/
+.staging-*/

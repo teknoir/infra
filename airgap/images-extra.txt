@@ -1,32 +1,29 @@
-# Extra images that `helm template` does not reveal (sidecars, injected images,
-# runtime-only pulls). One image reference per line; `#` starts a comment.
-# Merged and deduplicated with the template-extracted list by collect-images.sh.
-
-# Istio sidecar proxy — injected by istiod at pod creation, never appears in
-# rendered chart output.
-docker.io/istio/proxyv2:1.29.2
-
-# K3s sandbox (pause) container.
-docker.io/rancher/mirrored-pause:3.6
+# Extra images that `helm template` of the pinned charts does not reveal
+# (runtime-only pulls). One image reference per line; `#` starts a comment.
+# airgap/build/collect-images.sh merges them with the images extracted from
+# every rendered Application and pulls each one single-platform.
+#
+# The bootstrap-tier extras (istio sidecar proxyv2, the k3s pause image and
+# the toolbox) are listed in airgap/versions.env BOOTSTRAP_EXTRA_IMAGES, not
+# here: they ship as containerd-importable archives in node/bootstrap-images.
 
 # Generic init/debug helper used by several charts' init containers.
 docker.io/library/busybox:1.36.1
 
 # Redis backing oauth2-proxy sessions (auth chart).
-docker.io/redis:7.2-alpine
+docker.io/library/redis:7.2-alpine
 
 # Keycloak Postgres database (auth chart).
-docker.io/postgres:16
+docker.io/library/postgres:16
 
 # Config reloader sidecar that prometheus-operator v0.89.0 (monitoring 0.0.4,
-# kube-prometheus-stack 82.18.0) injects into Prometheus/Alertmanager pods. It
-# is passed as an operator arg (--prometheus-config-reloader=), which
-# collect-images.sh now extracts too; pinned here as well because without it
-# Prometheus and Alertmanager stay in ImagePullBackOff. Keep in step with the operator.
+# kube-prometheus-stack 82.18.0) injects into Prometheus/Alertmanager pods. The
+# operator gets it as --prometheus-config-reloader=, which the extraction reads
+# too; pinned here as well because without it Prometheus and Alertmanager stay
+# in ImagePullBackOff. Keep in step with the operator.
 quay.io/prometheus-operator/prometheus-config-reloader:v0.89.0
 
-# NOTE: harbor trivy adapter pulls its vulnerability database (trivy-db) from
-# ghcr.io/aquasecurity/trivy-db at scan time. That is an OCI *artifact*, not a
-# runnable image; mirror it manually with
-#   crane cp ghcr.io/aquasecurity/trivy-db:2 harbor.teknoir.airgapped/ghcr/aquasecurity/trivy-db:2
-# or disable scanning / accept stale DB in the air gap.
+# NOTE: the Harbor trivy adapter pulls its vulnerability database
+# (ghcr.io/aquasecurity/trivy-db:2) at scan time. That is an OCI artifact, not
+# a runnable image, so it is not mirrored: scanning runs with a stale or no DB
+# in the air gap.
