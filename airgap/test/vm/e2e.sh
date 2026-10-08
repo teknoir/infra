@@ -114,12 +114,17 @@ tk() {
   # would name the real teknoir-local node). While no host key is pinned,
   # the first-use confirmation is given with --host-key and the VM's
   # fingerprint (no terminal here). stdin is /dev/null.
-  local dir="$1" cmd="$2"
+  local dir="$1" cmd="$2" site="${SITE_FILE}"
   local -a hk=()
   shift 2
+  # the bundle carries site/vmtest.env (same domain): use it as the runbook does
+  if [[ -f "${dir}/site/vmtest.env" ]]; then
+    site=site/vmtest.env
+    cmp -s "${dir}/site/vmtest.env" "${SITE_FILE}" || tl_warn "the bundle's site/vmtest.env differs from ${LAN_SITE}"
+  fi
   if ! host_pinned && [[ " $* " != *" --host-key "* ]]; then hk=(--host-key "$(vm_host_fp)"); fi
   # shellcheck disable=SC2086  # E2E_UP_FLAGS is a flag list
-  lan "${dir}" ./teknoir-airgap "${cmd}" --site "${SITE_FILE}" ${hk[@]+"${hk[@]}"} ${E2E_UP_FLAGS:-} "$@" </dev/null
+  lan "${dir}" ./teknoir-airgap "${cmd}" --site "${site}" ${hk[@]+"${hk[@]}"} ${E2E_UP_FLAGS:-} "$@" </dev/null
 }
 
 up_in() {

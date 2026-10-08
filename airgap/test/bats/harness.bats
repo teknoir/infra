@@ -161,7 +161,9 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
   local calls
   calls="$(grep -nE '^[^#]*[^`]\./teknoir-airgap ' "${E2E}" | grep -v '^\S*:[[:space:]]*#' || true)"
   [ "$(grep -c . <<<"${calls}")" -eq 1 ]
-  [[ "${calls}" == *'lan "${dir}" ./teknoir-airgap "${cmd}" --site "${SITE_FILE}"'* ]]
+  [[ "${calls}" == *'lan "${dir}" ./teknoir-airgap "${cmd}" --site "${site}"'* ]]
+  # ${site} is the bundle's site/vmtest.env or the repo copy, never empty
+  grep -q 'local dir="$1" cmd="$2" site="${SITE_FILE}"' "${E2E}"
 }
 
 # ---------------------------------------------------------------------------

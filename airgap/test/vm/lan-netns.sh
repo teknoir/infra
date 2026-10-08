@@ -135,7 +135,9 @@ up() {
 
 down() {
   if ns_exists; then as_root ip netns del "${NS}"; log "deleted netns ${NS}"; fi
-  if ip link show "${VETH_HOST}" >/dev/null 2>&1; then as_root ip link del "${VETH_HOST}"; fi
+  # deleting the namespace removes the veth pair asynchronously: the host end
+  # may vanish between the check and the delete
+  if ip link show "${VETH_HOST}" >/dev/null 2>&1; then as_root ip link del "${VETH_HOST}" 2>/dev/null || true; fi
   if [[ -d "${ETC}" ]]; then as_root rm -rf "${ETC}"; log "removed ${ETC}"; fi
   if [[ -d /etc/netns ]]; then as_root rmdir --ignore-fail-on-non-empty /etc/netns; fi
   while as_root iptables -C FORWARD "${RULE[@]}" 2>/dev/null; do as_root iptables -D FORWARD "${RULE[@]}"; log "removed the FORWARD accept rule"; done
