@@ -24,8 +24,11 @@
 # The admin password is read from Secret teknoir-system/harbor-secret into a
 # variable only. curl gets it through a config on a pipe (-K <(...)), crane
 # and helm through --password-stdin into a DOCKER_CONFIG / HELM_REGISTRY_CONFIG
-# in a 0700 mktemp directory that an EXIT trap removes; the operator's
-# ~/.docker and ~/.config/helm are never touched. Nothing prints a credential.
+# in a 0700 mktemp directory; the operator's ~/.docker and ~/.config/helm are
+# never touched. Nothing prints a credential. The directory is removed at the
+# end of the phase and, after a die, by the runner's at_exit list (common.sh);
+# without at_exit, by a step chained onto the EXIT trap that keeps the exit
+# status for the runner's own handler.
 
 HARBOR_CHART_PROJECT="teknoir"
 HARBOR_MIRRORS="${HARBOR_MIRRORS:-docker.io=dockerhub ghcr.io=ghcr gcr.io=gcr quay.io=quay registry.k8s.io=k8s}"
@@ -37,6 +40,8 @@ HARBOR_CHART_MEDIA_TYPE="application/vnd.cncf.helm.chart.content.v1.tar+gzip"
 HARBOR_TMP=""
 HARBOR_PW=""
 HARBOR_PREV_EXIT=""
+HARBOR_TRAP_CHAINED=0
+HARBOR_AT_EXIT=0
 
 phase_harbor() {
   local force="${HARBOR_FORCE_IMAGES:-0}"
@@ -68,19 +73,26 @@ phase_harbor() {
 
 # --- session: credentials, temp dir, tools ------------------------------------
 
-harbor_session_begin() {
-  [[ -z "${HARBOR_TMP}" ]] || return 0
+harbor_init() {
+  # hosts and bundled tools; no credentials
   HARBOR_HOST="${HARBOR_HOST:-harbor.${TEKNOIR_DOMAIN}}"
   HARBOR_API="${HARBOR_API:-https://${HARBOR_HOST}/api/v2.0}"
   HARBOR_REGISTRY="${HARBOR_REGISTRY:-${HARBOR_HOST}}"
   HARBOR_CRANE="$(harbor_tool crane)" || exit 1
   HARBOR_HELM="$(harbor_tool helm)" || exit 1
   HARBOR_JQ="$(harbor_tool jq)" || exit 1
+}
+
+harbor_session_begin() {
+  [[ -z "${HARBOR_TMP}" ]] || return 0
+  harbor_init
   HARBOR_PW="$(secret_value "${HARBOR_SECRET_NS}" "${HARBOR_SECRET_NAME}" HARBOR_ADMIN_PASSWORD)" \
     || die "cannot read the Harbor admin password from Secret ${HARBOR_SECRET_NS}/${HARBOR_SECRET_NAME}"
   [[ -n "${HARBOR_PW}" ]] || die "Secret ${HARBOR_SECRET_NS}/${HARBOR_SECRET_NAME} has an empty HARBOR_ADMIN_PASSWORD"
   [[ "${HARBOR_PW}" != *$'\n'* ]] || die "the Harbor admin password contains a newline"
-  harbor_trap_install
+  # the runner's exit-time leak check proves it never reached the log
+  if declare -F mark_sensitive >/dev/null; then mark_sensitive "${HARBOR_PW}"; fi
+  harbor_cleanup_register
   HARBOR_TMP="$(mktemp -d)" || die "mktemp failed"
   chmod 0700 "${HARBOR_TMP}"
   mkdir -p "${HARBOR_TMP}/docker" "${HARBOR_TMP}/helm/config" "${HARBOR_TMP}/helm/cache" "${HARBOR_TMP}/helm/data"
@@ -88,28 +100,56 @@ harbor_session_begin() {
 }
 
 harbor_session_end() {
-  harbor_session_cleanup
-  if [[ -n "${HARBOR_PREV_EXIT}" ]]; then
-    # shellcheck disable=SC2064  # restore the runner's own EXIT trap verbatim
-    trap -- "${HARBOR_PREV_EXIT}" EXIT
-  else
-    trap - EXIT
+  harbor_session_wipe
+  if [[ "${HARBOR_TRAP_CHAINED}" == "1" ]]; then
+    # put the runner's own EXIT trap back, verbatim
+    if [[ -n "${HARBOR_PREV_EXIT}" ]]; then
+      trap -- "${HARBOR_PREV_EXIT}" EXIT
+    else
+      trap - EXIT
+    fi
+    HARBOR_TRAP_CHAINED=0
+    HARBOR_PREV_EXIT=""
   fi
-  HARBOR_PREV_EXIT=""
 }
 
-harbor_session_cleanup() {
+harbor_session_wipe() {
+  # remove the temp dir (registry logins) and forget the password; always 0
   if [[ -n "${HARBOR_TMP}" ]]; then
-    rm -rf -- "${HARBOR_TMP}"
+    rm -rf -- "${HARBOR_TMP}" || true
   fi
   HARBOR_TMP=""
   HARBOR_PW=""
 }
 
+harbor_exit_cleanup() {
+  # EXIT-trap step: wipe the session and return the status the shell is
+  # exiting with, so the next step of the trap (the runner's handler) sees it
+  local rc=$?
+  harbor_session_wipe
+  return "${rc}"
+}
+
+harbor_cleanup_register() {
+  # Clean up after a die too. common.sh's at_exit list runs from the runner's
+  # EXIT handler, which keeps the exit status: register there, once.
+  if declare -F at_exit >/dev/null; then
+    if [[ "${HARBOR_AT_EXIT}" != "1" ]]; then
+      at_exit harbor_session_wipe
+      HARBOR_AT_EXIT=1
+    fi
+    return 0
+  fi
+  harbor_trap_install
+}
+
 harbor_trap_install() {
-  # chain onto the runner's EXIT trap (lock, log) instead of replacing it
-  local t
+  # No at_exit: chain onto the EXIT trap. The runner's handler reads $? as the
+  # exit status, and under `set -e` a non-zero step would end the trap before
+  # it, so both branches of the `if` run it, with $? = the original status.
+  local t prev
   local -a parts=()
+  [[ "${HARBOR_TRAP_CHAINED}" != "1" ]] || return 0
   HARBOR_PREV_EXIT=""
   t="$(trap -p EXIT)"
   if [[ -n "${t}" ]]; then
@@ -117,8 +157,12 @@ harbor_trap_install() {
     eval "parts=(${t})"
     HARBOR_PREV_EXIT="${parts[2]:-}"
   fi
+  prev="${HARBOR_PREV_EXIT:-:}"
   # shellcheck disable=SC2064  # expand the previous command now
-  trap "harbor_session_cleanup${HARBOR_PREV_EXIT:+; ${HARBOR_PREV_EXIT}}" EXIT
+  trap "if harbor_exit_cleanup; then ${prev}
+else ${prev}
+fi" EXIT
+  HARBOR_TRAP_CHAINED=1
 }
 
 harbor_tool() {

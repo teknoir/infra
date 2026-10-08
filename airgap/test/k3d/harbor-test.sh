@@ -9,8 +9,9 @@
 # docker archive, skipped when present (also inside a multi-arch index),
 # refused when a mirror tag moved unless --force-images; robot$argocd kept
 # while an ArgoCD Secret uses it, deleted after; a second run changes nothing;
-# dry-run makes no mutating call; the password never appears in any output
-# and nothing is written to $HOME or left in $TMPDIR.
+# dry-run makes no mutating call; a refusal exits non-zero under a
+# runner-style EXIT handler, with and without at_exit; the password never
+# appears in any output and nothing is written to $HOME or left in $TMPDIR.
 #
 # Usage: airgap/test/k3d/harbor-test.sh [--keep]
 # Needs docker, k3d, kubectl, jq, crane, helm, python3, and internet access
@@ -63,7 +64,8 @@ harbor() {
   # run phase_harbor (or another function) like the node would, with an empty
   # HOME and a private TMPDIR so leftovers are visible
   env -i PATH="${PATH}" HOME="${WORK}/home" TMPDIR="${WORK}/tmp" \
-    KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG:-${HOME}/.kube/config}" KUBECACHEDIR="${WORK}/kcache" \
+    ${TEKNOIR_COMMON:+TEKNOIR_COMMON="${TEKNOIR_COMMON}"} STUB_NO_AT_EXIT="${STUB_NO_AT_EXIT:-0}" \
+    KUBECTL="${KCTL:-kubectl --context ${CTX}}" KUBECONFIG="${KUBECONFIG:-${HOME}/.kube/config}" KUBECACHEDIR="${WORK}/kcache" \
     NODE_ROOT="${NODE}" TEKNOIR_DOMAIN=teknoir.airgapped \
     HARBOR_API="http://127.0.0.1:${API_PORT}/api/v2.0" HARBOR_REGISTRY="${REG}" HARBOR_HELM_OPTS="--plain-http" \
     HARBOR_HOST="${REG}" K3S_DATA_DIR="${WORK}/k3s" MIGRATE_LEGACY_HOME="${WORK}/legacy-home" MIGRATE_ARGOCD_TIMEOUT=60 \
@@ -148,8 +150,13 @@ check "same files, packed differently: kept" grep -q "chart demo 0.1.0: Harbor's
 echo "# changed" >> "${WORK}/src/demo/values.yaml"
 th package "${WORK}/src/demo" -d "${WORK}/src" >/dev/null
 th push "${WORK}/src/demo-0.1.0.tgz" "oci://${REG}/teknoir" --plain-http >/dev/null 2>&1
-if harbor phase_harbor > "${WORK}/out/run5.log" 2>&1; then bad "a different chart under the same version is refused"; else
-  check "a different chart under the same version is refused" grep -q 'Harbor already holds a DIFFERENT chart under: demo 0.1.0' "${WORK}/out/run5.log"
+# the stub driver exits like the runner (EXIT handler, at_exit list): a
+# refusal must leave it non-zero, also when harbor.sh chains onto the trap
+if harbor phase_harbor > "${WORK}/out/run5.log" 2>&1; then bad "a different chart under the same version is refused (exit != 0)"; else
+  check "a different chart under the same version is refused (exit != 0)" grep -q 'Harbor already holds a DIFFERENT chart under: demo 0.1.0' "${WORK}/out/run5.log"
+fi
+if STUB_NO_AT_EXIT=1 harbor phase_harbor > "${WORK}/out/run5b.log" 2>&1; then bad "without at_exit too, the refusal exits != 0"; else
+  check "without at_exit too, the refusal exits != 0 and the handler reports it" bash -c "grep -q 'Harbor already holds a DIFFERENT chart' '${WORK}/out/run5b.log' && grep -q 'phase_harbor failed (exit 1)' '${WORK}/out/run5b.log'"
 fi
 
 say "images: a moved mirror tag is refused unless --force-images"
