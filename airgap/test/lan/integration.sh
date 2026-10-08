@@ -57,6 +57,8 @@ before-up)
   expect_rc 0 "credentials" "${T}" credentials keycloak-admin --out /tmp/out0/keycloak-admin.txt
   check "the credential file has the value" grep -qx 's3cr3t-keycloak-admin-value' /tmp/out0/keycloak-admin.txt
   expect_rc 0 "rotate" "${T}" rotate oauth2-proxy-cookie
+  expect_rc 0 "admin-user" "${T}" admin-user --email first.admin@teknoir.ai --out /tmp/out0/admin.txt
+  check "the temporary password is in the file" grep -qx 's3cr3t-temporary-password' /tmp/out0/admin.txt
   expect_rc 0 "status" "${T}" status
   expect_out "fake status --site /var/lib/teknoir-airgap/site/teknoir-local.env" "status runs teknoir-node with the site config"
   ;;
@@ -124,10 +126,20 @@ secrets)
   expect_rc 1 "credentials into the bundle directory" "${T}" credentials platform-admin --out "${B}/secret.txt"
   expect_out "refusing to write into the bundle directory" "refuses the bundle directory"
   expect_rc 1 "credentials to a terminal device" "${T}" credentials platform-admin --out /dev/null
-  expect_rc 0 "admin-user --email --out" "${T}" admin-user --email anders.aslund@teknoir.ai --out /tmp/out/admin.txt
+  expect_rc 0 "admin-user --email (mixed case) --out" "${T}" admin-user --email Anders.Aslund@Teknoir.AI --out /tmp/out/admin.txt
+  expect_out "admin user anders.aslund@teknoir.ai is set up" "uses the address in lower case"
+  expect_out "creating User anders.aslund-at-teknoir.ai" "the runner's log reaches the operator"
   check "the temporary password is in the file" grep -qx 's3cr3t-temporary-password' /tmp/out/admin.txt
   check "the admin file is 0600" test "$(mode_of /tmp/out/admin.txt)" = 600
   expect_no_out "s3cr3t" "the temporary password is not printed"
+  expect_rc 2 "admin-user with '_' in the address (the node refuses it)" "${T}" admin-user --email a_b@teknoir.ai --out /tmp/out/x.txt
+  expect_rc 1 "admin-user that fails on the node" "${T}" admin-user --email fail@teknoir.ai --out /tmp/out/fail.txt
+  expect_out "teknoir-node admin-user failed on the node" "reports the failure"
+  check "no --out file after a failure" test ! -e /tmp/out/fail.txt
+  check "no temporary file left next to --out" sh -c '! ls -A /tmp/out | grep -q "^\.teknoir-airgap\."'
+  expect_rc 0 "admin-user for a user without a temporary password" "${T}" admin-user --email existing@teknoir.ai --out /tmp/out/existing.txt
+  expect_out "recorded no temporary password" "says that no password was written"
+  check "no --out file without a password" test ! -e /tmp/out/existing.txt
   ;;
 passthrough)
   section "rotate, migrate and up flags reach teknoir-node"

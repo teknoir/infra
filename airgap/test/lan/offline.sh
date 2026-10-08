@@ -25,6 +25,13 @@ expect_rc 2 "option the command does not take" "${T}" status --print
 expect_rc 2 "unknown option" "${T}" up --bogus
 expect_rc 2 "credentials without a name" "${T}" credentials --out /tmp/x
 expect_rc 2 "admin-user with '+' in the address" "${T}" admin-user --email a+b@example.com --out /tmp/x
+expect_rc 2 "admin-user with '_' in the address (the node refuses it)" "${T}" admin-user --email a_b@example.com --out /tmp/x
+expect_out "no '_' or '+'" "explains the address rule"
+expect_rc 2 "admin-user with '..' in the address" "${T}" admin-user --email a..b@example.com --out /tmp/x
+expect_rc 2 "admin-user with a leading '-'" "${T}" admin-user --email -a@example.com --out /tmp/x
+expect_rc 2 "admin-user without a top-level domain" "${T}" admin-user --email a@example --out /tmp/x
+expect_rc 2 "admin-user with an address whose User name exceeds 63 characters" "${T}" admin-user --email "$(printf 'a%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50)@example.com" --out /tmp/x
+expect_out "at most 63 characters" "explains the length limit"
 
 section "verify"
 expect_rc 0 "verify, list-format MANIFEST" "${T}" verify
@@ -116,5 +123,11 @@ expect_out "fake converge .*--dry-run" "the runner sees --dry-run"
 expect_rc 0 "status --local uses the runner" "${T}" status --local
 expect_out "fake status --site" "status calls teknoir-node status"
 expect_rc 2 "kubeconfig refuses --local" "${T}" kubeconfig --local
+expect_rc 0 "admin-user --local (busybox tools for the node's private tmp dir)" "${T}" admin-user --local --email Admin@Example.com --out /tmp/admin.txt
+check "the temporary password is in the --out file" grep -qx 's3cr3t-temporary-password' /tmp/admin.txt
+check "the --out file is 0600" test "$(stat -c %a /tmp/admin.txt)" = 600
+# shellcheck disable=SC2016  # expanded by sh -c
+check "the private tmp dir is 0700 and empty" sh -c 'test "$(stat -c %a /var/lib/teknoir-airgap/tmp)" = 700 && test -z "$(ls -A /var/lib/teknoir-airgap/tmp)"'
+expect_no_out "s3cr3t" "the temporary password is not printed"
 
 summary

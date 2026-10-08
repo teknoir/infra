@@ -150,7 +150,7 @@ EOF
   node_check "the site config on the node is the bundle's" "cmp -s ${bb}/site/teknoir-local.env ${site}"
   node_check "no converge ran" '! grep -q " converge " /var/log/teknoir-airgap-fake-runner.log'
   node_check "backup, migrate, credentials, rotate and status ran with the site config" \
-    "for c in 'backup --export --take' 'migrate --site ${site} --dry-run' 'credentials keycloak-admin --site ${site}' 'rotate oauth2-proxy-cookie --site ${site}' 'status --site ${site}'; do grep -q \"uid=0 \$c\" /var/log/teknoir-airgap-fake-runner.log || exit 1; done"
+    "for c in 'backup --export --take' 'migrate --site ${site} --dry-run' 'credentials keycloak-admin --site ${site}' 'rotate oauth2-proxy-cookie --site ${site}' 'admin-user --email first.admin@teknoir.ai --out ' 'status --site ${site}'; do grep -q \"uid=0 \$c\" /var/log/teknoir-airgap-fake-runner.log || exit 1; done"
   docker exec "${node}" sh -c "echo 'NODE_IP=10.9.9.9  # stale' >>${site}"
   phase site-refresh-credentials
   node_check "credentials replaced the stale site config" "cmp -s ${bb}/site/teknoir-local.env ${site}"
@@ -178,7 +178,11 @@ EOF
   node_check "migrate passes --undo NAME" 'grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --undo teknoir-coredns-custom$" /var/log/teknoir-airgap-fake-runner.log'
   node_check "up passes every converge flag in order" \
     'grep -q "converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --lan-user root --rollback --sync-clock --reapply istio --force-images --dry-run --extra-flag$" /var/log/teknoir-airgap-fake-runner.log'
-  node_check "admin-user passes --email" 'grep -q "admin-user --email anders.aslund@teknoir.ai --site " /var/log/teknoir-airgap-fake-runner.log'
+  node_check "admin-user passes --email in lower case, --out in the private tmp dir, --site" \
+    'grep -q "admin-user --email anders.aslund@teknoir.ai --out /var/lib/teknoir-airgap/tmp/admin-user\.[A-Za-z0-9]* --site /var/lib/teknoir-airgap/site/teknoir-local.env$" /var/log/teknoir-airgap-fake-runner.log'
+  node_check "the node's tmp dir is root-only and empty after admin-user (also after a failure)" \
+    'test "$(stat -c %U:%a /var/lib/teknoir-airgap/tmp)" = root:700 && test -z "$(ls -A /var/lib/teknoir-airgap/tmp)"'
+  node_check "the state dir keeps mode 0755" 'test "$(stat -c %a /var/lib/teknoir-airgap)" = 755'
   phase status
   phase trust
   phase backup

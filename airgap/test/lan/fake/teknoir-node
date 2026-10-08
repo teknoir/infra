@@ -1,12 +1,16 @@
 #!/bin/sh
 # Fake node runner for the teknoir-airgap LAN tests: records how it was called
-# and answers like the real one (airgap/node/bin/teknoir-node): secrets on
-# stdout only when stdout is a pipe, backup --export needs a terminal.
+# and answers like the real one (airgap/node/bin/teknoir-node): stdout is the
+# log (sent to stderr) except for credentials and backup; secrets on stdout
+# only when stdout is a pipe; admin-user needs --out FILE and writes the
+# temporary password only there; backup --export needs a terminal.
 log=/var/log/teknoir-airgap-fake-runner.log
 printf '%s uid=%s %s\n' "$(date -u +%H:%M:%S)" "$(id -u)" "$*" >>"$log"
 [ "$(id -u)" = 0 ] || { echo "fake teknoir-node: not root" >&2; exit 1; }
 here=$(cd "$(dirname "$0")" && pwd)
 cmd=$1; shift
+# like setup_logging in the real runner
+case $cmd in credentials|backup) ;; *) exec 1>&2 ;; esac
 site='' prev='' export=0 take=0 stream='' keep=0
 for a in "$@"; do
   [ "$prev" = --site ] && site=$a
@@ -25,9 +29,30 @@ case $cmd in
     if [ -t 1 ]; then echo "refusing to print a secret to a terminal" >&2; exit 1; fi
     printf 's3cr3t-%s-value\n' "$1" ;;
   admin-user)
-    if [ -t 1 ]; then echo "refusing to print a secret to a terminal" >&2; exit 1; fi
-    echo "creating the admin user" >&2
-    printf 's3cr3t-temporary-password\n' ;;
+    # like lib/admin.sh; special addresses: fail@ fails after creating the
+    # User, existing@ has no temporary password (the node only warns)
+    email='' out=''
+    while [ $# -gt 0 ]; do
+      case $1 in --email) email=$2; shift ;; --out) out=$2; shift ;; esac
+      shift
+    done
+    [ -n "$email" ] || { echo "admin-user: --email is required" >&2; exit 1; }
+    [ -n "$out" ] || { echo "admin-user: --out FILE is required (the temporary password is never printed)" >&2; exit 1; }
+    printf '%s\n' "$email" | grep -Eq '^[a-z0-9]+([.-][a-z0-9]+)*@[a-z0-9]+([.-][a-z0-9]+)*\.[a-z]{2,}$' \
+      || { echo "admin-user: $email: only a-z, 0-9, '.' and '-' are supported" >&2; exit 1; }
+    if [ -L "$out" ] || [ -d "$out" ]; then echo "admin-user: --out $out is a symlink or a directory" >&2; exit 1; fi
+    [ -d "$(dirname "$out")" ] || { echo "admin-user: directory $(dirname "$out") does not exist" >&2; exit 1; }
+    echo "creating User ${email%@*}-at-${email#*@} (superadmin)"
+    case $email in
+      fail@*) echo "admin-user: timed out waiting for user-controller" >&2; exit 1 ;;
+      existing@*) echo "WARN: User records no temporary password: set one in Keycloak" >&2; exit 0 ;;
+    esac
+    t=$(mktemp "$(dirname "$out")/.teknoir-admin-user.XXXXXX") || exit 1
+    chmod 600 "$t"
+    printf 's3cr3t-temporary-password\n' >"$t"
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then chown "$SUDO_USER:" "$t"; fi
+    mv -f "$t" "$out"
+    echo "temporary password of $email written to $out (mode 0600, not shown)" ;;
   backup)
     b=/var/lib/teknoir-airgap/backups e=/var/lib/teknoir-airgap/exports
     if [ -n "$stream" ]; then

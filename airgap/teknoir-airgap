@@ -23,7 +23,11 @@
 #               [--force-images] [ARGS given after --]
 #   status      --site FILE --lan-time EPOCH
 #   credentials NAME --site FILE           value on stdout (a pipe, never a tty)
-#   admin-user  --email ADDR --site FILE   temporary password on stdout
+#   admin-user  --email ADDR --out FILE --site FILE
+#               the temporary password goes to FILE: a fresh root-only file
+#               in /var/lib/teknoir-airgap/tmp (0700) that teknoir-airgap then
+#               copies to the LAN host and deletes. The runner's stdout is its
+#               log here, never data.
 #   backup     --export --take --site FILE   (tty: age asks for a passphrase)
 #               new backup, encrypted to /var/lib/teknoir-airgap/exports/
 #               teknoir-backup-<ts>.tar.age
@@ -148,7 +152,9 @@ Options for trust:
 Options for credentials, admin-user and backup:
   --out FILE|DIR        Where to write: a file for credentials and admin-user, a
                         directory for backup. Required.
-  --email ADDRESS       admin-user: the new admin's e-mail address (the login).
+  --email ADDRESS       admin-user: the new admin's e-mail address (the login),
+                        used in lower case: letters, digits, '.' and '-'
+                        around one '@' (no '_' or '+').
 
 Options for rotate:
   --i-know              Confirm a rotation with side effects (Harbor secretKey,
@@ -189,8 +195,17 @@ TMPD=
 MASTER_UP=0
 SSH_OPTS=()
 NODE=
+# A file on the node, and one on this computer, that may hold a secret on its
+# way here: removed on any exit until the copy is complete.
+REMOTE_TMP=
+LOCAL_TMP=
 cleanup() {
   local rc=$?
+  if [ -n "${LOCAL_TMP}" ]; then rm -f "${LOCAL_TMP}"; fi
+  if [ -n "${REMOTE_TMP}" ]; then
+    node_sh pipe 'rm -f "$1"' "${REMOTE_TMP}" </dev/null >/dev/null 2>&1 \
+      || warn "could not remove ${REMOTE_TMP} on the node; remove it there (it may hold a temporary password)"
+  fi
   if [ "${MASTER_UP}" = 1 ]; then
     ssh "${SSH_OPTS[@]}" -O exit "${NODE}" >/dev/null 2>&1 || true
   fi
@@ -1349,6 +1364,29 @@ out_file_prepare() {
 }
 OUT_ABS=
 
+# Root-only scratch directory on the node for a secret on its way to the LAN
+# host. Files older than an hour are left-overs of an interrupted run.
+NODE_TMP=${NODE_STATE_DIR}/tmp
+NODE_MKTEMP_SCRIPT='
+d=$1; p=$2
+umask 022
+mkdir -p "$(dirname "$d")" || exit 1
+umask 077
+mkdir -p "$d" && chmod 700 "$d" || exit 1
+find "$d" -type f -name "$p.*" -mmin +60 -exec rm -f {} \; 2>/dev/null
+mktemp "$d/$p.XXXXXX"
+'
+# node_mktemp PREFIX: a new empty root-only file in NODE_TMP on the node; prints its path.
+node_mktemp() {
+  local p
+  p=$(node_sh pipe "${NODE_MKTEMP_SCRIPT}" "${NODE_TMP}" "$1" </dev/null 2>"${TMPD}/mktemp.err" | tail -n 1) || p=
+  case "${p}" in
+    "${NODE_TMP}/$1."*[!A-Za-z0-9._/-]*|"${NODE_TMP}/$1.") die "unexpected file name from mktemp on the node: ${p}" ;;
+    "${NODE_TMP}/$1."*) printf '%s\n' "${p}" ;;
+    *) sed 's/^/  node: /' "${TMPD}/mktemp.err" >&2; die "could not create a private file in ${NODE_TMP} on the node" ;;
+  esac
+}
+
 # secret_run OUT tty|pipe ARGS...: run teknoir-node ARGS and store its stdout in OUT (0600).
 secret_run() {
   local out=$1 tmp rc=0
@@ -1373,20 +1411,46 @@ cmd_credentials() {
   log "wrote credential ${name} to ${OUT_ABS} (mode 0600); delete the file when you no longer need it"
 }
 
+# email_check ADDRESS (lower case): the rule teknoir-node admin-user applies.
+# The User name is the address with '@' -> '-at-': a Kubernetes name and a
+# Backstage entity name (at most 63 characters, no '_' or '+').
+email_check() {
+  local e=$1
+  case "${e}" in
+    *[!a-z0-9.@-]*) usage_error "--email ${OPT_EMAIL}: use only letters, digits, '.' and '-' around one '@' (no '_' or '+': the address becomes a Kubernetes and Backstage entity name)" ;;
+  esac
+  printf '%s\n' "${e}" | grep -Eq '^[a-z0-9]+([.-][a-z0-9]+)*@[a-z0-9]+([.-][a-z0-9]+)*\.[a-z]{2,}$' \
+    || usage_error "--email ${OPT_EMAIL} is not an e-mail address of the form name@domain.tld ('.' and '-' only between letters or digits)"
+  [ ${#e} -le 60 ] || usage_error "--email ${OPT_EMAIL} is too long: the user name (the address with @ -> -at-) must be at most 63 characters"
+}
+
 cmd_admin_user() {
+  local email rc=0
   [ "$(npos)" -eq 0 ] || usage_error "admin-user takes no arguments besides --email and --out"
   [ -n "${OPT_EMAIL}" ] || usage_error "admin-user needs --email ADDRESS"
-  case "${OPT_EMAIL}" in
-    *[!A-Za-z0-9._@-]*) usage_error "--email ${OPT_EMAIL}: use letters, digits, '.', '_', '-' and one '@' (no '+'; the address becomes a Backstage entity name)" ;;
-    *@*@*|@*|*@|*@*.) usage_error "--email ${OPT_EMAIL} is not an e-mail address" ;;
-    *@*.*) ;;
-    *) usage_error "--email ${OPT_EMAIL} is not an e-mail address" ;;
-  esac
+  email=$(printf '%s' "${OPT_EMAIL}" | tr '[:upper:]' '[:lower:]')
+  email_check "${email}"
   common_open
   out_file_prepare "${OPT_OUT}"
+  LOCAL_TMP=$(mktemp "$(dirname "${OUT_ABS}")/.teknoir-airgap.XXXXXX") || die "cannot create a file next to ${OUT_ABS}"
+  chmod 600 "${LOCAL_TMP}"
   node_prepare
-  secret_run "${OUT_ABS}" admin-user --email "${OPT_EMAIL}" --site "${REMOTE_SITE}"
-  log "admin user ${OPT_EMAIL} is set up; its temporary password is in ${OUT_ABS} (mode 0600)"
+  # The runner writes the password into a root-only file on the node (its
+  # stdout is its log); this side copies that file and deletes it.
+  REMOTE_TMP=$(node_mktemp admin-user) || exit 1
+  log "setting up admin ${email} on the node (teknoir-node admin-user waits for user-controller and Keycloak)"
+  run_runner tty admin-user --email "${email}" --out "${REMOTE_TMP}" --site "${REMOTE_SITE}" >&2 || rc=$?
+  [ "${rc}" -eq 0 ] || die "teknoir-node admin-user failed on the node (exit ${rc}); fix the cause it reports and run the command again (it resumes)"
+  node_sh pipe 'cat "$1" && rm -f "$1"' "${REMOTE_TMP}" </dev/null >"${LOCAL_TMP}" 2>"${TMPD}/fetch.err" \
+    || { sed 's/^/  node: /' "${TMPD}/fetch.err" >&2; die "could not copy the temporary password from the node; run the command again"; }
+  REMOTE_TMP=
+  if [ ! -s "${LOCAL_TMP}" ]; then
+    warn "the node recorded no temporary password for ${email} (see its message above); ${OUT_ABS} was not written"
+    return 0
+  fi
+  mv -f "${LOCAL_TMP}" "${OUT_ABS}"
+  LOCAL_TMP=
+  log "admin user ${email} is set up; its temporary password is in ${OUT_ABS} (mode 0600)"
   log "sign in at https://${TEKNOIR_DOMAIN}/ ; Keycloak asks for a new password at the first login"
 }
 
