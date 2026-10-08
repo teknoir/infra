@@ -175,6 +175,8 @@ fetch_artifact() {
     return 0
   fi
   mkdir -p "${dir}"
+  # leftovers of a killed download are never used; drop stale ones
+  find "${dir}" -maxdepth 1 -name '.download.*' -mmin +60 -delete
   up="$(upstream_sha)"
   if [[ -n "${A_SUMS}" && -z "${up}" ]]; then
     die "${A_NAME} is not listed in ${A_SUMS}"
