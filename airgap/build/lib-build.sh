@@ -75,6 +75,7 @@ unset _v _pin_env
 #   tools/<key>/<file>        verified upstream artifacts (key carries the version)
 #   images/oci/<digest-hex>/  single-platform OCI layouts, keyed by manifest digest
 #   images/docker/<hex>-<slug>.tar  docker archives (the tag is in RepoTags)
+#   images/manifests/<hex>.json   raw manifests and indexes, keyed by their digest
 #   helm/                     isolated HELM_{CACHE,CONFIG,DATA}_HOME
 CACHE_DIR="${TEKNOIR_AIRGAP_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/teknoir-airgap}"
 

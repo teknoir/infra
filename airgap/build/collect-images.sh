@@ -106,19 +106,44 @@ fi
 echo "${INCOMPLETE}" > "${WORK}/images.incomplete"
 
 # --- resolve ------------------------------------------------------------------------
+cached_manifest() {
+  # cached_manifest <repo> <digest> — path of the raw manifest (immutable for
+  # a digest), fetched once and kept in <cache>/manifests/<hex>.json
+  local repo="$1" digest="$2" f tmp
+  f="${IMG_CACHE}/manifests/${digest#sha256:}.json"
+  if [[ -f "${f}" && "sha256:$(sha256_file "${f}")" == "${digest}" ]]; then
+    echo "${f}"
+    return 0
+  fi
+  mkdir -p "${IMG_CACHE}/manifests"
+  tmp="${f}.tmp.$$"
+  crane manifest "${repo}@${digest}" > "${tmp}" || { rm -f "${tmp}"; die "cannot fetch the manifest ${repo}@${digest}"; }
+  [[ "sha256:$(sha256_file "${tmp}")" == "${digest}" ]] || { rm -f "${tmp}"; die "${repo}@${digest}: the registry returned a manifest with another digest"; }
+  mv -f "${tmp}" "${f}"
+  echo "${f}"
+}
+
 resolve() {
   # resolve <ref> — sets R_INDEX (top-level digest; the index for multi-arch
-  # images) and R_PLATFORM (the manifest digest for PLATFORM)
-  local ref="$1" raw top mt
-  raw="$(crane manifest "${ref}")" || die "cannot resolve ${ref} (crane manifest failed)"
-  top="sha256:$(printf '%s' "${raw}" | sha256_stdin)"
-  mt="$(jq -r '.mediaType // (if .manifests then "index" else "manifest" end)' <<<"${raw}")"
+  # images) and R_PLATFORM (the manifest digest for PLATFORM). The tag is
+  # resolved with a HEAD request (crane digest), which registries do not
+  # count against pull rate limits; manifests are cached by digest.
+  local ref="$1" repo top m mt
+  repo="$(image_repo "${ref}")"
+  if [[ "${ref}" == *@sha256:* ]]; then
+    top="${ref##*@}"
+  else
+    top="$(crane digest "${ref}")" || die "cannot resolve ${ref} (crane digest failed)"
+  fi
+  [[ "${top}" =~ ^sha256:[0-9a-f]{64}$ ]] || die "${ref}: unexpected digest '${top}'"
+  m="$(cached_manifest "${repo}" "${top}")"
+  mt="$(jq -r '.mediaType // (if .manifests then "index" else "manifest" end)' "${m}")"
   R_INDEX="${top}"
   case "${mt}" in
     *index*|*manifest.list*)
       R_PLATFORM="$(jq -r --arg os "${P_OS}" --arg arch "${P_ARCH}" --arg v "${P_VARIANT}" '
         [.manifests[] | select(.platform.os == $os and .platform.architecture == $arch
-                               and ($v == "" or .platform.variant == $v))][0].digest // ""' <<<"${raw}")"
+                               and ($v == "" or .platform.variant == $v))][0].digest // ""' "${m}")"
       [[ -n "${R_PLATFORM}" ]] || die "${ref} has no ${PLATFORM} image (index ${top})"
       ;;
     *)
@@ -128,8 +153,8 @@ resolve() {
 }
 
 config_of() {
-  # config_of <repo@digest> — the config digest of a single-platform manifest
-  crane manifest "$1" | jq -r '.config.digest'
+  # config_of <repo> <digest> — the config digest of a single-platform manifest
+  jq -r '.config.digest' "$(cached_manifest "$1" "$2")"
 }
 
 check_platform_config() {
@@ -211,7 +236,7 @@ pull_docker() {
   # pull_docker <ref> <slug> — single-platform docker archive tagged <ref>
   local ref="$1" slug="$2" repo cfg cached tmp
   repo="$(image_repo "${ref}")"
-  cfg="$(config_of "${repo}@${R_PLATFORM}")" || die "cannot read the config of ${ref}"
+  cfg="$(config_of "${repo}" "${R_PLATFORM}")" || die "cannot read the config of ${ref}"
   cached="${IMG_CACHE}/docker/${R_PLATFORM#sha256:}-${slug}.tar"
   if [[ -f "${cached}" ]] && ! validate_docker_archive "${cached}" "${ref}" "${cfg}"; then
     warn "cache entry ${cached} is invalid; pulling again"
