@@ -649,8 +649,10 @@ Anders' approval.
 - The platform-secrets spec names the live Secrets and keys exactly, so they are
   adopted, not regenerated.
 
-**M1. Hygiene, before anything else.** Rotate the Keycloak master admin away from
-the published default password, delete the old bundle copy in
+**M1. Hygiene, before anything else.** Do not change the Keycloak master admin's
+password by hand: `migrate` carries the current one over and the first auth sync
+replaces it with a random one (M3). If it was already changed, keep the current
+password in a 0600 file for M3. Delete the old bundle copy in
 `/home/teknoir/teknoir-airgap-bundle-0.1.0` on the node (it holds the CA key and
 other secrets at mode 0644), and move any `.secrets/` and `bundle/*/bootstrap/secrets`
 copies on laptops and USB media into an encrypted backup.
@@ -668,7 +670,15 @@ kubectl --context teknoir-local get ns,secrets -A --no-headers | wc -l > before-
 kubectl --context teknoir-local get virtualservices,gateways,destinationrules,authorizationpolicies,peerauthentications,certificates,clusterissuers,applications -A --no-headers | wc -l >> before-counts.txt
 ```
 
-**M3. Detach the k3s manifest files** (the orphan Addons, the 8 legacy
+**M3. Carry the Keycloak admin over, then detach the k3s manifest files.** First,
+when `teknoir-auth/keycloak-admin` does not exist yet, `migrate` creates it with
+the admin's current password as `previous-password`, read from the keycloak
+StatefulSet and checked against Keycloak (never shown). The first `up` adds a
+random password and the auth sync rotates the admin to it; without this the
+realm import fails and every login breaks. If Keycloak refuses that password
+because it was changed by hand, run
+`./teknoir-airgap migrate --keycloak-admin-password-file FILE` (the current
+password, mode 0600, no trailing newline). Then it detaches (the orphan Addons, the 8 legacy
 `manifest-*-secret` files, the 10 `teknoir-*-secret` files, the namespaces, the
 CRDs, `coredns-custom` and the root app-of-apps; `teknoir-argo` stays until M4b).
 Each file gets a `.skip` guard, is moved to
@@ -677,7 +687,7 @@ labels, and its Addon is deleted; the object counts are checked after every
 file.
 
 ```sh
-./teknoir-airgap migrate --dry-run     # review the list
+./teknoir-airgap migrate --dry-run     # review the list; also checks the Keycloak admin password
 ./teknoir-airgap migrate
 ./teknoir-airgap migrate --undo <name> # only to re-attach one file
 ```
@@ -685,6 +695,7 @@ file.
 Verify:
 
 ```sh
+kubectl --context teknoir-local -n teknoir-auth get secret keycloak-admin   # exists (keys username, previous-password)
 kubectl --context teknoir-local get addons -n kube-system   # only k3s's own addons, plus teknoir-argo
 kubectl --context teknoir-local get crd,ns,secrets -A -l objectset.rio.cattle.io/hash --no-headers   # none of Teknoir's
 ssh teknoir@192.168.5.181 sudo ls /opt/k3s/server/manifests   # .skip guards; no Teknoir *.yaml but teknoir-argo.yaml
@@ -697,9 +708,13 @@ ssh teknoir@192.168.5.181 sudo ls /opt/k3s/server/manifests   # .skip guards; no
 ```
 
 The node creates only what is missing (the Harbor token certificate,
-`keycloak-platform-admin`, the Backstage secrets) and leaves every existing
-Secret untouched; ArgoCD adopts the CRDs and moves the wildcard Certificate to
-the cert-manager Application; harbor-core rolls once and then stops drifting.
+`keycloak-platform-admin`, the Backstage secrets, a random `password` in
+`keycloak-admin`) and leaves every existing Secret untouched; the auth sync
+rotates the Keycloak master admin to that password and imports realm `teknoir`;
+ArgoCD adopts the CRDs and moves the wildcard Certificate to the cert-manager
+Application; harbor-core rolls once and then stops drifting. One Secret goes
+away on purpose: Harbor's `harbor-registry-htpasswd`, replaced by
+`harbor-registry-auth`.
 Verify:
 
 ```sh
@@ -767,7 +782,7 @@ from a bundle copied there), `--forget-host-key`, `--host-key FINGERPRINT`.
 | `./teknoir-airgap admin-user --email ADDRESS --out FILE` | A named admin; temporary password into a 0600 file |
 | `./teknoir-airgap backup --out DIR` | Encrypted node backup copied to this host |
 | `./teknoir-airgap rotate NAME` | Replace one generated secret (`--i-know`) |
-| `./teknoir-airgap migrate` | One-time detach of the legacy k3s files (`--dry-run`, `--argo`, `--undo NAME`) |
+| `./teknoir-airgap migrate` | One-time move off the legacy k3s files (`--dry-run`, `--argo`, `--undo NAME`, `--keycloak-admin-password-file FILE`) |
 | `./teknoir-airgap doctor` | Check this LAN host and the node |
 | `./teknoir-airgap help` | The full reference |
 
