@@ -51,8 +51,9 @@ install and every update.
   harbor-core on every sync.
 - **Backstage and user-controller** ship enabled; `teknoir-airgap admin-user`
   creates the first admin; istiod and oauth2-proxy trust the platform CA.
-- **Operations.** Automatic backups before each converge and
-  `teknoir-airgap backup` (age-encrypted copy), explicit `rotate`, `status`,
+- **Operations.** An automatic backup before every converge that changes the
+  deployed bundle, `teknoir-airgap backup` (age-encrypted copy), explicit
+  `rotate`, `status`,
   `doctor`, `trust`, release record with a downgrade guard and `--rollback`.
 - **Docs.** `docs/airgap/` (BUILD, HOST-SETUP, OPERATE, this CHANGELOG) replaces
   `docs/AIRGAP-HOST-SETUP.md`, `AIRGAP-BOOTSTRAP.md` and `AIRGAP-UPDATE.md` and

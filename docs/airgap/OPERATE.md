@@ -68,7 +68,7 @@ The converge on the node runs these phases, each idempotent:
 |---|---|
 | verify | checks the payload against `node/SHA256SUMS` before changing anything |
 | preflight | `NODE_IP` is the node's address, enough free disk, clock within 30 s of the LAN host, bundle not older than the deployed release |
-| backup | on an existing cluster: a backup to `/var/lib/teknoir-airgap/backups/<ts>` (keeps 3) |
+| backup | when the cluster runs another bundle: a backup to `/var/lib/teknoir-airgap/backups/<ts>` (keeps 3) |
 | host | k3s install or upgrade (only when the version or config changes), `registries.yaml`, the CA in the OS and k3s trust, the `/etc/hosts` block, chrony, bootstrap images; restarts k3s only when its config changed |
 | cluster-base | `coredns-custom` with `NODE_IP`, missing namespaces |
 | secrets | creates the CA, the wildcard certificate placeholder and the Harbor token certificate if absent; refreshes the public CA copies |
@@ -328,11 +328,16 @@ Writes one credential to the `--out` file with mode 0600 and never prints it. It
 refuses a terminal, `-` and any path inside the bundle directory. Delete the file
 when you no longer need it, and never paste a credential into a chat or ticket.
 
-`platform-admin` is the initial Keycloak administrator in realm `teknoir` (group
-`admin`; its password must be changed at the first sign-in). The node runner
-defines the other names, such as the break-glass local administrators; on the
-node, `sudo /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/teknoir-node help`
-lists them.
+| Name | What |
+|---|---|
+| `platform-admin` | the initial Keycloak administrator in realm `teknoir` (group `admin`); its password must be changed at the first sign-in |
+| `keycloak-admin`, `keycloak-admin-username` | the Keycloak master realm administrator (break-glass) |
+| `harbor-admin` | Harbor's local `admin` (break-glass; also `https://harbor.teknoir.airgapped/account/sign-in` when OIDC is on) |
+| `argocd-admin` | ArgoCD's local `admin` (break-glass) |
+| `grafana-admin` | Grafana's local administrator |
+
+The node runner defines these names (`teknoir-node help` on the node lists
+them).
 
 ## 9. Users and Backstage sign-in
 
@@ -370,17 +375,22 @@ charts are not mirrored yet).
 
 ## 10. Backup and restore
 
-### Automatic backups on the node
+### Backups on the node
 
-Before each converge on an existing cluster, the node writes a backup to
-`/var/lib/teknoir-airgap/backups/<ts>/` (mode 0700, the last 3 are kept):
+Before a converge that changes the deployed bundle (an update, a rollback, or the
+first `up` on an existing cluster), the node writes a backup to
+`/var/lib/teknoir-airgap/backups/<UTC>/` (mode 0700, the last 3 are kept).
+Re-running the deployed bundle takes none, so the backups from before the last
+update survive. `./teknoir-airgap backup` takes one on demand. A backup holds:
 
-- dumps of the Harbor database (`harbor-database-0`) and the Keycloak database
-  (`keycloak-db-0`), taken with `kubectl exec`;
-- the k3s datastore, token and certificates from `/opt/k3s/server` (k3s is
-  stopped for a moment; running pods keep running);
-- the bootstrap-tier Secrets (the CA, `harbor-secret`, `keycloak-db-secret`,
-  `keycloak-admin`) as YAML.
+| Path in the backup | Content |
+|---|---|
+| `db/harbor.sql.gz`, `db/keycloak.sql.gz` | `pg_dumpall` of the Harbor and Keycloak databases (gzip-compressed SQL) |
+| `k3s/db/` | the k3s datastore (copied during a brief `systemctl stop k3s`; running pods keep running) |
+| `k3s/server/token`, `k3s/server/tls/`, `k3s/server/cred/` | the cluster token and certificates |
+| `k3s/etc/config.yaml`, `k3s/etc/registries.yaml` | the k3s configuration |
+| `secrets/bootstrap-secrets.json` | the Secrets a restore needs first: the CA, Harbor, Keycloak, the client secrets, oauth2-proxy, Backstage |
+| `BACKUP.info`, `SHA256SUMS` | what was backed up, and checksums |
 
 Container images and Harbor's registry blobs are not in the backup: every bundle
 carries them and `up` pushes them again.
@@ -394,6 +404,8 @@ carries them and `up` pushes them again.
 This takes a fresh backup on the node, encrypts it there with `age` (you choose a
 passphrase; it is asked twice) and copies
 `teknoir-backup-<site>-<ts>.tar.age` into the `--out` directory (mode 0600). The
+encrypted copy on the node is removed once the local file's sha256 matches it;
+if the copy fails, it stays in `/var/lib/teknoir-airgap/exports/`. The
 unencrypted backup never leaves the node. Keep the passphrase apart from the
 file, for example in your password manager: without it the backup is useless. Run
 it in a terminal; it needs one for the passphrase.
@@ -401,47 +413,47 @@ it in a terminal; it needs one for the passphrase.
 ### Restore
 
 Restore with two people and this section open; check each step's result before
-the next. The node's bundle payload provides `age` at
+the next. The restore commands run in a root shell on the node; the node's
+bundle payload provides `age` at
 `/var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/age`.
 
 1. Put the backup on the node and decrypt it there:
 
    ```sh
    scp teknoir-backup-teknoir-local-<ts>.tar.age teknoir@192.168.5.181:/tmp/
-   ssh teknoir@192.168.5.181
-   sudo install -d -m 0700 /root/restore
-   sudo /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/age -d \
+   ssh -t teknoir@192.168.5.181 sudo -i
+   install -d -m 0700 /root/restore
+   /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/age -d \
      -o /root/restore/backup.tar /tmp/teknoir-backup-teknoir-local-<ts>.tar.age
-   sudo tar -C /root/restore -xf /root/restore/backup.tar
-   sudo ls -lR /root/restore
+   tar -C /root/restore -xf /root/restore/backup.tar
    rm /tmp/teknoir-backup-teknoir-local-<ts>.tar.age
+   cd /root/restore/<ts> && sha256sum -c SHA256SUMS && cat BACKUP.info
    ```
 
-   A backup still on the node needs no decryption:
-   `/var/lib/teknoir-airgap/backups/<ts>/`.
+   A backup still on the node needs no decryption: use
+   `/var/lib/teknoir-airgap/backups/<ts>/` instead of `/root/restore/<ts>/`.
 
 2. Lost data inside a running cluster (for example a Keycloak realm or users, or
-   a Harbor project): restore only that database. Stop the application, load the
-   dump with the PostgreSQL client inside the database pod, start it again:
+   a Harbor project): restore only that database. The dumps are `pg_dumpall`
+   output, so drop the damaged database and let the dump re-create it. For
+   Keycloak (pod `keycloak-db-0`, database user in `$POSTGRES_USER` inside the
+   pod):
 
    ```sh
-   # Keycloak: database pod keycloak-db-0, user = key "username" of teknoir-auth/keycloak-db-secret
-   sudo k3s kubectl -n teknoir-auth scale statefulset keycloak --replicas=0
-   sudo k3s kubectl -n teknoir-auth exec -i keycloak-db-0 -- \
-     pg_restore --clean --if-exists -U <user> -d <database> < /root/restore/<ts>/<keycloak dump>
-   sudo k3s kubectl -n teknoir-auth scale statefulset keycloak --replicas=1
-
-   # Harbor: database pod harbor-database-0, user postgres, database registry
-   sudo k3s kubectl -n teknoir-system scale deploy harbor-core harbor-jobservice --replicas=0
-   sudo k3s kubectl -n teknoir-system exec -i harbor-database-0 -- \
-     pg_restore --clean --if-exists -U postgres -d registry < /root/restore/<ts>/<harbor dump>
-   sudo k3s kubectl -n teknoir-system scale deploy harbor-core harbor-jobservice --replicas=1
+   cd /root/restore/<ts>
+   gunzip -c db/keycloak.sql.gz | grep '^CREATE DATABASE'      # the database name
+   k3s kubectl -n teknoir-auth scale statefulset keycloak --replicas=0
+   k3s kubectl -n teknoir-auth exec keycloak-db-0 -- \
+     sh -c 'psql -U "$POSTGRES_USER" -d postgres -c "DROP DATABASE <name>"'
+   gunzip -c db/keycloak.sql.gz | k3s kubectl -n teknoir-auth exec -i keycloak-db-0 -- \
+     sh -c 'psql -U "$POSTGRES_USER" -d postgres'
+   k3s kubectl -n teknoir-auth scale statefulset keycloak --replicas=1
    ```
 
-   `pg_restore` reads a custom-format dump (`pg_dump -Fc`). For a plain SQL dump
-   (a text file starting with `--`), recreate the database empty instead
-   (`psql -U <user> -d postgres -c 'DROP DATABASE <database>' -c 'CREATE DATABASE <database>'`)
-   and load it with `psql -v ON_ERROR_STOP=1 -U <user> -d <database>`. Then run
+   For Harbor, the same with pod `harbor-database-0` in `teknoir-system`, user
+   `postgres`, the database `registry`, `db/harbor.sql.gz`, and the deployments
+   `harbor-core` and `harbor-jobservice` scaled to 0 and back to 1. Messages
+   that a role or the `postgres` database already exists are expected. Then run
    `./teknoir-airgap up` from the LAN host: it pushes any missing images and
    checks every Application.
 
@@ -449,21 +461,25 @@ the next. The node's bundle payload provides `age` at
    1. Install Debian as in [HOST-SETUP.md](HOST-SETUP.md), with the same `NODE_IP`.
    2. Run `./teknoir-airgap up --forget-host-key` with the bundle that was deployed
       (the node has a new ssh host key). This installs k3s and a fresh platform.
-   3. On the node, put the cluster state back: stop k3s
-      (`sudo systemctl stop k3s`), replace `/opt/k3s/server/db`,
+   3. In a root shell on the node, put the cluster state back: stop k3s
+      (`systemctl stop k3s`), replace `/opt/k3s/server/db`,
       `/opt/k3s/server/token`, `/opt/k3s/server/tls` and `/opt/k3s/server/cred`
-      with the copies from the backup, move the fresh database directories
+      with `k3s/db`, `k3s/server/token`, `k3s/server/tls` and `k3s/server/cred`
+      from the backup, move the fresh database directories
       `/opt/teknoir/keycloak/pg` and `/opt/teknoir/harbor/database` aside (their
       passwords no longer match the restored Secrets), and start k3s
-      (`sudo systemctl start k3s`). The databases start empty with the restored
-      passwords.
-   4. Load the Keycloak and Harbor dumps as in step 2.
+      (`systemctl start k3s`). The databases start empty with the restored
+      passwords. (On an etcd datastore the backup holds `k3s/etcd-snapshot`
+      instead; restore it with
+      `k3s server --cluster-reset --cluster-reset-restore-path=<snapshot> --data-dir /opt/k3s`.)
+   4. Load the Keycloak and Harbor dumps as in step 2 (the databases are empty,
+      so nothing needs dropping).
    5. Run `./teknoir-airgap up` again. It pushes the images, re-applies the node
       files and checks every Application.
    6. Verify: sign in to Keycloak, Harbor and ArgoCD with existing users, and
       check that Harbor lists its projects and charts.
 
-Finally remove the decrypted files: `sudo rm -rf /root/restore`.
+Finally remove the decrypted files: `rm -rf /root/restore` (root shell).
 
 ## 11. Rotating secrets
 
@@ -476,20 +492,20 @@ Finally remove the decrypted files: `sudo rm -rf /root/restore`.
 node runner prints what it did. Rotation is never implicit: re-running `up`
 never changes an existing secret.
 
-| Secret | Effect of a rotation | Notes |
+| Name | Effect | Notes |
 |---|---|---|
-| oauth2-proxy cookie secret (`rotate oauth2-proxy-cookie`) | oauth2-proxy restarts; everyone signs in again | safe at any time |
-| Keycloak client secrets (`teknoir`, `argocd`, `harbor`, `user-controller`) | the realm import updates Keycloak, the copies in the consumers' namespaces are re-synced, the consumers restart | single source: `teknoir-auth/keycloak-client-secrets` |
-| oauth2-proxy Redis password | Redis and oauth2-proxy restart; sessions are lost | |
-| Keycloak master admin (`keycloak-admin`) | the master realm admin gets the new password | break-glass account |
-| Keycloak database password (`keycloak-db-secret`) | the password must change inside PostgreSQL too | refused without `--i-know` |
-| Harbor `secretKey` (in `harbor-secret`) | Harbor can no longer decrypt values it stored with the old key (OIDC client secret and similar); they must be set again | refused without `--i-know`; take a backup first |
-| Harbor admin password (in `harbor-secret`) | Harbor keeps the admin password in its database after the first start; the Secret alone does not change it | follow the node runner's instructions |
-| Platform CA (`rotate ca`) | a new CA, every certificate re-issued, node and containerd trust updated | then run `./teknoir-airgap trust` on every LAN host and restart browsers; the live teknoir-local keeps its current CA |
+| `oauth2-proxy-cookie` | new oauth2-proxy cookie secret; oauth2-proxy restarts and everyone signs in again | safe at any time |
+| `oauth2-proxy-redis` | new Redis password; Redis and oauth2-proxy restart, sessions are lost | safe at any time |
+| `harbor-token-service` | new Harbor token certificate; harbor-core restarts | safe at any time |
+| `harbor-secret-key` | new Harbor `secretKey`; Harbor can no longer decrypt values it stored with the old key (the OIDC client secret and similar) and they must be set again | refused without `--i-know`; take a backup first |
+| `keycloak-db` | new Keycloak database password; it must also change inside PostgreSQL | refused without `--i-know`; take a backup first |
 
-The node runner defines the exact names; on the node,
-`sudo /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/teknoir-node help`
-lists them.
+Not rotatable with `rotate` in this release: the Keycloak client secrets (the
+realm import and their consumers would need a coordinated change), the admin
+passwords (change them in the application; Harbor and Keycloak keep theirs in
+their databases after the first start) and the platform CA (the live
+teknoir-local keeps its current CA; a new CA means running
+`./teknoir-airgap trust` on every LAN host again).
 
 Never delete `backstage-postgres-secrets` while the PVC
 `data-backstage-postgres-0` exists: a new random password would be generated, but
