@@ -3,8 +3,14 @@ set -euo pipefail
 
 # gen-argocd-harbor-repo-secret.sh
 # Generates the ArgoCD repo-creds secret for the in-cluster Harbor OCI Helm
-# registry. Prefers the robot account credentials written by
-# airgap/push-to-harbor.sh; falls back to the Harbor admin credential.
+# registry from the robot credential in airgap/.secrets/robot-argocd.env (kept
+# in sync with Harbor by airgap/push-to-harbor.sh). Falls back to the Harbor
+# admin credential only for the first bootstrap, before the robot exists.
+# Deterministic: re-running with the same credential rewrites identical content.
+
+# Paths are relative to the repo root, wherever the script is called from.
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+umask 077
 
 SECRETS_DIR=".secrets"
 MANIFEST_FILE="${SECRETS_DIR}/manifest-argocd-harbor-repo-secret.yaml"
@@ -51,9 +57,9 @@ else
   fi
 fi
 
-PREV_PASSWORD=""
+PREV_SUM=""
 if [ -f "${MANIFEST_FILE}" ]; then
-  PREV_PASSWORD=$(sed -n 's/^  password: "\(.*\)"$/\1/p' "${MANIFEST_FILE}" | head -n 1)
+  PREV_SUM="$(sha256sum < "${MANIFEST_FILE}")"
 fi
 
 cat > "${MANIFEST_FILE}" <<EOF
@@ -74,19 +80,11 @@ stringData:
   password: "${PASSWORD}"
 EOF
 
-echo "Wrote manifest to ${MANIFEST_FILE}"
-echo "Repo URL: ${HARBOR_URL}"
-echo "Username: ${USERNAME}"
-echo ""
+chmod 600 "${MANIFEST_FILE}"
+echo "Wrote ${MANIFEST_FILE} (repo ${HARBOR_URL}, user ${USERNAME})"
 
-if [ -n "${PREV_PASSWORD}" ] && [ "${PREV_PASSWORD}" != "${PASSWORD}" ]; then
-  printf "${YELLOW}NOTICE: the Harbor credential CHANGED (robot token rotated).${NC}\n" >&2
-  printf "${YELLOW}The generated secret differs from the previous manifest — redeploy it now:${NC}\n" >&2
-  echo ""
-elif [ -n "${PREV_PASSWORD}" ]; then
-  echo "Credential unchanged from the previous manifest."
-  echo ""
+if [ "${PREV_SUM}" = "$(sha256sum < "${MANIFEST_FILE}")" ]; then
+  echo "Unchanged from the previous manifest."
+else
+  printf "${YELLOW}The ArgoCD repo secret changed — deploy it: scripts/deploy-secrets.sh${NC}\n" >&2
 fi
-
-echo "Next steps:"
-echo "  - Deploy the secret with: scripts/deploy-secrets.sh"

@@ -269,3 +269,103 @@ remote_kubectl() {
 remote_kubectl_query() {
   ssh_query "sudo k3s kubectl $*"
 }
+
+# ---------------------------------------------------------------------------
+# K3s auto-deploy manifests: exactly one owning file per object
+# ---------------------------------------------------------------------------
+# K3s turns every file in the manifests dir into an Addon that owns the objects
+# it applies. Older tooling wrote the same objects under two names
+# (bootstrap-airgap.sh: manifest-*.yaml, app-of-apps.yaml, 10-teknoir-argo.yaml;
+# scripts/deploy-*.sh: teknoir-*.yaml), so a stale copy could re-apply over a
+# fresh one (that is how a rotated Harbor robot token got reverted). Every
+# script now deploys through k3s_deploy, which writes the canonical name only
+# and retires the legacy duplicates once the canonical Addon owns the objects.
+K3S_MANIFESTS_DIR="${K3S_DATA_DIR}/server/manifests"
+K3S_RETIRED_DIR="${K3S_DATA_DIR}/server/manifests-retired"
+
+k3s_canonical_name() {
+  # k3s_canonical_name <file> — canonical manifests-dir basename for <file>
+  local b
+  b="$(basename "$1")"
+  case "${b}" in
+    app-of-apps.yaml) echo "teknoir-app-of-apps.yaml" ;;
+    10-teknoir-argo.yaml) echo "teknoir-argo.yaml" ;;
+    manifest-teknoir-*) echo "${b#manifest-}" ;;
+    manifest-*) echo "teknoir-${b#manifest-}" ;;
+    *) echo "${b}" ;;
+  esac
+}
+
+k3s_legacy_names() {
+  # k3s_legacy_names <canonical-basename> — older names of the same objects
+  local c="$1"
+  case "${c}" in
+    teknoir-app-of-apps.yaml) echo "app-of-apps.yaml" ;;
+    teknoir-argo.yaml) echo "10-teknoir-argo.yaml" ;;
+    teknoir-*) echo "manifest-${c#teknoir-}"; echo "manifest-${c}" ;;
+  esac
+}
+
+k3s_wait_applied() {
+  # k3s_wait_applied <addon> <sha256> [timeout-seconds] — wait until the K3s
+  # deploy controller has applied the file content with checksum <sha256>.
+  local addon="$1" sum="$2" timeout="${3:-300}" deadline current
+  deadline=$(( $(date +%s) + timeout ))
+  while :; do
+    current="$(remote_kubectl_query "-n kube-system get addons.k3s.cattle.io ${addon} -o jsonpath='{.spec.checksum}'" 2>/dev/null || true)"
+    [[ "${current}" == "${sum}" ]] && return 0
+    (( $(date +%s) > deadline )) && die "K3s did not apply ${addon} within ${timeout}s (see: kubectl -n kube-system describe addon ${addon})"
+    sleep 5
+  done
+}
+
+k3s_owners() {
+  # k3s_owners <local-manifest> — print "<kind>/<name> <owning-addon>" for every
+  # object in <local-manifest>, as currently recorded in the cluster.
+  ssh "${SSH_OPTS[@]}" "${TEKNOIR_HOST}" \
+    "sudo k3s kubectl get -f - -o jsonpath='{range .items[*]}{.kind}/{.metadata.name} {.metadata.annotations.objectset\\.rio\\.cattle\\.io/owner-name}{\"\\n\"}{end}'" \
+    < "$1"
+}
+
+k3s_retire_legacy() {
+  # k3s_retire_legacy <legacy-basename> <canonical-basename> <local-manifest>
+  # Moves a legacy duplicate out of the manifests dir, but only after every
+  # object in <local-manifest> is owned by the canonical Addon, so removing the
+  # legacy Addon can never garbage-collect live objects. Idempotent.
+  local legacy="$1" canonical="$2" src="$3" addon owners foreign
+  addon="${canonical%.yaml}"
+  ssh_query "sudo test -e '${K3S_MANIFESTS_DIR}/${legacy}'" 2>/dev/null || return 0
+  owners="$(k3s_owners "${src}")" || die "cannot read owners of the objects in ${src}; keeping ${legacy}"
+  [[ -n "${owners}" ]] || die "no objects from ${src} found in the cluster; keeping ${legacy}"
+  foreign="$(awk -v a="${addon}" '$2 != a' <<<"${owners}")"
+  if [[ -n "${foreign}" ]]; then
+    # Owned by the legacy Addon (it was applied last): clear the canonical
+    # Addon's checksum so K3s re-applies the canonical file and takes ownership.
+    log "re-applying ${canonical} so it owns: $(echo "${foreign}" | awk '{print $1}' | tr '\n' ' ')"
+    remote_kubectl "-n kube-system patch addons.k3s.cattle.io ${addon} --type merge -p '{\"spec\":{\"checksum\":\"\"}}'" >/dev/null
+    k3s_wait_applied "${addon}" "$(sha256sum < "${src}" | cut -d' ' -f1)"
+    owners="$(k3s_owners "${src}")" || die "cannot read owners of the objects in ${src}; keeping ${legacy}"
+    foreign="$(awk -v a="${addon}" '$2 != a' <<<"${owners}")"
+    [[ -z "${foreign}" ]] || die "objects still not owned by ${addon}, keeping ${legacy}: ${foreign}"
+  fi
+  log "retiring legacy manifest ${legacy} (superseded by ${canonical})"
+  ssh_run "sudo install -d -m 700 '${K3S_RETIRED_DIR}' && sudo mv '${K3S_MANIFESTS_DIR}/${legacy}' '${K3S_RETIRED_DIR}/${legacy}.$(date +%Y%m%d%H%M%S)'"
+}
+
+k3s_deploy() {
+  # k3s_deploy <local-manifest> [mode] — install <local-manifest> into the K3s
+  # manifests dir under its canonical name, wait until K3s applied it, then
+  # retire legacy duplicates. Re-running with unchanged content is a no-op.
+  local src="$1" mode="${2:-0644}" name legacy
+  [[ -f "${src}" ]] || die "missing ${src}"
+  name="$(k3s_canonical_name "${src}")"
+  ssh_sudo_write "${src}" "${K3S_MANIFESTS_DIR}/${name}" "${mode}"
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] wait for Addon ${name%.yaml}, then retire legacy copies: $(k3s_legacy_names "${name}" | tr '\n' ' ')"
+    return 0
+  fi
+  k3s_wait_applied "${name%.yaml}" "$(sha256sum < "${src}" | cut -d' ' -f1)"
+  for legacy in $(k3s_legacy_names "${name}"); do
+    k3s_retire_legacy "${legacy}" "${name}" "${src}"
+  done
+}
