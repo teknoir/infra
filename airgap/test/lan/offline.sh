@@ -97,7 +97,7 @@ PD=/var/lib/teknoir-airgap/bundles/teknoir-local-aoa0.0.4-20261008-itest000-gtes
 expect_rc 0 "up --local, first run" "${T}" up --local
 expect_out "sending 9 of 9 payload files" "first run sends every payload file"
 expect_out "fake converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time" "the runner gets --site and --lan-time"
-expect_out "--operator root" "the runner gets --operator"
+expect_out "--lan-user root" "the runner gets --lan-user"
 check "payload unpacked with its modes" test -x "${PD}/bin/teknoir-node"
 check "site config copied to the node" cmp -s "${B}/site/teknoir-local.env" /var/lib/teknoir-airgap/site/teknoir-local.env
 expect_rc 0 "up --local, second run" "${T}" up --local

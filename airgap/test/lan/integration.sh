@@ -47,7 +47,7 @@ sudo-setup)
   with_tty "up in a terminal installs sudoers and converges" 0 "${T}" up
   expect_out "installed /etc/sudoers.d/teknoir-airgap" "reports the sudoers setup"
   expect_out "sending 9 of 9 payload files" "sends the whole payload"
-  expect_out "fake converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --operator root" "runs the converge with site, LAN time and operator"
+  expect_out "fake converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --lan-user root" "runs the converge with site, LAN time and operator"
   expect_out "saved the platform CA certificate" "saves the CA certificate"
   expect_out "wrote /root/.kube/config with context teknoir-local" "writes the kubeconfig"
   check "CA certificate cached" grep -q 'BEGIN CERTIFICATE' /root/.teknoir-airgap/teknoir-local/teknoir-root-ca.crt
@@ -153,6 +153,7 @@ backup)
   check "the encrypted backup exists" test -n "${f}"
   check "the backup file is 0600" test "$(mode_of "${f}")" = 600
   check "the backup carries the age header" grep -q '^age-encryption.org/v1' "${f}"
+  check "the backup holds the node's backup directory" sh -c "tail -n +2 '${f}' | tar -tf - | grep -q '/dump.sql$'"
   expect_no_out "s3cr3t" "backup content is not printed"
   ;;
 hostkey-changed)

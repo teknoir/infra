@@ -18,17 +18,22 @@
 #
 # Interface to the node runner (node/bin/teknoir-node, run as root via sudo,
 # from /var/lib/teknoir-airgap/bundles/<bundleId>/node):
-#   converge    --site FILE --lan-time EPOCH --operator USER
+#   converge    --site FILE --lan-time EPOCH --lan-user USER
 #               [--dry-run] [--rollback] [--sync-clock] [--reapply TIER]
 #               [--force-images] [ARGS given after --]
 #   status      --site FILE --lan-time EPOCH
 #   credentials NAME --site FILE           value on stdout (a pipe, never a tty)
 #   admin-user  --email ADDR --site FILE   temporary password on stdout
-#   backup      --site FILE                new backup in /var/lib/teknoir-airgap/backups/<ts>/
+#   backup      --export --take --site FILE   (tty: age asks for a passphrase)
+#               new backup, encrypted to /var/lib/teknoir-airgap/exports/
+#               teknoir-backup-<ts>.tar.age
+#   backup      --stream FILE --keep --site FILE   that export on stdout
 #   rotate      NAME --site FILE [--i-know]
 #   migrate     --site FILE [--dry-run | --undo NAME]
-# The payload sync, sudo setup, kubeconfig, CA and status fallback use only
-# sh, sudo, tar, sha256sum, find, awk, cmp and k3s on the node.
+# MANIFEST.yaml goes next to the payload (bundles/<bundleId>/MANIFEST.yaml),
+# where teknoir-node reads the bundle id, versions and commits. The payload
+# sync, sudo setup, kubeconfig, CA and status fallback use only sh, sudo,
+# tar, sha256sum, find, awk, cmp and k3s on the node.
 set -eu
 set -o pipefail
 
@@ -773,6 +778,8 @@ payload_sync() {
     || { sed 's/^/  node: /' "${TMPD}/check.err" >&2; die "files on the node do not match after the transfer; re-run the command to send them again"; }
   grep -q TEKNOIR-AIRGAP-CHECK-DONE "${TMPD}/check.out" || die "could not verify the payload on the node"
   if [ -s "${TMPD}/check.err" ]; then sed 's/^/  node: /' "${TMPD}/check.err" >&2; fi
+  # teknoir-node reads the bundle id, versions and commits from here
+  push_file "${MANIFEST}" "${NODE_STATE_DIR}/bundles/${BUNDLE_ID}/MANIFEST.yaml" "the bundle's"
 }
 
 # payload_ensure: for commands other than up, sync only when the node does not
@@ -787,8 +794,8 @@ payload_ensure() {
   payload_sync
 }
 
-# The site config goes to /var/lib/teknoir-airgap/site/<site>.env (no secrets).
-SITE_SCRIPT='
+# Write stdin to the file $1 on the node when it differs (public files only).
+PUSH_SCRIPT='
 f=$1
 umask 022
 mkdir -p "$(dirname "$f")" || exit 1
@@ -797,16 +804,20 @@ cat >"$t" || { rm -f "$t"; exit 1; }
 chmod 0644 "$t"
 if cmp -s "$t" "$f"; then rm -f "$t"; echo SAME; else mv -f "$t" "$f" && echo CHANGED; fi
 '
-site_push() {
+# push_file LOCAL REMOTE DESCRIPTION: copy a public file to the node if it differs.
+push_file() {
   local out
-  if [ "${LOCAL}" = 1 ] && [ "${SITE_FILE}" = "${REMOTE_SITE}" ]; then return 0; fi
-  out=$(node_sh pipe "${SITE_SCRIPT}" "${REMOTE_SITE}" <"${SITE_FILE}" | tail -n 1) || die "could not write ${REMOTE_SITE} on the node"
+  if [ "${LOCAL}" = 1 ] && [ "$1" = "$2" ]; then return 0; fi
+  out=$(node_sh pipe "${PUSH_SCRIPT}" "$2" <"$1" | tail -n 1) || die "could not write $2 on the node"
   case "${out}" in
     SAME) ;;
-    CHANGED) changed "wrote the site config ${REMOTE_SITE} on the node" ;;
-    *) die "could not write ${REMOTE_SITE} on the node" ;;
+    CHANGED) changed "wrote $3 $2 on the node" ;;
+    *) die "could not write $2 on the node" ;;
   esac
 }
+
+# The site config goes to /var/lib/teknoir-airgap/site/<site>.env (no secrets).
+site_push() { push_file "${SITE_FILE}" "${REMOTE_SITE}" "the site config"; }
 
 # The tools this script needs on the node (the converge checks its own).
 node_prereqs() {
@@ -1037,7 +1048,7 @@ cmd_up() {
   if [ "${LOCAL}" = 1 ] && [ -n "${SUDO_USER:-}" ]; then operator=${SUDO_USER}; fi
   [ "${DRY_RUN}" = 0 ] || UP_ARGS[${#UP_ARGS[@]}]=--dry-run
   log "running the converge on the node ($(runner_path) converge); its log is on the node in /var/log/teknoir-airgap/"
-  run_runner tty converge --site "${REMOTE_SITE}" --lan-time "$(date +%s)" --operator "${operator}" \
+  run_runner tty converge --site "${REMOTE_SITE}" --lan-time "$(date +%s)" --lan-user "${operator}" \
     ${UP_ARGS[@]+"${UP_ARGS[@]}"} ${PASS[@]+"${PASS[@]}"} || rc=$?
   if [ "${rc}" -ne 0 ]; then
     print_changes
@@ -1348,16 +1359,6 @@ cmd_admin_user() {
   log "sign in at https://${TEKNOIR_DOMAIN}/ ; Keycloak asks for a new password at the first login"
 }
 
-BACKUP_EXPORT_SCRIPT='
-src=$1; name=$2; age=$3; out=$4
-umask 077
-mkdir -p "$(dirname "$out")" || exit 1
-rm -f "$out.partial" "$out.tarfail"
-( tar -C "$src" -cf - "$name" || touch "$out.tarfail" ) | "$age" -p -o "$out.partial" || exit 1
-if [ -e "$out.tarfail" ]; then rm -f "$out.partial" "$out.tarfail"; echo "tar failed" >&2; exit 1; fi
-mv -f "$out.partial" "$out"
-'
-
 cmd_backup() {
   local dir latest exp out rsum lsum
   [ "$(npos)" -eq 0 ] || usage_error "backup takes no arguments besides --out"
@@ -1372,26 +1373,25 @@ cmd_backup() {
   refuse_inside_bundle "${dir}"
   node_connect setup
   payload_ensure
-  log "taking a backup on the node (teknoir-node backup)"
-  run_runner tty backup --site "${REMOTE_SITE}" || die "teknoir-node backup failed on the node"
-  latest=$(node_sh pipe 'ls -1 "$1" 2>/dev/null | LC_ALL=C sort | tail -n 1' "${NODE_STATE_DIR}/backups" </dev/null | tail -n 1) || latest=
+  log "taking a backup on the node and encrypting it there with age: choose a passphrase and keep it; a restore needs it"
+  run_runner tty backup --export --take --site "${REMOTE_SITE}" || die "teknoir-node backup --export failed on the node"
+  latest=$(node_sh pipe 'ls -1 "$1" 2>/dev/null | grep "^2.*Z$" | LC_ALL=C sort | tail -n 1' "${NODE_STATE_DIR}/backups" </dev/null | tail -n 1) || latest=
   case "${latest}" in ''|*[!A-Za-z0-9._:-]*) die "found no backup in ${NODE_STATE_DIR}/backups on the node" ;; esac
-  exp=${NODE_STATE_DIR}/exports/${SITE_NAME}-${latest}.tar.age
-  log "encrypting backup ${latest} with age on the node: choose a passphrase and keep it; a restore needs it"
-  node_sh tty "${BACKUP_EXPORT_SCRIPT}" "${NODE_STATE_DIR}/backups" "${latest}" "$(payload_dir)/bin/age" "${exp}" \
-    || die "encrypting the backup failed"
+  exp=${NODE_STATE_DIR}/exports/teknoir-backup-${latest}.tar.age
+  rsum=$(node_sh pipe 'sha256sum "$1"' "${exp}" </dev/null | awk '{ print $1 }' | tail -n 1) || rsum=
+  [ -n "${rsum}" ] || die "the encrypted backup ${exp} is not on the node"
   out=${dir}/teknoir-backup-${SITE_NAME}-${latest}.tar.age
   log "copying the encrypted backup to ${out}"
-  node_sh pipe 'cat "$1"' "${exp}" </dev/null >"${out}.partial" || { rm -f "${out}.partial"; die "copying the backup failed"; }
-  rsum=$(node_sh pipe 'sha256sum "$1"' "${exp}" </dev/null | awk '{ print $1 }' | tail -n 1) || rsum=
+  run_runner pipe backup --stream "${exp}" --keep --site "${REMOTE_SITE}" </dev/null >"${out}.partial" \
+    || { rm -f "${out}.partial"; die "copying the backup failed; the encrypted export stays on the node: ${exp}"; }
   lsum=$(sha256_of "${out}.partial")
-  if [ -z "${rsum}" ] || [ "${rsum}" != "${lsum}" ]; then
+  if [ "${rsum}" != "${lsum}" ]; then
     rm -f "${out}.partial"
-    die "the copied backup does not match the node's copy (sha256); run backup again"
+    die "the copied backup does not match the node's copy (sha256); the export stays on the node: ${exp}"
   fi
   chmod 600 "${out}.partial"
   mv -f "${out}.partial" "${out}"
-  node_sh pipe 'rm -f "$1"' "${exp}" </dev/null || warn "could not remove ${exp} on the node"
+  node_sh pipe 'rm -f "$1"' "${exp}" </dev/null || warn "could not remove the encrypted export ${exp} on the node"
   log "backup saved: ${out} (age-encrypted, sha256 ${lsum})"
   log "the unencrypted backup stays on the node in ${NODE_STATE_DIR}/backups/${latest} (the node keeps the last 3)"
 }

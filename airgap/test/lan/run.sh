@@ -141,8 +141,9 @@ EOF
   node_check "sudoers file installed, mode 0440, NOPASSWD for teknoir" \
     'test "$(stat -c %a /etc/sudoers.d/teknoir-airgap)" = 440 && grep -qx "teknoir ALL=(root) NOPASSWD: ALL" /etc/sudoers.d/teknoir-airgap'
   node_check "payload is owned by root" "test \"\$(stat -c %u ${pd}/bin/teknoir-node)\" = 0"
+  node_check "MANIFEST.yaml is next to the payload, where teknoir-node reads it" "cmp -s ${bb}/MANIFEST.yaml ${pd%/node}/MANIFEST.yaml"
   node_check "the runner ran as root with the converge arguments" \
-    'grep -q "uid=0 converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --operator root$" /var/log/teknoir-airgap-fake-runner.log'
+    'grep -q "uid=0 converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --lan-user root$" /var/log/teknoir-airgap-fake-runner.log'
   phase idempotent
   docker exec "${node}" sh -c "printf x >>${pd}/images/fake-image/blob2 && touch ${pd}/stray-file"
   phase resend
@@ -153,7 +154,7 @@ EOF
   node_check "migrate passes --dry-run" 'grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --dry-run$" /var/log/teknoir-airgap-fake-runner.log'
   node_check "migrate passes --undo NAME" 'grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --undo teknoir-coredns-custom$" /var/log/teknoir-airgap-fake-runner.log'
   node_check "up passes every converge flag in order" \
-    'grep -q "converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --operator root --rollback --sync-clock --reapply istio --force-images --dry-run --extra-flag$" /var/log/teknoir-airgap-fake-runner.log'
+    'grep -q "converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --lan-user root --rollback --sync-clock --reapply istio --force-images --dry-run --extra-flag$" /var/log/teknoir-airgap-fake-runner.log'
   node_check "admin-user passes --email" 'grep -q "admin-user --email anders.aslund@teknoir.ai --site " /var/log/teknoir-airgap-fake-runner.log'
   phase status
   phase trust
