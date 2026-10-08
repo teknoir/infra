@@ -1,0 +1,47 @@
+# Fixture: stand-in for the legacy K3s file 00-teknoir-istio-crds.yaml (2 of the 14 CRDs)
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gateways.networking.istio.io
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  group: networking.istio.io
+  names:
+    plural: gateways
+    singular: gateway
+    kind: Gateway
+    listKind: GatewayList
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualservices.networking.istio.io
+  annotations:
+    argocd.argoproj.io/sync-options: Prune=false,Delete=false
+spec:
+  group: networking.istio.io
+  names:
+    plural: virtualservices
+    singular: virtualservice
+    kind: VirtualService
+    listKind: VirtualServiceList
+  scope: Namespaced
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          x-kubernetes-preserve-unknown-fields: true

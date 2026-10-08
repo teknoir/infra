@@ -471,15 +471,15 @@ For each name, in this order:
   d. 00-teknoir-namespaces.
   e. teknoir-coredns-custom and teknoir-app-of-apps.
   f. 00-teknoir-istio-crds and 05-teknoir-certmanager-crds.
-  g. teknoir-argo is NOT in this pass; it is migrated in M7.
+  g. teknoir-argo is NOT in this pass; it is migrated in M7a (`migrate --argo`).
 Recipe per name:
   (1) Create /opt/k3s/server/manifests/<name>.yaml.skip.
   (2) Move <name>.yaml to /opt/k3s/server/manifests-retired/<UTC>/. Never truncate or edit it.
   (3) For every GVK in the Addon's addon.k3s.cattle.io/gvks annotation, select the objects with label objectset.rio.cattle.io/hash=<addon hash>. Remove that label and the annotations objectset.rio.cattle.io/{applied,id,owner-gvk,owner-name,owner-namespace}.
   (4) Delete the Addon object.
-Assert after every name: the object counts equal the baseline.
+Assert after every name: the object counts equal the baseline. Before the first change, migrate records one baseline for the whole run: kind, namespace, name and UID of every object of every Addon in the run, plus the counts of namespaces, Secrets per namespace, CRDs, applications.argoproj.io and the M2 istio and cert-manager kinds (virtualservices, gateways, destinationrules, authorizationpolicies, peerauthentications, certificates, clusterissuers). After every name, every baseline object must still exist with the same UID and every count must be unchanged; the first lost or re-created object, or changed count, stops the run with the undo command. So an earlier step that deletes or re-creates an object of a later name is caught, which a per-name check cannot see. The baseline goes to the log as names and counts only. A re-run takes a new baseline, so investigate a stop first.
 Never use the k3s `disable:` list. It deletes the objects.
-Undo: `migrate --undo <name>` removes the .skip and restores the file. K3s then re-applies it and re-labels the objects.
+Undo: `migrate --undo <name>` removes the .skip and restores the file with a fresh mtime (content unchanged). K3s then re-applies it and re-labels the objects. The fresh mtime matters: K3s's deploy watcher skips a file whose mtime it has already seen since its last start (k3s pkg/deploy/controller.go keeps a per-path modTime map and never prunes it), so a file put back with `mv` alone is ignored after an earlier detach and undo of the same name.
 Verify:
   kubectl --context teknoir-local get addons -n kube-system   # only K3s packaged addons, plus teknoir-argo
   kubectl --context teknoir-local get crd,ns,secrets -A -l objectset.rio.cattle.io/hash --no-headers   # only K3s's own (coredns, metrics-server, ...), none of Teknoir's
@@ -516,12 +516,12 @@ M6. RETIRE THE ROBOT:
   Verify: argocd app get app-of-apps shows no repo errors after a hard refresh.
 
 M7. LATER, IN SEPARATE WINDOWS:
-  a. ArgoCD self-management (G-07). Release app-of-apps 0.0.5 with the argo Application, using the same chart version and render as the live teknoir-argo.yaml, with crds.annotations Prune=false,Delete=false.
+  a. ArgoCD self-management (G-07). DECIDED (2026-10-08): app-of-apps 0.0.4 declares the argo Application but disabled (`applications.argo.enabled: false`, gitops 29e6775), so in 0.0.4 teknoir-argo.yaml stays ArgoCD's only owner on teknoir-local, and fresh installs run ArgoCD from the one-shot argo tier (argo chart 0.0.3, D14). App-of-apps 0.0.5 enables the argo Application, with crds.annotations Prune=false,Delete=false; ideally its render equals the live teknoir-argo.yaml, otherwise its adoption rolls the ArgoCD pods once.
      Order:
-       1. .skip and move teknoir-argo.yaml;
-       2. sync app-of-apps, so ArgoCD adopts argo;
-       3. strip the objectset labels and delete the teknoir-argo Addon.
-     Verify that the ArgoCD pods were not restarted (pod UIDs) and that the argoproj CRDs carry Prune=false.
+       1. `./teknoir-airgap up` with the 0.0.5 bundle: the oneshot phase skips the argo tier while the K3s file is live, and ArgoCD adopts itself through the argo Application;
+       2. right after it, with no k3s restart in between (K3s would re-apply its file over ArgoCD's): `teknoir-node migrate --argo` (`--dry-run` first). It refuses unless Application teknoir-system/argo is Synced/Healthy and every argoproj.io CRD carries Prune=false and Delete=false. It records the running ArgoCD pods (label app.kubernetes.io/part-of=argocd) by UID, then applies the M3 recipe and baseline to teknoir-argo alone (.skip, move teknoir-argo.yaml, strip the objectset labels, delete the Addon). After a short settle it asserts that the pod UIDs and the CRD annotations are unchanged, and warns about objects of the file that carry no argo tracking-id, which are left in place without an owner.
+     This adopts first and detaches second, the reverse of the earlier plan, so ArgoCD always has an owner: if the adoption fails, teknoir-argo.yaml is still in place.
+     Verify: `get addons -n kube-system` lists no Teknoir Addon; the ArgoCD pods were not restarted by the detach (pod UIDs); the argoproj CRDs carry Prune=false,Delete=false.
   b. Secrets encryption: `sudo k3s secrets-encrypt enable --data-dir /opt/k3s`, restart, `sudo k3s secrets-encrypt reencrypt --data-dir /opt/k3s`, then `status --data-dir /opt/k3s` shows Enabled. Always pass --data-dir explicitly.
   c. If decided, sqlite to embedded etcd: add cluster-init: true to config.yaml through converge and restart, after a fresh M2 backup. Verify that `k3s etcd-snapshot ls --data-dir /opt/k3s` works.
   d. If decided, PKI re-issue: `./teknoir-airgap rotate ca`, which issues the new name-constrained CA, renews every Certificate, updates node and containerd trust, then redistributes trust with `./teknoir-airgap trust` on every LAN host.
@@ -769,7 +769,7 @@ Before each mutating converge on an existing cluster: pg_dump harbor-database an
 - depends on: I-05
 - files: airgap/node/lib/migrate.sh
 
-`teknoir-node migrate [--dry-run] [--undo NAME]` implements the M3 recipe (see migration_for_live_env): .skip guard, move to manifests-retired/<ts>, strip objectset labels and annotations by GVK annotation and hash label, delete the Addon, in the documented order. It also deletes orphan Addons, removes ~teknoir/teknoir-airgap-bundle-* on the node, and prunes stale agent/images tarballs. Assert object counts before and after each name and stop at the first mismatch. Never touch K3s's packaged addons (allow-list only teknoir-*, 00-teknoir-*, 05-teknoir-*, 10-teknoir-*, manifest-*-secret, app-of-apps). Delete this file and lib.sh:559-659 (k3s_canonical_name, k3s_legacy_names, k3s_owners, k3s_retire_legacy) once teknoir-local is migrated.
+`teknoir-node migrate [--dry-run] [--undo NAME]` implements the M3 recipe (see migration_for_live_env): .skip guard, move to manifests-retired/<ts>, strip objectset labels and annotations by GVK annotation and hash label, delete the Addon, in the documented order. It also deletes orphan Addons, removes ~teknoir/teknoir-airgap-bundle-* on the node, and prunes stale agent/images tarballs. Before the first change it records the M3 baseline (the UID of every object of every Addon in the run, and the counts); after each name it compares all of it and stops at the first mismatch. `teknoir-node migrate --argo [--dry-run]` is the M7a step for teknoir-argo alone, with its preconditions and pod-UID check. Never touch K3s's packaged addons (allow-list only teknoir-*, 00-teknoir-*, 05-teknoir-*, 10-teknoir-*, manifest-*-secret, app-of-apps). Delete this file and lib.sh:559-659 (k3s_canonical_name, k3s_legacy_names, k3s_owners, k3s_retire_legacy) once teknoir-local is migrated.
 
 **Test:** k3d T4 and T9 (legacy-state fixture): after migrate and a k3s server restart, every object survives, no Teknoir Addon exists, and re-adding an old file next to its .skip is ignored. --undo re-adopts the object. Dry-run against the live node (read-only) lists exactly 3 orphan, 8 legacy, 10 canonical secret, 1 namespaces, 2 CRD, coredns and app-of-apps entries.
 

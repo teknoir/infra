@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# TEST DRIVER standing in for airgap/node/bin/teknoir-node: sources common.sh
+# and the node phase libraries, then calls one function.
+#   teknoir-node-stub <function> [args...]   e.g. cmd_migrate --dry-run
+# The environment supplies what the real runner and the site env would:
+# KUBECTL, NODE_ROOT, K3S_DATA_DIR, TEKNOIR_DOMAIN, NODE, DRY_RUN, ...
+#
+# common.sh: TEKNOIR_COMMON=<file> if set, else the tree's real
+# airgap/node/lib/common.sh when there is one, else stubs/common.sh
+# (TEKNOIR_COMMON=stub forces the stub). Like the runner, the driver sets an
+# EXIT handler that runs the at_exit list and exits with the status it was
+# called with; STUB_NO_AT_EXIT=1 removes at_exit, so a library falls back to
+# chaining onto that EXIT trap.
+# shellcheck source-path=SCRIPTDIR
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lib="$(cd "${here}/../../node/lib" && pwd)"
+common="${TEKNOIR_COMMON:-}"
+if [[ "${common}" == "stub" ]]; then
+  common="${here}/common.sh"
+elif [[ -z "${common}" ]]; then
+  common="${lib}/common.sh"
+  [[ -f "${common}" ]] || common="${here}/common.sh"
+fi
+# the real common.sh polls every WAIT_INTERVAL seconds
+WAIT_INTERVAL="${WAIT_INTERVAL:-${STUB_WAIT_INTERVAL:-3}}"
+# shellcheck source=common.sh
+source "${common}"
+if [[ "${STUB_NO_AT_EXIT:-0}" == "1" ]]; then
+  unset -f at_exit
+fi
+for f in oneshot harbor migrate admin; do
+  # shellcheck disable=SC1090
+  if [[ -f "${lib}/${f}.sh" ]]; then source "${lib}/${f}.sh"; fi
+done
+[[ $# -ge 1 ]] || { echo "usage: $0 <function> [args...]" >&2; exit 2; }
+STUB_FN="$1"
+stub_on_exit() {
+  # the runner's on_exit, reduced: at_exit list, failure line, same status
+  local rc=$?
+  trap - EXIT
+  if declare -F run_at_exit >/dev/null; then run_at_exit; fi
+  (( rc == 0 )) || printf 'teknoir-node-stub: %s failed (exit %s)\n' "${STUB_FN}" "${rc}" >&2
+  exit "${rc}"
+}
+trap stub_on_exit EXIT
+"$@"
+summary
