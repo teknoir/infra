@@ -543,6 +543,51 @@ k3s_retire_legacy() {
   ssh_run "sudo install -d -m 700 '${K3S_RETIRED_DIR}' && sudo mv '${K3S_MANIFESTS_DIR}/${legacy}' '${K3S_RETIRED_DIR}/${legacy}.$(date +%Y%m%d%H%M%S)'"
 }
 
+argocd_crd_gate() {
+  # argocd_crd_gate — run before deploying teknoir-argo.yaml. That ArgoCD no
+  # longer excludes CRDs, so it must not be able to take over, and later prune,
+  # the bootstrap-owned istio / cert-manager CRDs (deleting a CRD deletes every
+  # VirtualService, Gateway, AuthorizationPolicy, ... of that kind):
+  #   1. the ArgoCD Application istio, if it exists, last synced the pinned
+  #      istio version (istio >= 0.0.2 renders no CRDs; 0.0.1 renders all 14,
+  #      so syncing it with CRDs managed would adopt them) — roll out the
+  #      app-of-apps first (update-airgap.sh);
+  #   2. every live istio / cert-manager CRD carries
+  #      argocd.argoproj.io/sync-options: Prune=false,Delete=false (the K3s
+  #      CRD files from render-bootstrap.sh) — so a wrong order stays harmless.
+  # Read-only. Dry-run reports instead of failing. SKIP_CRD_GATE=1 overrides.
+  # Usage: argocd_crd_gate crds-live|crds-just-deployed — the latter when the
+  # caller deployed the CRD files right before (in dry-run that deploy did not
+  # happen, so check 2 is skipped).
+  local want synced unprotected problems=()
+  if [[ "${SKIP_CRD_GATE:-0}" == "1" ]]; then
+    warn "CRD gate skipped (--skip-crd-gate)"
+    return 0
+  fi
+  want="$(pinned_version istio)"
+  synced="$(remote_kubectl_query "-n teknoir-system get application istio --ignore-not-found -o jsonpath='{.status.history[-1:].revision}'")" \
+    || problems+=("cannot read the ArgoCD Application istio")
+  if [[ -n "${synced}" && "${synced}" != "${want}" ]]; then
+    problems+=("the istio Application last synced istio ${synced}, not the pinned ${want}: run airgap/update-airgap.sh first")
+  fi
+  if [[ "${1:-}" == "crds-just-deployed" && "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] CRD gate: the CRD files deployed above add Prune=false,Delete=false"
+  else
+    unprotected="$(remote_kubectl_query "get crd -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.metadata.annotations.argocd\\.argoproj\\.io/sync-options}{\"\\n\"}{end}'" \
+      | awk '$1 ~ /(istio\.io|cert-manager\.io)$/ && $2 != "Prune=false,Delete=false" {print $1}')" \
+      || problems+=("cannot read the CRDs")
+    if [[ -n "${unprotected}" ]]; then
+      problems+=("CRDs without Prune=false,Delete=false: $(tr '\n' ' ' <<<"${unprotected}")— deploy the CRD files first (airgap/bootstrap-airgap.sh --update)")
+    fi
+  fi
+  (( ${#problems[@]} == 0 )) && { log "CRD gate passed (istio ${synced:-not deployed yet}; bootstrap CRDs prune-protected)"; return 0; }
+  local p
+  for p in "${problems[@]}"; do
+    if [[ "${DRY_RUN}" == "1" ]]; then warn "[dry-run] CRD gate would refuse: ${p}"; else warn "CRD gate: ${p}"; fi
+  done
+  [[ "${DRY_RUN}" == "1" ]] || die "refusing to deploy ArgoCD without the CRD exclusion (override: --skip-crd-gate)"
+}
+
 k3s_deploy() {
   # k3s_deploy <local-manifest> [mode] — install <local-manifest> into the K3s
   # manifests dir under its canonical name, wait until K3s applied it, then

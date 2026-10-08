@@ -107,6 +107,13 @@ pruning. The CRDs in `00-teknoir-istio-crds.yaml` /
 `argocd.argoproj.io/sync-options: Prune=false,Delete=false` as a safety net,
 but only once step 4 has redeployed them.
 
+The tooling enforces this. Before deploying `teknoir-argo.yaml`,
+`bootstrap-airgap.sh` and `scripts/deploy-argo.sh` run a read-only gate
+(`lib.sh:argocd_crd_gate`). It refuses while the `istio` Application has not
+last synced the pinned istio version, or while a live istio / cert-manager
+CRD lacks `Prune=false,Delete=false`. `--dry-run` shows the verdict;
+`--skip-crd-gate` overrides it.
+
 ## 3. Image-completeness check (live diff)
 
 After an update settles, verify no running image is missing from the bundle

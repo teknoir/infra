@@ -14,8 +14,11 @@
 # with an unchanged chart is a no-op. From an unpacked bundle (no charts/argo),
 # use airgap/bootstrap-airgap.sh --update, which deploys the bundle's render.
 #
+# ArgoCD manages CRDs, so the deploy is refused until it cannot adopt the
+# bootstrap-owned istio / cert-manager CRDs (lib.sh:argocd_crd_gate).
+#
 # Usage: scripts/deploy-argo.sh [--out FILE] [--host user@host]
-#                               [--ssh-key FILE] [--dry-run]
+#                               [--ssh-key FILE] [--skip-crd-gate] [--dry-run]
 set -euo pipefail
 
 # shellcheck source=../airgap/lib.sh
@@ -29,6 +32,7 @@ Options:
   --out FILE      also write the rendered manifest to FILE (for inspection)
   --host H        ssh target (default: ${TEKNOIR_HOST})
   --ssh-key FILE  ssh identity file (default: \$SSH_KEY, else auto-detected)
+  --skip-crd-gate deploy even if lib.sh:argocd_crd_gate refuses
   --dry-run       render, but do not touch the node
   -h, --help      show this help
 EOF
@@ -40,6 +44,7 @@ while [[ $# -gt 0 ]]; do
     --out) OUT="$2"; shift ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
     --ssh-key) SSH_KEY="$2"; shift ;;
+    --skip-crd-gate) SKIP_CRD_GATE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -67,5 +72,6 @@ if [[ -n "${OUT}" ]]; then
   log "wrote ${OUT}"
 fi
 
+argocd_crd_gate crds-live
 k3s_deploy "${rendered}"
 log "deploy-argo complete"

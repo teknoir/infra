@@ -11,7 +11,8 @@
 #   4. bundle secrets (scripts/deploy-secrets.sh --secrets-dir --create-only:
 #      only Secrets that do not exist yet, incl. the wildcard TLS placeholder)
 #   5. istio resources, one-shot `kubectl apply` -> wait istiod + gateway
-#   6. teknoir-argo.yaml -> wait Application CRD Established + argocd-server
+#   6. teknoir-argo.yaml (after lib.sh:argocd_crd_gate) -> wait Application
+#      CRD Established + argocd-server
 #   7. harbor resources, one-shot `kubectl apply` -> wait pods + sidecars
 #   8. teknoir-app-of-apps.yaml (ArgoCD syncs once push-to-harbor.sh ran)
 #   The one-shot istio/harbor resources are adopted by their ArgoCD
@@ -29,7 +30,8 @@
 #
 # Usage: airgap/bootstrap-airgap.sh [--bundle DIR] [--host user@host]
 #                                   [--ssh-key FILE] [--node-ip IP] [--update]
-#                                   [--restart-k3s] [--reapply-adopted] [--dry-run]
+#                                   [--restart-k3s] [--reapply-adopted]
+#                                   [--skip-crd-gate] [--dry-run]
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -52,6 +54,9 @@ Options:
   --reapply-adopted  first bootstrap: re-apply the one-shot istio/harbor
                      resources even though ArgoCD already owns them
                      (disaster recovery only)
+  --skip-crd-gate    deploy ArgoCD even if the istio Application is not on the
+                     pinned version or a bootstrap CRD lacks Prune=false
+                     (see lib.sh:argocd_crd_gate)
   --dry-run          print every action without mutating the node
                      (read-only ssh queries still run)
   -h, --help         show this help
@@ -76,6 +81,7 @@ while [[ $# -gt 0 ]]; do
     --update) UPDATE_MODE=1 ;;
     --restart-k3s) RESTART_K3S=1 ;;
     --reapply-adopted) REAPPLY_ADOPTED=1 ;;
+    --skip-crd-gate) SKIP_CRD_GATE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown argument: $1 (see --help)" ;;
@@ -336,6 +342,10 @@ fi
 # 6. ArgoCD (K3s-owned teknoir-argo.yaml; after istio so its pods get sidecars)
 # ---------------------------------------------------------------------------
 log "ArgoCD -> ${K3S_MANIFESTS_DIR}/teknoir-argo.yaml"
+# ArgoCD manages CRDs: it must not be able to adopt the bootstrap CRDs (step 3
+# has just deployed them with Prune=false; the istio Application must already
+# run the pinned, CRD-free istio).
+argocd_crd_gate crds-just-deployed
 k3s_deploy "${ARGO_FILE}"
 wait_ready "Application CRD Established" "wait --for=condition=Established crd/applications.argoproj.io --timeout=60s"
 wait_ready "argocd server" "-n teknoir-system wait --for=condition=Available deployment -l app.kubernetes.io/name=argocd-server --timeout=30s"

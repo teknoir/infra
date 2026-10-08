@@ -47,6 +47,8 @@ object:
   clears that list), and `render-bootstrap.sh` annotates them
   `argocd.argoproj.io/sync-options: Prune=false,Delete=false` +
   `compare-options: IgnoreExtraneous`, so ArgoCD can never delete them.
+  ArgoCD is only (re)deployed once that holds and the `istio` Application
+  runs the CRD-free pinned version (`lib.sh:argocd_crd_gate`).
 
 **Charts are released once.** `airgap/versions.env` pins every chart version
 the root app-of-apps deploys: `GITOPS_CHARTS` (built from the gitops working
