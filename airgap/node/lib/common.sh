@@ -22,7 +22,10 @@
 # Never-print discipline: no `set -x` anywhere; secret values live only in
 # shell variables, private tmpfs files and pipes. Read them with read_secret
 # (marks the value for the leak check at exit) or capture secret_value. Never
-# pass a secret value as a command-line argument or to log/warn/die.
+# pass a secret value as a command-line argument or to log/warn/die. Mark only
+# generated or credential values: a public literal stored next to them (a user
+# name such as "keycloak") also appears in ordinary log lines and would fail
+# the leak check; read it with secret_value.
 #
 # Test-only knob: TEKNOIR_HOST_ROOT prefixes every host path (/etc, /opt,
 # /var, /run, /usr/local) so the host phase can run in a sandbox directory

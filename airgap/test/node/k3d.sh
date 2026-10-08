@@ -14,8 +14,10 @@
 #   I-10 downgrade refused, --rollback accepted and recorded, the next plain
 #       run with the rolled-back bundle keeps it; broken versions refused;
 #       post fails naming an Application that is not Synced/Healthy
-#   I-07 credentials --out (0600) and to a pipe; rotate oauth2-proxy-cookie
-#       changes only that key
+#   I-07 credentials --out (0600) and to a pipe, a user name passes the leak
+#       check; rotate oauth2-proxy-cookie changes only that key; rotate
+#       keycloak-db --i-know against a postgres stand-in (new password works,
+#       old one is refused, exit 0)
 #   I-12 backup: none before the first release; without DB pods a backup
 #       completes and warns (first install interrupted, DB restarting);
 #       pg_dumpall of harbor and keycloak through kubectl exec, Secrets
@@ -373,12 +375,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+echo "# I-07: rotate keycloak-db --i-know against the postgres stand-in"
+# The stand-in's password is the pod's POSTGRES_PASSWORD; the Secret holds the
+# same user name as the platform-secrets literal ("keycloak").
+k -n teknoir-auth create secret generic keycloak-db-secret \
+  --from-literal=username=keycloak --from-literal=password=unused-test-only >/dev/null
+db_login() {
+  # db_login - read a password on stdin and log in over TCP to the pod IP
+  # (scram-sha-256; the loopback rules of the image are trust).
+  # shellcheck disable=SC2016 # expanded by the pod's shell
+  k -n teknoir-auth exec -i keycloak-db-0 -c postgres -- \
+    sh -c 'PGPASSWORD="$(cat)" psql -h "$(hostname -i)" -U keycloak -d postgres -tAc "select 1"' 2>/dev/null
+}
+check "the stand-in accepts the old password over TCP" [ "$(printf 'unused-test-only' | db_login)" == 1 ]
+tn rotate keycloak-db --site test --i-know
+check "rotate keycloak-db --i-know succeeds (no leak-check exit 70)" \
+  bash -c "[ ${RC} = 0 ] && ! grep -q 'leak check' '${T}/out' && grep -q 'replaced teknoir-auth/keycloak-db-secret password' '${T}/out'"
+newpw="$(k -n teknoir-auth get secret keycloak-db-secret -o 'jsonpath={.data.password}' | base64 -d)"
+check "the Secret holds a new 32-character password" bash -c "[ \${#1} = 32 ] && [ \"\$1\" != unused-test-only ]" _ "${newpw}"
+check "the database accepts the new password" [ "$(printf '%s' "${newpw}" | db_login)" == 1 ]
+check "the database refuses the old password" [ "$(printf 'unused-test-only' | db_login || true)" != 1 ]
+check "the user name is unchanged" \
+  [ "$(k -n teknoir-auth get secret keycloak-db-secret -o 'jsonpath={.data.username}' | base64 -d)" == keycloak ]
+newpw=""
+k -n teknoir-auth create secret generic keycloak-admin \
+  --from-literal=username=keycloak --from-literal=password="$(openssl rand -hex 16)" >/dev/null
+tn credentials keycloak-admin-username --site test --out "${T}/kc-user.txt"
+check "credentials of a user name (a word in every log line) pass the leak check" \
+  bash -c "[ ${RC} = 0 ] && [ \"\$(cat '${T}/kc-user.txt')\" = keycloak ]"
+
+# ---------------------------------------------------------------------------
 echo "# T8: never print"
 # Every value of every Secret in the Teknoir namespaces (private keys line by
-# line; public certificates are not secret).
+# line; public certificates and user names are not secret: a user name such
+# as "keycloak" is part of ordinary log lines).
 k get secret -A -o json | jq -r '
   .items[] | select(.metadata.namespace | test("^(cert-manager|istio-system|teknoir-system|teknoir-auth)$")) |
-  .data // {} | to_entries[] | select(.key != "tls.crt" and .key != "ca.crt") | .value' \
+  .data // {} | to_entries[] | select(.key != "tls.crt" and .key != "ca.crt" and .key != "username") | .value' \
   | while read -r v; do printf '%s' "${v}" | base64 -d; printf '\n'; done \
   | grep -vE '^-----(BEGIN|END)' | awk 'length($0) >= 8' | sort -u > "${T}/values"
 nvalues="$(wc -l < "${T}/values")"

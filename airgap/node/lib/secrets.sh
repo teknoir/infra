@@ -291,14 +291,16 @@ secrets_status() {
 # credentials
 # ---------------------------------------------------------------------------
 secrets_credential_ref() {
-  # secrets_credential_ref <name> - "namespace secret key" of a named credential.
+  # secrets_credential_ref <name> - "namespace secret key class" of a named
+  # credential; class secret (marked for the leak check) or public (a user
+  # name: never marked, it legitimately appears in log lines).
   case "$1" in
-    keycloak-admin)          echo "teknoir-auth keycloak-admin password" ;;
-    keycloak-admin-username) echo "teknoir-auth keycloak-admin username" ;;
-    platform-admin)          echo "teknoir-auth keycloak-platform-admin password" ;;
-    harbor-admin)            echo "teknoir-system harbor-secret HARBOR_ADMIN_PASSWORD" ;;
-    argocd-admin)            echo "teknoir-system argocd-initial-admin-secret password" ;;
-    grafana-admin)           echo "teknoir-system monitoring-grafana admin-password" ;;
+    keycloak-admin)          echo "teknoir-auth keycloak-admin password secret" ;;
+    keycloak-admin-username) echo "teknoir-auth keycloak-admin username public" ;;
+    platform-admin)          echo "teknoir-auth keycloak-platform-admin password secret" ;;
+    harbor-admin)            echo "teknoir-system harbor-secret HARBOR_ADMIN_PASSWORD secret" ;;
+    argocd-admin)            echo "teknoir-system argocd-initial-admin-secret password secret" ;;
+    grafana-admin)           echo "teknoir-system monitoring-grafana admin-password secret" ;;
     *) return 1 ;;
   esac
 }
@@ -306,7 +308,7 @@ secrets_credential_ref() {
 cmd_credentials() {
   # credentials NAME [--out FILE] - one value, to a 0600 file or to a stdout
   # that is not a terminal (the LAN host captures it into its own 0600 file).
-  local name="" out="" ref ns secret key value
+  local name="" out="" ref ns secret key class value
   while (( $# > 0 )); do
     case "$1" in
       --out) [[ -n "${2:-}" ]] || die "credentials: --out needs a file"; out="$2"; shift ;;
@@ -317,14 +319,18 @@ cmd_credentials() {
   done
   [[ -n "${name}" ]] || die "credentials: NAME required (keycloak-admin keycloak-admin-username platform-admin harbor-admin argocd-admin grafana-admin)"
   ref="$(secrets_credential_ref "${name}")" || die "credentials: unknown NAME ${name}"
-  read -r ns secret key <<<"${ref}"
+  read -r ns secret key class <<<"${ref}"
   if [[ -z "${out}" && -t 1 ]]; then
     die "credentials: refusing to print a credential to a terminal; use --out FILE or redirect stdout"
   fi
   require_cluster credentials || return 0
   in_cluster secret "${secret}" "${ns}" || die "credentials: Secret ${ns}/${secret} does not exist (yet)"
   dry_run && { log "[dry-run] would write ${name} (${ns}/${secret} ${key}) to ${out:-stdout}"; return 0; }
-  read_secret value "${ns}" "${secret}" "${key}"
+  if [[ "${class}" == "secret" ]]; then
+    read_secret value "${ns}" "${secret}" "${key}"
+  else
+    value="$(secret_value "${ns}" "${secret}" "${key}")"
+  fi
   if [[ -n "${out}" ]]; then
     [[ ! -L "${out}" ]] || die "credentials: ${out} is a symlink"
     ( umask 077 && printf '%s\n' "${value}" > "${out}" ) || die "credentials: cannot write ${out}"
@@ -401,7 +407,10 @@ _secrets_rotate_keycloak_db() {
     changed "set a new Keycloak DB password (ALTER USER in keycloak-db-0, Secret keycloak-db-secret, restart keycloak)"
     return 0
   fi
-  read_secret user teknoir-auth keycloak-db-secret username
+  # The user name is a platform-secrets literal ("keycloak"), not a secret:
+  # read it unmarked, or the leak check would flag every log line naming
+  # keycloak-db-secret or statefulset/keycloak.
+  user="$(secret_value teknoir-auth keycloak-db-secret username)"
   [[ "${user}" =~ ^[A-Za-z0-9_]+$ ]] || die "rotate: unexpected DB user name format"
   newval="$(random_alnum 32)"
   mark_sensitive "${newval}"
