@@ -170,8 +170,8 @@ export GITOPS_REPO_DIR=../platform-applications-gitops-teknoir-local
 ```
 
 > **First bootstrap needs every pinned chart in the bundle.** Charts in
-> `RELEASED_CHARTS` (currently `harbor 0.0.5`, `auth 0.0.3`) are never
-> rebuilt from the working tree. Copy their `.tgz` into
+> `RELEASED_CHARTS` (empty today) are never rebuilt from the working tree.
+> Copy their `.tgz` into
 > `bundle/teknoir-airgap-bundle-<version>/charts/` (e.g. `helm pull` them from
 > an existing Harbor) before `make-bundle.sh`, or pin versions the working
 > tree carries. Without them `render-bootstrap.sh` leaves out

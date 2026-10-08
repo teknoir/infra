@@ -37,9 +37,11 @@ Changing a chart therefore always means a new version:
 `collect-charts.sh` (run by `make-bundle.sh`) refuses to build when the gitops
 checkout is not on `teknoir-local`, when a `Chart.yaml` version differs from its
 pin, or when `versions.env` does not pin exactly what the pinned `app-of-apps`
-deploys. `RELEASED_CHARTS` (currently `harbor 0.0.5`, `auth 0.0.3`) are
-already in Harbor and are never rebuilt: the working tree carries newer,
-undeployed versions of them.
+deploys. Pinned versions Harbor already has (today `auth 0.0.3`,
+`cert-manager 0.0.1`, `harbor 0.0.5`) are still packaged, for rendering, image
+collection and a first bootstrap, but never re-pushed. `RELEASED_CHARTS`
+(empty today) is for versions that are in Harbor but no longer in the working
+tree; they are never rebuilt.
 
 ## 2. Update procedure
 
