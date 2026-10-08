@@ -10,7 +10,9 @@
 #   4. integration: a Debian 13 "node" container with sshd and sudo (password
 #      required) and a bash 3.2 "LAN host" container on an internal docker
 #      network: host-key pinning, one-time sudo setup in a terminal,
-#      content-addressed payload sync, kubeconfig replacement, credentials,
+#      every runner command on a node that never ran up (the live migration
+#      order: backup, migrate), site config refresh, content-addressed
+#      payload sync, kubeconfig replacement, credentials,
 #      backup, trust, doctor, host key change, never-print check, up --local
 #
 # Usage: airgap/test/lan/run.sh [--no-integration] [--keep]
@@ -137,7 +139,27 @@ EOF
   }
   pd=/var/lib/teknoir-airgap/bundles/$(basename "${b}" | sed 's/^teknoir-airgap-//')/node
 
+  site=/var/lib/teknoir-airgap/site/teknoir-local.env
+
   phase first-use
+  # The live migration runs backup and migrate before the first up
+  # (docs/OPERATE.md section 14): every runner command must work on a node
+  # without a site config, payload or sudoers file.
+  phase before-up
+  node_check "backup set up sudo before any up" 'test -f /etc/sudoers.d/teknoir-airgap'
+  node_check "the site config on the node is the bundle's" "cmp -s ${bb}/site/teknoir-local.env ${site}"
+  node_check "no converge ran" '! grep -q " converge " /var/log/teknoir-airgap-fake-runner.log'
+  node_check "backup, migrate, credentials, rotate and status ran with the site config" \
+    "for c in 'backup --export --take' 'migrate --site ${site} --dry-run' 'credentials keycloak-admin --site ${site}' 'rotate oauth2-proxy-cookie --site ${site}' 'status --site ${site}'; do grep -q \"uid=0 \$c\" /var/log/teknoir-airgap-fake-runner.log || exit 1; done"
+  docker exec "${node}" sh -c "echo 'NODE_IP=10.9.9.9  # stale' >>${site}"
+  phase site-refresh-credentials
+  node_check "credentials replaced the stale site config" "cmp -s ${bb}/site/teknoir-local.env ${site}"
+  docker exec "${node}" sh -c "echo 'NODE_IP=10.9.9.9  # stale' >>${site}"
+  phase site-refresh-status
+  node_check "status replaced the stale site config" "cmp -s ${bb}/site/teknoir-local.env ${site}"
+  # back to a node that never saw teknoir-airgap (the pinned host key stays)
+  docker exec "${node}" sh -c 'rm -rf /var/lib/teknoir-airgap /etc/sudoers.d/teknoir-airgap && : >/var/log/teknoir-airgap-fake-runner.log'
+
   phase sudo-setup
   node_check "sudoers file installed, mode 0440, NOPASSWD for teknoir" \
     'test "$(stat -c %a /etc/sudoers.d/teknoir-airgap)" = 440 && grep -qx "teknoir ALL=(root) NOPASSWD: ALL" /etc/sudoers.d/teknoir-airgap'

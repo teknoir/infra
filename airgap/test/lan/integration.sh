@@ -42,6 +42,32 @@ first-use)
   expect_rc 1 "up --dry-run does not set up sudo" "${T}" up --dry-run
   expect_out "run ./teknoir-airgap up once in a terminal" "dry run points at the one-time setup"
   ;;
+before-up)
+  section "a node that never ran up: the live migration order (M2 backup, M3 migrate) and the other runner commands"
+  expect_rc 1 "migrate --dry-run before the sudo setup" "${T}" migrate --dry-run
+  expect_out "a dry run does not set it up; run ./teknoir-airgap backup --out DIR once in a terminal first" "points at the M2 backup, not at up"
+  with_tty "backup in a terminal: sudo setup, payload and site config, then the backup" 0 "${T}" backup --out /tmp/bk0
+  expect_out "one-time setup: installing /etc/sudoers.d/teknoir-airgap" "sets up sudo"
+  expect_out "sending 9 of 9 payload files" "sends the payload the runner lives in"
+  check "the encrypted backup arrived" sh -c 'ls /tmp/bk0/teknoir-backup-teknoir-local-*.tar.age >/dev/null'
+  expect_rc 0 "migrate --dry-run" "${T}" migrate --dry-run
+  expect_out "fake migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --dry-run" "the runner reads the pushed site config"
+  expect_rc 0 "migrate" "${T}" migrate
+  mkdir -p /tmp/out0
+  expect_rc 0 "credentials" "${T}" credentials keycloak-admin --out /tmp/out0/keycloak-admin.txt
+  check "the credential file has the value" grep -qx 's3cr3t-keycloak-admin-value' /tmp/out0/keycloak-admin.txt
+  expect_rc 0 "rotate" "${T}" rotate oauth2-proxy-cookie
+  expect_rc 0 "status" "${T}" status
+  expect_out "fake status --site /var/lib/teknoir-airgap/site/teknoir-local.env" "status runs teknoir-node with the site config"
+  ;;
+site-refresh-credentials)
+  section "a stale site config on the node is replaced (credentials)"
+  expect_rc 0 "credentials after the node's site config changed" "${T}" credentials keycloak-admin --out /tmp/out0/keycloak-admin.txt
+  ;;
+site-refresh-status)
+  section "a stale site config on the node is replaced (status)"
+  expect_rc 0 "status after the node's site config changed" "${T}" status
+  ;;
 sudo-setup)
   section "first up in a terminal: one sudo password, then the full run"
   with_tty "up in a terminal installs sudoers and converges" 0 "${T}" up

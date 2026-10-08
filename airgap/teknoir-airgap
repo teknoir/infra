@@ -24,12 +24,16 @@
 #   status      --site FILE --lan-time EPOCH
 #   credentials NAME --site FILE           value on stdout (a pipe, never a tty)
 #   admin-user  --email ADDR --site FILE   temporary password on stdout
-#   backup      --export --take --site FILE   (tty: age asks for a passphrase)
+#   backup     --export --take --site FILE   (tty: age asks for a passphrase)
 #               new backup, encrypted to /var/lib/teknoir-airgap/exports/
 #               teknoir-backup-<ts>.tar.age
 #   backup      --stream FILE --keep --site FILE   that export on stdout
 #   rotate      NAME --site FILE [--i-know]
 #   migrate     --site FILE [--dry-run | --undo NAME]
+# Every command that runs teknoir-node first copies the site config to
+# /var/lib/teknoir-airgap/site/<site>.env (when it differs) and the payload
+# when the node lacks it (node_prepare), so each works on a node that never
+# ran up (the live migration starts with backup and migrate).
 # MANIFEST.yaml goes next to the payload (bundles/<bundleId>/MANIFEST.yaml),
 # where teknoir-node reads the bundle id, versions and commits. The payload
 # sync, sudo setup, kubeconfig, CA and status fallback use only sh, sudo,
@@ -84,8 +88,9 @@ Commands:
                         then fetch the kubeconfig and the CA certificate. The
                         same command does the first install and every update,
                         and is safe to re-run at any time.
-  status                Read-only report: node, k3s, Applications, deployed
-                        release, clock skew.
+  status                Report: node, k3s, Applications, deployed release, clock
+                        skew. Changes nothing but the node's copy of the site
+                        config.
   verify                Check the extracted bundle against MANIFEST.yaml (no ssh).
   kubeconfig            Write the cluster's kubeconfig into ~/.kube/config as
                         context <site>, replacing older entries of that name.
@@ -682,6 +687,23 @@ sudo_ok() {
   return "${rc}"
 }
 
+# sudo_hint: how to get the one-time sudo setup done. Never suggests up for
+# migrate: on the live node, migrate runs before the first up (docs/OPERATE.md
+# section 14), and its M2 backup is the first command there.
+sudo_hint() {
+  local h
+  case "${CMD}" in
+    up) h="run ./teknoir-airgap up once in a terminal" ;;
+    migrate) h="run ./teknoir-airgap backup --out DIR once in a terminal first (docs/OPERATE.md section 14, M2)" ;;
+    *) h="run ./teknoir-airgap ${CMD} once in a terminal" ;;
+  esac
+  if [ "${DRY_RUN}" = 1 ]; then
+    [ "${CMD}" != up ] || h="${h} without --dry-run"
+    h="a dry run does not set it up; ${h}"
+  fi
+  printf '%s (it asks for the sudo password once and installs /etc/sudoers.d/teknoir-airgap)' "${h}"
+}
+
 # sudo_ensure [setup]: passwordless sudo for the ssh user on the node; with
 # "setup", install /etc/sudoers.d/teknoir-airgap once (asks for the password).
 sudo_ensure() {
@@ -690,10 +712,9 @@ sudo_ensure() {
     return 0
   fi
   sudo_ok && return 0
-  if [ "${1:-}" != setup ] || [ "${DRY_RUN}" = 1 ]; then
-    die "${REMOTE_USER} on ${NODE} has no passwordless sudo yet: run ./teknoir-airgap up once in a terminal (it asks for the sudo password once)"
+  if [ "${1:-}" != setup ] || [ "${DRY_RUN}" = 1 ] || [ ! -t 0 ]; then
+    die "${REMOTE_USER} on ${NODE} has no passwordless sudo yet: $(sudo_hint)"
   fi
-  [ -t 0 ] || die "${REMOTE_USER} on ${NODE} has no passwordless sudo yet: run ./teknoir-airgap up once in a terminal (it asks for the sudo password once and installs /etc/sudoers.d/teknoir-airgap)"
   log "one-time setup: installing /etc/sudoers.d/teknoir-airgap on ${NODE} so ${REMOTE_USER} can run the converge without a password prompt"
   log "sudo on the node asks for ${REMOTE_USER}'s password once"
   remote_exec tty "sudo -p '[sudo] password for %u on %h: ' sh -c $(shq "${SUDOERS_SCRIPT}") sh $(shq "${REMOTE_USER}")" \
@@ -1019,6 +1040,18 @@ node_connect() {  # ssh (or --local) + sudo; "setup" installs sudoers if needed
   fi
 }
 
+# node_prepare: what every command that runs teknoir-node --site needs, also on
+# a node that never ran up: ssh and sudo (one-time setup in a terminal), the
+# node's tools, the current site config at REMOTE_SITE (rewritten when it
+# differs, so a changed site file always reaches the node) and this bundle's
+# payload (sent only when missing).
+node_prepare() {
+  node_connect setup
+  node_prereqs
+  site_push
+  payload_ensure
+}
+
 run_runner() {   # run_runner tty|pipe SUBCOMMAND [ARGS...]: teknoir-node as root
   local mode=$1
   shift
@@ -1094,7 +1127,7 @@ if [ -x "$runner" ]; then echo RUNNER=yes; else echo RUNNER=no; fi
 '
 
 cmd_status() {
-  local now remote skew site rc=0
+  local now remote skew rc=0
   [ "$(npos)" -eq 0 ] || usage_error "status takes no arguments"
   common_open
   printf 'bundle:   %s\nsite:     %s (%s)\nnode:     %s (NODE_IP %s)\n' "${BUNDLE_ID}" "${SITE_NAME}" "${SITE_FILE}" "${NODE}" "${NODE_IP}"
@@ -1108,16 +1141,16 @@ cmd_status() {
     printf 'clock:    skew %s s\n' "${skew}"
   fi
   if ! sudo_ok; then
-    warn "${REMOTE_USER} has no passwordless sudo on the node yet: run ./teknoir-airgap up once in a terminal"
+    warn "${REMOTE_USER} has no passwordless sudo on the node yet: run ./teknoir-airgap up once in a terminal (on a live node before its migration: backup, docs/OPERATE.md section 14)"
     return 1
   fi
   node_sh pipe "${STATUS_SCRIPT}" "$(runner_path)" </dev/null >"${TMPD}/status.out" 2>&1 || rc=$?
   grep -v '^RUNNER=' "${TMPD}/status.out" || true
   if grep -q '^RUNNER=yes' "${TMPD}/status.out"; then
-    site=${REMOTE_SITE}
-    node_sh pipe 'test -f "$1"' "${site}" </dev/null 2>/dev/null || site=$(payload_dir)/site/$(basename "${SITE_FILE}")
+    # the runner reads the site config the operator uses now, not a stale copy
+    site_push
     printf '== teknoir-node status (bundle %s)\n' "${BUNDLE_ID}"
-    run_runner tty status --site "${site}" --lan-time "$(date +%s)" || rc=$?
+    run_runner tty status --site "${REMOTE_SITE}" --lan-time "$(date +%s)" || rc=$?
   else
     printf '(this bundle is not on the node yet; ./teknoir-airgap up copies it and adds the detailed checks)\n'
   fi
@@ -1335,8 +1368,7 @@ cmd_credentials() {
   case "${name}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid credential name '${name}'" ;; esac
   common_open
   out_file_prepare "${OPT_OUT}"
-  node_connect setup
-  payload_ensure
+  node_prepare
   secret_run "${OUT_ABS}" credentials "${name}" --site "${REMOTE_SITE}"
   log "wrote credential ${name} to ${OUT_ABS} (mode 0600); delete the file when you no longer need it"
 }
@@ -1352,8 +1384,7 @@ cmd_admin_user() {
   esac
   common_open
   out_file_prepare "${OPT_OUT}"
-  node_connect setup
-  payload_ensure
+  node_prepare
   secret_run "${OUT_ABS}" admin-user --email "${OPT_EMAIL}" --site "${REMOTE_SITE}"
   log "admin user ${OPT_EMAIL} is set up; its temporary password is in ${OUT_ABS} (mode 0600)"
   log "sign in at https://${TEKNOIR_DOMAIN}/ ; Keycloak asks for a new password at the first login"
@@ -1371,8 +1402,7 @@ cmd_backup() {
   chmod 700 "${OPT_OUT}" 2>/dev/null || true
   dir=$(abs_dir "${OPT_OUT}") || die "cannot use ${OPT_OUT}"
   refuse_inside_bundle "${dir}"
-  node_connect setup
-  payload_ensure
+  node_prepare
   log "taking a backup on the node and encrypting it there with age: choose a passphrase and keep it; a restore needs it"
   run_runner tty backup --export --take --site "${REMOTE_SITE}" || die "teknoir-node backup --export failed on the node"
   latest=$(node_sh pipe 'ls -1 "$1" 2>/dev/null | grep "^2.*Z$" | LC_ALL=C sort | tail -n 1' "${NODE_STATE_DIR}/backups" </dev/null | tail -n 1) || latest=
@@ -1402,8 +1432,7 @@ cmd_rotate() {
   name=${POS[0]}
   case "${name}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid secret name '${name}'" ;; esac
   common_open
-  node_connect setup
-  payload_ensure
+  node_prepare
   if [ "${OPT_I_KNOW}" = 1 ]; then
     run_runner tty rotate "${name}" --site "${REMOTE_SITE}" --i-know
   else
@@ -1416,8 +1445,7 @@ cmd_migrate() {
   if [ "${DRY_RUN}" = 1 ] && [ -n "${OPT_UNDO}" ]; then usage_error "migrate takes --dry-run or --undo, not both"; fi
   case "${OPT_UNDO}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid name for --undo: '${OPT_UNDO}'" ;; esac
   common_open
-  node_connect setup
-  payload_ensure
+  node_prepare
   if [ "${DRY_RUN}" = 1 ]; then
     run_runner tty migrate --site "${REMOTE_SITE}" --dry-run
   elif [ -n "${OPT_UNDO}" ]; then
