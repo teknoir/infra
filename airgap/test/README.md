@@ -98,4 +98,10 @@ ArgoCD runs in the fixture); T6 and E10 do.
   VM and run only with `--allow-destroy`. Inputs: `E2E_BUNDLE`, `E2E_BUNDLE_B`, `E2E_OLD_SETUP`
   (see the header of the script).
   Example: `E2E_BUNDLE=dist/teknoir-airgap-<id>.tar airgap/test/vm/e2e.sh --allow-destroy E1 E2 E3`.
+- `vm/old-setup.sh`: the `E2E_OLD_SETUP` command for E10. It installs the live env's old layout
+  on the fresh VM with the old tooling itself (infra e9a3b7f, gitops 158b3da = app-of-apps 0.0.3)
+  and dummy secrets, then adds the legacy file names and orphan Addons the live node has. Its
+  test-environment workarounds are listed in its header. `--build-only` runs only the vpro side
+  (worktrees, dummy secrets, bundle in `~/vmtest/old-setup`). Example:
+  `E2E_OLD_SETUP="$PWD/airgap/test/vm/old-setup.sh" E2E_BUNDLE=... airgap/test/vm/e2e.sh --allow-destroy E10`.
 - `vm/kc-login.sh`: scripted oauth2-proxy and Keycloak login. Passwords go only through files.

@@ -652,12 +652,15 @@ Scenarios. Each asserts and prints a pass/fail summary.
 - E8 rotation: `teknoir-airgap rotate oauth2-proxy-cookie` changes only that Secret, oauth2-proxy rolls, and login still works.
 - E9 (optional, memory permitting): a second VM joins as an agent through the host phase. Pods scheduled there pull from Harbor through registries.yaml with the CA trusted. The hostPath PVs stay on the server.
 - E10 migration rehearsal, the gate for the live env:
-  1. On a fresh VM, run the CURRENT tooling (HEAD e9a3b7f bundle, with generated dummy secrets) to reach the old layout.
-  2. Run the new bundle's `migrate`, then `up`, then a k3s restart.
+  1. On a fresh VM, run the CURRENT tooling (HEAD e9a3b7f bundle, with generated dummy secrets) to reach the old layout (airgap/test/vm/old-setup.sh, including the live node's legacy file names and orphan Addons).
+  2. Run the new bundle's `migrate --dry-run`, `migrate`, `up`, `migrate --argo --dry-run`, `migrate --argo`, `migrate` again (M6), then a k3s restart.
   3. Assert:
-     - no object loss (counts);
-     - the CRDs are ArgoCD-tracked;
-     - no Teknoir files or Addons under K3s;
+     - no object loss: every object of the baseline survives by name, except the expected-gone list (harbor-registry-htpasswd, which harbor 0.0.9 replaces, and the robot repo-creds Secret, which M6 deletes), and those are gone;
+     - migrate carries the Keycloak admin over (keycloak-admin with username and previous-password), and after up the admin logs in with password and not with previous-password; realm teknoir answers; admin-user and an oauth2-proxy login work;
+     - the CRDs are ArgoCD-tracked, and every argoproj.io CRD carries Prune=false,Delete=false;
+     - no Teknoir files or Addons under K3s, no old bundle copy on the node;
+     - after M6 the repo-creds Secret and robot$argocd are gone and app-of-apps still syncs;
+     - the restart changes no object, re-creates no Addon and keeps the platform Secrets' resourceVersions;
      - the existing secrets are unchanged, which proves adoption by name and key;
      - Harbor is stable for 1 h with no new harbor-core ReplicaSet.
 - Host-setup doc check, manual and once: install Debian 13 from the offline ISO into a VM attached to tkvm0 using only HOST-SETUP.md, then E1 from the netns. This validates the installer path the cloud image skips.
