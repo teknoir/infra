@@ -17,6 +17,7 @@ fi
 case "${a}" in
   *" get --raw=/readyz"*) echo ok ;;
   *" wait --for=condition=Ready node"*) ;;
+  *" get pods -A -o json"*) cat "${STUB_STATE}/pods.json" ;;
   *" get nodes -o json"*)
     echo '{"items":[{"metadata":{"name":"tk","labels":{}},"status":{"addresses":[{"type":"InternalIP","address":"10.77.0.10"}]}}]}' ;;
   *" get configmap teknoir-airgap-release"*"--ignore-not-found"*)

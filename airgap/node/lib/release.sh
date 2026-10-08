@@ -275,7 +275,7 @@ post_image_check() {
   # Every image of a running container must be re-pullable from Harbor, or at
   # least present in containerd (warned: lost on image GC). Missing from both
   # fails.
-  local images present ref norm ok=0 local_only=0 missing=0 missing_list=""
+  local images present ref norm ok=0 local_only=0 missing=0 missing_list="" local_list=""
   if [[ ! -x "${K3S_BIN}" ]]; then
     log "live image check: skipped (no k3s binary on this host)"
     return 0
@@ -290,13 +290,17 @@ post_image_check() {
       ok=$(( ok + 1 ))
     elif grep -qxF "${norm}" <<<"${present}"; then
       local_only=$(( local_only + 1 ))
-      warn "image ${norm}: in containerd but not pullable from ${HARBOR_HOST} (lost on image GC)"
+      (( local_only <= 10 )) && local_list+=" ${norm}"
     else
       missing=$(( missing + 1 ))
       missing_list+=" ${norm}"
     fi
   done
   log "live image check: ${ok} pullable from Harbor, ${local_only} only in containerd, ${missing} missing"
+  if (( local_only > 0 )); then
+    (( local_only > 10 )) && local_list+=" ... and $(( local_only - 10 )) more"
+    warn "running images not pullable from ${HARBOR_HOST} (kept only by containerd, lost on image GC):${local_list}"
+  fi
   (( missing == 0 )) || die "post: running images neither in Harbor nor in containerd:${missing_list}"
 }
 

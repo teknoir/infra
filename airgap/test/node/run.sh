@@ -304,6 +304,38 @@ check "broken 0.0.1 refused on a first install" [ "$(guard "" 0.0.1)" == refused
 check "an unpinned version is refused" [ "$(guard "" latest)" == refused ]
 
 # ---------------------------------------------------------------------------
+echo "# post: live image check"
+cat > "${STUB_STATE}/pods.json" <<'EOF'
+{"items": [
+  {"status": {"phase": "Running"}, "spec": {"containers": [{"image": "istio/proxyv2:1.29.2"}], "initContainers": [{"image": "redis:7"}]}},
+  {"status": {"phase": "Running"}, "spec": {"containers": [{"image": "ghcr.io/teknoir/gone:1"}]}},
+  {"status": {"phase": "Succeeded"}, "spec": {"containers": [{"image": "quay.io/ignored:1"}]}}
+]}
+EOF
+printf 'docker.io/library/redis:7\n' > "${STUB_STATE}/ctr-images"
+cat > "${T}/crane" <<'EOF'
+#!/usr/bin/env bash
+printf 'crane %s\n' "$*" >> "${STUB_CALLS}"
+[[ "$*" == "digest --platform linux/amd64 harbor.teknoir.airgapped/dockerhub/istio/proxyv2:1.29.2" ]]
+EOF
+chmod +x "${T}/crane"
+imgcheck() {
+  node_env CRANE="${T}/crane" bash -c "
+    set -euo pipefail
+    export NODE_ROOT='${PAYLOAD}'
+    source '${PAYLOAD}/lib/common.sh'; source '${PAYLOAD}/lib/host.sh'; source '${PAYLOAD}/lib/release.sh'
+    load_site '${PAYLOAD}/site/test.env'
+    post_image_check" > "${T}/out" 2>&1 && echo pass || echo fail
+}
+check "an image neither in Harbor nor in containerd fails the check" [ "$(imgcheck)" == fail ]
+check "the failure names the missing image" grep -q 'ghcr.io/teknoir/gone:1' "${T}/out"
+check "the Harbor lookup uses the mirror project path" grep -q 'harbor.teknoir.airgapped/dockerhub/istio/proxyv2:1.29.2' "${STUB_CALLS}"
+printf 'docker.io/library/redis:7\nghcr.io/teknoir/gone:1\n' > "${STUB_STATE}/ctr-images"
+r="$(imgcheck)"
+check "containerd-only images pass" [ "${r}" == pass ]
+check "they are listed in a single warning" [ "$(grep -c 'not pullable from harbor' "${T}/out")" == 1 ]
+
+# ---------------------------------------------------------------------------
 echo "# credentials"
 if command -v script >/dev/null 2>&1; then
   node_env script -qec "'${PAYLOAD}/bin/teknoir-node' credentials harbor-admin --site test" /dev/null > "${T}/out" 2>&1 || true
