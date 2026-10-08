@@ -21,6 +21,7 @@ source "${NODE_ROOT}/lib/common.sh"
 K3S_CONFIG_DIR="${HOST_ROOT}/etc/rancher/k3s"
 K3S_CONFIG_FILE="${K3S_CONFIG_DIR}/config.yaml"
 K3S_RESOLV_FILE="${K3S_CONFIG_DIR}/resolv.conf"
+RESOLVED_DROPIN="${HOST_ROOT}/etc/systemd/resolved.conf.d/teknoir-airgap.conf"
 K3S_REGISTRIES_FILE="${K3S_CONFIG_DIR}/registries.yaml"
 # The registry CA as k3s/containerd see it (registries.yaml ca_file).
 K3S_CA_FILE="${HOST_ROOT}/etc/rancher/k3s/teknoir-root-ca.crt"
@@ -40,6 +41,7 @@ TARBALL_RE='\.(tar|tar\.zst|tar\.gz|tgz|tar\.lz4|tar\.bz2|tzst)$'
 # Set by phase_host for the restart decision.
 HOST_FILES_CHANGED=0
 HOST_RESOLV_CHANGED=0
+RESOLV_LINE=""
 K3S_JUST_STARTED=0
 declare -A _BUNDLE_SUMS=()
 
@@ -116,21 +118,57 @@ host_system_dns() {
     "${HOST_ROOT}/etc/resolv.conf" "${HOST_ROOT}/run/systemd/resolve/resolv.conf" 2>/dev/null | awk '!seen[$0]++'
 }
 
-host_resolv_conf_line() {
+host_resolved_stub() {
+  # host_resolved_stub on|off - expose systemd-resolved's stub on NODE_IP (or
+  # stop doing so). With no upstream it answers at once: names from the node's
+  # /etc/hosts (the managed teknoir block) and NXDOMAIN/SERVFAIL for the rest.
+  local want="$1" d
+  d="$(dirname "${RESOLVED_DROPIN}")"
+  if [[ "${want}" == on ]]; then
+    ensure_work_dir
+    printf '# written by teknoir-node (host phase): resolved stub on NODE_IP for CoreDNS\n[Resolve]\nDNSStubListenerExtra=%s\n' \
+      "${NODE_IP}" > "${WORK_DIR}/resolved-teknoir.conf"
+    ensure_dir "${d}" 0755
+    install_file "${WORK_DIR}/resolved-teknoir.conf" "${RESOLVED_DROPIN}" 0644 "systemd-resolved stub on ${NODE_IP}"
+  elif [[ -f "${RESOLVED_DROPIN}" ]]; then
+    run rm -f "${RESOLVED_DROPIN}"
+    changed "removed ${RESOLVED_DROPIN} (an upstream resolver is configured now)"
+    FILE_CHANGED=1
+  else
+    FILE_CHANGED=0
+  fi
+  if (( FILE_CHANGED )) && ! dry_run; then
+    systemctl restart systemd-resolved || die "cannot restart systemd-resolved"
+  fi
+}
+
+host_resolv_conf_prepare() {
   # CoreDNS forwards unknown names to the resolvers k3s finds on the node. With
   # only a loopback stub and no upstream (a true air gap), k3s falls back to
   # 8.8.8.8 and every lookup it cannot answer locally waits for a timeout
-  # (seen as ArgoCD repo-server health checks taking 2 s and failing). So:
+  # (VM e2e: ArgoCD repo-server's self health check took 2 s, gRPC's
+  # _grpclb SRV lookups, and the pod was restarted over and over). So:
   #   UPSTREAM_DNS in the site config  -> CoreDNS uses those servers;
   #   a non-loopback upstream on the node -> nothing changes (k3s default);
-  #   no upstream at all -> NODE_IP, where nothing listens on port 53, so an
-  #   unknown name fails at once (ICMP port unreachable) instead of timing out.
+  #   no upstream at all -> systemd-resolved's stub, exposed on NODE_IP, which
+  #   answers at once (a closed port is not enough: the kernel rate-limits the
+  #   ICMP port-unreachable replies, so bursts of lookups still time out).
+  # Runs in the main shell (not in $(...)), so the resolved drop-in, its
+  # restart and the change records are kept; sets RESOLV_LINE for config.yaml.
   local servers="" s
+  RESOLV_LINE=""
   if [[ -n "${UPSTREAM_DNS:-}" ]]; then
     servers="${UPSTREAM_DNS}"
+    host_resolved_stub off
   elif [[ -n "$(host_system_dns)" ]]; then
+    host_resolved_stub off
     return 0
   else
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+      host_resolved_stub on
+    else
+      warn "no upstream DNS and no systemd-resolved: names CoreDNS cannot answer will time out; set UPSTREAM_DNS in the site config"
+    fi
     servers="${NODE_IP}"
   fi
   ensure_work_dir
@@ -138,21 +176,21 @@ host_resolv_conf_line() {
     echo "# written by teknoir-node (host phase): CoreDNS upstream for k3s (resolv-conf)"
     for s in ${servers}; do echo "nameserver ${s}"; done
   } > "${WORK_DIR}/k3s-resolv.conf"
-  printf 'resolv-conf: %s' "${K3S_RESOLV_FILE#"${HOST_ROOT}"}"
+  RESOLV_LINE="resolv-conf: ${K3S_RESOLV_FILE#"${HOST_ROOT}"}"
 }
 
 host_node_files() {
   ensure_work_dir
-  local cfg="${WORK_DIR}/config.yaml" reg="${WORK_DIR}/registries.yaml" resolv_line
-  resolv_line="$(host_resolv_conf_line)"
-  if [[ -n "${resolv_line}" ]]; then
+  local cfg="${WORK_DIR}/config.yaml" reg="${WORK_DIR}/registries.yaml"
+  host_resolv_conf_prepare
+  if [[ -n "${RESOLV_LINE}" ]]; then
     ensure_dir "${K3S_CONFIG_DIR}" 0755
     install_file "${WORK_DIR}/k3s-resolv.conf" "${K3S_RESOLV_FILE}" 0644 "k3s CoreDNS upstream"
     if (( FILE_CHANGED )); then HOST_FILES_CHANGED=1; HOST_RESOLV_CHANGED=1; fi
   fi
   render_template "${NODE_ROOT}/templates/config.yaml.tmpl" \
     "SECRETS_ENCRYPTION=$(host_secrets_encryption_line)" \
-    "FLANNEL_IFACE=$(host_flannel_iface_line)" "RESOLV_CONF=${resolv_line}" > "${cfg}"
+    "FLANNEL_IFACE=$(host_flannel_iface_line)" "RESOLV_CONF=${RESOLV_LINE}" > "${cfg}"
   render_template "${NODE_ROOT}/templates/registries.yaml.tmpl" > "${reg}"
   ensure_dir "${K3S_CONFIG_DIR}" 0755
   install_file "${cfg}" "${K3S_CONFIG_FILE}" 0600 "k3s config"
