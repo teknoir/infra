@@ -576,7 +576,12 @@ Tests:
     - Deleting the Application without cascade leaves everything.
   - T7 (converge idempotency): run the cluster phases of teknoir-node against the k3d cluster in --local mode with KUBECTL=kubectl, twice. The second run reports 0 changes and every Secret keeps its resourceVersion. Deleting one generated Secret re-creates only that Secret.
   - T8 (never print): capture stdout, stderr and the log of T7. For every value of every generated Secret, read through kubectl in the test harness only, the grep count must be 0.
-  - T9 (migration rehearsal on the legacy fixture): reproduce the live layout with dummy secrets, using the old render's 00-teknoir-*, 05-*, teknoir-*-secret and manifest-*-secret files plus orphan Addons. Run `migrate`, then converge, then restart. Object counts must equal the baseline, there must be no Teknoir Addons, and the CRDs must be ArgoCD-tracked.
+  - T9 (migration rehearsal on the legacy fixture): reproduce the live layout with dummy secrets and a throwaway real root CA, using the old render's 00-teknoir-*, 05-*, teknoir-*-secret and manifest-*-secret files plus orphan Addons.
+    - A converge before `migrate` is refused (preflight) and changes nothing.
+    - Run `migrate` (dry-run, run, re-run), then the cluster phases of converge (verify, preflight, cluster-base, secrets) twice. The second run reports 0 changes. The existing Secrets, CRDs, namespaces and root Application keep their uids and resourceVersions.
+    - Restart k3s with an old file next to its .skip, then converge again (0 changes); then `migrate --undo` and re-migrate.
+    - Object counts must equal the baseline, and there must be no Teknoir Addons but teknoir-argo.
+    - Not in T9: CRD adoption by ArgoCD (the fixture runs no ArgoCD). T6 covers it on k3d and E10 on the VM: the CRDs are Synced resources of their Applications (ArgoCD 3.5 writes no tracking-id on CRDs). The oneshot, harbor, release and post phases need the built bundle and run in E10.
 
 3. END-TO-END AIRGAP TEST IN A KVM VM ON vpro (airgap/test/vm/e2e.sh)
 Environment:

@@ -1,0 +1,16 @@
+# gitleaks configuration for airgap/test/run-static.sh and the airgap CI.
+# Default rules, plus two narrow allowlists for content that only looks like
+# a secret. Anything else that matches a rule fails the check.
+title = "teknoir infra (airgap)"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "planted inputs of the bundle build gate tests (fake keys and Secrets the gate must reject); never put a real credential here"
+paths = ['''^airgap/test/build/fixtures/''']
+
+[[allowlists]]
+description = "documentation examples: a PEM private-key header followed by a literal \\n... instead of a key body"
+regexTarget = "line"
+regexes = ['''-----BEGIN [A-Z ]*PRIVATE KEY-----\\n\.\.\.''']
