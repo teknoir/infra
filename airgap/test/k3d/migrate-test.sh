@@ -36,6 +36,7 @@ RETIRED_ROOT="${DATA}/server/manifests-retired"
 mkdir -p "${MAN}" "${WORK}/home" "${WORK}/node/bin" "${WORK}/out"
 chmod 0755 "${WORK}"
 ln -s "$(command -v crane 2>/dev/null || echo /bin/false)" "${WORK}/node/bin/crane"
+ln -s "$(command -v jq)" "${WORK}/node/bin/jq"
 
 PASS=0
 FAIL=0
