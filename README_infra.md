@@ -123,11 +123,19 @@ generation.
 
 `argocd-harbor-repo` is an ArgoCD `repo-creds` secret (`enableOCI: "true"`,
 `url: harbor.teknoir.airgapped/teknoir`) carrying the `robot$argocd`
-credential. `airgap/.secrets/robot-argocd.env` is its single source of truth:
-generated once by `airgap/push-to-harbor.sh`, which on every run creates the
-robot if missing, enforces its pull-only permissions, sets the secret in Harbor
-only when Harbor rejects the stored one, and regenerates the manifest
-(byte-identical when nothing changed).
+credential. `airgap/.secrets/robot-argocd.env` is its single source of truth.
+`airgap/push-to-harbor.sh` creates the robot if missing (with the stored
+credential, or a newly generated one when there is no file yet), enforces its
+pull-only permissions on every run, and regenerates the manifest
+(byte-identical when nothing changed). It sets the robot's secret in Harbor
+only when it creates the robot, or with `--rotate-robot`. If the robot exists
+and the file is missing, or Harbor rejects the stored credential (a stale
+copy: the robot was rotated from another machine), it refuses instead of
+overwriting Harbor, which would break the credential ArgoCD uses.
+
+The file is gitignored and never travels in a bundle. Running from a bundle
+directory (or another checkout), copy the operator's `robot-argocd.env` to
+`<dir>/airgap/.secrets/`, or point `--robot-env FILE` (`ROBOT_ENV_FILE`) at it.
 
 ```sh
 HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh --robot-only    # robot + manifest only

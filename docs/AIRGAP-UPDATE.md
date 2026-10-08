@@ -78,9 +78,12 @@ HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh   # 1. new chart versions
 ```
 
 1. Charts and images must be in Harbor before anything pins them. The robot
-   account `robot$argocd` keeps its credential
-   (`airgap/.secrets/robot-argocd.env`); the run only sets it in Harbor when
-   Harbor rejects it.
+   account `robot$argocd` keeps its credential: the run never changes it, and
+   refuses when `airgap/.secrets/robot-argocd.env` is missing or Harbor
+   rejects it. That file and `.secrets/` never travel in a bundle, so run the
+   steps from the directory that holds the operator's copies (a repo checkout,
+   or a bundle directory they were copied into), or point
+   `push-to-harbor.sh --robot-env FILE` at the robot credential.
 2. The ArgoCD repo secret must match the robot credential before ArgoCD pulls.
 3. `update-airgap.sh` redeploys the whole root manifest
    `teknoir-app-of-apps.yaml` (bundle content, requested `targetRevision`,

@@ -3,10 +3,19 @@ set -euo pipefail
 
 # gen-argocd-harbor-repo-secret.sh
 # Generates the ArgoCD repo-creds secret for the in-cluster Harbor OCI Helm
-# registry from the robot credential in airgap/.secrets/robot-argocd.env (kept
-# in sync with Harbor by airgap/push-to-harbor.sh). Falls back to the Harbor
-# admin credential only for the first bootstrap, before the robot exists.
+# registry from the robot credential in airgap/.secrets/robot-argocd.env, or
+# $ROBOT_ENV_FILE (kept in sync with Harbor by airgap/push-to-harbor.sh, which
+# passes its --robot-env file here). Falls back to the Harbor admin credential
+# only for the first bootstrap, before the robot exists.
 # Deterministic: re-running with the same credential rewrites identical content.
+
+# A relative $ROBOT_ENV_FILE is relative to the caller's directory.
+if [ -n "${ROBOT_ENV_FILE:-}" ]; then
+  case "${ROBOT_ENV_FILE}" in
+    /*) ;;
+    *) ROBOT_ENV_FILE="${PWD}/${ROBOT_ENV_FILE}" ;;
+  esac
+fi
 
 # Paths are relative to the repo root, wherever the script is called from.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -18,7 +27,7 @@ NAMESPACE="teknoir-system"
 SECRET_NAME="argocd-harbor-repo"
 HARBOR_URL="harbor.teknoir.airgapped/teknoir"
 
-ROBOT_ENV_FILE="airgap/.secrets/robot-argocd.env"
+ROBOT_ENV_FILE="${ROBOT_ENV_FILE:-airgap/.secrets/robot-argocd.env}"
 HARBOR_SECRET_MANIFEST="${SECRETS_DIR}/manifest-harbor-secret.yaml"
 
 mkdir -p "${SECRETS_DIR}"
@@ -38,8 +47,8 @@ if [ -f "${ROBOT_ENV_FILE}" ]; then
   PASSWORD="${HARBOR_ROBOT_TOKEN}"
   echo "Using robot account credentials from ${ROBOT_ENV_FILE}"
 else
-  printf "${YELLOW}WARNING: %s not found. Falling back to the Harbor admin credential.${NC}\n" "${ROBOT_ENV_FILE}" >&2
-  printf "${YELLOW}WARNING: Robot account credentials are preferred; run airgap/push-to-harbor.sh and re-run this script.${NC}\n" >&2
+  printf '%bWARNING: %s not found. Falling back to the Harbor admin credential.%b\n' "${YELLOW}" "${ROBOT_ENV_FILE}" "${NC}" >&2
+  printf '%bWARNING: Robot account credentials are preferred; run airgap/push-to-harbor.sh and re-run this script.%b\n' "${YELLOW}" "${NC}" >&2
   USERNAME="admin"
   if [ -n "${HARBOR_ADMIN_PASSWORD:-}" ]; then
     PASSWORD="${HARBOR_ADMIN_PASSWORD}"
@@ -86,5 +95,5 @@ echo "Wrote ${MANIFEST_FILE} (repo ${HARBOR_URL}, user ${USERNAME})"
 if [ "${PREV_SUM}" = "$(sha256sum < "${MANIFEST_FILE}")" ]; then
   echo "Unchanged from the previous manifest."
 else
-  printf "${YELLOW}The ArgoCD repo secret changed — deploy it: scripts/deploy-secrets.sh${NC}\n" >&2
+  printf '%bThe ArgoCD repo secret changed — deploy it: scripts/deploy-secrets.sh%b\n' "${YELLOW}" "${NC}" >&2
 fi

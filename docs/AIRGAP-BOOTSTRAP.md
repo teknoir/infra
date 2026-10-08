@@ -328,9 +328,12 @@ Idempotently:
   `ghcr`, `gcr`, `quay`, `k8s` public mirrors so containerd can pull
   unauthenticated);
 * ensures the system robot account **`robot$argocd`** (pull-only on all
-  projects). Its credential is generated once into
-  `airgap/.secrets/robot-argocd.env` and never rotated implicitly (only with
-  `--rotate-robot`); the script regenerates
+  projects). Its credential is generated together with the robot into
+  `airgap/.secrets/robot-argocd.env` (or `--robot-env FILE`) and never
+  rotated implicitly (only with `--rotate-robot`). Keep that file: once the
+  robot exists, a run without it, or with a copy Harbor rejects, is refused
+  ([README_infra.md](../README_infra.md#harbor-robot-credential-never-rotated-implicitly)).
+  The script regenerates
   `.secrets/manifest-argocd-harbor-repo-secret.yaml` from it;
 * creates a tag-immutability rule on `teknoir` and `helm push`es every pinned
   chart version Harbor does not have yet (existing versions are never

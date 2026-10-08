@@ -5,9 +5,10 @@
 #   1. create the six Harbor projects idempotently
 #      (teknoir = charts, dockerhub/ghcr/gcr/quay/k8s = public registry mirrors)
 #   2. ensure the system robot account `robot$argocd` (pull on all projects)
-#      matches the credential in airgap/.secrets/robot-argocd.env — generated
-#      once, never rotated implicitly — and regenerate the ArgoCD repo secret
-#      manifest from it (scripts/gen-argocd-harbor-repo-secret.sh)
+#      matches the credential in airgap/.secrets/robot-argocd.env (or
+#      --robot-env FILE) — generated only together with the robot, never
+#      rotated implicitly — and regenerate the ArgoCD repo secret manifest
+#      from it (scripts/gen-argocd-harbor-repo-secret.sh)
 #   3. push every pinned chart version (versions.env) from <bundle>/charts to
 #      oci://harbor/teknoir that Harbor does not have yet. An existing version
 #      is never overwritten (OCI tags are mutable: on 2026-09-14 re-pushes
@@ -20,8 +21,9 @@
 #
 # Re-running is safe: projects, robot and credential converge to the same state.
 #
-# Usage: airgap/push-to-harbor.sh [--bundle DIR] [--robot-only] [--rotate-robot]
-#                                 [--force-charts] [--insecure] [--dry-run]
+# Usage: airgap/push-to-harbor.sh [--bundle DIR] [--robot-env FILE] [--robot-only]
+#                                 [--rotate-robot] [--force-charts] [--insecure]
+#                                 [--dry-run]
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -32,10 +34,16 @@ Usage: $(basename "$0") [options]
 
 Options:
   --bundle DIR   bundle directory (default: $(bundle_dir))
+  --robot-env FILE
+                 the robot credential file (default: \$ROBOT_ENV_FILE, else
+                 ${ROBOT_ENV_FILE_DEFAULT#"${REPO_ROOT}"/}). It never travels
+                 in a bundle: running from one, copy it into the bundle or
+                 point here at the operator's copy
   --robot-only   only ensure projects + robot account + ArgoCD repo secret
                  manifest (no charts/images; no bundle needed)
-  --rotate-robot generate a NEW robot secret (then redeploy the ArgoCD secret
-                 with scripts/deploy-secrets.sh)
+  --rotate-robot generate a NEW robot secret and set it in Harbor (then
+                 redeploy the ArgoCD secret with scripts/deploy-secrets.sh).
+                 Without it an existing robot's secret is never changed
   --force-charts also push chart versions Harbor already has (refused while the
                  teknoir tag-immutability rule is enabled; bump versions instead)
   --insecure     skip TLS verification instead of using teknoir-root-ca.crt
@@ -44,9 +52,12 @@ Options:
 
 Environment:
   HARBOR_ADMIN_PASSWORD   Harbor admin password (prompted when unset)
+  ROBOT_ENV_FILE          as --robot-env
 EOF
 }
 
+ROBOT_ENV_FILE_DEFAULT="${AIRGAP_DIR}/.secrets/robot-argocd.env"
+ROBOT_ENV_FILE="${ROBOT_ENV_FILE:-${ROBOT_ENV_FILE_DEFAULT}}"
 INSECURE=0
 ROBOT_ONLY=0
 ROTATE_ROBOT=0
@@ -55,6 +66,7 @@ FORCE_CHARTS=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bundle) BUNDLE_DIR="$2"; shift ;;
+    --robot-env) ROBOT_ENV_FILE="$2"; shift ;;
     --robot-only) ROBOT_ONLY=1 ;;
     --rotate-robot) ROTATE_ROBOT=1 ;;
     --force-charts) FORCE_CHARTS=1 ;;
@@ -70,7 +82,13 @@ BUNDLE="$(bundle_dir)"
 ROBOT_NAME="argocd"
 # shellcheck disable=SC2016  # literal $ — Harbor prefixes system robots with 'robot$'
 ROBOT_FULL_NAME='robot$argocd'
-ROBOT_ENV_FILE="${AIRGAP_DIR}/.secrets/robot-argocd.env"
+# Absolute, so scripts/gen-argocd-harbor-repo-secret.sh (which runs from the
+# repo root) reads the same file.
+case "${ROBOT_ENV_FILE}" in
+  /*) ;;
+  *) ROBOT_ENV_FILE="${PWD}/${ROBOT_ENV_FILE}" ;;
+esac
+export ROBOT_ENV_FILE
 API="${HARBOR_URL}/api/v2.0"
 
 MIRROR_PROJECTS=()
@@ -115,7 +133,13 @@ fi
 # --- dry-run: report the plan and exit ---------------------------------------
 if [[ "${DRY_RUN}" == "1" ]]; then
   log "[dry-run] would ensure projects on ${HARBOR_URL}: ${ALL_PROJECTS[*]} (mirrors public, ${HARBOR_CHART_PROJECT} private)"
-  log "[dry-run] would ensure robot account ${ROBOT_FULL_NAME} (pull on all projects) matches ${ROBOT_ENV_FILE}$( [[ "${ROTATE_ROBOT}" == "1" ]] && echo ' (ROTATED)')"
+  if [[ "${ROTATE_ROBOT}" == "1" ]]; then
+    log "[dry-run] would ensure robot account ${ROBOT_FULL_NAME} (pull on all projects) with a NEW secret, written to ${ROBOT_ENV_FILE} (ROTATED)"
+  elif [[ -f "${ROBOT_ENV_FILE}" ]]; then
+    log "[dry-run] would ensure robot account ${ROBOT_FULL_NAME} (pull on all projects) accepts the credential in ${ROBOT_ENV_FILE} (refused if Harbor rejects it)"
+  else
+    warn "[dry-run] ${ROBOT_ENV_FILE} does not exist: a credential is generated only if ${ROBOT_FULL_NAME} does not exist yet; otherwise the run is refused (use --robot-env FILE, or --rotate-robot)"
+  fi
   log "[dry-run] would regenerate .secrets/manifest-argocd-harbor-repo-secret.yaml"
   [[ "${ROBOT_ONLY}" == "1" ]] && { log "dry-run complete (--robot-only)"; exit 0; }
   log "[dry-run] would ensure the tag-immutability rule (all repositories, all tags) on ${HARBOR_CHART_PROJECT}"
@@ -203,11 +227,15 @@ done
 # ---------------------------------------------------------------------------
 # 2. Robot account robot$argocd (idempotent, pull on all projects)
 # ---------------------------------------------------------------------------
-# ${ROBOT_ENV_FILE} is the single source of truth for the robot credential. It
-# is generated once (or on --rotate-robot); every run then makes Harbor match it
-# (create the robot if missing, set its permissions, set its secret) instead of
-# deleting and recreating the robot, which used to rotate the token on every
-# push and silently break ArgoCD's Harbor login.
+# ${ROBOT_ENV_FILE} is the single source of truth for the robot credential.
+# Harbor's robot secret is only ever set by this script, and only
+#   * when it creates the robot (with the stored credential, or a new one if
+#     there is no file yet), or
+#   * on --rotate-robot (a new credential, written to the file first).
+# An existing robot whose secret the file does not match is never "fixed" by
+# setting the file's secret: the file may be a stale or missing copy (a new
+# bundle directory, another laptop), and overwriting Harbor would break the
+# credential ArgoCD uses (the 2026-09-14 incident). The run is refused instead.
 gen_robot_secret() {
   # Harbor policy: 8-128 chars with upper, lower and digit.
   python3 -c 'import secrets, string
@@ -219,20 +247,22 @@ while True:
         break'
 }
 
-robot_token=""
-if [[ "${ROTATE_ROBOT}" != "1" && -f "${ROBOT_ENV_FILE}" ]]; then
-  # shellcheck source=/dev/null
-  robot_token="$(. "${ROBOT_ENV_FILE}" && printf '%s' "${HARBOR_ROBOT_TOKEN:-}")"
-fi
-if [[ -z "${robot_token}" ]]; then
-  log "generating a new robot secret -> ${ROBOT_ENV_FILE}"
-  robot_token="$(gen_robot_secret)"
-  mkdir -p "${AIRGAP_DIR}/.secrets"
-  chmod 700 "${AIRGAP_DIR}/.secrets"
+write_robot_env() {
+  # write_robot_env <token> — store the credential (mode 600, dir 700)
+  mkdir -p "$(dirname "${ROBOT_ENV_FILE}")"
+  chmod 700 "$(dirname "${ROBOT_ENV_FILE}")"
   (
     umask 077
-    printf "HARBOR_ROBOT_USER='%s'\nHARBOR_ROBOT_TOKEN='%s'\n" "${ROBOT_FULL_NAME}" "${robot_token}" > "${ROBOT_ENV_FILE}"
+    printf "HARBOR_ROBOT_USER='%s'\nHARBOR_ROBOT_TOKEN='%s'\n" "${ROBOT_FULL_NAME}" "$1" > "${ROBOT_ENV_FILE}.tmp"
   )
+  mv -f "${ROBOT_ENV_FILE}.tmp" "${ROBOT_ENV_FILE}"
+}
+
+robot_token=""
+if [[ -f "${ROBOT_ENV_FILE}" ]]; then
+  # shellcheck source=/dev/null
+  robot_token="$(. "${ROBOT_ENV_FILE}" && printf '%s' "${HARBOR_ROBOT_TOKEN:-}")"
+  [[ -n "${robot_token}" ]] || die "${ROBOT_ENV_FILE} does not set HARBOR_ROBOT_TOKEN"
 fi
 
 permissions="$(python3 - "${ALL_PROJECTS[@]}" <<'PYEOF'
@@ -256,13 +286,28 @@ for r in json.load(sys.stdin) or []:
         break
 ')"
 
+set_secret=0
 if [[ -z "${robot_json}" ]]; then
+  if [[ "${ROTATE_ROBOT}" == "1" || -z "${robot_token}" ]]; then
+    log "generating the robot credential -> ${ROBOT_ENV_FILE}"
+    robot_token="$(gen_robot_secret)"
+    write_robot_env "${robot_token}"
+  fi
   log "creating robot account ${ROBOT_FULL_NAME}"
   robot_id="$(api POST "/robots" \
     "{\"name\":\"${ROBOT_NAME}\",\"description\":\"ArgoCD pull-only robot (airgap)\",\"duration\":-1,\"level\":\"system\",\"disable\":false,\"permissions\":${permissions}}" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  set_secret=1   # Harbor generated its own secret on create
 else
   robot_id="$(printf '%s' "${robot_json}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')"
+  if [[ "${ROTATE_ROBOT}" == "1" ]]; then
+    log "--rotate-robot: generating a new robot credential -> ${ROBOT_ENV_FILE}"
+    robot_token="$(gen_robot_secret)"
+    write_robot_env "${robot_token}"
+    set_secret=1
+  elif [[ -z "${robot_token}" ]]; then
+    die "${ROBOT_FULL_NAME} exists in Harbor but ${ROBOT_ENV_FILE} does not: refusing to generate a credential, which would rotate the robot and break ArgoCD's Harbor login. Copy robot-argocd.env from the machine that holds it (airgap/.secrets/ of that checkout or bundle) to ${ROBOT_ENV_FILE}, or pass --robot-env FILE; only to rotate deliberately, pass --rotate-robot"
+  fi
   log "robot account ${ROBOT_FULL_NAME} exists (id ${robot_id}); ensuring permissions"
   api PUT "/robots/${robot_id}" "$(printf '%s' "${robot_json}" | python3 -c '
 import json, sys
@@ -272,20 +317,25 @@ r["disable"] = False
 print(json.dumps(r))' "${permissions}")" >/dev/null
 fi
 
-# Set the secret to the stored value only when Harbor does not accept it yet.
 robot_auth_status() {
   curl -s -o /dev/null -w '%{http_code}' "${CURL_TLS[@]}" \
     -K <(printf 'user = "%s:%s"\n' "${ROBOT_FULL_NAME}" "${robot_token}") \
     "${HARBOR_URL}/service/token?service=harbor-registry"
 }
-if [[ "$(robot_auth_status)" == "200" ]]; then
-  log "robot credential in ${ROBOT_ENV_FILE} is valid in Harbor"
-else
+if [[ "${set_secret}" == "1" ]]; then
   log "setting the robot secret from ${ROBOT_ENV_FILE}"
   printf '{"secret":"%s"}' "${robot_token}" \
     | curl -fsS -o /dev/null "${CURL_TLS[@]}" -K <(printf 'user = "admin:%s"\n' "${HARBOR_ADMIN_PASSWORD}") \
         -X PATCH -H 'Content-Type: application/json' --data @- "${API}/robots/${robot_id}"
   [[ "$(robot_auth_status)" == "200" ]] || die "Harbor still rejects the robot credential after setting it"
+else
+  status="$(robot_auth_status)"
+  case "${status}" in
+    200) log "robot credential in ${ROBOT_ENV_FILE} is valid in Harbor" ;;
+    401|403)
+      die "Harbor rejects the robot credential in ${ROBOT_ENV_FILE} (HTTP ${status}), so it is not the one ${ROBOT_FULL_NAME} uses: the file is stale (the robot was rotated elsewhere: copy that robot-argocd.env here, or pass --robot-env FILE) or Harbor's secret was changed by hand. Harbor's secret is left alone; to replace it deliberately, pass --rotate-robot and then redeploy the ArgoCD secret (scripts/deploy-secrets.sh)" ;;
+    *) die "cannot check the robot credential against Harbor (HTTP ${status})" ;;
+  esac
 fi
 
 # The ArgoCD repo secret manifest is derived from the env file; regenerating it
