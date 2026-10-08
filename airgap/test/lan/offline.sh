@@ -4,9 +4,9 @@
 # MANIFEST formats, tampering), version, doctor with a stub ssh, and up/status
 # with --local (this container plays the node; it is disposable and root).
 #
-# Usage (inside the container): offline.sh REPO LIST_BUNDLE MAP_BUNDLE
+# Usage (inside the container): offline.sh REPO LIST_BUNDLE MAP_BUNDLE BUILD_BUNDLE
 set -u
-REPO=$1 B=$2 M=$3
+REPO=$1 B=$2 M=$3 BB=$4
 # shellcheck source-path=SCRIPTDIR source=lib.sh
 . "${REPO}/airgap/test/lan/lib.sh"
 
@@ -30,6 +30,9 @@ section "verify"
 expect_rc 0 "verify, list-format MANIFEST" "${T}" verify
 expect_out "bundle verified" "verify reports success"
 expect_rc 0 "verify, map-format MANIFEST" "${M}/teknoir-airgap" verify
+expect_rc 0 "verify, MANIFEST shaped like make-bundle.sh writes it" "${BB}/teknoir-airgap" verify
+expect_rc 0 "version of that bundle" "${BB}/teknoir-airgap" version
+expect_out "bundleId: *teknoir-local-aoa0.0.4" "reads the top-level keys between the nested sections"
 expect_rc 1 "verify from the repository fails clearly" "${REPO}/airgap/teknoir-airgap" verify
 expect_out "no MANIFEST.yaml" "explains the missing MANIFEST.yaml"
 ln -sf "${T}" /tmp/teknoir-airgap-link

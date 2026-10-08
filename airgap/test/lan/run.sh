@@ -67,11 +67,12 @@ step "doc lint"
 "${here}/doc-lint.sh" || failures=$((failures + 1))
 
 step "offline tests under bash 3.2"
-mkdir -p "${work}/list" "${work}/map"
+mkdir -p "${work}/list" "${work}/map" "${work}/build"
 b_list=$("${here}/make-fake-bundle.sh" --out "${work}/list" --node-ip 10.0.0.1 --node teknoir@10.0.0.1)
 b_map=$("${here}/make-fake-bundle.sh" --out "${work}/map" --node-ip 10.0.0.1 --node teknoir@10.0.0.1 --format map)
+b_build=$("${here}/make-fake-bundle.sh" --out "${work}/build" --node-ip 10.0.0.1 --node teknoir@10.0.0.1 --format build)
 docker run --rm -v "${repo}:/src:ro" -v "${work}:/work" docker.io/library/bash:3.2 \
-  bash /src/airgap/test/lan/offline.sh /src "/work/list/$(basename "${b_list}")" "/work/map/$(basename "${b_map}")" \
+  bash /src/airgap/test/lan/offline.sh /src "/work/list/$(basename "${b_list}")" "/work/map/$(basename "${b_map}")" "/work/build/$(basename "${b_build}")" \
   | tee "${work}/offline.log" | grep -v '^PASS ' || true
 tally "${work}/offline.log"
 

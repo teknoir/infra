@@ -3,7 +3,7 @@
 # teknoir-airgap entrypoint and fake node programs, for the LAN tests.
 #
 # Usage: make-fake-bundle.sh --out DIR --node-ip IP --node USER@HOST
-#                            [--domain D] [--format list|map] [--kubectl FILE] [--docs DIR]
+#                            [--domain D] [--format list|map|build] [--kubectl FILE] [--docs DIR]
 # Prints the bundle directory (DIR/teknoir-airgap-<bundleId>).
 set -euo pipefail
 
@@ -64,6 +64,13 @@ printf 'docker.io/library/fake:1@sha256:%064d fake-image\n' 0 >"${b}/node/images
 mv "${out}/SHA256SUMS.tmp" "${b}/node/SHA256SUMS"
 
 {
+  if [ "${format}" = build ]; then
+    # the shape airgap/build/make-bundle.sh writes: header, nested sections, quoted image keys
+    echo "# Teknoir airgap bundle manifest. Written by airgap/build/make-bundle.sh;"
+    echo "# teknoir-airgap verifies every file below before it contacts the node."
+    echo "apiVersion: teknoir.org/v1"
+    echo "kind: AirgapBundleManifest"
+  fi
   echo "bundleId: ${id}"
   echo "env: teknoir-local"
   echo "domain: ${domain}"
@@ -73,15 +80,33 @@ mv "${out}/SHA256SUMS.tmp" "${b}/node/SHA256SUMS"
   echo "dirty: false"
   echo "appOfAppsVersion: 0.0.4"
   echo "k3sVersion: v1.33.5+k3s1"
-  echo "images:"
-  echo "  docker.io/library/fake:1: sha256:$(printf '%064d' 0)"
+  if [ "${format}" = build ]; then
+    echo "brokenAppOfApps: [0.0.1, 0.0.2]"
+    echo "platforms: [linux/amd64]"
+    echo "tools:"
+    echo "  helm: v4.2.4"
+    echo "  yq: v4.47.1 # build only"
+    echo "charts:"
+    echo "  app-of-apps: 0.0.4"
+    echo "oneshot:"
+    echo "  - tier: istio"
+    echo "    chart: istio"
+    echo "    renderSha256: $(printf '%064d' 7)"
+    echo "images:"
+    echo "  \"docker.io/library/fake:1\":"
+    echo "    digest: sha256:$(printf '%064d' 0)"
+    echo "    slug: fake-image"
+  else
+    echo "images:"
+    echo "  docker.io/library/fake:1: sha256:$(printf '%064d' 0)"
+  fi
   echo "files:"
   (cd "${b}" && find . -type f ! -name MANIFEST.yaml | sed 's|^\./||' | LC_ALL=C sort) | while IFS= read -r p; do
     h=$(sha256sum "${b}/${p}" | cut -d' ' -f1)
-    if [ "${format}" = map ]; then
-      printf '  %s: %s\n' "${p}" "${h}"
-    else
+    if [ "${format}" = list ]; then
       printf '  - path: %s\n    sha256: %s\n' "${p}" "${h}"
+    else
+      printf '  %s: %s\n' "${p}" "${h}"
     fi
   done
 } >"${b}/MANIFEST.yaml"
