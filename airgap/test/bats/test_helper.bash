@@ -23,8 +23,11 @@ STUB_BIN="${REPO_ROOT}/airgap/test/stubs/bin"
 # shellcheck disable=SC2034
 VMTEST_SITE="${REPO_ROOT}/airgap/site/vmtest.env"
 
-# Calls that change something. A kubectl call with --dry-run is not one.
-MUTATING_RE='^(kubectl|k3s kubectl) (.* )?(apply|create|delete|patch|replace|label|annotate|scale|edit|set|cordon|drain|taint|uncordon)( |$)|^(kubectl|k3s kubectl) (.* )?rollout restart|^k3s ctr .*( import| rm| delete)( |$)|^k3s (secrets-encrypt|etcd-snapshot save|server|agent)( |$)|^systemctl (start|stop|restart|reload|enable|disable|daemon-reload|mask|unmask)( |$)|^crane (push|copy|cp|tag|delete|mutate|append|rebase)( |$)|^helm (push|install|upgrade|uninstall|registry login)( |$)'
+# Calls that change something (or, for exec and cp, may: a dry-run has no
+# reason to run a command in a pod or copy files out of it). A kubectl call
+# with --dry-run is not one. curl: a request with a mutating method, or with a
+# body or upload (curl then sends POST or PUT).
+MUTATING_RE='^(kubectl|k3s kubectl) (.* )?(apply|create|delete|patch|replace|label|annotate|scale|edit|set|cordon|drain|taint|uncordon|exec|cp)( |$)|^(kubectl|k3s kubectl) (.* )?rollout restart|^k3s ctr .*( import| rm| delete)( |$)|^k3s (secrets-encrypt|etcd-snapshot save|server|agent)( |$)|^systemctl (start|stop|restart|reload|enable|disable|daemon-reload|mask|unmask)( |$)|^crane (push|copy|cp|tag|delete|mutate|append|rebase)( |$)|^helm (push|install|upgrade|uninstall|registry login)( |$)|^curl (.* )?(-X ?|--request[ =])(POST|PUT|PATCH|DELETE)( |$)|^curl (.* )?(-d|--data[a-z-]*|-F|--form[a-z-]*|-T|--upload-file|--json)( |=|$)'
 
 refute_grep() {
   # refute_grep <grep args...> — fail the test when grep matches (the matches
@@ -101,15 +104,21 @@ with_common() {
 stage_payload() {
   # stage_payload <dest> — copy the node payload, add small stand-ins for the
   # build artifacts a source tree lacks (contract #1: k3s/, bootstrap-images/,
-  # charts/pins.txt), and write node/SHA256SUMS the way the bundle build does
-  # (sha256 of every file, paths relative to node/)
-  local dest="$1" n img
+  # charts/*.tgz + pins.txt, oneshot/TIERS + one render per tier,
+  # images/images.lock), and write node/SHA256SUMS the way the bundle build
+  # does (sha256 of every file, paths relative to node/)
+  local dest="$1" n img t
   mkdir -p "${dest}"
   cp -a "${NODE_DIR}" "${dest}/node"
   n="${dest}/node"
   mkdir -p "${n}/k3s" "${n}/bootstrap-images" "${n}/charts"
   if [[ ! -e "${n}/k3s/k3s" ]]; then
-    printf '#!/bin/sh\necho "k3s version v1.33.5+k3s1 (test stand-in)"\n' > "${n}/k3s/k3s"
+    # the k3s stand-in answers --version; installed on the sandbox node, it
+    # hands every other call to the recording k3s stub on PATH
+    # shellcheck disable=SC2016  # the stand-in's own "$1" and "$@"
+    printf '%s\n' '#!/bin/sh' \
+      'case "$1" in --version|-v) echo "k3s version v1.33.5+k3s1 (test stand-in)"; exit 0 ;; esac' \
+      'exec k3s "$@"' > "${n}/k3s/k3s"
     printf '#!/bin/sh\nexit 0\n' > "${n}/k3s/install.sh"
     chmod +x "${n}/k3s/k3s" "${n}/k3s/install.sh"
     head -c 4096 /dev/urandom > "${n}/k3s/k3s-airgap-images-amd64.tar.zst"
@@ -122,7 +131,25 @@ stage_payload() {
     tar -C "${img}" -cf "${n}/bootstrap-images/docker.io_rancher_mirrored-pause_3.6.tar" manifest.json c.json
     rm -rf "${img}"
   fi
-  [[ -f "${n}/charts/pins.txt" ]] || echo "app-of-apps 0.0.4" > "${n}/charts/pins.txt"
+  if [[ ! -f "${n}/charts/pins.txt" ]]; then
+    img="$(mktemp -d)"
+    mkdir -p "${img}/app-of-apps/templates"
+    printf 'apiVersion: v2\nname: app-of-apps\nversion: 0.0.4\n' > "${img}/app-of-apps/Chart.yaml"
+    tar -C "${img}" -czf "${n}/charts/app-of-apps-0.0.4.tgz" app-of-apps
+    rm -rf "${img}"
+    echo "app-of-apps 0.0.4" > "${n}/charts/pins.txt"
+  fi
+  if [[ ! -f "${n}/oneshot/TIERS" ]]; then
+    # the tiers in contract order; each render is empty (nothing to apply)
+    mkdir -p "${n}/oneshot"
+    printf '%s\n' platform-secrets istio harbor argo > "${n}/oneshot/TIERS"
+    for t in platform-secrets istio harbor argo; do : > "${n}/oneshot/${t}.yaml"; done
+  fi
+  if [[ ! -f "${n}/images/images.lock" ]]; then
+    # no non-bootstrap images: the bootstrap archive above is the only image
+    mkdir -p "${n}/images"
+    : > "${n}/images/images.lock"
+  fi
   (cd "${n}" && rm -f SHA256SUMS &&
     find . -type f | sed 's|^\./||' | LC_ALL=C sort | xargs -d '\n' sha256sum > SHA256SUMS)
 }

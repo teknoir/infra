@@ -25,7 +25,11 @@ Test files:
   against `airgap/node/lib/common.sh` and again against the stub `airgap/test/stubs/common.sh`,
   so the two cannot drift apart.
 - `node_runner.bats`: `teknoir-node` CLI, lock (exit 75), 0600 run log, payload verify
-  (tampered, unlisted), dry-run without mutating calls, the downgrade guard.
+  (tampered, unlisted), the downgrade guard, and `converge --dry-run` without a mutating
+  call or a host file write in two stub worlds: a fresh node (no k3s: every API call is
+  refused, only `kubectl version --client` works) and an existing cluster (k3s active,
+  every object present, every server-side diff reports a change, Harbor healthy but
+  empty, so the run reaches every apply, restart and push gate).
 - `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2.
 - `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts.
 - `static.bats`: shebangs, no xtrace in node/LAN code, public site files, no key material,
@@ -36,15 +40,23 @@ Overrides: `COMMON_SH`, `TEKNOIR_NODE_DIR`, `TEKNOIR_LAN_BIN`.
 
 ### Stubs
 
-`stubs/bin/` holds recording stubs for `kubectl`, `k3s`, `ssh`, `crane`, `helm`, `systemctl`
-and `ip` (`test_helper.bash: setup_stubs` puts them first on PATH):
+`stubs/bin/` holds recording stubs for `kubectl`, `k3s`, `ssh`, `crane`, `helm`, `curl`,
+`systemctl` and `ip` (`test_helper.bash: setup_stubs` puts them first on PATH):
 - every call is logged to `$STUB_LOG`;
 - a call whose arguments match `$STUB_FAIL_ON` (an ERE) exits 97;
 - `stub_<name>` functions in `$STUB_HANDLER` answer calls;
 - the default is exit `$STUB_DEFAULT_RC` (0), and `k3s kubectl` forwards to the kubectl stub.
 
 `-f -` input is saved as `$STUB_STDIN`. `mutating_calls` lists every recorded call that
-would change something; a `kubectl ... --dry-run` call does not count.
+would change something (`MUTATING_RE`: kubectl writes, `exec` and `cp`, rollout restarts,
+k3s ctr imports, systemctl state changes, crane and helm pushes, curl with POST, PUT, PATCH,
+DELETE or a body); a `kubectl ... --dry-run` call does not count.
+
+`stage_payload` copies `airgap/node` and adds stand-ins for what only the bundle build
+produces (contract #1): `k3s/` (a `k3s` that answers `--version` and hands everything else
+to the k3s stub), one bootstrap image archive, `charts/app-of-apps-0.0.4.tgz` with
+`pins.txt`, `oneshot/TIERS` with an empty render per tier, an empty `images/images.lock`,
+then `SHA256SUMS`.
 
 ## k3d ownership suite
 
