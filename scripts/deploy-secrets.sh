@@ -13,12 +13,14 @@
 # overwrite the issued certificate. --bootstrap-wildcard creates it only when
 # it does not exist yet (fresh cluster), so even that is safe to re-run.
 #
-# The source is the operator's .secrets/ (the bundle copy in
-# bootstrap/secrets/ is only used by the first bootstrap, via --secrets-dir).
+# The source is the operator's .secrets/. The bundle copy (bootstrap/secrets/)
+# is only used by the first bootstrap, with --create-only: it may be older than
+# .secrets/ (e.g. an admin-fallback ArgoCD repo secret), so it never replaces a
+# Secret that already exists.
 #
 # Usage: scripts/deploy-secrets.sh [--only <manifest>]... [--bootstrap-wildcard]
-#                                  [--secrets-dir DIR] [--host user@host]
-#                                  [--ssh-key FILE] [--dry-run]
+#                                  [--create-only] [--secrets-dir DIR]
+#                                  [--host user@host] [--ssh-key FILE] [--dry-run]
 set -euo pipefail
 
 # shellcheck source=../airgap/lib.sh
@@ -49,6 +51,8 @@ Options:
                         --only manifest-argocd-harbor-repo-secret.yaml
   --bootstrap-wildcard  also create ${WILDCARD_MANIFEST} if the secret
                         does not exist yet (cert-manager owns it afterwards)
+  --create-only         skip manifests whose Secret already exists
+                        (first bootstrap from the bundle's copies)
   --secrets-dir DIR     where the manifest-*.yaml files are
                         (default: ${SECRETS_DIR})
   --host H              ssh target (default: ${TEKNOIR_HOST})
@@ -60,10 +64,12 @@ EOF
 
 ONLY=()
 BOOTSTRAP_WILDCARD=0
+CREATE_ONLY=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --only) ONLY+=("$2"); shift ;;
     --bootstrap-wildcard) BOOTSTRAP_WILDCARD=1 ;;
+    --create-only) CREATE_ONLY=1 ;;
     --secrets-dir) SECRETS_DIR="$2"; shift ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
     --ssh-key) SSH_KEY="$2"; shift ;;
@@ -84,9 +90,28 @@ if [[ ${#ONLY[@]} -gt 0 ]]; then
   SECRET_MANIFESTS=("${ONLY[@]}")
 fi
 
+in_cluster() {
+  # in_cluster <manifest> — print the objects of <manifest> that already exist.
+  # A failed query aborts: counting it as "absent" could overwrite live data.
+  local out
+  if ! out="$(ssh_query "sudo k3s kubectl get --ignore-not-found -o name -f -" < "$1")"; then
+    [[ "${DRY_RUN}" == "1" ]] || die "cannot check whether the objects in $(basename "$1") exist"
+    out=""  # dry-run against an unreachable node: report what would be created
+  fi
+  printf '%s' "${out}"
+}
+
 missing=0
 for manifest in "${SECRET_MANIFESTS[@]}"; do
   if [[ -f "${SECRETS_DIR}/${manifest}" ]]; then
+    if [[ "${CREATE_ONLY}" == "1" ]]; then
+      # Plain assignment, so a die() inside the substitution stops the script.
+      existing="$(in_cluster "${SECRETS_DIR}/${manifest}")"
+      if [[ -n "${existing}" ]]; then
+        log "${manifest}: already in the cluster, not replaced (--create-only; update with scripts/deploy-secrets.sh)"
+        continue
+      fi
+    fi
     log "deploying ${manifest} -> ${K3S_MANIFESTS_DIR}/$(k3s_canonical_name "${manifest}")"
     k3s_deploy "${SECRETS_DIR}/${manifest}" 0600
   else
@@ -97,12 +122,8 @@ done
 
 if [[ "${BOOTSTRAP_WILDCARD}" == "1" ]]; then
   [[ -f "${SECRETS_DIR}/${WILDCARD_MANIFEST}" ]] || die "missing ${SECRETS_DIR}/${WILDCARD_MANIFEST}"
-  # Create only: once it exists, cert-manager owns the content. A failed query
-  # aborts rather than counting as "absent" (that would overwrite the cert).
-  if ! existing="$(ssh_query "sudo k3s kubectl get --ignore-not-found -o name -f -" < "${SECRETS_DIR}/${WILDCARD_MANIFEST}")"; then
-    [[ "${DRY_RUN}" == "1" ]] || die "cannot check whether the wildcard TLS secret exists"
-    existing="(unknown: node unreachable)"
-  fi
+  # Always create-only: once it exists, cert-manager owns the content.
+  existing="$(in_cluster "${SECRETS_DIR}/${WILDCARD_MANIFEST}")"
   if [[ -n "${existing}" ]]; then
     log "wildcard TLS secret present (${existing}); cert-manager owns it, placeholder not re-applied"
   else
