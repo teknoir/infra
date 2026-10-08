@@ -45,7 +45,7 @@ install and every update.
   itself. The CRD gate and hand-over code is gone.
 - **Keycloak realm `teknoir` as code.** Clients (`teknoir`, `argocd`, `harbor`,
   `user-controller`), scopes, the `admin` group and the initial `platform-admin`
-  come from a realm import; issuers are `https://auth.<domain>/realms/teknoir`.
+  come from a realm import; issuers are `https://auth.<domain>/auth/realms/teknoir`.
   The master realm keeps only the admin, whose password is generated in the
   cluster: the published default password is gone. The manual Keycloak and
   Harbor UI steps of the old runbook are gone too.
