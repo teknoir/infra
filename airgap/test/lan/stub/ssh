@@ -1,0 +1,18 @@
+#!/bin/sh
+# Stub ssh for the offline LAN tests: `-G` prints a config, `-O` and `-N`
+# succeed, anything else runs the "remote" command line locally.
+target=; cmd=; G=0; O=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -G) G=1 ;;
+    -O) O=1; shift ;;
+    -o|-p|-i|-l|-F|-E|-c|-m|-S|-L|-R|-D|-W|-J|-b|-e) shift ;;
+    -*) ;;
+    *) if [ -z "$target" ]; then target=$1; else cmd="${cmd:+$cmd }$1"; fi ;;
+  esac
+  shift
+done
+if [ "$G" = 1 ]; then printf 'user %s\nhostname %s\nport 22\n' "${target%@*}" "${target#*@}"; exit 0; fi
+[ "$O" = 1 ] && exit 0
+[ -n "$cmd" ] || exit 0
+exec sh -c "$cmd"

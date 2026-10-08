@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stub sudo: drop -n and -p PROMPT, run the rest (the tests run as root).
+while [ $# -gt 0 ]; do case $1 in -n) shift ;; -p) shift 2 ;; *) break ;; esac; done
+exec "$@"

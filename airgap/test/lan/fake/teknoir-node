@@ -1,0 +1,76 @@
+#!/bin/sh
+# Fake node runner for the teknoir-airgap LAN tests: records how it was called
+# and answers like the real one (airgap/node/bin/teknoir-node): stdout is the
+# log (sent to stderr) except for credentials and backup; secrets on stdout
+# only when stdout is a pipe; admin-user needs --out FILE and writes the
+# temporary password only there; backup --export needs a terminal.
+log=/var/log/teknoir-airgap-fake-runner.log
+printf '%s uid=%s %s\n' "$(date -u +%H:%M:%S)" "$(id -u)" "$*" >>"$log"
+[ "$(id -u)" = 0 ] || { echo "fake teknoir-node: not root" >&2; exit 1; }
+here=$(cd "$(dirname "$0")" && pwd)
+cmd=$1; shift
+# like setup_logging in the real runner
+case $cmd in credentials|backup) ;; *) exec 1>&2 ;; esac
+site='' prev='' export=0 take=0 stream='' keep=0
+for a in "$@"; do
+  [ "$prev" = --site ] && site=$a
+  [ "$prev" = --stream ] && stream=$a
+  case $a in --export) export=1 ;; --take) take=1 ;; --keep) keep=1 ;; esac
+  prev=$a
+done
+if [ -n "$site" ] && [ ! -f "$site" ]; then echo "fake teknoir-node: no site file $site" >&2; exit 1; fi
+case $cmd in
+  converge)
+    for a in "$@"; do case $a in --operator) echo "fake teknoir-node: unexpected argument --operator" >&2; exit 2 ;; esac; done
+    echo "fake converge $*"
+    echo "summary: 0 changes" ;;
+  status) echo "fake status $*" ;;
+  credentials)
+    if [ -t 1 ]; then echo "refusing to print a secret to a terminal" >&2; exit 1; fi
+    printf 's3cr3t-%s-value\n' "$1" ;;
+  admin-user)
+    # like lib/admin.sh; special addresses: fail@ fails after creating the
+    # User, existing@ has no temporary password (the node only warns)
+    email='' out=''
+    while [ $# -gt 0 ]; do
+      case $1 in --email) email=$2; shift ;; --out) out=$2; shift ;; esac
+      shift
+    done
+    [ -n "$email" ] || { echo "admin-user: --email is required" >&2; exit 1; }
+    [ -n "$out" ] || { echo "admin-user: --out FILE is required (the temporary password is never printed)" >&2; exit 1; }
+    printf '%s\n' "$email" | grep -Eq '^[a-z0-9]+([.-][a-z0-9]+)*@[a-z0-9]+([.-][a-z0-9]+)*\.[a-z]{2,}$' \
+      || { echo "admin-user: $email: only a-z, 0-9, '.' and '-' are supported" >&2; exit 1; }
+    if [ -L "$out" ] || [ -d "$out" ]; then echo "admin-user: --out $out is a symlink or a directory" >&2; exit 1; fi
+    [ -d "$(dirname "$out")" ] || { echo "admin-user: directory $(dirname "$out") does not exist" >&2; exit 1; }
+    echo "creating User ${email%@*}-at-${email#*@} (superadmin)"
+    case $email in
+      fail@*) echo "admin-user: timed out waiting for user-controller" >&2; exit 1 ;;
+      existing@*) echo "WARN: User records no temporary password: set one in Keycloak" >&2; exit 0 ;;
+    esac
+    t=$(mktemp "$(dirname "$out")/.teknoir-admin-user.XXXXXX") || exit 1
+    chmod 600 "$t"
+    printf 's3cr3t-temporary-password\n' >"$t"
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then chown "$SUDO_USER:" "$t"; fi
+    mv -f "$t" "$out"
+    echo "temporary password of $email written to $out (mode 0600, not shown)" ;;
+  backup)
+    b=/var/lib/teknoir-airgap/backups e=/var/lib/teknoir-airgap/exports
+    if [ -n "$stream" ]; then
+      if [ -t 1 ]; then echo "refusing binary data to a terminal" >&2; exit 1; fi
+      cat "$stream" || exit 1
+      [ "$keep" = 1 ] || rm -f "$stream"
+      exit 0
+    fi
+    if [ "$take" = 1 ] || [ "$export" = 0 ]; then
+      ts=$(date -u +%Y%m%dT%H%M%SZ)
+      mkdir -p "$b/$ts" && echo "s3cr3t-backup-content" >"$b/$ts/dump.sql"
+    fi
+    if [ "$export" = 1 ]; then
+      ts=$(find "$b" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort | tail -n 1); ts=${ts##*/}
+      mkdir -p "$e"
+      tar -C "$b" -cf - "$ts" | "$here/age" -p -o "$e/teknoir-backup-$ts.tar.age" || exit 1
+      echo "$e/teknoir-backup-$ts.tar.age"
+    fi ;;
+  rotate|migrate) echo "fake $cmd $*" ;;
+  *) echo "fake teknoir-node: unknown command $cmd" >&2; exit 2 ;;
+esac

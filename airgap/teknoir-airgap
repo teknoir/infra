@@ -1,0 +1,1666 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016  # the single-quoted scripts run on the node
+# teknoir-airgap - the LAN-host entrypoint of a Teknoir airgap bundle.
+#
+#   ./teknoir-airgap up      install or update the node (the same command)
+#   ./teknoir-airgap help    command reference
+#   docs/OPERATE.md          runbook (shipped in the bundle)
+#
+# Runs on Linux and macOS with the OS-provided bash (3.2 or later), ssh,
+# ssh-keygen, ssh-keyscan, tar and sha256sum or shasum: no python, no GNU-only
+# flags. A kubectl is only used, when available (the bundle ships one in
+# tools/<os>-<arch>/), to merge the kubeconfig. The script finds its bundle
+# from its own path and keeps a re-derivable cache in ~/.teknoir-airgap/<site>/
+# (pinned host key, CA certificate, ssh control socket, logs).
+#
+# It never prints a secret value: credentials, temporary passwords, the
+# kubeconfig and backups only go to files created with mode 0600.
+#
+# Interface to the node runner (node/bin/teknoir-node, run as root via sudo,
+# from /var/lib/teknoir-airgap/bundles/<bundleId>/node):
+#   converge    --site FILE --lan-time EPOCH --lan-user USER
+#               [--dry-run] [--rollback] [--sync-clock] [--reapply TIER]
+#               [--force-images] [ARGS given after --]
+#   status      --site FILE --lan-time EPOCH
+#   credentials NAME --site FILE           value on stdout (a pipe, never a tty)
+#   admin-user  --email ADDR --out FILE --site FILE
+#               the temporary password goes to FILE: a fresh root-only file
+#               in /var/lib/teknoir-airgap/tmp (0700) that teknoir-airgap then
+#               copies to the LAN host and deletes. The runner's stdout is its
+#               log here, never data.
+#   backup     --export --take --site FILE   (tty: age asks for a passphrase)
+#               new backup, encrypted to /var/lib/teknoir-airgap/exports/
+#               teknoir-backup-<ts>.tar.age
+#   backup      --stream FILE --keep --site FILE   that export on stdout
+#   rotate      NAME --site FILE [--i-know]
+#   migrate     --site FILE [--dry-run | --undo NAME]
+# Every command that runs teknoir-node first copies the site config to
+# /var/lib/teknoir-airgap/site/<site>.env (when it differs) and the payload
+# when the node lacks it (node_prepare), so each works on a node that never
+# ran up (the live migration starts with backup and migrate).
+# MANIFEST.yaml goes next to the payload (bundles/<bundleId>/MANIFEST.yaml),
+# where teknoir-node reads the bundle id, versions and commits. The payload
+# sync, sudo setup, kubeconfig, CA and status fallback use only sh, sudo,
+# tar, sha256sum, find, awk, cmp and k3s on the node.
+set -eu
+set -o pipefail
+
+PROG=teknoir-airgap
+NODE_STATE_DIR=/var/lib/teknoir-airgap
+SKEW_LIMIT=30
+HOSTKEY_TYPES=ed25519,ecdsa,rsa
+
+# ------------------------------------------------------------------ output --
+if [ -t 2 ]; then
+  C_INFO=$'\033[1;34m'; C_WARN=$'\033[1;33m'; C_ERR=$'\033[1;31m'
+  C_OK=$'\033[1;32m'; C_OFF=$'\033[0m'
+else
+  C_INFO=; C_WARN=; C_ERR=; C_OK=; C_OFF=
+fi
+LOG_FILE=
+
+logf() {
+  if [ -n "${LOG_FILE}" ]; then
+    printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"${LOG_FILE}" 2>/dev/null || true
+  fi
+  return 0
+}
+log()  { printf '%s[%s]%s %s\n' "${C_INFO}" "${PROG}" "${C_OFF}" "$*" >&2; logf "INFO  $*"; }
+warn() { printf '%s[%s] WARN:%s %s\n' "${C_WARN}" "${PROG}" "${C_OFF}" "$*" >&2; logf "WARN  $*"; }
+die()  { printf '%s[%s] ERROR:%s %s\n' "${C_ERR}" "${PROG}" "${C_OFF}" "$*" >&2; logf "ERROR $*"; exit 1; }
+usage_error() {
+  printf '%s[%s] ERROR:%s %s (see: ./teknoir-airgap help)\n' "${C_ERR}" "${PROG}" "${C_OFF}" "$*" >&2
+  exit 2
+}
+# A line of the change summary printed at the end of a command.
+CHANGES=()
+changed() { CHANGES[${#CHANGES[@]}]="$*"; logf "CHANGE $*"; }
+
+usage() {
+  cat <<'EOF'
+teknoir-airgap - install, update and operate a Teknoir airgapped node from this bundle
+
+Usage: ./teknoir-airgap COMMAND [OPTIONS]
+
+Run it from the extracted bundle (teknoir-airgap-<bundleId>/) on a LAN host
+(Linux or macOS) that reaches the node over ssh. It needs only ssh, ssh-keygen,
+ssh-keyscan, tar and sha256sum or shasum. Runbook: docs/OPERATE.md.
+
+Commands:
+  up                    Install or update the node from this bundle: verify the
+                        bundle, copy its payload to the node, run the converge,
+                        then fetch the kubeconfig and the CA certificate. The
+                        same command does the first install and every update,
+                        and is safe to re-run at any time.
+  status                Report: node, k3s, Applications, deployed release, clock
+                        skew. Changes nothing but the node's copy of the site
+                        config.
+  verify                Check the extracted bundle against MANIFEST.yaml (no ssh).
+  kubeconfig            Write the cluster's kubeconfig into ~/.kube/config as
+                        context <site>, replacing older entries of that name.
+  trust                 Make this computer resolve the platform names (an
+                        /etc/hosts block) and trust the platform CA (Debian,
+                        Ubuntu, macOS). Uses sudo on this computer.
+  credentials NAME      Write one platform credential (for example
+                        platform-admin) to the --out file, mode 0600. Never
+                        prints it.
+  admin-user            Create a platform admin (Keycloak user and Backstage
+                        User) for --email; the temporary password goes to the
+                        --out file, mode 0600.
+  backup                Take a backup on the node and copy it into the --out
+                        directory, encrypted with age (you choose a passphrase).
+  rotate NAME           Replace one generated secret and restart what uses it.
+  migrate               One-time detach of the legacy K3s manifest files on the
+                        live teknoir-local node (docs/OPERATE.md, migration).
+  doctor                Check this computer and the node: tools, name
+                        resolution, CA trust, ssh, sudo, clock skew, macOS
+                        quarantine.
+  version               Print the bundle id and versions from MANIFEST.yaml.
+  help                  Show this help.
+
+Options for every command:
+  --site FILE|NAME      Site config (default: site/<env>.env of this bundle).
+  --node USER@HOST      ssh target (default: NODE from the site config).
+  --local               Run on the node itself (the bundle was copied there),
+                        as root or through sudo, without ssh.
+  --forget-host-key     Drop the node's pinned ssh host key (after a reinstall)
+                        and pin the key it presents now.
+  --host-key FINGERPRINT
+                        Pin this host key (SHA256:...) without asking; for a
+                        first connection without a terminal.
+  -h, --help            Show this help.
+
+Options for up:
+  --dry-run             Only report what the converge would change (the bundle
+                        payload is still copied to the node).
+  --rollback            Accept a bundle older than the deployed release.
+  --sync-clock          Set the node clock from this computer when they differ
+                        by more than 30 seconds.
+  --reapply TIER        Break-glass: apply a one-shot tier again
+                        (platform-secrets, istio, harbor, argo).
+  --force-images        Allow moving a mirror tag in Harbor to another digest.
+  -- ARGS               Pass the remaining arguments to teknoir-node converge.
+
+Options for kubeconfig:
+  --context NAME        Context, cluster and user name (default: the site name).
+  --kubeconfig FILE     File to update (default: ~/.kube/config).
+
+Options for trust:
+  --print               Print the /etc/hosts block and the CA trust commands;
+                        change nothing.
+
+Options for credentials, admin-user and backup:
+  --out FILE|DIR        Where to write: a file for credentials and admin-user, a
+                        directory for backup. Required.
+  --email ADDRESS       admin-user: the new admin's e-mail address (the login),
+                        used in lower case: letters, digits, '.' and '-'
+                        around one '@' (no '_' or '+').
+
+Options for rotate:
+  --i-know              Confirm a rotation with side effects (Harbor secretKey,
+                        Keycloak database password); see docs/OPERATE.md.
+
+Options for migrate:
+  --dry-run             List what would be detached; change nothing.
+  --undo NAME           Re-attach one detached K3s manifest file.
+
+Files: ~/.teknoir-airgap/<site>/ holds the pinned host key, the CA certificate,
+the ssh control socket and logs; deleting it is safe. Exit status: 0 success,
+1 failure, 2 usage error.
+EOF
+}
+
+# ------------------------------------------------------------ small tools --
+# Single-quote one word for a POSIX shell on the far side of ssh.
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+need_cmd() {
+  local c
+  for c in "$@"; do
+    command -v "$c" >/dev/null 2>&1 || die "'$c' is required on this computer but was not found"
+  done
+}
+
+SHA256=()
+sha_init() {
+  if command -v sha256sum >/dev/null 2>&1; then SHA256=(sha256sum)
+  elif command -v shasum >/dev/null 2>&1; then SHA256=(shasum -a 256)
+  else die "neither sha256sum nor shasum was found"
+  fi
+}
+sha256_of() { "${SHA256[@]}" <"$1" | awk '{ print $1 }'; }
+
+TMPD=
+# 1 only when this run started the ssh master; only then does it close it.
+MASTER_UP=0
+SSH_OPTS=()
+NODE=
+# A file on the node, and one on this computer, that may hold a secret on its
+# way here: removed on any exit until the copy is complete.
+REMOTE_TMP=
+LOCAL_TMP=
+cleanup() {
+  local rc=$?
+  if [ -n "${LOCAL_TMP}" ]; then rm -f "${LOCAL_TMP}"; fi
+  if [ -n "${REMOTE_TMP}" ]; then
+    node_sh pipe 'rm -f "$1"' "${REMOTE_TMP}" </dev/null >/dev/null 2>&1 \
+      || warn "could not remove ${REMOTE_TMP} on the node; remove it there (it may hold a temporary password)"
+  fi
+  if [ "${MASTER_UP}" = 1 ]; then
+    ssh "${SSH_OPTS[@]}" -O exit "${NODE}" >/dev/null 2>&1 || true
+  fi
+  if [ -n "${TMPD}" ] && [ -d "${TMPD}" ]; then rm -rf "${TMPD}"; fi
+  exit "${rc}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+tmp_init() {
+  TMPD=$(mktemp -d "${TMPDIR:-/tmp}/teknoir-airgap.XXXXXX") || die "mktemp failed"
+  chmod 700 "${TMPD}"
+}
+
+abs_dir() { (cd "$1" 2>/dev/null && pwd -P); }
+
+# Refuse to write secrets into the bundle tree (it is copied around and would
+# also fail the next verify as an unlisted file).
+refuse_inside_bundle() {
+  local d=$1
+  case "${d}/" in
+    "${BUNDLE_ROOT}"/*) die "refusing to write into the bundle directory ($1); choose a path outside it" ;;
+  esac
+}
+
+human_bytes() {
+  awk -v b="$1" 'BEGIN {
+    if (b >= 1073741824) printf "%.1f GiB", b / 1073741824
+    else if (b >= 1048576) printf "%.1f MiB", b / 1048576
+    else printf "%d bytes", b }'
+}
+
+# ----------------------------------------------------------------- bundle --
+BUNDLE_ROOT=
+MANIFEST=
+BUNDLE_ID=
+
+bundle_open() {
+  local src=${BASH_SOURCE[0]} dir
+  while [ -L "${src}" ]; do
+    dir=$(cd -P "$(dirname "${src}")" && pwd)
+    src=$(readlink "${src}")
+    case "${src}" in /*) ;; *) src=${dir}/${src} ;; esac
+  done
+  BUNDLE_ROOT=$(cd -P "$(dirname "${src}")" && pwd)
+  MANIFEST=${BUNDLE_ROOT}/MANIFEST.yaml
+  [ -f "${MANIFEST}" ] || die "no MANIFEST.yaml next to ${src}: run teknoir-airgap from an extracted bundle directory (teknoir-airgap-<bundleId>/), not from a repository checkout"
+  BUNDLE_ID=$(manifest_get bundleId)
+  [ -n "${BUNDLE_ID}" ] || die "MANIFEST.yaml has no bundleId"
+  case "${BUNDLE_ID}" in
+    *[!A-Za-z0-9._-]*|.*) die "MANIFEST.yaml has an invalid bundleId: ${BUNDLE_ID}" ;;
+  esac
+}
+
+# manifest_get KEY: the value of a top-level scalar in MANIFEST.yaml ('' if absent).
+manifest_get() {
+  awk -v key="$1" -v q="'" '
+    function unq(s,  f, l) {
+      sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s)
+      f = substr(s, 1, 1); l = substr(s, length(s), 1)
+      if (length(s) >= 2 && ((f == "\"" && l == "\"") || (f == q && l == q))) s = substr(s, 2, length(s) - 2)
+      return s
+    }
+    /^[^ \t#-]/ {
+      k = $0; sub(/:.*/, "", k); k = unq(k)
+      if (k == key) { v = $0; sub(/^[^:]*:/, "", v); sub(/[ \t]+#.*$/, "", v); print unq(v); exit }
+    }' "${MANIFEST}"
+}
+
+# manifest_files: "sha256  path" for every file MANIFEST.yaml lists. Accepts a
+# files/sha256/checksums section written as a list (- path: P / sha256: S, in
+# either order or as a flow mapping) or as a map (P: S). Exits 3 on an entry
+# without a valid sha256.
+manifest_files() {
+  awk -v q="'" '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    function unq(s,  f, l) {
+      s = trim(s); f = substr(s, 1, 1); l = substr(s, length(s), 1)
+      if (length(s) >= 2 && ((f == "\"" && l == "\"") || (f == q && l == q))) s = substr(s, 2, length(s) - 2)
+      return s
+    }
+    function ishex(h) { return length(h) == 64 && h !~ /[^0-9a-fA-F]/ }
+    function emit(p, h) {
+      p = unq(p); h = unq(h); sub(/^sha256:/, "", h); sub(/^\.\//, "", p)
+      if (p == "" || !ishex(h)) { bad = bad "\n  " p; return }
+      print tolower(h) "  " p
+    }
+    function kv(s) { K = s; sub(/:.*/, "", K); K = unq(K); V = s; sub(/^[^:]*:/, "", V); V = trim(V) }
+    function ispath(k) { return k == "path" || k == "file" }
+    function issum(k) { return k == "sha256" || k == "sha" || k == "digest" || k == "hash" }
+    /^[^ \t#-]/ {
+      kv($0); insec = (K == "files" || K == "sha256" || K == "sha256sums" || K == "checksums")
+      cp = ""; ch = ""; next
+    }
+    !insec { next }
+    /^[ \t]*(#.*)?$/ { next }
+    {
+      t = trim($0)
+      if (t == "-" || substr(t, 1, 2) == "- ") { cp = ""; ch = ""; t = trim(substr(t, 2)) }
+      if (t ~ /^\{.*\}$/) {
+        n = split(substr(t, 2, length(t) - 2), parts, ","); fp = ""; fh = ""
+        for (i = 1; i <= n; i++) { kv(parts[i]); if (ispath(K)) fp = V; else if (issum(K)) fh = V }
+        emit(fp, fh); next
+      }
+      kv(t)
+      if (ispath(K)) cp = V
+      else if (issum(K)) ch = V
+      else if (V != "") { emit(K, V); next }
+      if (cp != "" && ch != "") { emit(cp, ch); cp = ""; ch = "" }
+    }
+    END { if (bad != "") { printf "MANIFEST.yaml entries without a valid sha256:%s\n", bad > "/dev/stderr"; exit 3 } }
+  ' "${MANIFEST}"
+}
+
+# Lines "sha256  path" -> path (column 67 onwards; "*path" binary markers stripped).
+sums_paths() { awk '{ p = substr($0, 67); print p }' "$1"; }
+
+# not_in SETFILE [AWK-EXPR]: print the stdin lines whose key (default: the
+# whole line) is not a line of SETFILE. An empty or missing SETFILE is an empty
+# set (unlike the NR == FNR idiom, which misreads an empty first file).
+not_in() {
+  awk -v f="$1" 'BEGIN { while ((getline l < f) > 0) seen[l] = 1; close(f) }
+                 { k = '"${2:-\$0}"' } !(k in seen)'
+}
+
+# bundle_verify: 0 when the extracted tree matches MANIFEST.yaml exactly (every
+# listed file present with its sha256, no unlisted file, no symlink). Prints
+# what is wrong otherwise. Writes ${TMPD}/manifest.sha256 for later checks.
+VERIFIED=0
+bundle_verify() {
+  local list=${TMPD}/manifest.sha256 n bad unlisted links meta
+  if ! manifest_files >"${list}"; then
+    warn "MANIFEST.yaml could not be parsed"
+    return 1
+  fi
+  n=$(wc -l <"${list}" | tr -d ' ')
+  if [ "${n}" -eq 0 ]; then
+    warn "MANIFEST.yaml lists no files (unknown format?)"
+    return 1
+  fi
+  if sums_paths "${list}" | awk '/^\// || /(^|\/)\.\.(\/|$)/ { found = 1 } END { exit !found }'; then
+    warn "MANIFEST.yaml lists an absolute path or a path with '..'"
+    return 1
+  fi
+  bad=$(sums_paths "${list}" | LC_ALL=C sort | uniq -d)
+  if [ -n "${bad}" ]; then
+    warn "MANIFEST.yaml lists these paths twice:"; printf '  %s\n' "${bad}" >&2
+    return 1
+  fi
+  log "verifying ${n} files of bundle ${BUNDLE_ID} against MANIFEST.yaml (this reads the whole bundle once)"
+  (cd "${BUNDLE_ROOT}" && "${SHA256[@]}" -c "${list}") >"${TMPD}/verify.out" 2>/dev/null || true
+  awk '/: OK$/ { sub(/: OK$/, ""); print }' "${TMPD}/verify.out" >"${TMPD}/ok.paths"
+  sums_paths "${list}" >"${TMPD}/listed.paths"
+  bad=$(not_in "${TMPD}/ok.paths" <"${TMPD}/listed.paths")
+  (cd "${BUNDLE_ROOT}" && find . \( -type f -o -type l \) -print) | sed 's|^\./||' \
+    | awk '$0 != "MANIFEST.yaml"' >"${TMPD}/found.paths"
+  meta=$(awk -F/ '$NF == ".DS_Store" || $NF ~ /^\._/' "${TMPD}/found.paths")
+  unlisted=$(awk -F/ '$NF != ".DS_Store" && $NF !~ /^\._/' "${TMPD}/found.paths" | not_in "${TMPD}/listed.paths")
+  links=$(cd "${BUNDLE_ROOT}" && find . -type l -print | sed 's|^\./||')
+  if [ -n "${meta}" ]; then
+    warn "ignoring macOS Finder metadata files in the bundle ($(printf '%s\n' "${meta}" | wc -l | tr -d ' ') of them)"
+  fi
+  if [ -z "${bad}${unlisted}${links}" ]; then
+    VERIFIED=1
+    log "bundle verified: ${n} files match MANIFEST.yaml"
+    return 0
+  fi
+  if [ -n "${bad}" ]; then
+    warn "missing or modified files (sha256 differs from MANIFEST.yaml):"
+    printf '%s\n' "${bad}" | head -n 20 | while IFS= read -r p; do
+      if [ -e "${BUNDLE_ROOT}/${p}" ]; then printf '  modified: %s\n' "${p}" >&2
+      else printf '  missing:  %s\n' "${p}" >&2; fi
+    done
+  fi
+  if [ -n "${unlisted}" ]; then
+    warn "files that MANIFEST.yaml does not list:"
+    printf '%s\n' "${unlisted}" | head -n 20 | sed 's/^/  /' >&2
+  fi
+  if [ -n "${links}" ]; then
+    warn "symbolic links (a bundle contains none):"
+    printf '%s\n' "${links}" | head -n 20 | sed 's/^/  /' >&2
+  fi
+  return 1
+}
+
+bundle_verify_or_die() {
+  bundle_verify || die "the bundle does not match its MANIFEST.yaml: copy it again from the USB medium (check the .tar against its .tar.sha256 first)"
+  payload_check
+}
+
+# node/SHA256SUMS (the node's own checklist) must agree with MANIFEST.yaml.
+payload_check() {
+  local sums=${BUNDLE_ROOT}/node/SHA256SUMS
+  [ -f "${sums}" ] || die "node/SHA256SUMS is missing from the bundle"
+  awk '{ h = substr($0, 1, 64); p = substr($0, 67)
+         if (length(h) != 64 || h ~ /[^0-9a-fA-F]/ || p == "") { bad = 1; exit }
+         print tolower(h) "  " p }
+       END { if (bad) exit 3 }' "${sums}" | LC_ALL=C sort >"${TMPD}/node.sha256" \
+    || die "node/SHA256SUMS has a malformed line"
+  awk '{ p = substr($0, 67) } p ~ /^node\// && p != "node/SHA256SUMS" { print substr($0, 1, 64) "  " substr(p, 6) }' \
+    "${TMPD}/manifest.sha256" | LC_ALL=C sort >"${TMPD}/node.from-manifest"
+  cmp -s "${TMPD}/node.sha256" "${TMPD}/node.from-manifest" \
+    || die "node/SHA256SUMS does not agree with the node/ entries of MANIFEST.yaml: the bundle is inconsistent, rebuild it"
+}
+
+# ------------------------------------------------------------------- site --
+SITE_ARG=
+SITE_FILE=
+SITE_NAME=
+REMOTE_SITE=
+LAN_STATE=
+KNOWN_HOSTS=
+CA_CACHE=
+OPT_NODE=
+
+site_load() {
+  local f env mdomain h
+  if [ -z "${SITE_ARG}" ]; then
+    env=$(manifest_get env)
+    if [ -n "${env}" ] && [ -f "${BUNDLE_ROOT}/site/${env}.env" ]; then
+      f=${BUNDLE_ROOT}/site/${env}.env
+    else
+      set -- "${BUNDLE_ROOT}"/site/*.env
+      if [ $# -ne 1 ] || [ ! -f "$1" ]; then
+        die "cannot choose a site config: pass --site FILE (this bundle has: $(cd "${BUNDLE_ROOT}" && find site -name '*.env' 2>/dev/null | tr '\n' ' '))"
+      fi
+      f=$1
+    fi
+  elif [ -f "${SITE_ARG}" ]; then
+    f=${SITE_ARG}
+  elif [ -f "${BUNDLE_ROOT}/site/${SITE_ARG}.env" ]; then
+    f=${BUNDLE_ROOT}/site/${SITE_ARG}.env
+  else
+    die "site config not found: ${SITE_ARG} (a file, or a name from site/ in the bundle)"
+  fi
+  SITE_FILE=$(abs_dir "$(dirname "${f}")")/$(basename "${f}")
+  SITE_NAME=$(basename "${f}")
+  SITE_NAME=${SITE_NAME%.env}
+  case "${SITE_NAME}" in
+    ''|*[!A-Za-z0-9._-]*|.*) die "invalid site name '${SITE_NAME}' (from ${SITE_FILE})" ;;
+  esac
+  # shellcheck disable=SC2034  # TEKNOIR_ENV, TIME_SOURCE and K3S_DATA_DIR are the node's
+  TEKNOIR_ENV='' TEKNOIR_DOMAIN='' NODE_IP='' NODE='' TEKNOIR_HOSTNAMES='' TIME_SOURCE='' K3S_DATA_DIR=''
+  # shellcheck source=/dev/null
+  . "${SITE_FILE}" || die "cannot read ${SITE_FILE}"
+  [ -z "${OPT_NODE}" ] || NODE=${OPT_NODE}
+  [ -n "${TEKNOIR_DOMAIN}" ] || die "${SITE_FILE}: TEKNOIR_DOMAIN is not set"
+  [ -n "${NODE_IP}" ] || die "${SITE_FILE}: NODE_IP is not set"
+  [ -n "${NODE}" ] || die "${SITE_FILE}: NODE is not set (or pass --node USER@HOST)"
+  case "${TEKNOIR_DOMAIN}" in *[!A-Za-z0-9.-]*|.*|*.) die "${SITE_FILE}: invalid TEKNOIR_DOMAIN '${TEKNOIR_DOMAIN}'" ;; esac
+  case "${NODE_IP}" in *[!0-9.]*) die "${SITE_FILE}: NODE_IP '${NODE_IP}' is not an IPv4 address" ;; esac
+  [ "$(printf '%s' "${NODE_IP}" | awk -F. 'NF == 4 && $1 != "" && $2 != "" && $3 != "" && $4 != "" && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 { print "ok" }')" = ok ] \
+    || die "${SITE_FILE}: NODE_IP '${NODE_IP}' is not an IPv4 address"
+  case "${NODE}" in -*|*[!A-Za-z0-9@._:-]*) die "invalid ssh target '${NODE}' (expected USER@HOST)" ;; esac
+  for h in ${TEKNOIR_HOSTNAMES}; do
+    case "${h}" in *[!A-Za-z0-9-]*|-*) die "${SITE_FILE}: invalid name '${h}' in TEKNOIR_HOSTNAMES" ;; esac
+  done
+  mdomain=$(manifest_get domain)
+  if [ -n "${mdomain}" ] && [ "${mdomain}" != "${TEKNOIR_DOMAIN}" ]; then
+    die "site ${SITE_NAME} is for domain ${TEKNOIR_DOMAIN}, but this bundle was built for ${mdomain}"
+  fi
+  REMOTE_SITE=${NODE_STATE_DIR}/site/${SITE_NAME}.env
+}
+
+state_init() {
+  local root=${HOME:?HOME is not set}/.teknoir-airgap old n
+  LAN_STATE=${root}/${SITE_NAME}
+  mkdir -p "${LAN_STATE}/logs" || die "cannot create ${LAN_STATE}"
+  chmod 700 "${root}" "${LAN_STATE}" "${LAN_STATE}/logs" 2>/dev/null || true
+  KNOWN_HOSTS=${LAN_STATE}/known_hosts
+  CA_CACHE=${LAN_STATE}/teknoir-root-ca.crt
+  LOG_FILE=${LAN_STATE}/logs/$(date -u +%Y%m%dT%H%M%SZ)-${CMD}.log
+  if : >"${LOG_FILE}" 2>/dev/null; then chmod 600 "${LOG_FILE}"; else LOG_FILE=; fi
+  logf "${PROG} ${CMD} bundle=${BUNDLE_ID} site=${SITE_FILE} node=${NODE} local=${LOCAL}"
+  # keep the 30 newest logs (their names start with a UTC timestamp)
+  n=$(find "${LAN_STATE}/logs" -type f -name '*.log' | wc -l | tr -d ' ')
+  if [ "${n}" -gt 30 ]; then
+    find "${LAN_STATE}/logs" -type f -name '*.log' | LC_ALL=C sort | awk -v drop=$((n - 30)) 'NR <= drop' \
+      | while IFS= read -r old; do rm -f "${old}"; done
+  fi
+}
+
+payload_dir() { printf '%s/bundles/%s/node' "${NODE_STATE_DIR}" "${BUNDLE_ID}"; }
+runner_path() { printf '%s/bin/teknoir-node' "$(payload_dir)"; }
+
+# -------------------------------------------------------------------- ssh --
+SSH_HOST=
+SSH_PORT=
+SSH_USER=
+KH_NAME=
+REMOTE_USER=
+LOCAL=0
+OPT_FORGET_HOSTKEY=0
+OPT_HOST_KEY=
+
+ssh_setup() {
+  local ctl
+  need_cmd ssh ssh-keygen ssh-keyscan
+  # A unix socket path must stay under ~104 bytes; %C expands to 40 hex chars.
+  ctl=${LAN_STATE}/cm-%C
+  if [ ${#LAN_STATE} -gt 55 ] || case "${LAN_STATE}" in *' '*) true ;; *) false ;; esac; then
+    ctl=/tmp/teknoir-airgap-$(id -u)-%C
+  fi
+  case "${KNOWN_HOSTS}" in *' '*) die "the home directory path contains a space; ssh cannot use ${KNOWN_HOSTS}" ;; esac
+  SSH_OPTS=(
+    -o "UserKnownHostsFile=${KNOWN_HOSTS}" -o GlobalKnownHostsFile=/dev/null
+    -o StrictHostKeyChecking=yes -o CheckHostIP=no -o UpdateHostKeys=no -o HashKnownHosts=no
+    -o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=8
+    -o "ControlPath=${ctl}" -o LogLevel=ERROR
+  )
+  local cfg
+  cfg=$(ssh -G "${SSH_OPTS[@]}" "${NODE}" 2>"${TMPD}/ssh-G.err") \
+    || { sed 's/^/  ssh: /' "${TMPD}/ssh-G.err" >&2; die "ssh cannot use the target '${NODE}'"; }
+  SSH_HOST=$(printf '%s\n' "${cfg}" | awk '$1 == "hostname" { print $2; exit }')
+  SSH_PORT=$(printf '%s\n' "${cfg}" | awk '$1 == "port" { print $2; exit }')
+  SSH_USER=$(printf '%s\n' "${cfg}" | awk '$1 == "user" { print $2; exit }')
+  if [ -z "${SSH_HOST}" ] || [ -z "${SSH_PORT}" ]; then die "ssh -G gave no hostname/port for '${NODE}'"; fi
+  if [ "${SSH_PORT}" = 22 ]; then KH_NAME=${SSH_HOST}; else KH_NAME="[${SSH_HOST}]:${SSH_PORT}"; fi
+}
+
+hostkey_pinned() {
+  [ -f "${KNOWN_HOSTS}" ] || return 1
+  awk -v h="${KH_NAME}" '$1 !~ /^#/ { n = split($1, a, ","); for (i = 1; i <= n; i++) if (a[i] == h) found = 1 }
+                         END { exit !found }' "${KNOWN_HOSTS}"
+}
+
+hostkey_forget() {
+  if [ -f "${KNOWN_HOSTS}" ]; then
+    awk -v h="${KH_NAME}" '{ n = split($1, a, ","); for (i = 1; i <= n; i++) if (a[i] == h) next; print }' \
+      "${KNOWN_HOSTS}" >"${TMPD}/known_hosts.new"
+    cat "${TMPD}/known_hosts.new" >"${KNOWN_HOSTS}"
+  fi
+  ssh "${SSH_OPTS[@]}" -O exit "${NODE}" >/dev/null 2>&1 || true
+  log "forgot the pinned host key of ${KH_NAME} for site ${SITE_NAME}"
+}
+
+# hostkey_scan: "TYPE FINGERPRINT<TAB>KNOWN_HOSTS_LINE" for each key the node
+# offers, preferred type first. Unauthenticated; only used to pin after the
+# operator (or --host-key) confirmed the fingerprint.
+hostkey_scan() {
+  local line fp kt p i=0
+  ssh-keyscan -T 10 -p "${SSH_PORT}" -t "${HOSTKEY_TYPES}" "${SSH_HOST}" >"${TMPD}/keyscan" 2>"${TMPD}/keyscan.err" || true
+  : >"${TMPD}/keyscan.fp"
+  while IFS= read -r line; do
+    case "${line}" in ''|'#'*) continue ;; esac
+    i=$((i + 1))
+    printf '%s\n' "${line}" >"${TMPD}/key.${i}"
+    fp=$(ssh-keygen -lf "${TMPD}/key.${i}" 2>/dev/null | awk '{ print $2 }') || fp=
+    kt=$(printf '%s\n' "${line}" | awk '{ print $2 }')
+    [ -n "${fp}" ] || continue
+    case "${kt}" in ssh-ed25519) p=1 ;; ecdsa-*) p=2 ;; *) p=3 ;; esac
+    printf '%s %s %s\t%s\n' "${p}" "${kt}" "${fp}" "${line}" >>"${TMPD}/keyscan.fp"
+  done <"${TMPD}/keyscan"
+  LC_ALL=C sort -n "${TMPD}/keyscan.fp" | cut -d' ' -f2-
+}
+
+hostkey_pin() {
+  local offers want line kt fp ans
+  offers=$(hostkey_scan)
+  if [ -z "${offers}" ]; then
+    sed 's/^/  ssh-keyscan: /' "${TMPD}/keyscan.err" >&2
+    die "could not read an ssh host key from ${SSH_HOST} port ${SSH_PORT}: is the node up and is sshd running?"
+  fi
+  if [ -n "${OPT_HOST_KEY}" ]; then
+    want=${OPT_HOST_KEY}
+    case "${want}" in SHA256:*) ;; *) want=SHA256:${want} ;; esac
+    line=$(printf '%s\n' "${offers}" | awk -F'\t' -v w="${want}" '{ split($1, a, " ") } a[2] == w { print $2; exit }')
+    if [ -z "${line}" ]; then
+      warn "the node offers these host keys:"
+      printf '%s\n' "${offers}" | cut -f1 | sed 's/^/  /' >&2
+      die "none of them has the fingerprint given with --host-key (${want})"
+    fi
+  else
+    kt=$(printf '%s\n' "${offers}" | head -n 1 | cut -f1 | awk '{ print $1 }')
+    fp=$(printf '%s\n' "${offers}" | head -n 1 | cut -f1 | awk '{ print $2 }')
+    line=$(printf '%s\n' "${offers}" | head -n 1 | cut -f2-)
+    if [ ! -t 0 ]; then
+      die "first connection to ${KH_NAME} for site ${SITE_NAME}: its host key must be confirmed. Run this in a terminal, or pass --host-key ${fp} after checking that fingerprint on the node console (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub)"
+    fi
+    {
+      printf '\nFirst connection to %s for site %s. The node presents this %s host key:\n\n' "${KH_NAME}" "${SITE_NAME}" "${kt}"
+      printf '    %s\n\n' "${fp}"
+      printf 'Compare it with the output of this command on the node console:\n'
+      printf '    ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub\n\n'
+      printf 'Pin this key? Type yes or paste the fingerprint (anything else aborts): '
+    } >&2
+    read -r ans || ans=
+    if [ "${ans}" != yes ] && [ "${ans}" != "${fp}" ]; then
+      die "host key not confirmed; nothing was changed"
+    fi
+  fi
+  printf '%s\n' "${line}" >>"${KNOWN_HOSTS}"
+  chmod 600 "${KNOWN_HOSTS}"
+  changed "pinned the ssh host key of ${KH_NAME} in ${KNOWN_HOSTS}"
+  log "pinned the host key of ${KH_NAME} ($(printf '%s\n' "${line}" | awk '{ print $2 }'))"
+}
+
+# Explain an ssh failure from its stderr and die.
+ssh_fail() {
+  local err=$1
+  if grep -Eq 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed|host key for .* has changed' "${err}"; then
+    sed 's/^/  ssh: /' "${err}" >&2
+    {
+      printf '\nThe host key that %s presents is not the one pinned for site %s\n' "${KH_NAME}" "${SITE_NAME}"
+      printf '(%s).\n\n' "${KNOWN_HOSTS}"
+      printf 'If the node was reinstalled, forget the old key and confirm the new one:\n'
+      printf '    ./teknoir-airgap %s --forget-host-key\n' "${CMD}"
+      printf 'or remove it by hand:\n'
+      printf "    ssh-keygen -R '%s' -f '%s'\n\n" "${KH_NAME}" "${KNOWN_HOSTS}"
+      printf 'Otherwise stop here: another machine may be answering on %s.\n\n' "${SSH_HOST}"
+    } >&2
+    die "ssh host key mismatch for ${KH_NAME}"
+  fi
+  sed 's/^/  ssh: /' "${err}" >&2
+  if grep -q 'Permission denied' "${err}"; then
+    die "the node refused the ssh login as ${SSH_USER}: install your public key there (ssh-copy-id -i ~/.ssh/id_ed25519.pub ${NODE}; docs/HOST-SETUP.md)"
+  fi
+  if grep -Eq 'Connection refused|timed out|No route to host|Network is unreachable|Could not resolve|Connection reset' "${err}"; then
+    die "cannot reach ${SSH_HOST} port ${SSH_PORT} over ssh"
+  fi
+  die "ssh to ${NODE} failed"
+}
+
+ssh_connect() {
+  ssh_setup
+  if [ "${OPT_FORGET_HOSTKEY}" = 1 ]; then hostkey_forget; fi
+  hostkey_pinned || hostkey_pin
+  if ssh "${SSH_OPTS[@]}" -O check "${NODE}" >/dev/null 2>&1; then
+    : # another teknoir-airgap run's master: use it, leave it to that run
+  elif ssh "${SSH_OPTS[@]}" -o ControlMaster=yes -o ControlPersist=300 -f -N "${NODE}" \
+       </dev/null >/dev/null 2>"${TMPD}/ssh-connect.err"; then
+    MASTER_UP=1
+  else
+    ssh_fail "${TMPD}/ssh-connect.err"
+  fi
+  REMOTE_USER=$(remote_exec pipe 'id -un' </dev/null 2>"${TMPD}/ssh.err" | tail -n 1) || ssh_fail "${TMPD}/ssh.err"
+  case "${REMOTE_USER}" in ''|*[!A-Za-z0-9._-]*) die "unexpected remote user name '${REMOTE_USER}'" ;; esac
+}
+
+# remote_exec tty|pipe COMMAND-LINE: run a command line on the node as the ssh
+# user. tty allocates a terminal when this side has one.
+remote_exec() {
+  local t=-T
+  if [ "$1" = tty ] && [ -t 0 ]; then t=-t; fi
+  ssh "${SSH_OPTS[@]}" -o ControlMaster=no "${t}" "${NODE}" "$2"
+}
+
+# node_sh tty|pipe SCRIPT [ARG...]: run `sh -c SCRIPT sh ARG...` as root on the
+# node, over ssh with sudo, or directly with --local.
+node_sh() {
+  local mode=$1 script=$2 cmd a
+  shift 2
+  if [ "${LOCAL}" = 1 ]; then
+    if [ "$(id -u)" = 0 ]; then sh -c "${script}" sh "$@"; else sudo sh -c "${script}" sh "$@"; fi
+    return
+  fi
+  if [ "${mode}" = tty ] && [ -t 0 ]; then cmd=sudo; else cmd="sudo -n"; fi
+  cmd="${cmd} sh -c $(shq "${script}") sh"
+  for a in "$@"; do cmd="${cmd} $(shq "${a}")"; done
+  remote_exec "${mode}" "${cmd}"
+}
+
+# node_user_sh SCRIPT [ARG...]: run `sh -c SCRIPT` as the ssh user (no sudo).
+node_user_sh() {
+  local script=$1 cmd a
+  shift
+  if [ "${LOCAL}" = 1 ]; then sh -c "${script}" sh "$@"; return; fi
+  cmd="sh -c $(shq "${script}") sh"
+  for a in "$@"; do cmd="${cmd} $(shq "${a}")"; done
+  remote_exec pipe "${cmd}"
+}
+
+# ------------------------------------------------------------------ sudo --
+SUDOERS_SCRIPT='
+set -e
+u=$1
+case $u in ""|*[!A-Za-z0-9._-]*) echo "unexpected user name" >&2; exit 1 ;; esac
+f=/etc/sudoers.d/teknoir-airgap
+t=$(mktemp /etc/sudoers.d/.teknoir-airgap.XXXXXX)
+trap "rm -f \"$t\"" EXIT
+printf "%s\n" "# Managed by teknoir-airgap (docs/OPERATE.md): $u runs the Teknoir node converge as root." "$u ALL=(root) NOPASSWD: ALL" >"$t"
+chmod 0440 "$t"
+visudo -cf "$t" >/dev/null
+mv -f "$t" "$f"
+trap - EXIT
+'
+
+sudo_ok() {
+  local rc=0
+  [ "${LOCAL}" = 1 ] && return 0
+  remote_exec pipe 'sudo -n true' </dev/null >/dev/null 2>"${TMPD}/sudo.err" || rc=$?
+  [ "${rc}" -ne 255 ] || ssh_fail "${TMPD}/sudo.err"
+  return "${rc}"
+}
+
+# sudo_hint: how to get the one-time sudo setup done. Never suggests up for
+# migrate: on the live node, migrate runs before the first up (docs/OPERATE.md
+# section 14), and its M2 backup is the first command there.
+sudo_hint() {
+  local h
+  case "${CMD}" in
+    up) h="run ./teknoir-airgap up once in a terminal" ;;
+    migrate) h="run ./teknoir-airgap backup --out DIR once in a terminal first (docs/OPERATE.md section 14, M2)" ;;
+    *) h="run ./teknoir-airgap ${CMD} once in a terminal" ;;
+  esac
+  if [ "${DRY_RUN}" = 1 ]; then
+    [ "${CMD}" != up ] || h="${h} without --dry-run"
+    h="a dry run does not set it up; ${h}"
+  fi
+  printf '%s (it asks for the sudo password once and installs /etc/sudoers.d/teknoir-airgap)' "${h}"
+}
+
+# sudo_ensure [setup]: passwordless sudo for the ssh user on the node; with
+# "setup", install /etc/sudoers.d/teknoir-airgap once (asks for the password).
+sudo_ensure() {
+  if [ "${LOCAL}" = 1 ]; then
+    [ "$(id -u)" = 0 ] || command -v sudo >/dev/null 2>&1 || die "--local needs root or sudo"
+    return 0
+  fi
+  sudo_ok && return 0
+  if [ "${1:-}" != setup ] || [ "${DRY_RUN}" = 1 ] || [ ! -t 0 ]; then
+    die "${REMOTE_USER} on ${NODE} has no passwordless sudo yet: $(sudo_hint)"
+  fi
+  log "one-time setup: installing /etc/sudoers.d/teknoir-airgap on ${NODE} so ${REMOTE_USER} can run the converge without a password prompt"
+  log "sudo on the node asks for ${REMOTE_USER}'s password once"
+  remote_exec tty "sudo -p '[sudo] password for %u on %h: ' sh -c $(shq "${SUDOERS_SCRIPT}") sh $(shq "${REMOTE_USER}")" \
+    || die "could not install /etc/sudoers.d/teknoir-airgap (wrong password, or ${REMOTE_USER} may not use sudo: see docs/HOST-SETUP.md)"
+  sudo_ok || die "passwordless sudo still does not work for ${REMOTE_USER} on ${NODE}"
+  changed "installed /etc/sudoers.d/teknoir-airgap on ${NODE}"
+}
+
+# ---------------------------------------------------------- payload sync --
+# Files on the node that already match node/SHA256SUMS (stdin), then a marker.
+LIST_SCRIPT='
+d=$1
+if [ -d "$d" ]; then
+  cd "$d" || exit 1
+  sha256sum -c - 2>/dev/null | grep ": OK$" || true
+else
+  cat >/dev/null
+fi
+echo TEKNOIR-AIRGAP-LIST-DONE
+'
+# Unpack the tar stream on stdin into the payload directory.
+RECV_SCRIPT='
+d=$1
+umask 022
+mkdir -p "$d" && cd "$d" && tar -x -o -f - && echo TEKNOIR-AIRGAP-RECV-DONE
+'
+# Verify the files just sent (stdin), remove files node/SHA256SUMS does not
+# list, record the payload as complete.
+CHECK_SCRIPT='
+d=$1; marker=$2; sums=$3
+cd "$d" || exit 1
+bad=$(sha256sum -c - 2>/dev/null | grep -v ": OK$")
+if [ -n "$bad" ]; then printf "%s\n" "$bad" >&2; exit 3; fi
+find . -type f | sed "s|^\./||" \
+  | awk "BEGIN { keep[\"SHA256SUMS\"] = 1; while ((getline l < \"SHA256SUMS\") > 0) keep[substr(l, 67)] = 1 } !(\$0 in keep)" \
+  | while IFS= read -r f; do rm -f -- "$f"; echo "removed unlisted payload file $f" >&2; done
+umask 022
+printf "%s\n" "$sums" >"$marker.tmp" && mv -f "$marker.tmp" "$marker" && echo TEKNOIR-AIRGAP-CHECK-DONE
+'
+
+TAR_CFLAGS=()
+tar_init() {
+  TAR_CFLAGS=()
+  if tar --version 2>/dev/null | grep -q bsdtar; then
+    if tar -c --no-xattrs -f /dev/null -T /dev/null >/dev/null 2>&1; then TAR_CFLAGS[${#TAR_CFLAGS[@]}]=--no-xattrs; fi
+    if tar -c --no-mac-metadata -f /dev/null -T /dev/null >/dev/null 2>&1; then TAR_CFLAGS[${#TAR_CFLAGS[@]}]=--no-mac-metadata; fi
+  fi
+}
+
+payload_marker() { printf '%s/bundles/%s/payload.sha256' "${NODE_STATE_DIR}" "${BUNDLE_ID}"; }
+
+# payload_sync: make the node's payload directory equal to node/ of this
+# bundle. One call lists what already matches, one tar stream sends the rest,
+# one call verifies what was sent; an interrupted copy resumes per file.
+payload_sync() {
+  local dir total n bytes sums_sha
+  dir=$(payload_dir)
+  sums_sha=$(sha256_of "${BUNDLE_ROOT}/node/SHA256SUMS")
+  # node/SHA256SUMS lists every payload file but itself; the node needs it too.
+  { cat "${TMPD}/node.sha256"; printf '%s  SHA256SUMS\n' "${sums_sha}"; } >"${TMPD}/payload.sha256"
+  total=$(wc -l <"${TMPD}/payload.sha256" | tr -d ' ')
+  node_sh pipe "${LIST_SCRIPT}" "${dir}" <"${TMPD}/payload.sha256" >"${TMPD}/remote.list" 2>"${TMPD}/remote.err" \
+    || { sed 's/^/  node: /' "${TMPD}/remote.err" >&2; die "could not list the payload on the node"; }
+  [ "$(tail -n 1 "${TMPD}/remote.list")" = TEKNOIR-AIRGAP-LIST-DONE ] || die "could not list the payload on the node (incomplete answer)"
+  awk '/: OK$/ { sub(/: OK$/, ""); print }' "${TMPD}/remote.list" >"${TMPD}/remote.ok"
+  not_in "${TMPD}/remote.ok" 'substr($0, 67)' <"${TMPD}/payload.sha256" >"${TMPD}/send.sha256"
+  sums_paths "${TMPD}/send.sha256" >"${TMPD}/send.paths"
+  n=$(wc -l <"${TMPD}/send.paths" | tr -d ' ')
+  if [ "${n}" -eq 0 ]; then
+    log "the node already has this bundle's payload (${total} files)"
+  else
+    bytes=$(cd "${BUNDLE_ROOT}/node" && while IFS= read -r f; do wc -c <"${f}"; done <"${TMPD}/send.paths" | awk '{ s += $1 } END { print s + 0 }')
+    log "sending ${n} of ${total} payload files ($(human_bytes "${bytes}")) to ${NODE}:${dir}"
+    tar_init
+    (cd "${BUNDLE_ROOT}/node" && COPYFILE_DISABLE=1 tar ${TAR_CFLAGS[@]+"${TAR_CFLAGS[@]}"} -cf - -T "${TMPD}/send.paths") \
+      | node_sh pipe "${RECV_SCRIPT}" "${dir}" >"${TMPD}/recv.out" 2>"${TMPD}/recv.err" \
+      || { sed 's/^/  node: /' "${TMPD}/recv.err" >&2; die "the payload transfer failed; re-run the command to resume"; }
+    grep -q TEKNOIR-AIRGAP-RECV-DONE "${TMPD}/recv.out" || die "the payload transfer did not complete; re-run the command to resume"
+    changed "copied ${n} payload files ($(human_bytes "${bytes}")) to ${dir}"
+  fi
+  node_sh pipe "${CHECK_SCRIPT}" "${dir}" "$(payload_marker)" "${sums_sha}" <"${TMPD}/send.sha256" >"${TMPD}/check.out" 2>"${TMPD}/check.err" \
+    || { sed 's/^/  node: /' "${TMPD}/check.err" >&2; die "files on the node do not match after the transfer; re-run the command to send them again"; }
+  grep -q TEKNOIR-AIRGAP-CHECK-DONE "${TMPD}/check.out" || die "could not verify the payload on the node"
+  if [ -s "${TMPD}/check.err" ]; then sed 's/^/  node: /' "${TMPD}/check.err" >&2; fi
+  # teknoir-node reads the bundle id, versions and commits from here
+  push_file "${MANIFEST}" "${NODE_STATE_DIR}/bundles/${BUNDLE_ID}/MANIFEST.yaml" "the bundle's"
+}
+
+# payload_ensure: for commands other than up, sync only when the node does not
+# have this bundle's complete payload yet.
+payload_ensure() {
+  local have want
+  have=$(node_sh pipe 'cat "$1" 2>/dev/null || true' "$(payload_marker)" </dev/null 2>/dev/null | tail -n 1) || have=
+  want=$(sha256_of "${BUNDLE_ROOT}/node/SHA256SUMS")
+  if [ "${have}" = "${want}" ]; then return 0; fi
+  log "the node does not have this bundle's payload yet; verifying and sending it"
+  [ "${VERIFIED}" = 1 ] || bundle_verify_or_die
+  payload_sync
+}
+
+# Write stdin to the file $1 on the node when it differs (public files only).
+PUSH_SCRIPT='
+f=$1
+umask 022
+mkdir -p "$(dirname "$f")" || exit 1
+t=$(mktemp "$f.XXXXXX") || exit 1
+cat >"$t" || { rm -f "$t"; exit 1; }
+chmod 0644 "$t"
+if cmp -s "$t" "$f"; then rm -f "$t"; echo SAME; else mv -f "$t" "$f" && echo CHANGED; fi
+'
+# push_file LOCAL REMOTE DESCRIPTION: copy a public file to the node if it differs.
+push_file() {
+  local out
+  if [ "${LOCAL}" = 1 ] && [ "$1" = "$2" ]; then return 0; fi
+  out=$(node_sh pipe "${PUSH_SCRIPT}" "$2" <"$1" | tail -n 1) || die "could not write $2 on the node"
+  case "${out}" in
+    SAME) ;;
+    CHANGED) changed "wrote $3 $2 on the node" ;;
+    *) die "could not write $2 on the node" ;;
+  esac
+}
+
+# The site config goes to /var/lib/teknoir-airgap/site/<site>.env (no secrets).
+site_push() { push_file "${SITE_FILE}" "${REMOTE_SITE}" "the site config"; }
+
+# The tools this script needs on the node (the converge checks its own).
+node_prereqs() {
+  local missing
+  missing=$(node_user_sh 'for c in sh tar sha256sum find awk sed cmp mktemp sort; do command -v "$c" >/dev/null 2>&1 || printf "%s " "$c"; done; echo' </dev/null) \
+    || die "could not check the tools on the node"
+  missing=$(printf '%s' "${missing}" | tail -n 1)
+  [ -z "${missing}" ] || die "missing on the node: ${missing}(install them from the Debian installation medium, docs/HOST-SETUP.md)"
+}
+
+# --------------------------------------------------------- CA, kubeconfig --
+CA_SCRIPT='
+k3s kubectl -n teknoir-system get secret teknoir-root-ca-bundle -o "jsonpath={.data.ca\.crt}" | base64 -d
+'
+# ca_fetch: refresh ~/.teknoir-airgap/<site>/teknoir-root-ca.crt (public
+# certificate only) from teknoir-system/teknoir-root-ca-bundle.
+ca_fetch() {
+  local new=${TMPD}/ca.crt
+  node_sh pipe "${CA_SCRIPT}" </dev/null >"${new}" 2>"${TMPD}/ca.err" || { sed 's/^/  node: /' "${TMPD}/ca.err" >&2; return 1; }
+  if ! grep -q 'BEGIN CERTIFICATE' "${new}" || grep -q 'PRIVATE KEY' "${new}"; then
+    warn "teknoir-system/teknoir-root-ca-bundle does not hold a plain CA certificate"
+    return 1
+  fi
+  if [ -f "${CA_CACHE}" ] && cmp -s "${new}" "${CA_CACHE}"; then return 0; fi
+  if [ -f "${CA_CACHE}" ]; then
+    warn "the platform CA certificate changed: run ./teknoir-airgap trust again on every LAN host"
+  fi
+  cat "${new}" >"${CA_CACHE}.tmp" && chmod 644 "${CA_CACHE}.tmp" && mv -f "${CA_CACHE}.tmp" "${CA_CACHE}"
+  changed "saved the platform CA certificate to ${CA_CACHE}"
+}
+
+find_kubectl() {
+  local os arch b
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$(uname -m)" in x86_64|amd64) arch=amd64 ;; arm64|aarch64) arch=arm64 ;; *) arch=$(uname -m) ;; esac
+  b=${BUNDLE_ROOT}/tools/${os}-${arch}/kubectl
+  if [ -x "${b}" ] && "${b}" version --client >/dev/null 2>&1; then printf '%s\n' "${b}"; return 0; fi
+  if command -v kubectl >/dev/null 2>&1; then command -v kubectl; return 0; fi
+  return 1
+}
+
+OPT_CONTEXT=
+OPT_KUBECONFIG=
+# kubeconfig_install: fetch k3s.yaml, rename default -> CONTEXT, point it at
+# NODE_IP and replace any CONTEXT cluster/user/context in the target file.
+kubeconfig_install() {
+  local ctx=${OPT_CONTEXT:-${SITE_NAME}} target=${OPT_KUBECONFIG:-${HOME}/.kube/config}
+  local raw=${TMPD}/k3s.yaml new=${TMPD}/kubeconfig.new work=${TMPD}/kubeconfig.work merged=${TMPD}/kubeconfig.merged kc kind name
+  case "${ctx}" in ''|*[!A-Za-z0-9._-]*) die "invalid context name '${ctx}'" ;; esac
+  node_sh pipe 'cat /etc/rancher/k3s/k3s.yaml' </dev/null >"${raw}" 2>"${TMPD}/kc.err" \
+    || { sed 's/^/  node: /' "${TMPD}/kc.err" >&2; die "could not read /etc/rancher/k3s/k3s.yaml on the node (is k3s installed?)"; }
+  if ! grep -q '^clusters:' "${raw}" || ! grep -q 'name: default$' "${raw}"; then
+    die "/etc/rancher/k3s/k3s.yaml on the node is not a k3s kubeconfig"
+  fi
+  sed -e "s|^\([[:space:]]*server:\) https://[^[:space:]]*|\1 https://${NODE_IP}:6443|" \
+      -e "s|^\([[:space:]-]*name:\) default\$|\1 ${ctx}|" \
+      -e "s|^\([[:space:]]*cluster:\) default\$|\1 ${ctx}|" \
+      -e "s|^\([[:space:]]*user:\) default\$|\1 ${ctx}|" \
+      -e "s|^current-context: default\$|current-context: ${ctx}|" "${raw}" >"${new}"
+  chmod 600 "${new}"
+  mkdir -p "$(dirname "${target}")"
+  if ! kc=$(find_kubectl); then
+    if [ ! -s "${target}" ]; then
+      cat "${new}" >"${target}"
+      chmod 600 "${target}"
+      changed "wrote ${target} with context ${ctx}"
+    else
+      cat "${new}" >"${LAN_STATE}/kubeconfig"
+      chmod 600 "${LAN_STATE}/kubeconfig"
+      warn "no kubectl on this computer to merge into ${target}; wrote ${LAN_STATE}/kubeconfig instead (use: export KUBECONFIG=${LAN_STATE}/kubeconfig)"
+      changed "wrote ${LAN_STATE}/kubeconfig with context ${ctx}"
+    fi
+    return 0
+  fi
+  # kubectl writes the result, also for a new file, so a re-run compares equal.
+  if [ -s "${target}" ]; then cat "${target}" >"${work}"; else : >"${work}"; fi
+  chmod 600 "${work}"
+  for kind in context cluster user; do
+    [ -s "${work}" ] || break
+    name=$(KUBECONFIG=${work} "${kc}" config view -o "jsonpath={range .${kind}s[*]}{.name}{\"\\n\"}{end}" 2>"${TMPD}/kc.err") \
+      || { sed 's/^/  kubectl: /' "${TMPD}/kc.err" >&2; die "kubectl cannot read ${target}"; }
+    if printf '%s\n' "${name}" | grep -qx "${ctx}"; then
+      KUBECONFIG=${work} "${kc}" config "delete-${kind}" "${ctx}" >/dev/null 2>"${TMPD}/kc.err" \
+        || { sed 's/^/  kubectl: /' "${TMPD}/kc.err" >&2; die "kubectl could not remove the old ${kind} ${ctx}"; }
+    fi
+  done
+  if [ -s "${work}" ]; then set -- "${work}:${new}"; else set -- "${new}"; fi
+  KUBECONFIG=$1 "${kc}" config view --flatten >"${merged}" 2>"${TMPD}/kc.err" \
+    || { sed 's/^/  kubectl: /' "${TMPD}/kc.err" >&2; die "kubectl could not merge the kubeconfig"; }
+  KUBECONFIG=${merged} "${kc}" config get-contexts "${ctx}" >/dev/null 2>&1 || die "the merged kubeconfig lacks context ${ctx}"
+  if [ -s "${target}" ] && cmp -s "${merged}" "${target}"; then
+    log "kubeconfig context ${ctx} in ${target} is up to date"
+    return 0
+  fi
+  if [ ! -s "${target}" ]; then
+    cat "${merged}" >"${target}"
+    chmod 600 "${target}"
+    changed "wrote ${target} with context ${ctx}"
+    return 0
+  fi
+  cat "${target}" >"${target}.teknoir-airgap.bak" && chmod 600 "${target}.teknoir-airgap.bak"
+  cat "${merged}" >"${target}"
+  chmod 600 "${target}"
+  changed "replaced context ${ctx} in ${target} (previous file: ${target}.teknoir-airgap.bak)"
+}
+
+# ------------------------------------------------------------- arguments --
+CMD=
+DRY_RUN=0
+POS=()
+PASS=()
+UP_ARGS=()
+OPT_OUT=
+OPT_EMAIL=
+OPT_PRINT=0
+OPT_I_KNOW=0
+OPT_UNDO=
+
+# Options a command accepts (beyond the global ones).
+allowed() {
+  case "$1:$2" in
+    up:--dry-run|up:--rollback|up:--sync-clock|up:--reapply|up:--force-images|up:--) return 0 ;;
+    kubeconfig:--context|kubeconfig:--kubeconfig) return 0 ;;
+    trust:--print) return 0 ;;
+    credentials:--out|admin-user:--out|admin-user:--email|backup:--out) return 0 ;;
+    rotate:--i-know) return 0 ;;
+    migrate:--dry-run|migrate:--undo) return 0 ;;
+  esac
+  return 1
+}
+
+parse_args() {
+  local a v
+  while [ $# -gt 0 ]; do
+    a=$1
+    case "${a}" in
+      --*=*) v=${a#*=}; a=${a%%=*} ;;
+      *) v= ;;
+    esac
+    case "${a}" in
+      -h|--help) usage; exit 0 ;;
+      --site|--node|--host-key|--reapply|--context|--kubeconfig|--out|--email|--undo)
+        if [ -z "${v}" ]; then
+          [ $# -ge 2 ] || usage_error "${a} needs a value"
+          v=$2; shift
+        fi
+        case "${a}" in
+          --site) SITE_ARG=${v} ;;
+          --node) OPT_NODE=${v} ;;
+          --host-key) OPT_HOST_KEY=${v} ;;
+          --reapply) UP_ARGS[${#UP_ARGS[@]}]=--reapply; UP_ARGS[${#UP_ARGS[@]}]=${v} ;;
+          --context) OPT_CONTEXT=${v} ;;
+          --kubeconfig) OPT_KUBECONFIG=${v} ;;
+          --out) OPT_OUT=${v} ;;
+          --email) OPT_EMAIL=${v} ;;
+          --undo) OPT_UNDO=${v} ;;
+        esac
+        case "${a}" in --site|--node|--host-key) ;; *) PARSED_OPTS="${PARSED_OPTS} ${a}" ;; esac ;;
+      --local) LOCAL=1 ;;
+      --forget-host-key) OPT_FORGET_HOSTKEY=1 ;;
+      --dry-run) DRY_RUN=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
+      --rollback|--sync-clock|--force-images) UP_ARGS[${#UP_ARGS[@]}]=${a}; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
+      --print) OPT_PRINT=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
+      --i-know) OPT_I_KNOW=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
+      --) shift; while [ $# -gt 0 ]; do PASS[${#PASS[@]}]=$1; shift; done; PARSED_OPTS="${PARSED_OPTS} --"; break ;;
+      -*) usage_error "unknown option ${a}" ;;
+      *)
+        if [ -z "${CMD}" ]; then CMD=${a}; else POS[${#POS[@]}]=${a}; fi ;;
+    esac
+    shift
+  done
+}
+PARSED_OPTS=
+
+check_opts() {
+  local o
+  for o in ${PARSED_OPTS}; do
+    allowed "${CMD}" "${o}" || usage_error "${CMD} does not take ${o}"
+  done
+}
+
+npos() { echo ${#POS[@]}; }
+
+# -------------------------------------------------------------- commands --
+common_open() {   # bundle + site + state (no verify)
+  tmp_init
+  sha_init
+  bundle_open
+  site_load
+  state_init
+}
+
+node_connect() {  # ssh (or --local) + sudo; "setup" installs sudoers if needed
+  if [ "${LOCAL}" = 1 ]; then
+    sudo_ensure
+  else
+    ssh_connect
+    sudo_ensure "${1:-}"
+  fi
+}
+
+# node_prepare: what every command that runs teknoir-node --site needs, also on
+# a node that never ran up: ssh and sudo (one-time setup in a terminal), the
+# node's tools, the current site config at REMOTE_SITE (rewritten when it
+# differs, so a changed site file always reaches the node) and this bundle's
+# payload (sent only when missing).
+node_prepare() {
+  node_connect setup
+  node_prereqs
+  site_push
+  payload_ensure
+}
+
+run_runner() {   # run_runner tty|pipe SUBCOMMAND [ARGS...]: teknoir-node as root
+  local mode=$1
+  shift
+  node_sh "${mode}" 'exec "$@"' "$(runner_path)" "$@"
+}
+
+print_changes() {
+  local c
+  if [ ${#CHANGES[@]} -eq 0 ]; then
+    log "${PROG} itself changed nothing (the converge reports its own changes)"
+  else
+    log "${PROG} itself changed:"
+    for c in "${CHANGES[@]}"; do printf '  - %s\n' "${c}" >&2; done
+  fi
+}
+
+cmd_up() {
+  local rc=0 operator
+  [ "$(npos)" -eq 0 ] || usage_error "up takes no arguments"
+  common_open
+  bundle_verify_or_die
+  node_connect setup
+  node_prereqs
+  site_push
+  payload_sync
+  operator=$(id -un)
+  if [ "${LOCAL}" = 1 ] && [ -n "${SUDO_USER:-}" ]; then operator=${SUDO_USER}; fi
+  [ "${DRY_RUN}" = 0 ] || UP_ARGS[${#UP_ARGS[@]}]=--dry-run
+  log "running the converge on the node ($(runner_path) converge); its log is on the node in /var/log/teknoir-airgap/"
+  run_runner tty converge --site "${REMOTE_SITE}" --lan-time "$(date +%s)" --lan-user "${operator}" \
+    ${UP_ARGS[@]+"${UP_ARGS[@]}"} ${PASS[@]+"${PASS[@]}"} || rc=$?
+  if [ "${rc}" -ne 0 ]; then
+    print_changes
+    die "the converge on the node failed (exit ${rc}); fix the cause it reports and run ./teknoir-airgap up again (it resumes)"
+  fi
+  if [ "${DRY_RUN}" = 1 ]; then
+    print_changes
+    log "dry run complete: the node and the cluster were not changed (the payload cache on the node may have been updated)"
+    return 0
+  fi
+  if [ "${LOCAL}" = 0 ]; then
+    ca_fetch || warn "could not fetch the platform CA certificate; ./teknoir-airgap trust fetches it again"
+    kubeconfig_install || warn "could not update the kubeconfig; run ./teknoir-airgap kubeconfig"
+  fi
+  print_changes
+  log "bundle ${BUNDLE_ID} is deployed on ${NODE}"
+  if [ "${LOCAL}" = 0 ] && ! ca_trusted; then
+    log "next on this computer (once): ./teknoir-airgap trust   (name resolution and CA trust for the browser)"
+  fi
+}
+
+STATUS_SCRIPT='
+runner=$1
+echo "== k3s"
+if command -v k3s >/dev/null 2>&1; then
+  printf "service: %s\n" "$(systemctl is-active k3s 2>/dev/null || echo unknown)"
+  k3s --version 2>/dev/null | head -n 1
+else
+  echo "k3s is not installed"
+fi
+if command -v k3s >/dev/null 2>&1 && k3s kubectl get --raw=/readyz >/dev/null 2>&1; then
+  echo "== nodes"; k3s kubectl get nodes -o wide
+  echo "== release (teknoir-system/teknoir-airgap-release)"
+  k3s kubectl -n teknoir-system get configmap teknoir-airgap-release -o "jsonpath={.data}" 2>/dev/null || echo "none"
+  echo
+  echo "== applications"; k3s kubectl -n teknoir-system get applications.argoproj.io 2>/dev/null || echo "none"
+else
+  echo "the Kubernetes API is not reachable"
+fi
+echo "== bundle payloads in /var/lib/teknoir-airgap/bundles"
+ls -1 /var/lib/teknoir-airgap/bundles 2>/dev/null || echo "none"
+if [ -x "$runner" ]; then echo RUNNER=yes; else echo RUNNER=no; fi
+'
+
+cmd_status() {
+  local now remote skew rc=0
+  [ "$(npos)" -eq 0 ] || usage_error "status takes no arguments"
+  common_open
+  printf 'bundle:   %s\nsite:     %s (%s)\nnode:     %s (NODE_IP %s)\n' "${BUNDLE_ID}" "${SITE_NAME}" "${SITE_FILE}" "${NODE}" "${NODE_IP}"
+  if [ "${LOCAL}" = 0 ]; then ssh_connect; fi
+  now=$(date +%s)
+  remote=$(node_user_sh 'date +%s' </dev/null | tail -n 1) || die "could not read the node clock"
+  skew=$((remote - now)); [ "${skew}" -ge 0 ] || skew=$((-skew))
+  if [ "${skew}" -gt "${SKEW_LIMIT}" ]; then
+    printf 'clock:    %sOFF by %s s%s (up refuses more than %s s; fix the clock or use up --sync-clock)\n' "${C_ERR}" "${skew}" "${C_OFF}" "${SKEW_LIMIT}"
+  else
+    printf 'clock:    skew %s s\n' "${skew}"
+  fi
+  if ! sudo_ok; then
+    warn "${REMOTE_USER} has no passwordless sudo on the node yet: run ./teknoir-airgap up once in a terminal (on a live node before its migration: backup, docs/OPERATE.md section 14)"
+    return 1
+  fi
+  node_sh pipe "${STATUS_SCRIPT}" "$(runner_path)" </dev/null >"${TMPD}/status.out" 2>&1 || rc=$?
+  grep -v '^RUNNER=' "${TMPD}/status.out" || true
+  if grep -q '^RUNNER=yes' "${TMPD}/status.out"; then
+    # the runner reads the site config the operator uses now, not a stale copy
+    site_push
+    printf '== teknoir-node status (bundle %s)\n' "${BUNDLE_ID}"
+    run_runner tty status --site "${REMOTE_SITE}" --lan-time "$(date +%s)" || rc=$?
+  else
+    printf '(this bundle is not on the node yet; ./teknoir-airgap up copies it and adds the detailed checks)\n'
+  fi
+  return "${rc}"
+}
+
+cmd_verify() {
+  [ "$(npos)" -eq 0 ] || usage_error "verify takes no arguments"
+  tmp_init; sha_init; bundle_open
+  bundle_verify_or_die
+  log "node/SHA256SUMS agrees with MANIFEST.yaml"
+}
+
+cmd_version() {
+  local k v
+  [ "$(npos)" -eq 0 ] || usage_error "version takes no arguments"
+  tmp_init; bundle_open
+  for k in bundleId env domain createdAt infraCommit gitopsCommit dirty appOfAppsVersion k3sVersion; do
+    v=$(manifest_get "${k}")
+    printf '%-17s %s\n' "${k}:" "${v:--}"
+  done
+}
+
+cmd_kubeconfig() {
+  [ "$(npos)" -eq 0 ] || usage_error "kubeconfig takes no arguments"
+  [ "${LOCAL}" = 0 ] || usage_error "kubeconfig is for the LAN host (on the node use: sudo k3s kubectl)"
+  common_open
+  node_connect setup
+  kubeconfig_install
+  print_changes
+  log "use it with: kubectl --context ${OPT_CONTEXT:-${SITE_NAME}} get nodes"
+}
+
+# ----------------------------------------------------------------- trust --
+hosts_line() {
+  local h line="${NODE_IP} ${TEKNOIR_DOMAIN}"
+  for h in ${TEKNOIR_HOSTNAMES}; do line="${line} ${h}.${TEKNOIR_DOMAIN}"; done
+  printf '%s\n' "${line}"
+}
+HOSTS_BEGIN() { printf '# BEGIN teknoir-airgap %s' "${SITE_NAME}"; }
+HOSTS_END() { printf '# END teknoir-airgap %s' "${SITE_NAME}"; }
+
+ca_dest_debian() { printf '/usr/local/share/ca-certificates/teknoir-airgap-%s.crt' "${SITE_NAME}"; }
+
+ca_trusted() {
+  [ -f "${CA_CACHE}" ] || return 1
+  case "$(uname -s)" in
+    Darwin) security verify-cert -c "${CA_CACHE}" >/dev/null 2>&1 ;;
+    *) [ -f "$(ca_dest_debian)" ] && cmp -s "${CA_CACHE}" "$(ca_dest_debian)" ;;
+  esac
+}
+
+as_root() {
+  if [ "$(id -u)" = 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+trust_print() {
+  local ca=$1
+  cat <<EOF
+# 1. Name resolution: put this block in /etc/hosts (replace an older block with
+#    the same BEGIN/END lines). Every platform name points at the node.
+$(HOSTS_BEGIN)
+$(hosts_line)
+$(HOSTS_END)
+
+# 2. CA trust on Debian or Ubuntu:
+sudo install -m 0644 '${ca}' '$(ca_dest_debian)'
+sudo update-ca-certificates
+#    Chrome/Chromium on Linux also read the user NSS database (package libnss3-tools):
+certutil -d "sql:\$HOME/.pki/nssdb" -A -t C,, -n 'teknoir-airgap-${SITE_NAME}' -i '${ca}'
+
+# 2. CA trust on macOS (System keychain; Safari and Chrome use it):
+sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '${ca}'
+sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+
+# Firefox keeps its own store: Settings > Privacy & Security > Certificates >
+# View Certificates > Authorities > Import, then tick "Trust this CA to identify websites".
+EOF
+}
+
+trust_hosts() {
+  local new=${TMPD}/hosts.new conflicts
+  awk -v b="$(HOSTS_BEGIN)" -v e="$(HOSTS_END)" '$0 == b { skip = 1; next } $0 == e { skip = 0; next } !skip' /etc/hosts >"${new}"
+  { HOSTS_BEGIN; echo; hosts_line; HOSTS_END; echo; } >>"${new}"
+  conflicts=$(awk -v ip="${NODE_IP}" -v names=" $(hosts_line | cut -d' ' -f2-) " -v b="$(HOSTS_BEGIN)" -v e="$(HOSTS_END)" '
+    $0 == b { skip = 1; next } $0 == e { skip = 0; next } skip || /^[ \t]*#/ || NF < 2 { next }
+    { for (i = 2; i <= NF; i++) if (index(names, " " $i " ") && $1 != ip) print "  line " NR ": " $0 }' /etc/hosts)
+  if [ -n "${conflicts}" ]; then
+    warn "/etc/hosts also maps platform names to another address; remove these lines, they may win:"
+    printf '%s\n' "${conflicts}" >&2
+  fi
+  if cmp -s "${new}" /etc/hosts; then
+    log "/etc/hosts already has the ${SITE_NAME} block"
+    return 0
+  fi
+  log "updating /etc/hosts (sudo)"
+  # rewrite in place: keeps the file's inode, owner and mode (and works on a
+  # bind-mounted /etc/hosts)
+  as_root sh -c 'cat "$1" >/etc/hosts' sh "${new}" || die "could not write /etc/hosts"
+  changed "wrote the teknoir-airgap ${SITE_NAME} block in /etc/hosts"
+  if [ "$(uname -s)" = Darwin ]; then
+    as_root dscacheutil -flushcache 2>/dev/null || true
+    as_root killall -HUP mDNSResponder 2>/dev/null || true
+  fi
+}
+
+trust_ca() {
+  local dest
+  case "$(uname -s)" in
+    Darwin)
+      if security verify-cert -c "${CA_CACHE}" >/dev/null 2>&1; then
+        log "the macOS keychain already trusts the platform CA"
+      else
+        log "adding the platform CA to the macOS System keychain (sudo; macOS may also ask for confirmation)"
+        as_root security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "${CA_CACHE}" \
+          || die "could not add the CA to the System keychain"
+        changed "added the platform CA to the macOS System keychain"
+      fi ;;
+    Linux)
+      if [ -d /usr/local/share/ca-certificates ] && command -v update-ca-certificates >/dev/null 2>&1; then
+        dest=$(ca_dest_debian)
+        if [ -f "${dest}" ] && cmp -s "${CA_CACHE}" "${dest}"; then
+          log "the system CA store already has the platform CA (${dest})"
+        else
+          log "adding the platform CA to the system CA store (sudo)"
+          as_root install -m 0644 "${CA_CACHE}" "${dest}" || die "could not write ${dest}"
+          as_root update-ca-certificates >/dev/null || die "update-ca-certificates failed"
+          changed "added the platform CA as ${dest}"
+        fi
+        if command -v certutil >/dev/null 2>&1 && [ -d "${HOME}/.pki/nssdb" ]; then
+          if certutil -d "sql:${HOME}/.pki/nssdb" -A -t C,, -n "teknoir-airgap-${SITE_NAME}" -i "${CA_CACHE}"; then
+            log "added the platform CA to ${HOME}/.pki/nssdb (Chrome/Chromium)"
+          else
+            warn "could not add the CA to ${HOME}/.pki/nssdb"
+          fi
+        fi
+      else
+        warn "this Linux has no /usr/local/share/ca-certificates + update-ca-certificates; add ${CA_CACHE} to its trust store by hand"
+        return 1
+      fi ;;
+    *)
+      warn "unsupported OS $(uname -s): add ${CA_CACHE} to the trust store by hand (Windows: use WSL2)"
+      return 1 ;;
+  esac
+}
+
+ca_refresh() {
+  (
+    trap 'if [ "${MASTER_UP}" = 1 ]; then ssh "${SSH_OPTS[@]}" -O exit "${NODE}" >/dev/null 2>&1; fi; true' EXIT
+    ssh_setup
+    hostkey_pinned || { echo "no pinned host key for ${KH_NAME} yet" >&2; exit 1; }
+    ssh_connect
+    sudo_ok || { echo "no passwordless sudo on the node yet" >&2; exit 1; }
+    ca_fetch
+  )
+}
+
+cmd_trust() {
+  local rc=0
+  [ "$(npos)" -eq 0 ] || usage_error "trust takes no arguments"
+  [ "${LOCAL}" = 0 ] || usage_error "trust is for LAN hosts (the converge already makes the node trust the CA)"
+  common_open
+  # Refresh the CA from the node when it is reachable and its key is pinned
+  # (no prompts here); fall back to the cached copy.
+  if ca_refresh 2>"${TMPD}/trust-fetch.err"; then
+    :
+  elif [ -f "${CA_CACHE}" ]; then
+    warn "could not refresh the CA from the node; using the cached ${CA_CACHE}"
+  elif [ "${OPT_PRINT}" = 1 ]; then
+    warn "no CA certificate yet (run ./teknoir-airgap up first); the commands below use its future path"
+  else
+    sed 's/^/  /' "${TMPD}/trust-fetch.err" >&2
+    die "no CA certificate: run ./teknoir-airgap up first (it saves ${CA_CACHE})"
+  fi
+  if [ "${OPT_PRINT}" = 1 ]; then
+    trust_print "${CA_CACHE}"
+    return 0
+  fi
+  trust_hosts
+  trust_ca || rc=1
+  print_changes
+  return "${rc}"
+}
+
+# -------------------------------------------------------- secrets to file --
+# out_file_prepare PATH: refuse terminals, stdout and the bundle tree.
+out_file_prepare() {
+  local f=$1 d
+  [ -n "${f}" ] || usage_error "${CMD} needs --out FILE"
+  case "${f}" in -) usage_error "--out - would print a secret; give a file" ;; esac
+  [ ! -c "${f}" ] || die "refusing to write a secret to the device ${f}"
+  [ ! -d "${f}" ] || die "--out ${f} is a directory; give a file name"
+  d=$(abs_dir "$(dirname "${f}")") || die "the directory of ${f} does not exist"
+  refuse_inside_bundle "${d}"
+  OUT_ABS=${d}/$(basename "${f}")
+}
+OUT_ABS=
+
+# Root-only scratch directory on the node for a secret on its way to the LAN
+# host. Files older than an hour are left-overs of an interrupted run.
+NODE_TMP=${NODE_STATE_DIR}/tmp
+NODE_MKTEMP_SCRIPT='
+d=$1; p=$2
+umask 022
+mkdir -p "$(dirname "$d")" || exit 1
+umask 077
+mkdir -p "$d" && chmod 700 "$d" || exit 1
+find "$d" -type f -name "$p.*" -mmin +60 -exec rm -f {} \; 2>/dev/null
+mktemp "$d/$p.XXXXXX"
+'
+# node_mktemp PREFIX: a new empty root-only file in NODE_TMP on the node; prints its path.
+node_mktemp() {
+  local p
+  p=$(node_sh pipe "${NODE_MKTEMP_SCRIPT}" "${NODE_TMP}" "$1" </dev/null 2>"${TMPD}/mktemp.err" | tail -n 1) || p=
+  case "${p}" in
+    "${NODE_TMP}/$1."*[!A-Za-z0-9._/-]*|"${NODE_TMP}/$1.") die "unexpected file name from mktemp on the node: ${p}" ;;
+    "${NODE_TMP}/$1."*) printf '%s\n' "${p}" ;;
+    *) sed 's/^/  node: /' "${TMPD}/mktemp.err" >&2; die "could not create a private file in ${NODE_TMP} on the node" ;;
+  esac
+}
+
+# secret_run OUT tty|pipe ARGS...: run teknoir-node ARGS and store its stdout in OUT (0600).
+secret_run() {
+  local out=$1 tmp rc=0
+  shift
+  tmp=$(mktemp "$(dirname "${out}")/.teknoir-airgap.XXXXXX") || die "cannot create a file next to ${out}"
+  chmod 600 "${tmp}"
+  run_runner pipe "$@" </dev/null >"${tmp}" || rc=$?
+  if [ "${rc}" -ne 0 ]; then rm -f "${tmp}"; die "teknoir-node $1 failed on the node (exit ${rc})"; fi
+  if [ ! -s "${tmp}" ]; then rm -f "${tmp}"; die "teknoir-node $1 returned nothing"; fi
+  mv -f "${tmp}" "${out}"
+}
+
+cmd_credentials() {
+  local name
+  [ "$(npos)" -eq 1 ] || usage_error "credentials needs exactly one NAME (for example: credentials platform-admin --out FILE)"
+  name=${POS[0]}
+  case "${name}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid credential name '${name}'" ;; esac
+  common_open
+  out_file_prepare "${OPT_OUT}"
+  node_prepare
+  secret_run "${OUT_ABS}" credentials "${name}" --site "${REMOTE_SITE}"
+  log "wrote credential ${name} to ${OUT_ABS} (mode 0600); delete the file when you no longer need it"
+}
+
+# email_check ADDRESS (lower case): the rule teknoir-node admin-user applies.
+# The User name is the address with '@' -> '-at-': a Kubernetes name and a
+# Backstage entity name (at most 63 characters, no '_' or '+').
+email_check() {
+  local e=$1
+  case "${e}" in
+    *[!a-z0-9.@-]*) usage_error "--email ${OPT_EMAIL}: use only letters, digits, '.' and '-' around one '@' (no '_' or '+': the address becomes a Kubernetes and Backstage entity name)" ;;
+  esac
+  printf '%s\n' "${e}" | grep -Eq '^[a-z0-9]+([.-][a-z0-9]+)*@[a-z0-9]+([.-][a-z0-9]+)*\.[a-z]{2,}$' \
+    || usage_error "--email ${OPT_EMAIL} is not an e-mail address of the form name@domain.tld ('.' and '-' only between letters or digits)"
+  [ ${#e} -le 60 ] || usage_error "--email ${OPT_EMAIL} is too long: the user name (the address with @ -> -at-) must be at most 63 characters"
+}
+
+cmd_admin_user() {
+  local email rc=0
+  [ "$(npos)" -eq 0 ] || usage_error "admin-user takes no arguments besides --email and --out"
+  [ -n "${OPT_EMAIL}" ] || usage_error "admin-user needs --email ADDRESS"
+  email=$(printf '%s' "${OPT_EMAIL}" | tr '[:upper:]' '[:lower:]')
+  email_check "${email}"
+  common_open
+  out_file_prepare "${OPT_OUT}"
+  LOCAL_TMP=$(mktemp "$(dirname "${OUT_ABS}")/.teknoir-airgap.XXXXXX") || die "cannot create a file next to ${OUT_ABS}"
+  chmod 600 "${LOCAL_TMP}"
+  node_prepare
+  # The runner writes the password into a root-only file on the node (its
+  # stdout is its log); this side copies that file and deletes it.
+  REMOTE_TMP=$(node_mktemp admin-user) || exit 1
+  log "setting up admin ${email} on the node (teknoir-node admin-user waits for user-controller and Keycloak)"
+  run_runner tty admin-user --email "${email}" --out "${REMOTE_TMP}" --site "${REMOTE_SITE}" >&2 || rc=$?
+  [ "${rc}" -eq 0 ] || die "teknoir-node admin-user failed on the node (exit ${rc}); fix the cause it reports and run the command again (it resumes)"
+  node_sh pipe 'cat "$1" && rm -f "$1"' "${REMOTE_TMP}" </dev/null >"${LOCAL_TMP}" 2>"${TMPD}/fetch.err" \
+    || { sed 's/^/  node: /' "${TMPD}/fetch.err" >&2; die "could not copy the temporary password from the node; run the command again"; }
+  REMOTE_TMP=
+  if [ ! -s "${LOCAL_TMP}" ]; then
+    warn "the node recorded no temporary password for ${email} (see its message above); ${OUT_ABS} was not written"
+    return 0
+  fi
+  mv -f "${LOCAL_TMP}" "${OUT_ABS}"
+  LOCAL_TMP=
+  log "admin user ${email} is set up; its temporary password is in ${OUT_ABS} (mode 0600)"
+  log "sign in at https://${TEKNOIR_DOMAIN}/ ; Keycloak asks for a new password at the first login"
+}
+
+cmd_backup() {
+  local dir latest exp out rsum lsum
+  [ "$(npos)" -eq 0 ] || usage_error "backup takes no arguments besides --out"
+  [ -n "${OPT_OUT}" ] || usage_error "backup needs --out DIR"
+  [ -t 0 ] || die "backup asks for an encryption passphrase: run it in a terminal"
+  common_open
+  case "${OPT_OUT}" in /*) dir=${OPT_OUT} ;; *) dir=$(pwd -P)/${OPT_OUT} ;; esac
+  refuse_inside_bundle "${dir}"
+  mkdir -p "${OPT_OUT}" || die "cannot create ${OPT_OUT}"
+  chmod 700 "${OPT_OUT}" 2>/dev/null || true
+  dir=$(abs_dir "${OPT_OUT}") || die "cannot use ${OPT_OUT}"
+  refuse_inside_bundle "${dir}"
+  node_prepare
+  log "taking a backup on the node and encrypting it there with age: choose a passphrase and keep it; a restore needs it"
+  run_runner tty backup --export --take --site "${REMOTE_SITE}" || die "teknoir-node backup --export failed on the node"
+  latest=$(node_sh pipe 'ls -1 "$1" 2>/dev/null | grep "^2.*Z$" | LC_ALL=C sort | tail -n 1' "${NODE_STATE_DIR}/backups" </dev/null | tail -n 1) || latest=
+  case "${latest}" in ''|*[!A-Za-z0-9._:-]*) die "found no backup in ${NODE_STATE_DIR}/backups on the node" ;; esac
+  exp=${NODE_STATE_DIR}/exports/teknoir-backup-${latest}.tar.age
+  rsum=$(node_sh pipe 'sha256sum "$1"' "${exp}" </dev/null | awk '{ print $1 }' | tail -n 1) || rsum=
+  [ -n "${rsum}" ] || die "the encrypted backup ${exp} is not on the node"
+  out=${dir}/teknoir-backup-${SITE_NAME}-${latest}.tar.age
+  log "copying the encrypted backup to ${out}"
+  run_runner pipe backup --stream "${exp}" --keep --site "${REMOTE_SITE}" </dev/null >"${out}.partial" \
+    || { rm -f "${out}.partial"; die "copying the backup failed; the encrypted export stays on the node: ${exp}"; }
+  lsum=$(sha256_of "${out}.partial")
+  if [ "${rsum}" != "${lsum}" ]; then
+    rm -f "${out}.partial"
+    die "the copied backup does not match the node's copy (sha256); the export stays on the node: ${exp}"
+  fi
+  chmod 600 "${out}.partial"
+  mv -f "${out}.partial" "${out}"
+  node_sh pipe 'rm -f "$1"' "${exp}" </dev/null || warn "could not remove the encrypted export ${exp} on the node"
+  log "backup saved: ${out} (age-encrypted, sha256 ${lsum})"
+  log "the unencrypted backup stays on the node in ${NODE_STATE_DIR}/backups/${latest} (the node keeps the last 3)"
+}
+
+cmd_rotate() {
+  local name
+  [ "$(npos)" -eq 1 ] || usage_error "rotate needs exactly one NAME"
+  name=${POS[0]}
+  case "${name}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid secret name '${name}'" ;; esac
+  common_open
+  node_prepare
+  if [ "${OPT_I_KNOW}" = 1 ]; then
+    run_runner tty rotate "${name}" --site "${REMOTE_SITE}" --i-know
+  else
+    run_runner tty rotate "${name}" --site "${REMOTE_SITE}"
+  fi
+}
+
+cmd_migrate() {
+  [ "$(npos)" -eq 0 ] || usage_error "migrate takes no arguments besides --dry-run or --undo NAME"
+  if [ "${DRY_RUN}" = 1 ] && [ -n "${OPT_UNDO}" ]; then usage_error "migrate takes --dry-run or --undo, not both"; fi
+  case "${OPT_UNDO}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid name for --undo: '${OPT_UNDO}'" ;; esac
+  common_open
+  node_prepare
+  if [ "${DRY_RUN}" = 1 ]; then
+    run_runner tty migrate --site "${REMOTE_SITE}" --dry-run
+  elif [ -n "${OPT_UNDO}" ]; then
+    run_runner tty migrate --site "${REMOTE_SITE}" --undo "${OPT_UNDO}"
+  else
+    run_runner tty migrate --site "${REMOTE_SITE}"
+  fi
+}
+
+# ---------------------------------------------------------------- doctor --
+D_FAIL=0
+d_ok()   { printf '  %sok%s    %s\n' "${C_OK}" "${C_OFF}" "$*"; logf "DOCTOR ok $*"; }
+d_warn() { printf '  %sWARN%s  %s\n' "${C_WARN}" "${C_OFF}" "$*"; logf "DOCTOR warn $*"; }
+d_fail() { printf '  %sFAIL%s  %s\n' "${C_ERR}" "${C_OFF}" "$*"; logf "DOCTOR fail $*"; D_FAIL=1; }
+
+# resolve_name NAME: the IPv4 address this computer resolves NAME to ('' if none).
+resolve_name() {
+  if command -v getent >/dev/null 2>&1; then
+    { getent hosts "$1" 2>/dev/null || true; } | awk '$1 ~ /^[0-9.]+$/ { print $1; exit }'
+  elif command -v dscacheutil >/dev/null 2>&1; then
+    { dscacheutil -q host -a name "$1" 2>/dev/null || true; } | awk '/^ip_address:/ { print $2; exit }'
+  fi
+  return 0
+}
+
+doctor_lan() {
+  local c missing='' f ip name names kc
+  echo "This computer:"
+  d_ok "bash ${BASH_VERSION} on $(uname -s) $(uname -m)"
+  for c in ssh ssh-keygen ssh-keyscan tar mktemp awk sed find cmp; do
+    command -v "${c}" >/dev/null 2>&1 || missing="${missing} ${c}"
+  done
+  if [ -n "${missing}" ]; then d_fail "missing tools:${missing}"; else d_ok "ssh, ssh-keygen, ssh-keyscan, tar and the shell tools are present"; fi
+  d_ok "checksums with: ${SHA256[*]}"
+  if kc=$(find_kubectl); then d_ok "kubectl for the kubeconfig merge: ${kc}"; else d_warn "no runnable kubectl (bundle tools/ or PATH): the kubeconfig goes to a separate file"; fi
+  if [ "$(uname -s)" = Darwin ] && command -v xattr >/dev/null 2>&1; then
+    if xattr -p com.apple.quarantine "${BUNDLE_ROOT}/teknoir-airgap" >/dev/null 2>&1 \
+       || { [ -d "${BUNDLE_ROOT}/tools" ] && find "${BUNDLE_ROOT}/tools" -type f -xattrname com.apple.quarantine 2>/dev/null | grep -q .; }; then
+      d_fail "the bundle carries the macOS quarantine attribute; clear it: xattr -dr com.apple.quarantine '${BUNDLE_ROOT}'"
+    else
+      d_ok "no macOS quarantine attribute on the bundle"
+    fi
+  fi
+  echo "Bundle:"
+  if bundle_verify 2>"${TMPD}/doctor-verify.err"; then
+    d_ok "bundle ${BUNDLE_ID}: every file matches MANIFEST.yaml"
+    if ( payload_check ) 2>"${TMPD}/doctor-payload.err"; then d_ok "node/SHA256SUMS agrees with MANIFEST.yaml"
+    else d_fail "$(tail -n 1 "${TMPD}/doctor-payload.err" | sed 's/^.*ERROR:[^ ]* //')"; fi
+  else
+    d_fail "bundle ${BUNDLE_ID} does not match MANIFEST.yaml:"
+    grep -v 'verifying ' "${TMPD}/doctor-verify.err" | sed 's/^/          /'
+  fi
+  echo "Name resolution (site ${SITE_NAME}, NODE_IP ${NODE_IP}):"
+  names=${TEKNOIR_DOMAIN}
+  for name in ${TEKNOIR_HOSTNAMES}; do names="${names} ${name}.${TEKNOIR_DOMAIN}"; done
+  for name in ${names}; do
+    ip=$(resolve_name "${name}")
+    if [ -z "${ip}" ]; then d_fail "${name} does not resolve (./teknoir-airgap trust adds an /etc/hosts block)"
+    elif [ "${ip}" != "${NODE_IP}" ]; then d_fail "${name} resolves to ${ip}, not ${NODE_IP}"
+    else d_ok "${name} -> ${ip}"; fi
+  done
+  echo "CA trust:"
+  if [ ! -f "${CA_CACHE}" ]; then
+    d_warn "no platform CA certificate cached yet (${CA_CACHE}); ./teknoir-airgap up saves it"
+  elif ca_trusted; then
+    d_ok "the OS trusts the platform CA (${CA_CACHE})"
+  else
+    d_fail "the OS does not trust the platform CA yet: ./teknoir-airgap trust"
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    f=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "https://harbor.${TEKNOIR_DOMAIN}/api/v2.0/ping" 2>"${TMPD}/curl.err") || f=
+    if [ "${f}" = 200 ]; then d_ok "https://harbor.${TEKNOIR_DOMAIN}/ answers with a trusted certificate"
+    else d_warn "https://harbor.${TEKNOIR_DOMAIN}/api/v2.0/ping: ${f:-no answer} $(tr '\n' ' ' <"${TMPD}/curl.err" | cut -c1-120)"; fi
+  fi
+}
+
+doctor_node() {
+  local now remote skew missing err=${TMPD}/doctor-ssh.err
+  echo "Node ${NODE}:"
+  if [ "${LOCAL}" = 0 ]; then
+    if ! ( ssh_setup ) 2>"${err}"; then d_fail "$(tail -n 1 "${err}")"; return; fi
+    ssh_setup
+    if ! hostkey_pinned; then
+      d_warn "no host key pinned for ${KH_NAME} yet; the first up asks you to confirm it"
+      return
+    fi
+    if ssh "${SSH_OPTS[@]}" -o BatchMode=yes -o ControlMaster=no "${NODE}" true </dev/null >/dev/null 2>"${err}"; then
+      d_ok "ssh as ${SSH_USER} works and the host key matches the pinned one"
+    elif grep -Eq 'REMOTE HOST IDENTIFICATION HAS CHANGED|Host key verification failed' "${err}"; then
+      d_fail "the host key changed: ./teknoir-airgap up --forget-host-key (after checking the node was reinstalled)"
+      return
+    else
+      d_fail "ssh failed: $(tr '\n' ' ' <"${err}" | cut -c1-160)"
+      return
+    fi
+    if remote_exec pipe 'sudo -n true' </dev/null >/dev/null 2>&1; then d_ok "passwordless sudo works"
+    else d_warn "no passwordless sudo yet; the first up in a terminal sets it up"; fi
+  fi
+  now=$(date +%s)
+  remote=$(node_user_sh 'date +%s' </dev/null 2>/dev/null | tail -n 1) || remote=
+  if [ -n "${remote}" ]; then
+    skew=$((remote - now)); [ "${skew}" -ge 0 ] || skew=$((-skew))
+    if [ "${skew}" -gt "${SKEW_LIMIT}" ]; then d_fail "clock skew ${skew} s (more than ${SKEW_LIMIT} s): set the clocks or use up --sync-clock"
+    else d_ok "clock skew ${skew} s"; fi
+  else
+    d_fail "could not read the node clock"
+  fi
+  missing=$(node_user_sh 'for c in sudo tar sha256sum find awk sed cmp flock openssl update-ca-certificates curl systemctl; do command -v "$c" >/dev/null 2>&1 || printf "%s " "$c"; done; echo' </dev/null 2>/dev/null | tail -n 1) || missing="?"
+  if [ -z "${missing}" ]; then d_ok "the node has the tools the converge uses"
+  else d_fail "missing on the node: ${missing}(install from the Debian installation medium, docs/HOST-SETUP.md)"; fi
+  if node_user_sh 'command -v chronyc >/dev/null 2>&1' </dev/null >/dev/null 2>&1; then d_ok "chrony is installed on the node"
+  else d_warn "chrony is not installed on the node (optional: it keeps the node clock and can serve time to the LAN)"; fi
+  if node_user_sh 'ip -o -4 addr show 2>/dev/null | grep -q " $1/"' "${NODE_IP}" </dev/null >/dev/null 2>&1; then d_ok "NODE_IP ${NODE_IP} is configured on the node"
+  else d_fail "NODE_IP ${NODE_IP} is not an address of the node (static IP, docs/HOST-SETUP.md)"; fi
+}
+
+cmd_doctor() {
+  [ "$(npos)" -eq 0 ] || usage_error "doctor takes no arguments"
+  common_open
+  printf 'teknoir-airgap doctor: bundle %s, site %s (%s)\n' "${BUNDLE_ID}" "${SITE_NAME}" "${SITE_FILE}"
+  if [ "${LOCAL}" = 0 ]; then doctor_lan; fi
+  doctor_node
+  if [ "${D_FAIL}" = 1 ]; then
+    echo "doctor found problems (FAIL lines above)."
+    return 1
+  fi
+  echo "doctor found no problems."
+}
+
+# ------------------------------------------------------------------ main --
+main() {
+  parse_args "$@"
+  case "${CMD}" in
+    ''|help) usage; [ -n "${CMD}" ] || exit 2; exit 0 ;;
+  esac
+  check_opts
+  case "${CMD}" in
+    up) cmd_up ;;
+    status) cmd_status ;;
+    verify) cmd_verify ;;
+    version) cmd_version ;;
+    kubeconfig) cmd_kubeconfig ;;
+    trust) cmd_trust ;;
+    credentials) cmd_credentials ;;
+    admin-user) cmd_admin_user ;;
+    backup) cmd_backup ;;
+    rotate) cmd_rotate ;;
+    migrate) cmd_migrate ;;
+    doctor) cmd_doctor ;;
+    *) usage_error "unknown command '${CMD}'" ;;
+  esac
+}
+
+main "$@"

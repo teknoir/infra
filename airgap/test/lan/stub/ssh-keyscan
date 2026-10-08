@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stub ssh-keyscan: one fixed ed25519 key for the last argument (the host).
+for a in "$@"; do host=$a; done
+echo "$host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIStubStubStubStubStubStubStubStubStubStubStub"
