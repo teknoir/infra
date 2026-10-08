@@ -4,7 +4,10 @@
 # Runs as root on the k3s node, from the payload the LAN host sent to
 # /var/lib/teknoir-airgap/bundles/<bundleId>/node:
 #   sudo /var/lib/teknoir-airgap/bundles/<id>/node/bin/teknoir-node converge \
-#        --site <site.env> --lan-time <epoch> --lan-user <name>
+#        --site <site.env> --lan-time <epoch> --lan-user <name> \
+#        [--dry-run] [--rollback] [--sync-clock] [--reapply TIER]... [--force-images]
+# That argv is the interface teknoir-airgap `up` uses (DESIGN.md "Node runner
+# interface"); --operator is accepted as an alias of --lan-user.
 #
 # converge brings the node and the cluster to this bundle's state. Every phase
 # is idempotent, so the same command bootstraps a fresh node and updates a
@@ -94,7 +97,7 @@ Options:
 
 converge options:
   --lan-time EPOCH         the LAN host's clock (date +%s) for the skew check
-  --lan-user NAME          operator recorded in the release record
+  --lan-user NAME          operator recorded in the release record (alias: --operator)
   --sync-clock             set the node clock from --lan-time when the skew exceeds 30s
   --rollback               accept an app-of-apps older than the deployed one
   --reapply TIER           re-apply a one-shot tier ArgoCD already owns (break-glass, repeatable)
@@ -131,7 +134,7 @@ while (( $# > 0 )); do
     --site) need_value "$@"; SITE_ARG="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
     --lan-time) need_value "$@"; LAN_TIME="$2"; LAN_TIME_AT="${SECONDS}"; shift ;;
-    --lan-user) need_value "$@"; LAN_USER="$2"; shift ;;
+    --lan-user|--operator) need_value "$@"; LAN_USER="$2"; shift ;;
     --sync-clock) SYNC_CLOCK=1 ;;
     --rollback) ROLLBACK=1 ;;
     --reapply) need_value "$@"; REAPPLY_TIERS="${REAPPLY_TIERS:+${REAPPLY_TIERS} }$2"; shift ;;
@@ -406,12 +409,39 @@ phase_cluster_base() {
   base_ensure_storage_label
 }
 
+converge_phase_inputs() {
+  # Check the break-glass flags against this payload and hand them to the
+  # phase libraries under the names those read (DESIGN.md "Node runner
+  # interface"): lib/oneshot.sh ONESHOT_REAPPLY (space-separated tiers),
+  # lib/harbor.sh HARBOR_FORCE_IMAGES (0|1). The command line wins over the
+  # environment.
+  local t tiers="" tiers_file="${NODE_ROOT}/oneshot/TIERS"
+  if [[ -n "${REAPPLY_TIERS}" ]]; then
+    phase_wanted oneshot || usage_die "--reapply needs the oneshot phase, which --only/--skip leave out"
+    [[ -f "${tiers_file}" ]] || usage_die "--reapply: this payload has no oneshot/TIERS"
+    tiers="$(sed -e 's/#.*//' "${tiers_file}" | awk 'NF {print $1}')"
+    for t in ${REAPPLY_TIERS}; do
+      grep -qxF -- "${t}" <<<"${tiers}" \
+        || usage_die "--reapply: '${t}' is not a one-shot tier of this bundle (oneshot/TIERS: $(tr '\n' ' ' <<<"${tiers}"))"
+    done
+    warn "break-glass --reapply ${REAPPLY_TIERS}: applied over ArgoCD's Application(s) in the oneshot phase"
+  fi
+  if [[ "${FORCE_IMAGES}" == "1" ]]; then
+    phase_wanted harbor || usage_die "--force-images needs the harbor phase, which --only/--skip leave out"
+    warn "break-glass --force-images: the harbor phase may move mirror tags to this bundle's digests"
+  fi
+  ONESHOT_REAPPLY="${REAPPLY_TIERS}"
+  HARBOR_FORCE_IMAGES="${FORCE_IMAGES}"
+  export ONESHOT_REAPPLY HARBOR_FORCE_IMAGES
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 cmd_converge() {
   local p fn
   (( ${#CMD_ARGS[@]} == 0 )) || usage_die "converge: unexpected argument(s): ${CMD_ARGS[*]}"
+  converge_phase_inputs
   log "converge$(dry_run && printf ' (dry-run)'): bundle ${BUNDLE_ID}, app-of-apps ${APP_OF_APPS_VERSION:-?}, site ${SITE_FILE}"
   log "env ${TEKNOIR_ENV}, domain ${TEKNOIR_DOMAIN}, node ${NODE_IP}, role ${ROLE}, operator ${LAN_USER:-?} (${SUDO_USER:-root})"
   [[ -n "${PHASE_ONLY}${PHASE_SKIP}" ]] && warn "phase selection: only=[${PHASE_ONLY}] skip=[${PHASE_SKIP}]"

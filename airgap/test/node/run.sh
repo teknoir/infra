@@ -9,15 +9,23 @@
 # host phase (fresh install, idempotent re-run, restart only on a desired
 # config change, restart after an interrupted run, secrets-encryption only on
 # new installs, managed /etc/hosts block), node CA trust, the release guard
-# (downgrade, --rollback, broken list), credentials refusing a terminal, and
-# the leak check.
+# (downgrade, --rollback, broken list), credentials refusing a terminal, the
+# runner interface (teknoir-airgap up's exact converge argv, --operator, the
+# break-glass flags reaching the oneshot and harbor phases as ONESHOT_REAPPLY
+# and HARBOR_FORCE_IMAGES, --reapply checked against oneshot/TIERS), and the
+# leak check. With lib/oneshot.sh and lib/harbor.sh present the real phases
+# parse the flags (only their cluster/Harbor work is replaced); without them
+# a stand-in with their interface is used.
 #
 # Usage: airgap/test/node/run.sh [-v]
+#   TEKNOIR_NODE_SRC=DIR   test another airgap/node tree
 # shellcheck disable=SC2016 # literal $1 / $ patterns in single quotes are intended
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SRC="$(cd "${HERE}/../../node" && pwd)"
+# TEKNOIR_NODE_SRC: another airgap/node tree (e.g. with the oneshot/harbor
+# libraries of I-08/I-09 merged in) to test instead of this checkout's.
+SRC="$(cd "${TEKNOIR_NODE_SRC:-${HERE}/../../node}" && pwd)"
 VERBOSE=0
 [[ "${1:-}" == "-v" ]] && VERBOSE=1
 
@@ -368,6 +376,83 @@ check "an unknown credential name fails" [ "${RC}" != 0 ]
 tn credentials platform-admin --site test --out "${T}/pa.txt"
 check "platform-admin is no credential; the error points to admin-user" \
   bash -c "[ ${RC} != 0 ] && grep -q 'admin-user --email' '${T}/out' && [ ! -e '${T}/pa.txt' ]"
+
+# ---------------------------------------------------------------------------
+echo "# runner interface: the converge argv of teknoir-airgap up; break-glass flags reach the phases"
+new_sandbox 3
+mkdir -p "${PAYLOAD}/oneshot"
+printf '# order\nplatform-secrets\nistio istio-system\nharbor\nargo\n' > "${PAYLOAD}/oneshot/TIERS"
+for t in platform-secrets istio harbor argo; do echo '---' > "${PAYLOAD}/oneshot/${t}.yaml"; done
+if [[ -f "${SRC}/lib/oneshot.sh" ]]; then
+  # The real phase (I-08) parses the flags; only its per-tier apply is replaced.
+  printf '\noneshot_tier() { log "oneshot_tier $1 ns=$2 force=$3"; }\n' >> "${PAYLOAD}/lib/oneshot.sh"
+else
+  cat > "${PAYLOAD}/lib/oneshot.sh" <<'EOF'
+# shellcheck shell=bash
+# Test stand-in with the interface of lib/oneshot.sh (I-08): ONESHOT_REAPPLY.
+phase_oneshot() {
+  local tier ns f
+  while read -r tier ns; do
+    f=0
+    [[ " ${ONESHOT_REAPPLY:-} " == *" ${tier} "* ]] && f=1
+    oneshot_tier "${tier}" "${ns:-teknoir-system}" "${f}"
+  done < <(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "${NODE_ROOT}/oneshot/TIERS")
+}
+oneshot_tier() { log "oneshot_tier $1 ns=$2 force=$3"; }
+EOF
+fi
+if [[ -f "${SRC}/lib/harbor.sh" ]]; then
+  # The real phase (I-09) parses the flag; Harbor itself is replaced.
+  cat >> "${PAYLOAD}/lib/harbor.sh" <<'EOF'
+harbor_session_begin() { HARBOR_API="https://harbor.invalid/api/v2.0"; }
+harbor_healthy() { return 0; }
+harbor_login() { :; }
+harbor_ensure_project() { :; }
+harbor_mirror_projects() { :; }
+harbor_ensure_immutability() { :; }
+harbor_retire_robot() { :; }
+harbor_push_charts() { :; }
+harbor_session_end() { :; }
+harbor_push_images() { log "harbor_push_images force=$1"; }
+EOF
+else
+  cat > "${PAYLOAD}/lib/harbor.sh" <<'EOF'
+# shellcheck shell=bash
+# Test stand-in with the interface of lib/harbor.sh (I-09): HARBOR_FORCE_IMAGES.
+phase_harbor() { harbor_push_images "${HARBOR_FORCE_IMAGES:-0}"; }
+harbor_push_images() { log "harbor_push_images force=$1"; }
+EOF
+fi
+reseal
+# teknoir-airgap pushes the site file to /var/lib/teknoir-airgap/site/<name>.env
+# and runs (cmd_up): converge --site <that> --lan-time <now> --lan-user <id -un>
+# followed by up's options in the order given and --dry-run last.
+REMOTE_SITE="${ROOT}/var/lib/teknoir-airgap/site/test.env"
+mkdir -p "$(dirname "${REMOTE_SITE}")"
+cp "${PAYLOAD}/site/test.env" "${REMOTE_SITE}"
+KMODE=refused tn converge --site "${REMOTE_SITE}" --lan-time "$(date +%s)" --lan-user anders \
+  --rollback --sync-clock --reapply istio --force-images --dry-run
+check "teknoir-airgap up's exact converge argv is accepted" [ "${RC}" == 0 ]
+check "the operator is recorded" grep -q 'operator anders' "${T}/out"
+check "--reapply istio reaches oneshot_tier istio with force=1, and only istio" \
+  bash -c "grep -q 'oneshot_tier istio ns=istio-system force=1' '${T}/out' && [ \$(grep -c 'oneshot_tier .* force=1' '${T}/out') = 1 ] && [ \$(grep -c 'oneshot_tier ' '${T}/out') = 4 ]"
+check "--force-images reaches the harbor phase" grep -q 'harbor_push_images force=1' "${T}/out"
+tn converge --site test --lan-time "$(date +%s)" --operator anders --only oneshot,harbor --reapply istio --reapply argo
+check "--operator is an alias of --lan-user" bash -c "[ ${RC} = 0 ] && grep -q 'operator anders' '${T}/out'"
+check "a repeated --reapply marks both tiers" \
+  bash -c "grep -q 'oneshot_tier istio ns=istio-system force=1' '${T}/out' && grep -q 'oneshot_tier argo ns=teknoir-system force=1' '${T}/out' && [ \$(grep -c 'oneshot_tier .* force=1' '${T}/out') = 2 ]"
+check "without --force-images the harbor phase gets force=0" grep -q 'harbor_push_images force=0' "${T}/out"
+tn converge --site test --only oneshot --reapply nosuchtier
+check "--reapply of a tier not in oneshot/TIERS is a usage error before any phase" \
+  bash -c "[ ${RC} = 2 ] && grep -q 'not a one-shot tier of this bundle' '${T}/out' && ! grep -q '== oneshot' '${T}/out'"
+tn converge --site test --skip oneshot --reapply istio
+check "--reapply with the oneshot phase skipped is a usage error" [ "${RC}" == 2 ]
+tn converge --site test --only release --force-images
+check "--force-images with the harbor phase skipped is a usage error" [ "${RC}" == 2 ]
+rm -rf "${PAYLOAD}/oneshot"
+reseal
+tn converge --site test --only oneshot --reapply istio
+check "--reapply on a payload without oneshot/TIERS is a usage error" [ "${RC}" == 2 ]
 
 # ---------------------------------------------------------------------------
 echo "# leak check"

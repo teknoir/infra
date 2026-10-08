@@ -689,6 +689,13 @@ A bash runner, executed as root on the node, with the subcommands converge|statu
 
 **Test:** shellcheck -x clean. bats with a stub kubectl and k3s: error-vs-absent handling (a stub returning rc=1 with 'connection refused' must abort, not be read as absent); a second lock holder exits 75; dry-run makes no mutating stub calls.
 
+#### Node runner interface (addendum to shared contract #3)
+`teknoir-airgap` runs `teknoir-node` as root from /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/ with these argument lists. The two sides change together; airgap/test/node/run.sh runs the exact `up` argv.
+- `converge --site FILE --lan-time EPOCH --lan-user USER [--rollback] [--sync-clock] [--reapply TIER]... [--force-images] [--dry-run]`. `--operator USER` is an alias of `--lan-user`. For tests and break-glass only: `--only`/`--skip PHASE[,PHASE]`, `--no-backup`, `--backup`, `--wait-timeout SECONDS`. Unknown arguments are a usage error (exit 2).
+- `status --site FILE [--lan-time EPOCH]`, `verify`, `credentials NAME --site FILE [--out FILE]` (without --out: stdout, never a terminal), `rotate NAME --site FILE [--i-know]`, `backup --site FILE [--list | --export [--take] | --stream FILE [--keep] | --recipient AGE1...]` (no option: take a backup now), `migrate --site FILE [--dry-run | --undo NAME]`, `admin-user --site FILE --email ADDR --out FILE`.
+- Phase functions (`phase_<name>`, one per lib file) take no arguments. The break-glass flags reach them as environment variables, set by `converge` from its command line: `ONESHOT_REAPPLY` (space-separated tier names; each must be listed in oneshot/TIERS, otherwise converge exits 2 before any phase runs) for lib/oneshot.sh, and `HARBOR_FORCE_IMAGES` (0|1) for lib/harbor.sh. Further inputs: `DRY_RUN`, `ROLLBACK`, `LAN_TIME`, `LAN_USER`, `WAIT_TIMEOUT`, `BACKUP_MODE`.
+- Exit codes: 0 ok, 1 error, 2 usage, 70 the leak check found a secret value or a private key in the run log, 75 another run holds /run/teknoir-airgap.lock.
+
 ### I-06 — Host phase: idempotent k3s install/upgrade and node files, ready for agents
 - repo: infra (branch teknoir-local)
 - depends on: I-05, I-03

@@ -15,7 +15,10 @@
 #                      derived HARBOR_HOST (harbor.<domain>)
 #   bundle variables   BUNDLE_ID APP_OF_APPS_VERSION MANIFEST_SHA256
 #                      INFRA_COMMIT GITOPS_COMMIT (load_bundle_info)
-#   converge options   ROLLBACK REAPPLY_TIERS FORCE_IMAGES LAN_TIME LAN_USER
+#   converge options   ROLLBACK REAPPLY_TIERS FORCE_IMAGES LAN_TIME LAN_USER;
+#                      the oneshot and harbor phases read the break-glass
+#                      flags as ONESHOT_REAPPLY and HARBOR_FORCE_IMAGES, which
+#                      cmd_converge sets from REAPPLY_TIERS and FORCE_IMAGES
 #   tools              JQ HELM CRANE AGE (bundled linux-amd64 binaries),
 #                      K3S_BIN (/usr/local/bin/k3s)
 #
