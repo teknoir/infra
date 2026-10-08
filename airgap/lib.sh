@@ -543,32 +543,69 @@ k3s_retire_legacy() {
   ssh_run "sudo install -d -m 700 '${K3S_RETIRED_DIR}' && sudo mv '${K3S_MANIFESTS_DIR}/${legacy}' '${K3S_RETIRED_DIR}/${legacy}.$(date +%Y%m%d%H%M%S)'"
 }
 
+# First istio chart version that renders no CRDs (0.0.1 renders all 14).
+ISTIO_CRD_FREE_SINCE="0.0.2"
+
+version_ge() {
+  # version_ge <a> <b> — true when the dotted numeric version <a> >= <b>;
+  # false when either is not numeric (e.g. a git branch as targetRevision)
+  local -a a b
+  local i x y
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+)*$ && "$2" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  for (( i = 0; i < ${#a[@]} || i < ${#b[@]}; i++ )); do
+    x=$(( 10#${a[i]:-0} )); y=$(( 10#${b[i]:-0} ))
+    (( x > y )) && return 0
+    (( x < y )) && return 1
+  done
+  return 0
+}
+
 argocd_crd_gate() {
-  # argocd_crd_gate — run before deploying teknoir-argo.yaml. That ArgoCD no
-  # longer excludes CRDs, so it must not be able to take over, and later prune,
-  # the bootstrap-owned istio / cert-manager CRDs (deleting a CRD deletes every
+  # argocd_crd_gate — run before deploying teknoir-argo.yaml. That ArgoCD
+  # manages CRDs, so it must never take over, and later prune, the
+  # bootstrap-owned istio / cert-manager CRDs (deleting a CRD deletes every
   # VirtualService, Gateway, AuthorizationPolicy, ... of that kind):
-  #   1. the ArgoCD Application istio, if it exists, last synced the pinned
-  #      istio version (istio >= 0.0.2 renders no CRDs; 0.0.1 renders all 14,
-  #      so syncing it with CRDs managed would adopt them) — roll out the
-  #      app-of-apps first (update-airgap.sh);
-  #   2. every live istio / cert-manager CRD carries
+  #   1. only during the CRD hand-over, i.e. while the live argocd-cm still
+  #      excludes CRDs (an ArgoCD from older tooling): the ArgoCD Application
+  #      istio, if it exists, must target and have last synced a CRD-free
+  #      istio (>= ISTIO_CRD_FREE_SINCE; 0.0.1 renders all 14 CRDs, which
+  #      ArgoCD would adopt once it stops excluding them) — roll out the
+  #      app-of-apps first (update-airgap.sh). Before ArgoCD exists, and after
+  #      the hand-over, ArgoCD cannot hold an older istio sync with CRDs, so
+  #      the check is skipped (it would otherwise tie every later istio bump
+  #      to the update order);
+  #   2. always: every live istio / cert-manager CRD carries
   #      argocd.argoproj.io/sync-options: Prune=false,Delete=false (the K3s
   #      CRD files from render-bootstrap.sh) — so a wrong order stays harmless.
-  # Read-only. Dry-run reports instead of failing. SKIP_CRD_GATE=1 overrides.
+  # Sets ARGOCD_CRD_HANDOVER=1 when this deploy ends the CRD exclusion, for
+  # argocd_crd_handover_resync. Read-only. Dry-run reports instead of failing.
+  # SKIP_CRD_GATE=1 skips the checks, not that detection.
   # Usage: argocd_crd_gate crds-live|crds-just-deployed — the latter when the
   # caller deployed the CRD files right before (in dry-run that deploy did not
   # happen, so check 2 is skipped).
-  local want synced unprotected problems=()
+  local excl state target synced unprotected problems=()
+  ARGOCD_CRD_HANDOVER=0
+  if ! excl="$(remote_kubectl_query "-n teknoir-system get configmap argocd-cm --ignore-not-found -o jsonpath='{.data.resource\\.exclusions}'")"; then
+    problems+=("cannot read the live argocd-cm")
+  elif grep -q 'CustomResourceDefinition' <<<"${excl}"; then
+    ARGOCD_CRD_HANDOVER=1
+  fi
   if [[ "${SKIP_CRD_GATE:-0}" == "1" ]]; then
     warn "CRD gate skipped (--skip-crd-gate)"
     return 0
   fi
-  want="$(pinned_version istio)"
-  synced="$(remote_kubectl_query "-n teknoir-system get application istio --ignore-not-found -o jsonpath='{.status.history[-1:].revision}'")" \
-    || problems+=("cannot read the ArgoCD Application istio")
-  if [[ -n "${synced}" && "${synced}" != "${want}" ]]; then
-    problems+=("the istio Application last synced istio ${synced}, not the pinned ${want}: run airgap/update-airgap.sh first")
+  if [[ "${ARGOCD_CRD_HANDOVER}" == "1" ]]; then
+    if ! state="$(remote_kubectl_query "-n teknoir-system get applications.argoproj.io istio --ignore-not-found -o jsonpath='{.spec.source.targetRevision} {.status.history[-1:].revision}'")"; then
+      problems+=("cannot read the ArgoCD Application istio")
+    else
+      read -r target synced <<<"${state}" || true
+      if [[ -n "${target:-}" ]] && ! { version_ge "${target}" "${ISTIO_CRD_FREE_SINCE}" \
+                                        && version_ge "${synced:-}" "${ISTIO_CRD_FREE_SINCE}"; }; then
+        problems+=("CRD hand-over: the istio Application targets istio ${target} and last synced ${synced:-nothing}, but must run istio >= ${ISTIO_CRD_FREE_SINCE} (no CRDs) first: run airgap/update-airgap.sh and wait until istio is Synced")
+      fi
+    fi
   fi
   if [[ "${1:-}" == "crds-just-deployed" && "${DRY_RUN}" == "1" ]]; then
     log "[dry-run] CRD gate: the CRD files deployed above add Prune=false,Delete=false"
@@ -580,12 +617,86 @@ argocd_crd_gate() {
       problems+=("CRDs without Prune=false,Delete=false: $(tr '\n' ' ' <<<"${unprotected}")— deploy the CRD files first (airgap/bootstrap-airgap.sh --update)")
     fi
   fi
-  (( ${#problems[@]} == 0 )) && { log "CRD gate passed (istio ${synced:-not deployed yet}; bootstrap CRDs prune-protected)"; return 0; }
+  if (( ${#problems[@]} == 0 )); then
+    if [[ "${ARGOCD_CRD_HANDOVER}" == "1" ]]; then
+      log "CRD gate passed (CRD hand-over: istio ${synced:-not deployed}; bootstrap CRDs prune-protected)"
+    else
+      log "CRD gate passed (no CRD hand-over pending; bootstrap CRDs prune-protected)"
+    fi
+    return 0
+  fi
   local p
   for p in "${problems[@]}"; do
     if [[ "${DRY_RUN}" == "1" ]]; then warn "[dry-run] CRD gate would refuse: ${p}"; else warn "CRD gate: ${p}"; fi
   done
   [[ "${DRY_RUN}" == "1" ]] || die "refusing to deploy ArgoCD without the CRD exclusion (override: --skip-crd-gate)"
+}
+
+argocd_failed_autosyncs() {
+  # argocd_failed_autosyncs — print "<application> <sync-operation-patch>" for
+  # every Application with automated sync whose last operation failed on its
+  # current targetRevision (and none is running). The patch re-runs that sync
+  # with the Application's own prune / syncOptions. Read-only.
+  remote_kubectl_query "-n teknoir-system get applications.argoproj.io -o json" | python3 -c '
+import json, sys
+for a in json.load(sys.stdin).get("items") or []:
+    spec = a.get("spec") or {}
+    policy = spec.get("syncPolicy") or {}
+    auto, src = policy.get("automated"), spec.get("source")
+    if auto is None or auto.get("enabled") is False or not src or spec.get("sources") or a.get("operation"):
+        continue
+    op = (a.get("status") or {}).get("operationState") or {}
+    rev = src.get("targetRevision") or ""
+    if op.get("phase") not in ("Failed", "Error") or ((op.get("operation") or {}).get("sync") or {}).get("revision") != rev:
+        continue
+    print(a["metadata"]["name"], json.dumps({"operation": {
+        "initiatedBy": {"username": "airgap-crd-handover"},
+        "sync": {"revision": rev, "prune": bool(auto.get("prune")), "syncOptions": policy.get("syncOptions") or []},
+        "retry": {"limit": 5, "backoff": {"duration": "30s", "factor": 2, "maxDuration": "5m"}}}}, separators=(",", ":")))
+'
+}
+
+argocd_crd_handover_resync() {
+  # argocd_crd_handover_resync — run once K3s has applied teknoir-argo.yaml
+  # (k3s_deploy). If that deploy ended the CRD exclusion
+  # (ARGOCD_CRD_HANDOVER=1, from argocd_crd_gate), re-run the automated syncs
+  # the exclusion made fail: a chart that ships CRDs together with resources
+  # of those kinds (monitoring, user-controller) cannot sync while CRDs are
+  # excluded ("failed to discover server resources"), and ArgoCD never retries
+  # a failed automated sync of the same revision by itself. Each one is
+  # re-run once (argocd_failed_autosyncs). Outside the hand-over a no-op, so
+  # re-running is safe.
+  local excl sts candidates name patch
+  [[ "${ARGOCD_CRD_HANDOVER:-0}" == "1" ]] || return 0
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    candidates="$(argocd_failed_autosyncs)" || candidates=""
+    log "[dry-run] CRD hand-over: once the application controller runs without the CRD exclusion, would re-sync: $(awk '{print $1}' <<<"${candidates}" | tr '\n' ' ')"
+    return 0
+  fi
+  excl="$(remote_kubectl_query "-n teknoir-system get configmap argocd-cm -o jsonpath='{.data.resource\\.exclusions}'")" \
+    || die "cannot read the live argocd-cm"
+  if grep -q 'CustomResourceDefinition' <<<"${excl}"; then
+    warn "CRD hand-over: argocd-cm still excludes CRDs after the deploy; nothing re-synced"
+    return 0
+  fi
+  # argocd-cm feeds a checksum annotation, so the controller restarts; an
+  # operation the old pod picked up would fail on the old exclusion again.
+  sts="$(remote_kubectl_query "-n teknoir-system get statefulset -l app.kubernetes.io/name=argocd-application-controller -o name")"
+  [[ -n "${sts}" ]] || die "ArgoCD application controller StatefulSet not found"
+  remote_kubectl "-n teknoir-system rollout status ${sts} --timeout=300s" >/dev/null \
+    || die "the ArgoCD application controller did not roll out with the new argocd-cm"
+  candidates="$(argocd_failed_autosyncs)" \
+    || die "cannot list the ArgoCD Applications; re-sync the failed ones by hand (docs/AIRGAP-UPDATE.md §2.4)"
+  if [[ -z "${candidates}" ]]; then
+    log "CRD hand-over: no failed automated sync to re-run"
+    return 0
+  fi
+  while read -r name patch; do
+    [[ "${patch}" != *"'"* ]] || die "unexpected quote in the sync operation for ${name}"
+    log "CRD hand-over: re-syncing ${name} (its automated sync failed while CRDs were excluded)"
+    remote_kubectl "-n teknoir-system patch applications.argoproj.io ${name} --type merge -p '${patch}'" >/dev/null
+  done <<<"${candidates}"
+  log "CRD hand-over: follow with: sudo k3s kubectl -n teknoir-system get applications"
 }
 
 k3s_deploy() {

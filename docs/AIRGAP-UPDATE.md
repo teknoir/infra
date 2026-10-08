@@ -99,20 +99,42 @@ Finish with the checklist in §7.
 app-of-apps 0.0.3 pins controllers 0.0.83, istio 0.0.2 (renders no CRDs),
 monitoring 0.0.4 and the running harbor 0.0.5 / auth 0.0.3. The new ArgoCD
 render (`charts/argo`) stops excluding CRDs, so the controller and monitoring
-CRDs become ArgoCD-managed. Run step 3 **before** step 4: if ArgoCD stopped
-excluding CRDs while istio 0.0.1 is still live, the `istio` Application would
-take over the 14 istio CRDs, and istio 0.0.2 would later mark them for
-pruning. The CRDs in `00-teknoir-istio-crds.yaml` /
-`05-teknoir-certmanager-crds.yaml` carry
+CRDs become ArgoCD-managed. For this one-time **CRD hand-over**, run step 3
+**before** step 4: if ArgoCD stopped excluding CRDs while istio 0.0.1 is still
+live, the `istio` Application would take over the 14 istio CRDs, and istio
+0.0.2 would later mark them for pruning. The CRDs in
+`00-teknoir-istio-crds.yaml` / `05-teknoir-certmanager-crds.yaml` carry
 `argocd.argoproj.io/sync-options: Prune=false,Delete=false` as a safety net,
 but only once step 4 has redeployed them.
 
 The tooling enforces this. Before deploying `teknoir-argo.yaml`,
 `bootstrap-airgap.sh` and `scripts/deploy-argo.sh` run a read-only gate
-(`lib.sh:argocd_crd_gate`). It refuses while the `istio` Application has not
-last synced the pinned istio version, or while a live istio / cert-manager
-CRD lacks `Prune=false,Delete=false`. `--dry-run` shows the verdict;
+(`lib.sh:argocd_crd_gate`). It always refuses while a live istio /
+cert-manager CRD lacks `Prune=false,Delete=false`. While the live `argocd-cm`
+still excludes CRDs, i.e. during the hand-over only, it also refuses until the
+`istio` Application targets and has last synced istio 0.0.2 or later. On a
+fresh node and after the hand-over that check is skipped, so later istio bumps
+do not make step 4 depend on step 3. `--dry-run` shows the verdict;
 `--skip-crd-gate` overrides it.
+
+Between steps 3 and 4, a chart that ships CRDs together with resources of
+those kinds cannot sync (`failed to discover server resources for group
+version monitoring.coreos.com/v1`; on the live cluster `monitoring` and
+`user-controller`), and ArgoCD never retries a failed automated sync of
+the same version on its own. So once step 4 has deployed the new ArgoCD, it
+waits for the application controller to restart with the new `argocd-cm` and
+re-runs, once, every automated sync that failed on its current target version
+(`lib.sh:argocd_crd_handover_resync`). If step 4 stopped after ArgoCD was
+deployed, a re-run no longer sees the hand-over; re-run such a sync by hand
+with the Application's version, prune flag and sync options:
+
+```sh
+ssh teknoir@teknoir.airgapped sudo k3s kubectl -n teknoir-system patch application monitoring \
+  --type merge --patch-file /dev/stdin <<'EOF'
+{"operation": {"initiatedBy": {"username": "operator"},
+  "sync": {"revision": "0.0.4", "prune": true, "syncOptions": ["ServerSideApply=true"]}}}
+EOF
+```
 
 ## 3. Image-completeness check (live diff)
 

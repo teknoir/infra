@@ -12,7 +12,9 @@
 #      only Secrets that do not exist yet, incl. the wildcard TLS placeholder)
 #   5. istio resources, one-shot `kubectl apply` -> wait istiod + gateway
 #   6. teknoir-argo.yaml (after lib.sh:argocd_crd_gate) -> wait Application
-#      CRD Established + argocd-server
+#      CRD Established + argocd-server; when this deploy ended the CRD
+#      exclusion of an older ArgoCD, re-run the automated syncs that failed
+#      because of it (lib.sh:argocd_crd_handover_resync)
 #   7. harbor resources, one-shot `kubectl apply` -> wait pods + sidecars
 #   8. teknoir-app-of-apps.yaml (ArgoCD syncs once push-to-harbor.sh ran)
 #   The one-shot istio/harbor resources are adopted by their ArgoCD
@@ -54,9 +56,9 @@ Options:
   --reapply-adopted  first bootstrap: re-apply the one-shot istio/harbor
                      resources even though ArgoCD already owns them
                      (disaster recovery only)
-  --skip-crd-gate    deploy ArgoCD even if the istio Application is not on the
-                     pinned version or a bootstrap CRD lacks Prune=false
-                     (see lib.sh:argocd_crd_gate)
+  --skip-crd-gate    deploy ArgoCD even if a bootstrap CRD lacks Prune=false or,
+                     during the CRD hand-over, the istio Application still
+                     runs istio with CRDs (see lib.sh:argocd_crd_gate)
   --dry-run          print every action without mutating the node
                      (read-only ssh queries still run)
   -h, --help         show this help
@@ -89,7 +91,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-require_cmd ssh tar
+require_cmd ssh tar python3
 apply_ssh_key
 
 # Preflight: fail early with a clear hint instead of a mid-run
@@ -343,12 +345,14 @@ fi
 # ---------------------------------------------------------------------------
 log "ArgoCD -> ${K3S_MANIFESTS_DIR}/teknoir-argo.yaml"
 # ArgoCD manages CRDs: it must not be able to adopt the bootstrap CRDs (step 3
-# has just deployed them with Prune=false; the istio Application must already
-# run the pinned, CRD-free istio).
+# has just deployed them with Prune=false; during the one-time CRD hand-over
+# the istio Application must already run a CRD-free istio).
 argocd_crd_gate crds-just-deployed
 k3s_deploy "${ARGO_FILE}"
 wait_ready "Application CRD Established" "wait --for=condition=Established crd/applications.argoproj.io --timeout=60s"
 wait_ready "argocd server" "-n teknoir-system wait --for=condition=Available deployment -l app.kubernetes.io/name=argocd-server --timeout=30s"
+# Hand-over only: re-run the automated syncs that failed while CRDs were excluded.
+argocd_crd_handover_resync
 
 if [[ "${UPDATE_MODE}" == "1" ]]; then
   log "bootstrap tier updated (secrets: scripts/deploy-secrets.sh; app-of-apps: airgap/update-airgap.sh)"

@@ -15,7 +15,9 @@
 # use airgap/bootstrap-airgap.sh --update, which deploys the bundle's render.
 #
 # ArgoCD manages CRDs, so the deploy is refused until it cannot adopt the
-# bootstrap-owned istio / cert-manager CRDs (lib.sh:argocd_crd_gate).
+# bootstrap-owned istio / cert-manager CRDs (lib.sh:argocd_crd_gate). If the
+# deploy ends the CRD exclusion of an older ArgoCD, the automated syncs that
+# failed because of it are re-run (lib.sh:argocd_crd_handover_resync).
 #
 # Usage: scripts/deploy-argo.sh [--out FILE] [--host user@host]
 #                               [--ssh-key FILE] [--skip-crd-gate] [--dry-run]
@@ -56,7 +58,7 @@ CHART_DIR="${REPO_ROOT}/charts/argo"
 [[ -f "${CHART_DIR}/Chart.yaml" ]] \
   || die "${CHART_DIR} not found — from a bundle, deploy ArgoCD with airgap/bootstrap-airgap.sh --update"
 
-require_cmd helm ssh
+require_cmd helm ssh python3
 apply_ssh_key
 
 tmpdir="$(mktemp -d)"
@@ -74,4 +76,5 @@ fi
 
 argocd_crd_gate crds-live
 k3s_deploy "${rendered}"
+argocd_crd_handover_resync
 log "deploy-argo complete"
