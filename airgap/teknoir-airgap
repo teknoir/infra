@@ -505,11 +505,17 @@ OPT_HOST_KEY=
 ssh_setup() {
   local ctl
   need_cmd ssh ssh-keygen ssh-keyscan
-  # A unix socket path must stay under ~104 bytes; %C expands to 40 hex chars.
-  ctl=${LAN_STATE}/cm-%C
-  if [ ${#LAN_STATE} -gt 55 ] || case "${LAN_STATE}" in *' '*) true ;; *) false ;; esac; then
-    ctl=/tmp/teknoir-airgap-$(id -u)-%C
+  # A unix socket path must stay under ~104 bytes (macOS) including the
+  # 17-char temporary suffix ssh adds while creating it; %C is 40 hex chars.
+  # So the master socket always lives in a short private per-user dir.
+  local ctl_dir
+  ctl_dir=/tmp/tka-$(id -u)
+  if [ ! -e "${ctl_dir}" ]; then mkdir -m 700 "${ctl_dir}" 2>/dev/null || [ -d "${ctl_dir}" ] || die "cannot create ${ctl_dir}"; fi
+  if [ -L "${ctl_dir}" ] || [ ! -d "${ctl_dir}" ] || [ ! -O "${ctl_dir}" ]; then
+    die "${ctl_dir} is not a directory owned by you; remove it and retry"
   fi
+  chmod 700 "${ctl_dir}"
+  ctl=${ctl_dir}/%C
   case "${KNOWN_HOSTS}" in *' '*) die "the home directory path contains a space; ssh cannot use ${KNOWN_HOSTS}" ;; esac
   SSH_OPTS=(
     -o "UserKnownHostsFile=${KNOWN_HOSTS}" -o GlobalKnownHostsFile=/dev/null
