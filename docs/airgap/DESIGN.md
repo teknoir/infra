@@ -42,7 +42,7 @@ Verified facts and agreed deviations that supersede the text below where they di
   - Harbor's token service needs the token key in PKCS#1 (the traditional RSA PEM type, `openssl genrsa -traditional`); a PKCS#8 key gave HTTP 500 on every token request. The secrets phase generates PKCS#1 and replaces a PKCS#8 key (rolling core and registry).
   - Istio gateway pods created before istiod answered its injection webhook keep `image: auto` and never start; after the istio tier the converge waits for istiod and re-creates those pods.
   - The Backstage postgres StatefulSet stayed OutOfSync on client-side diff (defaulted fields); every Application, the root one included, uses `ServerSideDiff=true`.
-- Known residuals: Backstage logout hard-codes realm `master` (backstage repo `Header.tsx`, needs an image rebuild); Keycloak asks for Update Profile at first login (user-controller sets no lastName); teamspace creation needs the profile-plugins charts mirrored (out of scope).
+- Known residuals: over HTTP/2 the ingress gateway resets the stream (RST_STREAM PROTOCOL_ERROR) right after ext_authz's 302 to `/oauth2/start` (`content-length: 0`), on staging and production as well; browsers tolerate it, curl does not (the e2e login uses HTTP/1.1); `grafana.<domain>` is in the hosts list but has no route (Grafana is at `/teknoir-system/grafana/`); Backstage logout hard-codes realm `master` (backstage repo `Header.tsx`, needs an image rebuild); Keycloak asks for Update Profile at first login (user-controller sets no lastName); teamspace creation needs the profile-plugins charts mirrored (out of scope).
 
 ## Backstage + user-controller (folded into the redesign)
 
