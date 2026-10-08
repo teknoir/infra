@@ -69,13 +69,19 @@ The converge on the node runs these phases, each idempotent:
 | verify | checks the payload against `node/SHA256SUMS` before changing anything |
 | preflight | `NODE_IP` is the node's address, enough free disk, clock within 30 s of the LAN host, bundle not older than the deployed release |
 | backup | when the cluster runs another bundle: a backup to `/var/lib/teknoir-airgap/backups/<ts>` (keeps 3) |
-| host | k3s install or upgrade (only when the version or config changes), `registries.yaml`, the CA in the OS and k3s trust, the `/etc/hosts` block, chrony, bootstrap images; restarts k3s only when its config changed |
+| host | k3s install or upgrade (only when the version or config changes), `registries.yaml`, the CA in the OS and k3s trust, the `/etc/hosts` block, chrony, bootstrap images, the pod network pinned to `NODE_IP`'s interface, the resolver CoreDNS forwards to (see below); restarts k3s only when its config changed |
 | cluster-base | `coredns-custom` with `NODE_IP`, missing namespaces |
 | secrets | creates the CA, the wildcard certificate placeholder and the Harbor token certificate if absent; refreshes the public CA copies |
 | one-shot | first install only: applies platform-secrets, istio, harbor and argo once, then ArgoCD owns them |
 | harbor | Harbor projects, charts and images (skips what is already there) |
 | release | pins the root Application `app-of-apps` to the bundle's version and records the release |
 | post | waits for every Application to be Synced and Healthy, checks that every running image is available offline, prunes old payloads |
+
+CoreDNS answers the platform names itself and forwards every other name to
+`UPSTREAM_DNS` from the site config when it is set, else to the node's own
+resolvers. A node with neither (a full air gap) gets its systemd-resolved
+exposed on `NODE_IP`, so lookups get an immediate answer (the `/etc/hosts` names,
+NXDOMAIN for the rest) instead of hanging on an unreachable public resolver.
 
 Integrity is checked three times, and each check is fatal: you check the tar
 against its `.tar.sha256`, `teknoir-airgap` checks the extracted files against
@@ -573,6 +579,11 @@ it against its `.tar.sha256`. Never fix files by hand.
 browser or AirDrop and carries the quarantine attribute. `doctor` reports it;
 clear it with `xattr -dr com.apple.quarantine teknoir-airgap-<bundleId>`.
 
+**A pod cannot resolve a LAN name** (a NAS, a camera, an NTP server). With no
+`UPSTREAM_DNS` and no resolver on the node, CoreDNS knows only the platform
+names. Set `UPSTREAM_DNS` in the site config to the LAN's resolvers and run
+`up` again; k3s restarts once and CoreDNS picks them up.
+
 **A platform name does not resolve or the browser warns about the certificate.**
 Run `./teknoir-airgap doctor`, then `./teknoir-airgap trust`. Firefox needs the CA
 imported separately (section 7). A certificate warning is itself a finding: do
@@ -659,7 +670,7 @@ kubectl --context teknoir-local get virtualservices,gateways,destinationrules,au
 
 **M3. Detach the k3s manifest files** (the orphan Addons, the 8 legacy
 `manifest-*-secret` files, the 10 `teknoir-*-secret` files, the namespaces, the
-CRDs, `coredns-custom` and the root app-of-apps; `teknoir-argo` stays until M7).
+CRDs, `coredns-custom` and the root app-of-apps; `teknoir-argo` stays until M4b).
 Each file gets a `.skip` guard, is moved to
 `/opt/k3s/server/manifests-retired/<UTC>/`, its objects lose the k3s ownership
 labels, and its Addon is deleted; the object counts are checked after every
@@ -699,6 +710,22 @@ kubectl --context teknoir-local -n teknoir-system get rs -l component=core   # n
 
 plus the browser checks from section 3.
 
+**M4b. Detach `teknoir-argo`, right after M4.** The bundle's app-of-apps (0.0.4)
+runs ArgoCD from its own Application `argo`. Once that is Synced and Healthy,
+detach the last k3s file. Do not restart k3s between M4 and M4b: k3s would
+apply its copy of ArgoCD over the one ArgoCD now manages.
+
+```sh
+kubectl --context teknoir-local -n teknoir-system get application argo   # Synced, Healthy
+./teknoir-airgap migrate --argo --dry-run
+./teknoir-airgap migrate --argo
+```
+
+It refuses while `argo` is not Synced/Healthy or an argoproj CRD lacks
+`Prune=false,Delete=false`, and fails if any ArgoCD pod restarts during the
+detach. Afterwards `kubectl --context teknoir-local get addons -n kube-system`
+lists only k3s's own addons.
+
 **M5. Restart test.**
 
 ```sh
@@ -708,12 +735,13 @@ ssh teknoir@192.168.5.181 sudo systemctl restart k3s
 Repeat the M2 counts: they must be equal, no Teknoir Addon re-appears, every
 Application stays `Synced`, and the Secrets keep their `resourceVersion`.
 
-**M6. Retire the Harbor robot.** Once app-of-apps syncs through the credential-less
-repository, delete the old `teknoir-system/argocd-harbor-repo` Secret and the
-Harbor robot account `robot$argocd`.
+**M6. Retire the Harbor robot.** Run `./teknoir-airgap migrate` once more. Now
+that the argo chart has created the credential-less repository Secret, it deletes
+the old `teknoir-system/argocd-harbor-repo` Secret, checks that app-of-apps
+still syncs, and then deletes the Harbor robot account `robot$argocd`. Before M4
+it only reports `robot: not yet`.
 
-**M7. Later windows.** ArgoCD self-management (detach `teknoir-argo` the same
-way), k3s secrets encryption
+**M7. Later windows.** k3s secrets encryption
 (`sudo k3s secrets-encrypt enable --data-dir /opt/k3s`, restart,
 `sudo k3s secrets-encrypt reencrypt --data-dir /opt/k3s`), and, if decided, the
 datastore move to embedded etcd.
@@ -739,7 +767,7 @@ from a bundle copied there), `--forget-host-key`, `--host-key FINGERPRINT`.
 | `./teknoir-airgap admin-user --email ADDRESS --out FILE` | A named admin; temporary password into a 0600 file |
 | `./teknoir-airgap backup --out DIR` | Encrypted node backup copied to this host |
 | `./teknoir-airgap rotate NAME` | Replace one generated secret (`--i-know`) |
-| `./teknoir-airgap migrate` | One-time detach of the legacy k3s files (`--dry-run`, `--undo NAME`) |
+| `./teknoir-airgap migrate` | One-time detach of the legacy k3s files (`--dry-run`, `--argo`, `--undo NAME`) |
 | `./teknoir-airgap doctor` | Check this LAN host and the node |
 | `./teknoir-airgap help` | The full reference |
 

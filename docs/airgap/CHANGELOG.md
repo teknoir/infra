@@ -34,6 +34,10 @@ install and every update.
   clock), automatic backup, host (k3s, registries, CA, hosts, chrony, bootstrap
   images), cluster base, secrets, one-shot tiers, Harbor content, release pin,
   post-checks. Every phase is idempotent and an interrupted run resumes.
+- **Works on a node with no route and no resolver.** The pod network is pinned
+  to `NODE_IP`'s interface, and CoreDNS forwards to `UPSTREAM_DNS` (new optional
+  site key), the node's resolvers, or the node's systemd-resolved on `NODE_IP`;
+  before, k3s fell back to `8.8.8.8` and lookups hung.
 - **Single owners, no Teknoir k3s files.** Nothing of Teknoir's lives in
   `/opt/k3s/server/manifests` any more. `coredns-custom` and the root
   Application are server-side applied by each `up`; the istio and cert-manager

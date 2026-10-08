@@ -36,6 +36,12 @@ Verified facts and agreed deviations that supersede the text below where they di
 - **Payload layout**: the LAN entrypoint copies `MANIFEST.yaml` next to `node/` (`/var/lib/teknoir-airgap/bundles/<id>/MANIFEST.yaml`) and the site file to `/var/lib/teknoir-airgap/site/<site>.env`; converge takes `--lan-user` (alias `--operator`).
 - **Image digests**: Harbor comparisons use the linux/amd64 image config digest (old pushes left multi-arch indexes; crane rewrites docker-archive manifests); charts compare the content layer digest, then the unpacked files.
 - **Size gate**: 4.5 GiB (backstage, keycloak-config-cli and the toolbox add ~650 MiB).
+- **VM e2e findings (E0/E1, 2026-10-08)**, all fixed in the converge:
+  - A node with no default route made flannel fail to pick an interface (k3s crash-loop): the host phase pins `flannel-iface` to the interface that holds `NODE_IP`.
+  - A node with no resolver made k3s hand CoreDNS `8.8.8.8`; every external lookup (ArgoCD repo-server's health checks among them) then hung until timeout. The host phase writes `/etc/rancher/k3s/resolv.conf`: `UPSTREAM_DNS` from the site config, else nothing when the node has its own resolvers, else systemd-resolved exposed on `NODE_IP` (`DNSStubListenerExtra`), which answers at once. A change restarts k3s and re-creates the CoreDNS pods.
+  - Harbor's token service needs the token key in PKCS#1 (the traditional RSA PEM type, `openssl genrsa -traditional`); a PKCS#8 key gave HTTP 500 on every token request. The secrets phase generates PKCS#1 and replaces a PKCS#8 key (rolling core and registry).
+  - Istio gateway pods created before istiod answered its injection webhook keep `image: auto` and never start; after the istio tier the converge waits for istiod and re-creates those pods.
+  - The Backstage postgres StatefulSet stayed OutOfSync on client-side diff (defaulted fields); every Application, the root one included, uses `ServerSideDiff=true`.
 - Known residuals: Backstage logout hard-codes realm `master` (backstage repo `Header.tsx`, needs an image rebuild); Keycloak asks for Update Profile at first login (user-controller sets no lastName); teamspace creation needs the profile-plugins charts mirrored (out of scope).
 
 ## Backstage + user-controller (folded into the redesign)
