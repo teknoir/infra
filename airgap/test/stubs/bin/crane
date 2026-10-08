@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# crane — recording test stub; see _stub.bash in this directory.
+# shellcheck source-path=SCRIPTDIR
+STUB_NAME=crane
+# shellcheck source=_stub.bash
+. "$(dirname "$0")/_stub.bash"

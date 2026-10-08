@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# kubectl — recording test stub; see _stub.bash in this directory.
+# shellcheck source-path=SCRIPTDIR
+STUB_NAME=kubectl
+# shellcheck source=_stub.bash
+. "$(dirname "$0")/_stub.bash"
