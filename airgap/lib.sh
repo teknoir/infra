@@ -92,7 +92,13 @@ chart_template_args() {
            "--set istio-ingressgateway.imagePullPolicy=IfNotPresent" \
            "--set istio-ingressgateway-public.imagePullPolicy=IfNotPresent" \
            "--set istio-egressgateway.imagePullPolicy=IfNotPresent" \
-           "--set certificate.enabled=false"
+           "--set certificate.enabled=false" \
+           "--set-json istio-base.base.excludedCRDs=[]"
+      # The istio CRDs are bootstrap-owned (00-teknoir-istio-crds.yaml). The
+      # chart's GitOps default lists every CRD in istio-base.base.excludedCRDs
+      # so the ArgoCD Application renders none (helm.skipCrds cannot drop them:
+      # the base subchart renders CRDs from templates); the bootstrap render
+      # clears that list to get them back.
       ;;
     harbor)
       # externalURL feeds Harbor core's EXT_ENDPOINT, which builds the registry
@@ -161,13 +167,15 @@ helm_template_chart() {
       ca_args=(--set-file "argo-cd.configs.cm.oidc\.config=${oidc_base}")
     fi
   fi
-  # shellcheck disable=SC2086
+  # read -a splits without pathname expansion, so values such as [] stay literal.
+  local -a extra_args=()
+  read -r -a extra_args <<<"${args}"
   helm template "${name}" "${dir}" \
     --namespace "$(chart_namespace "${name}")" \
     --include-crds \
     --kube-version "${KUBE_VERSION:-1.33.0}" \
     ${ca_args[@]+"${ca_args[@]}"} \
-    ${args}
+    ${extra_args[@]+"${extra_args[@]}"}
   local rc=$?
   [[ -n "${oidc_tmp}" ]] && rm -f "${oidc_tmp}"
   return $rc

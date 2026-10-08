@@ -105,6 +105,10 @@ for doc in yaml.safe_load_all(sys.stdin):
 yaml.safe_dump_all(out, sys.stdout, default_flow_style=False, sort_keys=False)
 '
 
+# Bootstrap-owned CRDs are marked so that ArgoCD never prunes or deletes them,
+# even if an Application starts tracking them (e.g. a chart that still renders
+# them while CRDs are not excluded) and later stops rendering them; deleting a
+# CRD deletes every custom resource of that kind.
 FILTER_CRD_PY='
 import sys
 import yaml
@@ -114,6 +118,10 @@ for doc in yaml.safe_load_all(sys.stdin):
     if doc is None:
         continue
     if isinstance(doc, dict) and doc.get("kind") == "CustomResourceDefinition":
+        annotations = doc.setdefault("metadata", {}).get("annotations") or {}
+        annotations["argocd.argoproj.io/sync-options"] = "Prune=false,Delete=false"
+        annotations["argocd.argoproj.io/compare-options"] = "IgnoreExtraneous"
+        doc["metadata"]["annotations"] = annotations
         out.append(doc)
 yaml.safe_dump_all(out, sys.stdout, default_flow_style=False, sort_keys=False)
 '
@@ -131,13 +139,12 @@ track_instance() {
 }
 
 filter_crds() {
-  # stdin: rendered manifests; stdout: only CustomResourceDefinition docs (unmodified)
+  # stdin: rendered manifests; stdout: only CustomResourceDefinition docs,
+  # annotated Prune=false,Delete=false + IgnoreExtraneous for ArgoCD
   if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
     python3 -c "${FILTER_CRD_PY}"
-  elif command -v yq >/dev/null 2>&1; then
-    yq eval 'select(.kind == "CustomResourceDefinition")' -
   else
-    die "python3+PyYAML or yq is required to extract CRDs (missing)"
+    die "python3 with PyYAML is required to extract CRDs (missing)"
   fi
 }
 
@@ -340,7 +347,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
     warn "kubectl not available — skipping client-side validation"
   fi
 
-  # --- adoption/ownership assertions (best effort) ------------------------
+  # --- adoption/ownership assertions (fatal: a bundle failing them is broken) -
   validation_ok=1
 
   # Adopted resources carry the ArgoCD v3 tracking-id for the right app.
@@ -390,6 +397,14 @@ if [[ "${DRY_RUN}" != "1" ]]; then
   else
     log "istio CRD manifest: ${istio_crd_count} CustomResourceDefinition(s)"
   fi
+  # ...and every one of them must be protected from ArgoCD pruning.
+  for f in "${ISTIO_CRDS_OUT}" "${CERTMANAGER_CRDS_OUT}"; do
+    if [[ "$(grep -cE '^kind: CustomResourceDefinition$' "${f}" || true)" != \
+          "$(grep -c 'argocd.argoproj.io/sync-options: Prune=false,Delete=false' "${f}" || true)" ]]; then
+      warn "not every CRD in $(basename "${f}") carries argocd.argoproj.io/sync-options: Prune=false,Delete=false"
+      validation_ok=0
+    fi
+  done
 
   # The bootstrap render must contain no Certificate (cert-manager owns it).
   for f in "${ISTIO_APPLY_OUT}" "${HARBOR_OUT}"; do
@@ -400,9 +415,9 @@ if [[ "${DRY_RUN}" != "1" ]]; then
   done
 
   if [[ "${validation_ok}" == "1" ]]; then
-    log "validation OK: tracking-ids present, CRDs/namespaces untracked, no Certificate in bootstrap render"
+    log "validation OK: tracking-ids present, CRDs/namespaces untracked, CRDs prune-protected, no Certificate in bootstrap render"
   else
-    warn "validation failed — review the warnings above"
+    die "bootstrap render validation failed — see the warnings above"
   fi
   log "bootstrap manifests rendered into ${MANIFESTS_OUT} (one-shot resources in ${APPLY_OUT})"
 fi
