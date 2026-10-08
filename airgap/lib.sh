@@ -700,7 +700,7 @@ argocd_crd_gate() {
   # Usage: argocd_crd_gate crds-live|crds-just-deployed — the latter when the
   # caller deployed the CRD files right before (in dry-run that deploy did not
   # happen, so check 2 is skipped).
-  local excl state target synced unprotected problems=()
+  local excl state target synced status unprotected problems=()
   ARGOCD_CRD_HANDOVER=0
   if ! excl="$(remote_kubectl_query "-n teknoir-system get configmap argocd-cm --ignore-not-found -o jsonpath='{.data.resource\\.exclusions}'")"; then
     problems+=("cannot read the live argocd-cm")
@@ -712,13 +712,17 @@ argocd_crd_gate() {
     return 0
   fi
   if [[ "${ARGOCD_CRD_HANDOVER}" == "1" ]]; then
-    if ! state="$(remote_kubectl_query "-n teknoir-system get applications.argoproj.io istio --ignore-not-found -o jsonpath='{.spec.source.targetRevision} {.status.history[-1:].revision}'")"; then
+    # Use the live comparison (.status.sync), not .status.history: going from
+    # istio 0.0.1 to 0.0.2 only drops CRDs that are still excluded, so ArgoCD
+    # reports Synced at 0.0.2 without running a sync and writes no history.
+    if ! state="$(remote_kubectl_query "-n teknoir-system get applications.argoproj.io istio --ignore-not-found -o jsonpath='{.spec.source.targetRevision} {.status.sync.revision} {.status.sync.status}'")"; then
       problems+=("cannot read the ArgoCD Application istio")
     else
-      read -r target synced <<<"${state}" || true
+      read -r target synced status <<<"${state}" || true
       if [[ -n "${target:-}" ]] && ! { version_ge "${target}" "${ISTIO_CRD_FREE_SINCE}" \
-                                        && version_ge "${synced:-}" "${ISTIO_CRD_FREE_SINCE}"; }; then
-        problems+=("CRD hand-over: the istio Application targets istio ${target} and last synced ${synced:-nothing}, but must run istio >= ${ISTIO_CRD_FREE_SINCE} (no CRDs) first: run airgap/update-airgap.sh and wait until istio is Synced")
+                                        && version_ge "${synced:-}" "${ISTIO_CRD_FREE_SINCE}" \
+                                        && [[ "${status:-}" == "Synced" ]]; }; then
+        problems+=("CRD hand-over: the istio Application targets istio ${target} and is ${status:-unknown} at ${synced:-nothing}, but must be Synced at istio >= ${ISTIO_CRD_FREE_SINCE} (no CRDs) first: run airgap/update-airgap.sh and wait until istio is Synced")
       fi
     fi
   fi
