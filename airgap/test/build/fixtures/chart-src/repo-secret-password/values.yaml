@@ -1,0 +1,15 @@
+# The documentation examples upstream charts carry (argo-cd values.yaml,
+# redis-ha values.yaml and README.md). They have no base64 body, so the gate's
+# PEM block matcher must not count them as keys.
+#   githubAppPrivateKey: |
+#     -----BEGIN OPENSSH PRIVATE KEY-----
+#     ...
+#     -----END OPENSSH PRIVATE KEY-----
+# REQUIRED for ssh restore: 'key' should be in one line including CR i.e. '-----BEGIN RSA PRIVATE KEY-----\n...\n...\n...\n-----END RSA PRIVATE KEY-----'
+repository:
+  name: teknoir
+  type: helm
+  url: harbor.teknoir.airgapped/teknoir
+  enableOCI: "true"
+  username: x
+  password: x

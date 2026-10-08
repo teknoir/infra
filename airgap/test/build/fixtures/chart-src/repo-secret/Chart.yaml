@@ -1,0 +1,5 @@
+apiVersion: v2
+name: fixture-repo
+description: Test fixture for the bundle gate. A credential-less ArgoCD repository Secret, as the argo chart renders it.
+type: application
+version: 0.0.1

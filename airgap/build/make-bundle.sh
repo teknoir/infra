@@ -256,10 +256,11 @@ while IFS= read -r -d '' f; do plain_cfg+=("${f}"); done < <(
 for f in "${plain_cfg[@]}"; do
   if grep -qE "PRIVATE KEY|${b64_re}" "${f}"; then gate_fail "private key material in ${f#"${TREE}"/}"; fi
 done
-# Secrets with data in anything the node applies as is
-while IFS= read -r s; do
-  [[ -z "${s}" ]] || gate_fail "Secret with data/stringData in node/oneshot: ${s}"
-done < <(secrets_with_data "${TREE}/node/oneshot/"*.yaml)
+# Secrets with data in anything the node applies as is; the one exception is a
+# credential-less ArgoCD repository Secret for the Harbor chart project
+# (secret_gate in lib-build.sh)
+CHART_REPO="harbor.${TEKNOIR_DOMAIN}/${HARBOR_CHART_PROJECT}"
+secret_gate_report gate_fail "node/oneshot" "${CHART_REPO}" "${TREE}/node/oneshot/"*.yaml
 for f in "${TREE}/node/templates/"*; do
   if grep -qE '^kind:[[:space:]]*Secret[[:space:]]*$' "${f}"; then gate_fail "node/templates/$(basename "${f}") contains a Secret"; fi
 done
@@ -274,8 +275,7 @@ for f in "${WORK}/renders/"*.yaml; do
   if grep -qE "${cred_re}|${cred_b64_re}" "${f}"; then
     gate_warn "the $(basename "${f}" .yaml) render carries a known default credential literal (G-08 territory: fix it in the gitops chart)"
   fi
-  s="$(secrets_with_data "${f}" | tr '\n' ' ')"
-  [[ -z "${s// /}" ]] || gate_warn "the $(basename "${f}" .yaml) render has Secrets with data, applied by ArgoCD from the chart: ${s}"
+  secret_gate_report gate_warn "the $(basename "${f}" .yaml) render (applied by ArgoCD from the chart)" "${CHART_REPO}" "${f}"
 done
 # no credential-like files
 while IFS= read -r -d '' f; do

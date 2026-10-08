@@ -404,14 +404,15 @@ Layout inside teknoir-airgap-<bundleId>/:
     k3s/k3s, k3s/k3s-airgap-images-amd64.tar.zst, k3s/install.sh (pinned to raw.githubusercontent.com/k3s-io/k3s/<K3S_VERSION>/install.sh), k3s/sha256sum-amd64.txt
     templates/                  coredns-custom.yaml.tmpl and registries.yaml.tmpl (NODE_IP and domain substituted at run time); root app-of-apps Application template
     oneshot/platform-secrets.yaml, oneshot/istio-crds.yaml, oneshot/istio.yaml, oneshot/harbor.yaml, oneshot/argo.yaml
-                                pre-rendered from the bundled charts with zero overrides; contain no Secrets with data and no node IP
+                                pre-rendered from the bundled charts with zero overrides; contain no Secrets with data (one exception: the credential-less ArgoCD repository Secret, see "NOT in the bundle") and no node IP
     bootstrap-images/*.tar      single-platform docker archives of the bootstrap tier (istio, harbor, argocd, redis, pause, the platform-secrets Job image), used both for the containerd import and for the crane push to Harbor
     charts/*.tgz, charts/pins.txt
     images/<ref-slug>/          one OCI layout per non-bootstrap image, single platform, written atomically at build (.tmp then mv), no hardlinks
     images/images.lock          ref@sha256 lines
 
 NOT in the bundle:
-- any Secret, private key, password or robot credential (the build gate greps for "PRIVATE KEY", kind: Secret with data/stringData, and known literal credentials);
+- any Secret, private key, password or robot credential (the build gate greps for "PRIVATE KEY", kind: Secret with data/stringData, and known literal credentials).
+  One exception, by design (D3): an ArgoCD repository Secret (label `argocd.argoproj.io/secret-type: repository` or `repo-creds`) whose data/stringData keys are all in {url, type, name, enableOCI, project, insecure} and whose decoded url is `harbor.<domain>/<HARBOR_CHART_PROJECT>` (optionally with `oci://`). It tells ArgoCD where the public chart project is and holds no credential; the argo chart renders it as `teknoir-system/argocd-repo-harbor-teknoir`. Any other key (username, password, sshPrivateKey, tlsClientCert*, githubApp*, bearerToken, ...), another url, or a Secret without that label still fails. The gate prints key names only, never values (not even a non-matching url);
 - per-site mutable state;
 - python;
 - scripts for other environments (copy-cert-secret.sh, deploy-argo.sh).
@@ -538,7 +539,7 @@ M8. CLEAN-UP: once the live env is migrated, delete the migrate subcommand and t
   - host-key mismatch message.
 - Build-gate tests on a real build:
   - MANIFEST verifies, and an unlisted file fails;
-  - no 'PRIVATE KEY', no `kind: Secret` with data/stringData, and no known literal credentials anywhere in the tar;
+  - no 'PRIVATE KEY', no `kind: Secret` with data/stringData apart from the credential-less ArgoCD repository Secret, and no known literal credentials anywhere in the tar (fixtures: airgap/test/build/gate-test.sh);
   - every image in images/ has exactly one linux/amd64 manifest;
   - every image referenced by the rendered charts is in images.lock;
   - the bundle is under 3.5 GB;
@@ -678,7 +679,7 @@ Download into ~/.cache/teknoir-airgap/<tool>-<version>/ through a .tmp file, ver
 
 Render platform-secrets, istio (CRDs split into istio-crds.yaml only for apply ordering), harbor and, until G-07, argo from the bundled chart .tgz with `helm template --include-crds` and NO --set at all; every value must come from the env-branch values (G-01..G-06). Render the root Application from APP_OF_APPS_VERSION and delete the committed root manifest and the lib.sh:223-227 cross-check. Keep __NODE_IP__ and __DOMAIN__ placeholders in the coredns and registries templates for run-time substitution. Delete TRACK_PY, FILTER_CRD_PY, render_split_chart, render_crds_only, 00-teknoir-namespaces, the CRD K3s files, the RELEASED_CHARTS and PINS_FROM_WORKTREE paths and the python3 requirement on the build side, using `yq` from the tool cache or helm's own output split by kind.
 
-**Test:** For every one-shot chart, `diff <(helm template X chart.tgz) oneshot/X.yaml` is empty, so the bootstrap render equals ArgoCD's render. `grep -c 192.168` over node/oneshot is 0. A grep for 'kind: Secret' with data/stringData in oneshot/ finds nothing.
+**Test:** For every one-shot chart, `diff <(helm template X chart.tgz) oneshot/X.yaml` is empty, so the bootstrap render equals ArgoCD's render. `grep -c 192.168` over node/oneshot is 0. A grep for 'kind: Secret' with data/stringData in oneshot/ finds nothing except the credential-less ArgoCD repository Secret of the argo tier.
 
 ### I-05 — teknoir-node converge framework (node-side runner)
 - repo: infra (branch teknoir-local)

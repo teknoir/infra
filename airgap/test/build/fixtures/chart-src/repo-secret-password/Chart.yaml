@@ -1,0 +1,5 @@
+apiVersion: v2
+name: fixture-repo-password
+description: Test fixture for the bundle gate. The same repository Secret with basic-auth credentials, which the gate must refuse.
+type: application
+version: 0.0.1

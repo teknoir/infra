@@ -16,9 +16,11 @@
 # `cat <tier>-crds.yaml <tier>.yaml` is the helm output with the CRDs moved to
 # the front (identical when the chart ships them in crds/).
 #
-# Gates (fatal): no Secret with data/stringData, no PEM private key, no node
-# IP (the coredns/registries templates substitute it at run time), a non-empty
-# render for every tier.
+# Gates (fatal): no Secret with data/stringData (the one exception is a
+# credential-less ArgoCD repository Secret for harbor.<domain>/<project>, see
+# secret_gate in lib-build.sh), no PEM private key header, no node IP (the
+# coredns/registries templates substitute it at run time), a non-empty render
+# for every tier.
 #
 # Usage: render-oneshot.sh --stage DIR --work DIR --site FILE
 set -euo pipefail
@@ -44,6 +46,9 @@ use_build_tools "${WORK}"
 
 NODE_IP="$(site_get "${SITE}" NODE_IP)"
 [[ -n "${NODE_IP}" ]] || die "${SITE} sets no NODE_IP"
+DOMAIN="$(site_get "${SITE}" TEKNOIR_DOMAIN)"
+[[ -n "${DOMAIN}" ]] || die "${SITE} sets no TEKNOIR_DOMAIN"
+CHART_REPO="harbor.${DOMAIN}/${HARBOR_CHART_PROJECT}"
 
 OUT="${STAGE}/node/oneshot"
 [[ ! -e "${OUT}" ]] || rm -rf -- "${OUT:?}"
@@ -56,6 +61,7 @@ printf '%s\n' "${tiers[@]}" > "${OUT}/TIERS"
 [[ "$(sort "${OUT}/TIERS" | uniq -d)" == "" ]] || die "ONESHOT_TIERS lists a tier twice: ${ONESHOT_TIERS}"
 
 bad=0
+tier_fail() { warn "$*"; bad=1; }
 for tier in "${tiers[@]}"; do
   [[ "${tier}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "invalid tier name '${tier}'"
   app_json="$(jq -c --arg t "${tier}" 'select(.app == $t)' "${WORK}/apps.jsonl" | head -1)"
@@ -96,15 +102,17 @@ for tier in "${tiers[@]}"; do
   if [[ -f "${crds}" ]] && ! cmp -s "${full}" <(cat "${crds}" "${rest}"); then order="crds-moved-first"; fi
 
   # --- per-tier gates ---
-  secrets="$(secrets_with_data "${full}")"
-  if [[ -n "${secrets}" ]]; then
-    warn "tier ${tier}: Secrets with data/stringData (secret material must come from platform-secrets / the node, never from a render): $(tr '\n' ' ' <<<"${secrets}")"
-    bad=1
-  fi
-  if grep -lE -- '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' "${full}" >/dev/null; then
-    warn "tier ${tier}: the render contains a PEM private key"
-    bad=1
-  fi
+  # secret material must come from platform-secrets / the node, never from a render
+  secret_gate_report tier_fail "tier ${tier}" "${CHART_REPO}" "${full}"
+  # stricter than the chart scan: the tiers ship verbatim, so any PEM private
+  # key header fails, with or without a body
+  rc=0
+  grep -qE -- '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' "${full}" || rc=$?
+  case "${rc}" in
+    0) tier_fail "tier ${tier}: the render contains a PEM private key header" ;;
+    1) ;;
+    *) tier_fail "tier ${tier}: cannot scan the render (grep rc ${rc})" ;;
+  esac
   if grep -qF -- "${NODE_IP}" "${full}" || grep -qE '(^|[^0-9.])192\.168\.[0-9]+\.[0-9]+' "${full}"; then
     warn "tier ${tier}: the render contains a node/LAN IP address (${NODE_IP} or 192.168.x.x); node IPs are substituted on the node at run time"
     bad=1

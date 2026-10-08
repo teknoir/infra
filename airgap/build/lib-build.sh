@@ -397,19 +397,71 @@ is_immutable_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# YAML helpers (yq from the build tools)
+# Secret gate (yq and jq from the build tools)
 # ---------------------------------------------------------------------------
-secrets_with_data() {
-  # secrets_with_data <yaml-file>... — print ns/name of every Secret that
-  # carries at least one non-empty data or stringData value
-  yq -N '
-    select(.kind == "Secret")
-    | select(
-        (((.data // {}) | to_entries | map(select(.value != null and .value != "")) | length) > 0)
-        or (((.stringData // {}) | to_entries | map(select(.value != null and .value != "")) | length) > 0)
-      )
-    | (.metadata.namespace // "-") + "/" + (.metadata.name // "?")
-  ' "$@" | sort -u
+# Keys a credential-less ArgoCD repository Secret may carry (D3: the Harbor
+# chart project is public, so ArgoCD needs only where, never who).
+ARGOCD_REPO_SECRET_KEYS="url type name enableOCI project insecure"
+
+secret_gate() {
+  # secret_gate <chart-repo> <yaml-file>... — classify every Secret that
+  # carries at least one non-empty data/stringData value. One line each:
+  #   allow <ns>/<name> <why>  an ArgoCD repository/repo-creds Secret
+  #                            (label argocd.argoproj.io/secret-type) whose
+  #                            keys are all in ARGOCD_REPO_SECRET_KEYS and
+  #                            whose url is <chart-repo> (optionally oci://)
+  #   deny <ns>/<name> <why>   every other one
+  # Prints key names, never a value (not even a non-matching url). Fails when
+  # a file does not parse or a data value is not valid base64: an unreadable
+  # Secret must never pass as an empty one.
+  local repo="$1" json out
+  shift
+  (( $# > 0 )) || return 0
+  json="$(yq -o=json -I=0 'select(.kind == "Secret")' "$@")" || die "secret_gate: cannot parse $*"
+  [[ -n "${json}" ]] || return 0
+  out="$(jq -r --arg repo "${repo}" --arg allowed "${ARGOCD_REPO_SECRET_KEYS}" '
+    def nonempty: map(select(.value != null and .value != ""));
+    . as $s
+    | ((($s.data // {}) | to_entries | map(.value |= (if . == null then null else (tostring | @base64d) end)))
+       + (($s.stringData // {}) | to_entries | map(.value |= (if . == null then null else tostring end)))) as $all
+    | select(($all | nonempty | length) > 0)
+    | "\($s.metadata.namespace // "-")/\($s.metadata.name // "?")" as $id
+    | ($s.metadata.labels["argocd.argoproj.io/secret-type"] // "") as $type
+    | ($all | map(.key) | unique) as $keys
+    | ($keys - ($allowed | split(" "))) as $extra
+    | ($all | map(select(.key == "url") | .value)) as $urls
+    | if ($type == "repository" or $type == "repo-creds") then
+        if ($extra | length) > 0 then
+          "deny \($id) ArgoCD \($type) Secret with keys beyond the credential-less set: \($extra | join(","))"
+        elif ($urls | length) == 0 then
+          "deny \($id) ArgoCD \($type) Secret without url"
+        elif ($urls | all(. == $repo or . == "oci://" + $repo)) | not then
+          "deny \($id) ArgoCD \($type) Secret whose url is not \($repo)"
+        else
+          "allow \($id) credential-less ArgoCD \($type) Secret for \($repo) (keys: \($keys | join(",")))"
+        end
+      else
+        "deny \($id) Secret with data/stringData (keys: \($keys | join(",")))"
+      end
+  ' <<<"${json}" 2>/dev/null)" \
+    || die "secret_gate: a Secret in $* does not decode (data must be base64; jq's own message would quote the value, so it is not shown)"
+  [[ -z "${out}" ]] || LC_ALL=C sort -u <<<"${out}"
+}
+
+secret_gate_report() {
+  # secret_gate_report <fail-fn> <label> <chart-repo> <yaml-file>... — run
+  # secret_gate, log the allowed Secrets and pass each denied one to
+  # <fail-fn> (gate_fail, gate_warn, ...) as one message
+  local fail="$1" label="$2" repo="$3" verdicts verdict id why
+  shift 3
+  verdicts="$(secret_gate "${repo}" "$@")"
+  [[ -n "${verdicts}" ]] || return 0
+  while read -r verdict id why; do
+    case "${verdict}" in
+      allow) log "${label}: ${id}: ${why}" ;;
+      *) "${fail}" "${label}: ${id}: ${why}" ;;
+    esac
+  done <<<"${verdicts}"
 }
 
 # ---------------------------------------------------------------------------
