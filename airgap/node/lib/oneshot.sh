@@ -195,6 +195,15 @@ oneshot_reinject_auto_pods() {
   done <<<"${pods}"
 }
 
+oneshot_injector_ready() {
+  # every webhook of each MutatingWebhookConfiguration that injects the Istio
+  # sidecar (name istio-sidecar-injector*) has a CA bundle, patched in by istiod
+  local out
+  out="$(kc get mutatingwebhookconfigurations.admissionregistration.k8s.io -o json)" || return 1
+  "${ONESHOT_JQ}" -e '[.items[] | select(.metadata.name | startswith("istio-sidecar-injector"))] as $w
+      | ($w | length) > 0 and all($w[].webhooks[]; (.clientConfig.caBundle // "") != "")' <<<"${out}" >/dev/null
+}
+
 oneshot_crds_established() {
   local n s
   for n in "$@"; do
@@ -232,7 +241,7 @@ oneshot_tier() {
   # oneshot_tier <tier> <namespace> <force 0|1>
   local tier="$1" ns="$2" force="$3"
   local main="${NODE_ROOT}/oneshot/${tier}.yaml" crds_file="${NODE_ROOT}/oneshot/${tier}-crds.yaml"
-  local split crds rest list objs line kind jns jname crd_names
+  local split crds rest list objs line kind jns jname crd_names early late
   [[ -f "${main}" ]] || die "missing ${main}"
   if oneshot_k3s_owned "${tier}"; then
     [[ "${force}" != "1" ]] || die "--reapply ${tier}: refused, the K3s file ${ONESHOT_K3S_FILE} still owns this tier (detach it first, DESIGN M7)"
@@ -275,14 +284,25 @@ oneshot_tier() {
   [[ -z "${line}" ]] || log "tier ${tier}: namespace ${ns} set (as ArgoCD would) on: ${line}"
   rest="$("${ONESHOT_JQ}" -c '.apply' <<<"${objs}")"
   [[ "$("${ONESHOT_JQ}" 'length' <<<"${rest}")" != "0" ]] || { log "tier ${tier}: nothing to apply"; return 0; }
-  list="$("${ONESHOT_JQ}" -c '{apiVersion: "v1", kind: "List", items: .}' <<<"${rest}")"
+  # Deployments whose pods take their image from istiod's injection webhook
+  # (image "auto": the Istio gateways) come last, once istiod runs and its
+  # webhook has a CA bundle: a pod created before that keeps "auto" for good
+  # (ErrImagePull)
+  early="$("${ONESHOT_JQ}" -c '[.[] | select((.kind == "Deployment" and any(.spec.template.spec.containers[]?; .image == "auto")) | not)]' <<<"${rest}")"
+  late="$("${ONESHOT_JQ}" -c '[.[] | select(.kind == "Deployment" and any(.spec.template.spec.containers[]?; .image == "auto"))]' <<<"${rest}")"
+  list="$("${ONESHOT_JQ}" -c '{apiVersion: "v1", kind: "List", items: .}' <<<"${early}")"
+  oneshot_converge "${tier}" "${list}" "${early}"
+  if [[ "$("${ONESHOT_JQ}" 'length' <<<"${late}")" != "0" ]]; then
+    if "${ONESHOT_JQ}" -e 'any(.[]; .kind == "Deployment" and .metadata.name == "istiod")' <<<"${early}" >/dev/null; then
+      wait_for "Deployment istio-system/istiod to roll out" "${ONESHOT_TIMEOUT}" oneshot_rolled_out istio-system deployment istiod
+      wait_for "istiod's injection webhook to get its CA bundle" 300 oneshot_injector_ready
+    fi
+    list="$("${ONESHOT_JQ}" -c '{apiVersion: "v1", kind: "List", items: .}' <<<"${late}")"
+    oneshot_converge "${tier} (injected Deployments)" "${list}" "${late}"
+  fi
 
-  oneshot_converge "${tier}" "${list}" "${rest}"
-
-  # 3. wait until the tier runs. Istio gateways use image "auto", which
-  # istiod's injection webhook fills in when the pod is created; a gateway pod
-  # created before istiod answered keeps "auto" for good (ImagePullBackOff), so
-  # once istiod is up such pods are re-created.
+  # 3. wait until the tier runs. A pod left with image "auto" by an earlier,
+  # interrupted run is re-created now that istiod answers.
   if "${ONESHOT_JQ}" -e 'any(.[]; .kind == "Deployment" and .metadata.name == "istiod")' <<<"${rest}" >/dev/null; then
     wait_for "Deployment istio-system/istiod to roll out" "${ONESHOT_TIMEOUT}" oneshot_rolled_out istio-system deployment istiod
     oneshot_reinject_auto_pods
