@@ -180,6 +180,21 @@ oneshot_scope_map() {
   rm -rf "${tmp}"
 }
 
+oneshot_reinject_auto_pods() {
+  # Delete pods that still carry the injection placeholder image "auto": their
+  # ReplicaSet re-creates them and istiod's webhook injects the real image.
+  local pods ns name
+  pods="$(kc get pods -A -o json | "${ONESHOT_JQ}" -r '.items[]
+      | select(any(.spec.containers[]?; .image == "auto")) | "\(.metadata.namespace) \(.metadata.name)"')" \
+    || die "cannot list pods for the injection check"
+  while read -r ns name; do
+    [[ -n "${name}" ]] || continue
+    if dry_run; then log "[dry-run] would re-create pod ${ns}/${name} (image \"auto\" was never injected)"; continue; fi
+    kc -n "${ns}" delete pod "${name}" --wait=false >/dev/null || die "cannot delete pod ${ns}/${name}"
+    changed "re-created pod ${ns}/${name}: it was created before istiod could inject its proxy image"
+  done <<<"${pods}"
+}
+
 oneshot_crds_established() {
   local n s
   for n in "$@"; do
@@ -264,7 +279,14 @@ oneshot_tier() {
 
   oneshot_converge "${tier}" "${list}" "${rest}"
 
-  # 3. wait until the tier runs
+  # 3. wait until the tier runs. Istio gateways use image "auto", which
+  # istiod's injection webhook fills in when the pod is created; a gateway pod
+  # created before istiod answered keeps "auto" for good (ImagePullBackOff), so
+  # once istiod is up such pods are re-created.
+  if "${ONESHOT_JQ}" -e 'any(.[]; .kind == "Deployment" and .metadata.name == "istiod")' <<<"${rest}" >/dev/null; then
+    wait_for "Deployment istio-system/istiod to roll out" "${ONESHOT_TIMEOUT}" oneshot_rolled_out istio-system deployment istiod
+    oneshot_reinject_auto_pods
+  fi
   while read -r kind jns jname; do
     [[ -n "${jname}" ]] || continue
     wait_for "${kind} ${jns}/${jname} to roll out" "${ONESHOT_TIMEOUT}" oneshot_rolled_out "${jns}" "${kind,,}" "${jname}"
