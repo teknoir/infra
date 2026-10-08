@@ -49,20 +49,116 @@ bundle_dir() {
   echo "${BUNDLE_DIR:-${REPO_ROOT}/bundle/teknoir-airgap-bundle-${BUNDLE_VERSION}}"
 }
 
-# Print "name version dir" for every chart that ships in the bundle
-# (all GitOps charts + the infra argo chart).
-all_charts() {
-  local entry name version
+# Chart pins (versions.env), one "name version" entry each:
+#   GITOPS_CHARTS + INFRA_CHARTS  built from a working tree (collect-charts.sh)
+#   RELEASED_CHARTS               already in Harbor, never rebuilt
+built_charts() {
+  # print "name version dir" for every chart collect-charts.sh packages
+  local entry
   for entry in "${GITOPS_CHARTS[@]}"; do
-    name="${entry%% *}"
-    version="${entry##* }"
-    echo "${name} ${version} ${GITOPS_REPO_DIR}/charts/${name}"
+    echo "${entry} ${GITOPS_REPO_DIR}/charts/${entry%% *}"
   done
   for entry in "${INFRA_CHARTS[@]}"; do
-    name="${entry%% *}"
-    version="${entry##* }"
-    echo "${name} ${version} ${REPO_ROOT}/charts/${name}"
+    echo "${entry} ${REPO_ROOT}/charts/${entry%% *}"
   done
+}
+
+released_charts() {
+  # print "name version" for every released (not rebuilt) chart
+  local entry
+  for entry in ${RELEASED_CHARTS[@]+"${RELEASED_CHARTS[@]}"}; do
+    echo "${entry}"
+  done
+}
+
+pinned_charts() {
+  # print "name version" for every pinned chart (built + released)
+  built_charts | awk '{print $1, $2}'
+  released_charts
+}
+
+pinned_version() {
+  # pinned_version <name> — the pinned version of <name>, empty if not pinned
+  # (no early exit: under pipefail the writer's SIGPIPE would fail the caller)
+  pinned_charts | awk -v n="$1" '$1 == n && !f {print $2; f = 1}'
+}
+
+chart_dir_version() {
+  # chart_dir_version <dir> — the version in <dir>/Chart.yaml, empty if none
+  awk '/^version:/{print $2; exit}' "$1/Chart.yaml" 2>/dev/null || true
+}
+
+chart_source() {
+  # chart_source <name> <version> — what to render for a pin: the bundle's
+  # <name>-<version>.tgz (exactly what is pushed to Harbor), else the working
+  # tree dir whose Chart.yaml carries <version>. Non-zero when neither exists
+  # (a released chart whose .tgz is not in the bundle).
+  local name="$1" version="$2" dir
+  if [[ -f "$(bundle_dir)/charts/${name}-${version}.tgz" ]]; then
+    echo "$(bundle_dir)/charts/${name}-${version}.tgz"
+    return 0
+  fi
+  for dir in "${GITOPS_REPO_DIR}/charts/${name}" "${REPO_ROOT}/charts/${name}"; do
+    if [[ "$(chart_dir_version "${dir}")" == "${version}" ]]; then
+      echo "${dir}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+require_gitops_branch() {
+  # Refuse to build from a GitOps checkout on another branch (e.g. staging).
+  local branch
+  [[ "${GITOPS_ALLOW_ANY_BRANCH:-0}" == "1" ]] && return 0
+  branch="$(git -C "${GITOPS_REPO_DIR}" rev-parse --abbrev-ref HEAD 2>/dev/null)" \
+    || die "${GITOPS_REPO_DIR} is not a git checkout (set GITOPS_REPO_DIR)"
+  [[ "${branch}" == "${GITOPS_BRANCH}" ]] \
+    || die "${GITOPS_REPO_DIR} is on branch '${branch}', not '${GITOPS_BRANCH}' — set GITOPS_REPO_DIR to a ${GITOPS_BRANCH} checkout (or GITOPS_ALLOW_ANY_BRANCH=1)"
+}
+
+check_app_of_apps_pins() {
+  # check_app_of_apps_pins — fail unless versions.env pins exactly the chart
+  # versions the pinned app-of-apps deploys, and the root manifest
+  # (teknoir-local-app-of-apps.yaml) pins that app-of-apps version.
+  local version src root_rev apps app chart rev pinned bad=0
+  version="$(pinned_version app-of-apps)"
+  [[ -n "${version}" ]] || die "app-of-apps is not pinned in versions.env"
+  src="$(chart_source app-of-apps "${version}")" || die "no source for app-of-apps ${version}"
+  root_rev="$(awk '/^[[:space:]]*targetRevision:/{print $2; exit}' "${REPO_ROOT}/teknoir-local-app-of-apps.yaml" 2>/dev/null || true)"
+  if [[ "${root_rev}" != "${version}" ]]; then
+    warn "teknoir-local-app-of-apps.yaml pins app-of-apps ${root_rev:-<none>}, versions.env ${version}"
+    bad=1
+  fi
+  apps="$(helm_template_chart app-of-apps "${src}" | python3 -c '
+import sys, yaml
+for d in yaml.safe_load_all(sys.stdin):
+    if not d or d.get("kind") != "Application":
+        continue
+    spec = d.get("spec", {})
+    sources = spec.get("sources") or [spec.get("source") or {}]
+    for s in sources:
+        print(d["metadata"]["name"], s.get("chart") or "-", s.get("targetRevision") or "-")
+')" || die "cannot render app-of-apps ${version}"
+  while read -r app chart rev; do
+    [[ -n "${app}" ]] || continue
+    if [[ "${chart}" == "-" ]]; then
+      warn "app-of-apps ${version}: Application ${app} has no chart source (not checked)"
+      continue
+    fi
+    pinned="$(pinned_version "${chart}")"
+    if [[ "${pinned}" != "${rev}" ]]; then
+      warn "app-of-apps ${version} deploys ${chart} ${rev}, versions.env pins ${pinned:-nothing}"
+      bad=1
+    fi
+  done <<<"${apps}"
+  while read -r chart rev; do
+    [[ "${chart}" == "app-of-apps" || "${chart}" == "argo" ]] && continue
+    awk -v c="${chart}" '$2 == c {f=1} END {exit !f}' <<<"${apps}" \
+      || warn "${chart} ${rev} is pinned but app-of-apps ${version} does not deploy it"
+  done < <(pinned_charts)
+  (( bad == 0 )) || die "versions.env does not match app-of-apps ${version} (see above)"
+  log "versions.env matches app-of-apps ${version} ($(grep -c . <<<"${apps}") Applications)"
 }
 
 # Namespace a chart is installed into (bootstrap + gitops conventions).
@@ -181,13 +277,18 @@ helm_template_chart() {
   return $rc
 }
 
-# Ensure a chart's dependencies are vendored (charts/*.tgz present).
+# Ensure a chart dir's dependencies are vendored (charts/*.tgz present).
 # Falls back to `helm dependency update` when the lock file is missing/stale.
 helm_dep_build() {
   local dir="$1"
-  if grep -q '^dependencies:' "${dir}/Chart.yaml" 2>/dev/null; then
-    (cd "${dir}" && { helm dependency build >/dev/null 2>&1 || helm dependency update >/dev/null; })
+  [[ -d "${dir}" ]] || return 0   # packaged .tgz: dependencies are inside
+  grep -q '^dependencies:' "${dir}/Chart.yaml" 2>/dev/null || return 0
+  # Already vendored at the declared versions: nothing to fetch (works offline).
+  if helm dependency list "${dir}" 2>/dev/null \
+       | awk 'NR > 1 && NF {n++; if ($NF != "ok") bad = 1} END {exit (bad || !n)}'; then
+    return 0
   fi
+  (cd "${dir}" && { helm dependency build >/dev/null 2>&1 || helm dependency update >/dev/null; })
 }
 
 # Sanitize an image reference into a filesystem-friendly name

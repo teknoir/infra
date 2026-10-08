@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # verify-offline.sh — offline-readiness verification (plan §8):
 #   1. bash -n every airgap/ + scripts/ shell script
-#   2. helm template every chart (infra argo + gitops charts) and grep the
-#      rendered output for internet dependencies
+#   2. helm template every pinned chart version (versions.env; bundle .tgz,
+#      else the working tree at that version) and grep the rendered output for
+#      internet dependencies
 #      (teknoir.cloud | github.com | storage.googleapis.com | ghcr creds)
-#      => zero hits per chart = pass
+#      => zero hits per chart = pass; and check that versions.env pins exactly
+#      what the pinned app-of-apps deploys
 #   3. optional (--live): diff the images running in the cluster against the
 #      bundle image list (via KUBECONFIG kubectl, or ssh to $TEKNOIR_HOST)
 #
@@ -88,9 +90,9 @@ require_cmd helm
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
 
-while read -r name version dir; do
-  if [[ ! -d "${dir}" ]]; then
-    fail "chart missing: ${name} (${dir})"
+while read -r name version; do
+  if ! dir="$(chart_source "${name}" "${version}")"; then
+    warn "skipped: released ${name}-${version} has no .tgz in the bundle (must already be in Harbor)"
     continue
   fi
   helm_dep_build "${dir}" 2>/dev/null || warn "dependency build failed for ${name} (offline?)"
@@ -110,7 +112,10 @@ while read -r name version dir; do
     fail "${name}-${version}: ${hits} internet reference(s):"
     head -10 "${tmpdir}/${name}.hits" >&2
   fi
-done < <(all_charts)
+done < <(pinned_charts)
+
+# versions.env must pin exactly what the pinned app-of-apps deploys.
+( check_app_of_apps_pins ) || fail "versions.env does not match the pinned app-of-apps"
 
 # ---------------------------------------------------------------------------
 # 3. optional live-cluster image diff

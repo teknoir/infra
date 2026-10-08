@@ -4,7 +4,7 @@
 #   <bundle>/bootstrap/manifests/00-teknoir-istio-crds.yaml       (istio CRDs, untracked)
 #   <bundle>/bootstrap/manifests/05-teknoir-certmanager-crds.yaml (cert-manager CRDs, untracked)
 #   <bundle>/bootstrap/manifests/teknoir-argo.yaml                (infra charts/argo)
-#   <bundle>/bootstrap/apply/harbor.yaml                          (gitops charts/harbor, one-shot apply -> adopted by ArgoCD)
+#   <bundle>/bootstrap/apply/harbor.yaml                          (harbor chart, one-shot apply -> adopted by ArgoCD)
 #   <bundle>/bootstrap/manifests/teknoir-app-of-apps.yaml         (copy of teknoir-local-app-of-apps.yaml)
 #   <bundle>/bootstrap/apply/istio.yaml                           (istio resources, one-shot apply -> adopted by ArgoCD)
 #   <bundle>/bootstrap/k3s/registries.yaml                        (K3s registry mirrors -> Harbor)
@@ -19,6 +19,12 @@
 # annotation nor the instance label to them, so no ArgoCD app can prune them;
 # they are split into their own untracked manifests.
 #
+# Charts are rendered at their PINNED versions (versions.env): from the
+# bundle's packaged .tgz, else the working tree at exactly that version. A
+# released chart without a source (harbor) is left out, so this bundle cannot
+# do a first bootstrap; the working tree's newer version is never used.
+#
+# CRDs are annotated so that ArgoCD never prunes or deletes them.
 # Files under manifests/ carry their K3s manifests-dir name (the canonical,
 # single-owner name; see lib.sh:k3s_canonical_name).
 #
@@ -167,9 +173,9 @@ EOF
 }
 
 render_chart_manifest() {
-  # render_chart_manifest <chart-name> <chart-dir> <out-file> [tracking-app]
+  # render_chart_manifest <chart-name> <chart-dir|tgz> <out-file> [tracking-app]
   local name="$1" dir="$2" out="$3" app="${4:-}"
-  [[ -d "${dir}" ]] || die "chart directory not found: ${dir}"
+  [[ -e "${dir}" ]] || die "chart not found: ${dir}"
   if [[ "${DRY_RUN}" == "1" ]]; then
     log "[dry-run] helm template ${name} ${dir} -> ${out}${app:+ (track app.kubernetes.io/instance=${app} + argocd.argoproj.io/tracking-id)}"
     return 0
@@ -188,9 +194,9 @@ render_chart_manifest() {
 # remaining resources (no CustomResourceDefinition, no Namespace) are one-shot
 # applied and later adopted by the ArgoCD `istio` Application.
 render_split_chart() {
-  # render_split_chart <chart-name> <chart-dir> <crds-out> <resources-out> <tracking-app>
+  # render_split_chart <chart-name> <chart-dir|tgz> <crds-out> <resources-out> <tracking-app>
   local name="$1" dir="$2" crds_out="$3" resources_out="$4" app="$5" tmp
-  [[ -d "${dir}" ]] || die "chart directory not found: ${dir}"
+  [[ -e "${dir}" ]] || die "chart not found: ${dir}"
   if [[ "${DRY_RUN}" == "1" ]]; then
     log "[dry-run] helm template ${name} ${dir} -> split ${crds_out} (CRDs, untracked) + ${resources_out} (tracked)"
     return 0
@@ -206,9 +212,9 @@ render_split_chart() {
 
 # Render only the CRDs of a chart (untracked, K3s-owned).
 render_crds_only() {
-  # render_crds_only <chart-name> <chart-dir> <crds-out>
+  # render_crds_only <chart-name> <chart-dir|tgz> <crds-out>
   local name="$1" dir="$2" crds_out="$3" tmp
-  [[ -d "${dir}" ]] || die "chart directory not found: ${dir}"
+  [[ -e "${dir}" ]] || die "chart not found: ${dir}"
   if [[ "${DRY_RUN}" == "1" ]]; then
     log "[dry-run] helm template ${name} ${dir} --include-crds -> CRDs only (${crds_out})"
     return 0
@@ -247,10 +253,32 @@ if [[ "${DRY_RUN}" != "1" ]]; then
   : > "${ISTIO_APPLY_OUT}"
 fi
 
-render_split_chart "istio"        "${GITOPS_REPO_DIR}/charts/istio"         "${ISTIO_CRDS_OUT}" "${ISTIO_APPLY_OUT}" "istio"
-render_crds_only   "cert-manager" "${GITOPS_REPO_DIR}/charts/cert-manager"  "${CERTMANAGER_CRDS_OUT}"
-render_chart_manifest "argo"      "${REPO_ROOT}/charts/argo"                "${ARGO_OUT}"
-render_chart_manifest "harbor"    "${GITOPS_REPO_DIR}/charts/harbor"        "${HARBOR_OUT}" "harbor"
+# Render the PINNED chart versions (versions.env), never whatever the working
+# tree happens to carry: the bundle's packaged .tgz (what ArgoCD will render
+# from Harbor), else the working-tree dir at exactly that version.
+pinned_source() {
+  # pinned_source <name> — chart source for the pinned version of <name>
+  local version
+  version="$(pinned_version "$1")"
+  [[ -n "${version}" ]] || die "$1 is not pinned in versions.env"
+  chart_source "$1" "${version}"
+}
+
+for c in istio cert-manager argo; do
+  pinned_source "${c}" >/dev/null || die "no source for pinned ${c} $(pinned_version "${c}") (run collect-charts.sh)"
+done
+render_split_chart "istio"        "$(pinned_source istio)"        "${ISTIO_CRDS_OUT}" "${ISTIO_APPLY_OUT}" "istio"
+render_crds_only   "cert-manager" "$(pinned_source cert-manager)" "${CERTMANAGER_CRDS_OUT}"
+render_chart_manifest "argo"      "$(pinned_source argo)"         "${ARGO_OUT}"
+# A released harbor without its .tgz in the bundle cannot be rendered: leave
+# harbor.yaml out (bootstrap-airgap.sh then refuses a first bootstrap) rather
+# than render the working tree's newer, undeployed version.
+if harbor_src="$(pinned_source harbor)"; then
+  render_chart_manifest "harbor" "${harbor_src}" "${HARBOR_OUT}" "harbor"
+else
+  warn "no source for pinned harbor $(pinned_version harbor): bootstrap/apply/harbor.yaml left out — this bundle can update a running cluster but not bootstrap a new one (put harbor-$(pinned_version harbor).tgz into $(bundle_dir)/charts/ to enable)"
+  run rm -f "${HARBOR_OUT}"
+fi
 
 # ---------------------------------------------------------------------------
 # teknoir-app-of-apps.yaml (root Application)
@@ -347,13 +375,15 @@ if [[ "${DRY_RUN}" != "1" ]]; then
 
   # --- adoption/ownership assertions (fatal: a bundle failing them is broken) -
   validation_ok=1
+  adopted_outs=("${ISTIO_APPLY_OUT}")
+  [[ -f "${HARBOR_OUT}" ]] && adopted_outs+=("${HARBOR_OUT}")
 
   # Adopted resources carry the ArgoCD v3 tracking-id for the right app.
   if ! grep -q 'argocd.argoproj.io/tracking-id: istio:' "${ISTIO_APPLY_OUT}"; then
     warn "no istio tracking-id found in $(basename "${ISTIO_APPLY_OUT}")"
     validation_ok=0
   fi
-  if ! grep -q 'argocd.argoproj.io/tracking-id: harbor:' "${HARBOR_OUT}"; then
+  if [[ -f "${HARBOR_OUT}" ]] && ! grep -q 'argocd.argoproj.io/tracking-id: harbor:' "${HARBOR_OUT}"; then
     warn "no harbor tracking-id found in $(basename "${HARBOR_OUT}")"
     validation_ok=0
   fi
@@ -364,7 +394,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
   fi
 
   # Adopted resources must exclude CRDs and Namespaces (they are split out).
-  for f in "${ISTIO_APPLY_OUT}" "${HARBOR_OUT}"; do
+  for f in "${adopted_outs[@]}"; do
     if grep -qE '^kind: (CustomResourceDefinition|Namespace)$' "${f}"; then
       warn "$(basename "${f}") must not contain CustomResourceDefinition or Namespace"
       validation_ok=0
@@ -405,7 +435,7 @@ if [[ "${DRY_RUN}" != "1" ]]; then
   done
 
   # The bootstrap render must contain no Certificate (cert-manager owns it).
-  for f in "${ISTIO_APPLY_OUT}" "${HARBOR_OUT}"; do
+  for f in "${adopted_outs[@]}"; do
     if grep -qE '^kind: Certificate$' "${f}"; then
       warn "bootstrap render must not contain Certificate: $(basename "${f}")"
       validation_ok=0

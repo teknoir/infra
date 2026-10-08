@@ -8,7 +8,11 @@
 #      matches the credential in airgap/.secrets/robot-argocd.env — generated
 #      once, never rotated implicitly — and regenerate the ArgoCD repo secret
 #      manifest from it (scripts/gen-argocd-harbor-repo-secret.sh)
-#   3. helm push every chart from <bundle>/charts to oci://harbor/teknoir
+#   3. push every pinned chart version (versions.env) from <bundle>/charts to
+#      oci://harbor/teknoir that Harbor does not have yet. An existing version
+#      is never overwritten (OCI tags are mutable: on 2026-09-14 re-pushes
+#      silently changed app-of-apps 0.0.1/0.0.2), and a tag-immutability rule
+#      on the project enforces that server-side
 #   4. crane push every OCI image layout from <bundle>/images into the mirror
 #      projects (docker.io/* -> dockerhub/*, ghcr.io/* -> ghcr/*, ...)
 #
@@ -17,7 +21,7 @@
 # Re-running is safe: projects, robot and credential converge to the same state.
 #
 # Usage: airgap/push-to-harbor.sh [--bundle DIR] [--robot-only] [--rotate-robot]
-#                                 [--insecure] [--dry-run]
+#                                 [--force-charts] [--insecure] [--dry-run]
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -32,6 +36,8 @@ Options:
                  manifest (no charts/images; no bundle needed)
   --rotate-robot generate a NEW robot secret (then redeploy the ArgoCD secret
                  with scripts/deploy-secrets.sh)
+  --force-charts also push chart versions Harbor already has (refused while the
+                 teknoir tag-immutability rule is enabled; bump versions instead)
   --insecure     skip TLS verification instead of using teknoir-root-ca.crt
   --dry-run      print planned actions, no network calls
   -h, --help     show this help
@@ -44,12 +50,14 @@ EOF
 INSECURE=0
 ROBOT_ONLY=0
 ROTATE_ROBOT=0
+FORCE_CHARTS=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bundle) BUNDLE_DIR="$2"; shift ;;
     --robot-only) ROBOT_ONLY=1 ;;
     --rotate-robot) ROTATE_ROBOT=1 ;;
+    --force-charts) FORCE_CHARTS=1 ;;
     --insecure) INSECURE=1 ;;
     --dry-run) DRY_RUN=1 ;;
     -h|--help) usage; exit 0 ;;
@@ -110,11 +118,14 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   log "[dry-run] would ensure robot account ${ROBOT_FULL_NAME} (pull on all projects) matches ${ROBOT_ENV_FILE}$( [[ "${ROTATE_ROBOT}" == "1" ]] && echo ' (ROTATED)')"
   log "[dry-run] would regenerate .secrets/manifest-argocd-harbor-repo-secret.yaml"
   [[ "${ROBOT_ONLY}" == "1" ]] && { log "dry-run complete (--robot-only)"; exit 0; }
-  shopt -s nullglob
-  for tgz in "${BUNDLE}/charts/"*.tgz; do
-    log "[dry-run] helm push ${tgz} oci://${HARBOR_HOST}/${HARBOR_CHART_PROJECT}"
-  done
-  shopt -u nullglob
+  log "[dry-run] would ensure the tag-immutability rule (all repositories, all tags) on ${HARBOR_CHART_PROJECT}"
+  while read -r name version; do
+    if [[ -f "${BUNDLE}/charts/${name}-${version}.tgz" ]]; then
+      log "[dry-run] helm push ${name}-${version}.tgz -> oci://${HARBOR_HOST}/${HARBOR_CHART_PROJECT} unless Harbor has it$( [[ "${FORCE_CHARTS}" == "1" ]] && echo ' (--force-charts: push anyway)')"
+    else
+      log "[dry-run] ${name} ${version} is not in the bundle: must already be in Harbor"
+    fi
+  done < <(pinned_charts)
   if [[ -f "${BUNDLE}/images/images.txt" ]]; then
     while read -r ref name; do
       [[ -n "${ref}" ]] || continue
@@ -287,22 +298,79 @@ if [[ "${ROBOT_ONLY}" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Charts -> oci://harbor/teknoir
+# 3. Charts -> oci://harbor/teknoir: each pinned version is pushed once
 # ---------------------------------------------------------------------------
+# Tag immutability on the chart project (all repositories, all tags), so no
+# client can overwrite a released chart version. Created once; a rule an
+# operator disabled is reported and left alone.
+project_id="$(api GET "/projects?name=${HARBOR_CHART_PROJECT}&page_size=100" | python3 -c '
+import json, sys
+for p in json.load(sys.stdin) or []:
+    if p.get("name") == sys.argv[1]:
+        print(p["project_id"])
+        break' "${HARBOR_CHART_PROJECT}")"
+[[ -n "${project_id}" ]] || die "Harbor project ${HARBOR_CHART_PROJECT} not found"
+immutable_state="$(api GET "/projects/${project_id}/immutabletagrules" | python3 -c '
+import json, sys
+state = "absent"
+for r in json.load(sys.stdin) or []:
+    tags = r.get("tag_selectors") or []
+    repos = (r.get("scope_selectors") or {}).get("repository") or []
+    if any(t.get("decoration") == "matches" and t.get("pattern") == "**" for t in tags) and \
+       any(s.get("decoration") == "repoMatches" and s.get("pattern") == "**" for s in repos):
+        state = "disabled" if r.get("disabled") else "enabled"
+        if state == "enabled":
+            break
+print(state)')"
+case "${immutable_state}" in
+  enabled) log "tag immutability rule on ${HARBOR_CHART_PROJECT}: enabled" ;;
+  disabled) warn "the tag immutability rule on ${HARBOR_CHART_PROJECT} is DISABLED; left as is (re-enable it in Harbor: Projects > ${HARBOR_CHART_PROJECT} > Policy)" ;;
+  *)
+    log "creating the tag immutability rule on ${HARBOR_CHART_PROJECT} (all repositories, all tags)"
+    api POST "/projects/${project_id}/immutabletagrules" \
+      '{"disabled":false,"action":"immutable","template":"immutable_template","tag_selectors":[{"kind":"doublestar","decoration":"matches","pattern":"**"}],"scope_selectors":{"repository":[{"kind":"doublestar","decoration":"repoMatches","pattern":"**"}]}}' >/dev/null
+    ;;
+esac
+
 log "helm registry login ${HARBOR_HOST}"
 printf '%s' "${HARBOR_ADMIN_PASSWORD}" \
   | helm registry login "${HARBOR_HOST}" --username admin --password-stdin "${HELM_TLS[@]}"
 
-shopt -s nullglob
-chart_tgzs=("${BUNDLE}/charts/"*.tgz)
-shopt -u nullglob
-if [[ ${#chart_tgzs[@]} -eq 0 ]]; then
-  warn "no charts in ${BUNDLE}/charts/ (run collect-charts.sh)"
-fi
-for tgz in "${chart_tgzs[@]}"; do
+# Check every pin first, so nothing is pushed when one cannot be satisfied.
+to_push=()
+while read -r name version; do
+  tgz="${BUNDLE}/charts/${name}-${version}.tgz"
+  status="$(api_status GET "/projects/${HARBOR_CHART_PROJECT}/repositories/${name}/artifacts/${version}")"
+  case "${status}" in
+    200)
+      if [[ "${FORCE_CHARTS}" != "1" ]]; then
+        log "chart ${name}:${version} already in Harbor — not pushed (Harbor's copy wins)"
+        continue
+      fi
+      [[ -f "${tgz}" ]] || die "--force-charts: ${tgz} not in the bundle"
+      warn "--force-charts: will overwrite ${name}:${version} in Harbor"
+      ;;
+    404)
+      [[ -f "${tgz}" ]] || die "chart ${name}:${version} is pinned but neither in Harbor nor in ${BUNDLE}/charts/"
+      ;;
+    *) die "cannot check ${name}:${version} in Harbor (HTTP ${status})" ;;
+  esac
+  to_push+=("${tgz}")
+done < <(pinned_charts)
+
+for tgz in ${to_push[@]+"${to_push[@]}"}; do
   log "helm push $(basename "${tgz}")"
-  helm push "${tgz}" "oci://${HARBOR_HOST}/${HARBOR_CHART_PROJECT}" "${HELM_TLS[@]}" >/dev/null
+  helm push "${tgz}" "oci://${HARBOR_HOST}/${HARBOR_CHART_PROJECT}" "${HELM_TLS[@]}" >/dev/null \
+    || die "helm push $(basename "${tgz}") failed (an existing tag is immutable: bump the chart version instead)"
 done
+
+shopt -s nullglob
+for tgz in "${BUNDLE}/charts/"*.tgz; do
+  base="$(basename "${tgz}" .tgz)"
+  pinned_charts | awk -v b="${base}" '$1 "-" $2 == b {f=1} END {exit !f}' \
+    || warn "${base}.tgz is in the bundle but not pinned in versions.env — not pushed"
+done
+shopt -u nullglob
 
 # ---------------------------------------------------------------------------
 # 4. Images -> mirror projects (registry-prefix rewrite)

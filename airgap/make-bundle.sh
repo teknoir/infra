@@ -5,6 +5,8 @@
 # side's operational scripts (airgap/ runtime + scripts/ secret helpers), and
 # writes bundle-manifest.yaml with a sha256 checksum for every file.
 #
+# The gitops checkout (GITOPS_REPO_DIR) must be on GITOPS_BRANCH (teknoir-local).
+#
 # Usage: airgap/make-bundle.sh [--dry-run] [--diff [OLD_MANIFEST]] [--bundle-dir DIR]
 set -euo pipefail
 
@@ -51,8 +53,11 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-require_cmd helm curl tar
+require_cmd helm curl tar git
 [[ "${DRY_RUN}" == "1" ]] || require_cmd crane
+# Fail before anything is built when the gitops checkout is on the wrong branch
+# (GITOPS_ALLOW_ANY_BRANCH=1 overrides).
+require_gitops_branch
 
 BUNDLE="$(bundle_dir)"
 export BUNDLE_DIR="${BUNDLE}"

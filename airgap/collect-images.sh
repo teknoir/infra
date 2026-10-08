@@ -96,23 +96,23 @@ is_bootstrap_chart() {
   return 1
 }
 
-while read -r name version dir; do
-  if [[ ! -d "${dir}" ]]; then
-    warn "chart directory missing, skipping: ${dir}"
+# Pinned versions only (bundle .tgz, else the working tree at that version).
+while read -r name version; do
+  if ! dir="$(chart_source "${name}" "${version}")"; then
+    warn "no source for released ${name}-${version}: its images are not collected (they must already be in Harbor)"
     continue
   fi
   log "templating ${name}-${version} for image extraction"
-  helm_dep_build "${dir}" || { warn "dependency build failed for ${name}"; continue; }
+  helm_dep_build "${dir}" || die "dependency build failed for ${name}"
   if ! rendered="$(helm_template_chart "${name}" "${dir}" 2>"${tmpdir}/err")"; then
-    warn "helm template failed for ${name}: $(head -1 "${tmpdir}/err")"
-    continue
+    die "helm template failed for ${name}: $(head -1 "${tmpdir}/err")"
   fi
   images="$(printf '%s\n' "${rendered}" | extract_images)"
   printf '%s\n' "${images}" >> "${all_list}"
   if is_bootstrap_chart "${name}"; then
     printf '%s\n' "${images}" >> "${bootstrap_list}"
   fi
-done < <(all_charts)
+done < <(pinned_charts)
 
 # extras (comments / blank lines stripped)
 sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "${AIRGAP_DIR}/images-extra.txt" \
