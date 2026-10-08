@@ -49,7 +49,8 @@ host_k3s_data_path() { printf '%s%s%s' "${HOST_ROOT}" "${K3S_DATA_DIR}" "${1:-}"
 host_k3s_images_dir() { host_k3s_data_path /agent/images; }
 
 host_k3s_datastore_exists() {
-  [[ -e "$(host_k3s_data_path /server/db/state.db)" || -d "$(host_k3s_data_path /server/db/etcd)" ]]
+  # sqlite (state.db) or embedded etcd (db/etcd/member; db/etcd alone exists on sqlite too)
+  [[ -e "$(host_k3s_data_path /server/db/state.db)" || -d "$(host_k3s_data_path /server/db/etcd/member)" ]]
 }
 
 host_bundle_sha() {

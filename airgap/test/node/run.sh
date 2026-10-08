@@ -346,8 +346,11 @@ check "they are listed in a single warning" [ "$(grep -c 'not pullable from harb
 
 # ---------------------------------------------------------------------------
 echo "# backup: sqlite datastore with a brief k3s stop"
-mkdir -p "${ROOT}/opt/k3s/server/db" "${ROOT}/opt/k3s/server/tls" "${ROOT}/opt/k3s/server/cred"
+# k3s on sqlite still creates server/db/etcd/name (VM and live node): only
+# server/db/etcd/member means embedded etcd
+mkdir -p "${ROOT}/opt/k3s/server/db/etcd" "${ROOT}/opt/k3s/server/tls" "${ROOT}/opt/k3s/server/cred"
 echo "sqlite" > "${ROOT}/opt/k3s/server/db/state.db"
+echo "name" > "${ROOT}/opt/k3s/server/db/etcd/name"
 echo "token" > "${ROOT}/opt/k3s/server/token"
 before="$(ncalls)"
 tn backup --site test
@@ -357,6 +360,8 @@ check "backup takes the datastore, token and k3s config" \
 check "k3s is stopped for the copy and started again" \
   bash -c "tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -E '^systemctl (stop|start) k3s' | tr '\n' ' ' | grep -q 'systemctl stop k3s systemctl start k3s'"
 check "backup prints its path on stdout" grep -qx "${B}" "${T}/out"
+check "no etcd snapshot on a sqlite node (server/db/etcd holds only its name file)" \
+  bash -c "! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q 'etcd-snapshot'"
 chmod 000 "${ROOT}/opt/k3s/server/db/state.db"
 tn backup --site test
 chmod 644 "${ROOT}/opt/k3s/server/db/state.db"

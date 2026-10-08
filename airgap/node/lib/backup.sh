@@ -120,7 +120,9 @@ backup_k3s() {
   for f in token tls cred; do
     [[ -e "${data}/server/${f}" ]] && cp -a "${data}/server/${f}" "${out}/server/"
   done
-  if [[ -d "${data}/server/db/etcd" ]]; then
+  # embedded etcd keeps its data in db/etcd/member; k3s on sqlite also creates
+  # db/etcd (holding only a name file), so that directory alone means nothing
+  if [[ -d "${data}/server/db/etcd/member" ]]; then
     log "backup: etcd snapshot"
     "${K3S_BIN}" etcd-snapshot save --data-dir "${K3S_DATA_DIR}" --dir "${out}" --name teknoir-backup >&2 \
       || die "backup: k3s etcd-snapshot save failed"
@@ -189,7 +191,7 @@ backup_take() {
 
 phase_backup() {
   if ! cluster_up; then
-    if [[ -e "${HOST_ROOT}${K3S_DATA_DIR}/server/db/state.db" || -d "${HOST_ROOT}${K3S_DATA_DIR}/server/db/etcd" ]]; then
+    if [[ -e "${HOST_ROOT}${K3S_DATA_DIR}/server/db/state.db" || -d "${HOST_ROOT}${K3S_DATA_DIR}/server/db/etcd/member" ]]; then
       if [[ "${BACKUP_MODE}" == "never" ]]; then
         warn "the k3s API is down; no pre-change backup (--no-backup)"
         return 0
