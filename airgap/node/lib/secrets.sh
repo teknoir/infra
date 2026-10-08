@@ -297,6 +297,7 @@ secrets_credential_ref() {
   case "$1" in
     keycloak-admin)          echo "teknoir-auth keycloak-admin password secret" ;;
     keycloak-admin-username) echo "teknoir-auth keycloak-admin username public" ;;
+    platform-admin)          echo "teknoir-auth keycloak-platform-admin password secret" ;;
     harbor-admin)            echo "teknoir-system harbor-secret HARBOR_ADMIN_PASSWORD secret" ;;
     argocd-admin)            echo "teknoir-system argocd-initial-admin-secret password secret" ;;
     grafana-admin)           echo "teknoir-system monitoring-grafana admin-password secret" ;;
@@ -316,9 +317,9 @@ cmd_credentials() {
     esac
     shift
   done
-  [[ -n "${name}" ]] || die "credentials: NAME required (keycloak-admin keycloak-admin-username harbor-admin argocd-admin grafana-admin; the first platform admin comes from admin-user)"
+  [[ -n "${name}" ]] || die "credentials: NAME required (platform-admin keycloak-admin keycloak-admin-username harbor-admin argocd-admin grafana-admin)"
   ref="$(secrets_credential_ref "${name}")" \
-    || die "credentials: unknown NAME ${name} (keycloak-admin keycloak-admin-username harbor-admin argocd-admin grafana-admin; the first platform admin: teknoir-airgap admin-user --email ADDR --out FILE)"
+    || die "credentials: unknown NAME ${name} (platform-admin keycloak-admin keycloak-admin-username harbor-admin argocd-admin grafana-admin)"
   read -r ns secret key class <<<"${ref}"
   if [[ -z "${out}" && -t 1 ]]; then
     die "credentials: refusing to print a credential to a terminal; use --out FILE or redirect stdout"
