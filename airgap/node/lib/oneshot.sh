@@ -87,7 +87,7 @@ phase_oneshot() {
     printf '%s\n' "${lines[@]}" | awk -v t="${t}" '$1 == t {f = 1} END {exit !f}' \
       || die "--reapply ${t}: not a tier in ${tiers_file} ($(awk '{printf "%s ", $1}' < <(printf '%s\n' "${lines[@]}")))"
   done
-  ONESHOT_JQ="$(oneshot_tool jq)"
+  ONESHOT_JQ="$(oneshot_tool jq)" || exit 1
   for line in "${lines[@]}"; do
     read -r tier ns _ <<<"${line}"
     [[ "${tier}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "${tiers_file}: bad tier name '${tier}'"
@@ -179,29 +179,29 @@ oneshot_rolled_out() {
 }
 
 oneshot_job_state() {
-  # oneshot_job_state <ns> <name> — Complete, Failed, Running or Absent
+  # oneshot_job_state <ns> <name> — sets ONESHOT_JOB to Complete, Failed,
+  # Running or Absent (not for $(...): it dies when the Job cannot be read)
   local c
   c="$(kc -n "$1" get job "$2" --ignore-not-found \
     -o jsonpath='{.metadata.name}{" "}{range .status.conditions[*]}{.type}={.status}{" "}{end}')" \
     || die "cannot read Job $1/$2"
-  if [[ -z "${c}" ]]; then echo Absent
-  elif [[ " ${c} " == *" Complete=True "* ]]; then echo Complete
-  elif [[ " ${c} " == *" Failed=True "* ]]; then echo Failed
-  else echo Running
+  if [[ -z "${c}" ]]; then ONESHOT_JOB=Absent
+  elif [[ " ${c} " == *" Complete=True "* ]]; then ONESHOT_JOB=Complete
+  elif [[ " ${c} " == *" Failed=True "* ]]; then ONESHOT_JOB=Failed
+  else ONESHOT_JOB=Running
   fi
 }
 
 oneshot_job_finished() {
-  local s
-  s="$(oneshot_job_state "$1" "$2")"
-  [[ "${s}" == "Complete" || "${s}" == "Failed" ]]
+  oneshot_job_state "$1" "$2"
+  [[ "${ONESHOT_JOB}" == "Complete" || "${ONESHOT_JOB}" == "Failed" ]]
 }
 
 oneshot_tier() {
   # oneshot_tier <tier> <namespace> <force 0|1>
   local tier="$1" ns="$2" force="$3"
   local main="${NODE_ROOT}/oneshot/${tier}.yaml" crds_file="${NODE_ROOT}/oneshot/${tier}-crds.yaml"
-  local split crds rest list objs line kind jns jname state crd_names
+  local split crds rest list objs line kind jns jname crd_names
   [[ -f "${main}" ]] || die "missing ${main}"
   if oneshot_k3s_owned "${tier}"; then
     [[ "${force}" != "1" ]] || die "--reapply ${tier}: refused, the K3s file ${ONESHOT_K3S_FILE} still owns this tier (detach it first, DESIGN M7)"
@@ -259,15 +259,17 @@ oneshot_tier() {
     [[ -n "${jname}" ]] || continue
     wait_for "Job ${jns}/${jname} to finish" "${ONESHOT_TIMEOUT}" oneshot_job_finished "${jns}" "${jname}"
     [[ "${DRY_RUN}" == "1" ]] && continue
-    state="$(oneshot_job_state "${jns}" "${jname}")"
-    [[ "${state}" == "Complete" ]] \
-      || die "tier ${tier}: Job ${jns}/${jname} ${state} (logs: kubectl -n ${jns} logs job/${jname}); a re-run re-creates it"
+    oneshot_job_state "${jns}" "${jname}"
+    [[ "${ONESHOT_JOB}" == "Complete" ]] \
+      || die "tier ${tier}: Job ${jns}/${jname} ${ONESHOT_JOB} (logs: kubectl -n ${jns} logs job/${jname}); a re-run re-creates it"
     log "tier ${tier}: Job ${jns}/${jname} complete"
   done < <(oneshot_jobs "${rest}")
   # 4. a finished ArgoCD hook Job carries no tracking: remove it, ArgoCD runs its own
   while read -r jns jname; do
     [[ -n "${jname}" ]] || continue
-    if [[ "${DRY_RUN}" != "1" && "$(oneshot_job_state "${jns}" "${jname}")" == "Complete" ]]; then
+    [[ "${DRY_RUN}" != "1" ]] || continue
+    oneshot_job_state "${jns}" "${jname}"
+    if [[ "${ONESHOT_JOB}" == "Complete" ]]; then
       kc -n "${jns}" delete job "${jname}" --cascade=background --wait=false >/dev/null \
         || die "cannot delete the finished Job ${jns}/${jname}"
     fi
@@ -291,7 +293,8 @@ oneshot_converge() {
   local desc="$1" list="$2" objs="$3" rc=0 err jns jname
   while read -r jns jname; do
     [[ -n "${jname}" ]] || continue
-    if [[ "$(oneshot_job_state "${jns}" "${jname}")" == "Failed" ]]; then
+    oneshot_job_state "${jns}" "${jname}"
+    if [[ "${ONESHOT_JOB}" == "Failed" ]]; then
       warn "${desc}: Job ${jns}/${jname} failed earlier; re-creating it"
       run kc -n "${jns}" delete job "${jname}" --cascade=foreground --wait=true >/dev/null
     fi
@@ -304,7 +307,8 @@ oneshot_converge() {
   [[ "${rc}" == "1" ]] || log "${desc}: kubectl diff could not compare (${err##*$'\n'}); applying"
   while read -r jns jname; do
     [[ -n "${jname}" ]] || continue
-    [[ "$(oneshot_job_state "${jns}" "${jname}")" != "Absent" ]] || continue
+    oneshot_job_state "${jns}" "${jname}"
+    [[ "${ONESHOT_JOB}" != "Absent" ]] || continue
     run kc -n "${jns}" delete job "${jname}" --cascade=foreground --wait=true >/dev/null
   done < <(oneshot_jobs "${objs}")
   oneshot_apply "${desc}" "${list}"

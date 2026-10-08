@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# shellcheck disable=SC2154  # DRY_RUN, K3S_DATA_DIR, NODE, TEKNOIR_DOMAIN: common.sh and the site env
+# shellcheck disable=SC2154,SC2016  # DRY_RUN, K3S_DATA_DIR, NODE, NODE_ROOT, TEKNOIR_DOMAIN come from common.sh and the site env; jq programs are single-quoted on purpose
 #
 # lib/migrate.sh — `teknoir-node migrate`: the one-time move of the live
 # teknoir-local off K3s auto-deploy files (docs/airgap/DESIGN.md M3, M6, I-13).
@@ -71,8 +71,20 @@ and robot$argocd (M6). Safe to re-run. --undo NAME puts a detached file back.
 EOF
 }
 
+migrate_tool() {
+  # migrate_tool <name> — the bundled node/bin/<name>, else one on PATH
+  if [[ -x "${NODE_ROOT}/bin/$1" ]]; then
+    echo "${NODE_ROOT}/bin/$1"
+  elif command -v "$1" >/dev/null 2>&1; then
+    command -v "$1"
+  else
+    die "$1 not found (expected ${NODE_ROOT}/bin/$1)"
+  fi
+}
+
 migrate_init() {
   local data="${K3S_DATA_DIR:-/opt/k3s}"
+  MIGRATE_JQ="$(migrate_tool jq)" || exit 1
   MIGRATE_MANIFESTS="${data}/server/manifests"
   MIGRATE_RETIRED_ROOT="${data}/server/manifests-retired"
   MIGRATE_RETIRED="${MIGRATE_RETIRED_ROOT}/$(date -u +%Y%m%dT%H%M%SZ)"
@@ -178,7 +190,7 @@ migrate_inventory() {
   local addons rows name gvks src base f file_present lines=""
   local -A seen=()
   addons="$(kc -n kube-system get addons.k3s.cattle.io -o json)" || die "cannot list the K3s Addons"
-  rows="$(jq -r '.items[] | [.metadata.name, (.metadata.annotations["addon.k3s.cattle.io/gvks"] // ""), (.spec.source // "")] | map(gsub("[|\n]"; " ")) | join("|")' <<<"${addons}")" \
+  rows="$("${MIGRATE_JQ}" -r '.items[] | [.metadata.name, (.metadata.annotations["addon.k3s.cattle.io/gvks"] // ""), (.spec.source // "")] | map(gsub("[|\n]"; " ")) | join("|")' <<<"${addons}")" \
     || die "cannot parse the K3s Addons"
   while IFS='|' read -r name gvks src; do
     [[ -n "${name}" ]] || continue
@@ -410,14 +422,15 @@ migrate_retire_robot() {
     log "robot: not yet: ${ns}/${legacy} is still owned by a K3s file (it is detached above unless --dry-run)"
     return 0
   fi
-  # names only leave jq; the values stay in the pipe
-  anon="$(kc -n "${ns}" get secrets -l argocd.argoproj.io/secret-type -o json | jq -r --arg url "${repo}" --arg skip "${legacy}" '
+  # names only leave jq; the values stay in memory
+  anon="$(kc -n "${ns}" get secrets -l argocd.argoproj.io/secret-type -o json)" || die "cannot list the ArgoCD repository Secrets"
+  anon="$("${MIGRATE_JQ}" -r --arg url "${repo}" --arg skip "${legacy}" '
       [.items[]
        | select(.metadata.name != $skip)
        | select(.metadata.labels["argocd.argoproj.io/secret-type"] == "repository")
        | select((.data.username // "") == "" and (.data.password // "") == "")
        | select(((.data.url // "") | @base64d | sub("^oci://"; "") | sub("/+$"; "")) == $url)
-       | .metadata.name][0] // empty')" || die "cannot list the ArgoCD repository Secrets"
+       | .metadata.name][0] // empty' <<<"${anon}")" || die "cannot parse the ArgoCD repository Secrets"
   if [[ -z "${anon}" ]]; then
     log "robot: not yet: no credential-less ArgoCD repository Secret for ${repo} (it comes with the argo chart; run up first)"
     return 0
@@ -437,8 +450,10 @@ migrate_retire_robot() {
     return 0
   fi
   # Keep a copy in memory only, to put back if ArgoCD cannot read the chart without it.
-  backup="$(kc -n "${ns}" get secret "${legacy}" -o json | jq -c 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.managedFields, .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"])')" \
-    || die "cannot read Secret ${ns}/${legacy}"
+  backup="$(kc -n "${ns}" get secret "${legacy}" -o json)" || die "cannot read Secret ${ns}/${legacy}"
+  backup="$("${MIGRATE_JQ}" -c 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.managedFields, .metadata.annotations["kubectl.kubernetes.io/last-applied-configuration"])' <<<"${backup}")" \
+    || die "cannot copy Secret ${ns}/${legacy}"
+  "${MIGRATE_JQ}" -e '.kind == "Secret" and (.data | length > 0)' <<<"${backup}" >/dev/null || die "the in-memory copy of ${ns}/${legacy} is incomplete; not deleting it"
   t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   kc -n "${ns}" delete secret "${legacy}" >/dev/null || die "cannot delete Secret ${ns}/${legacy}"
   if ! migrate_argocd_reads_anonymously "${ns}" "${t0}"; then
@@ -455,8 +470,7 @@ migrate_retire_robot() {
 migrate_anonymous_pull() {
   # migrate_anonymous_pull <ref> — 0 when <ref> can be read without credentials
   local cfg rc=0 crane
-  crane="${NODE_ROOT}/bin/crane"
-  [[ -x "${crane}" ]] || crane="$(command -v crane)" || die "crane not found (node/bin/crane)"
+  crane="$(migrate_tool crane)" || exit 1
   cfg="$(mktemp -d)" || die "mktemp failed"
   DOCKER_CONFIG="${cfg}" "${crane}" manifest "$1" >/dev/null 2>&1 || rc=$?
   rm -rf -- "${cfg}"
@@ -472,7 +486,7 @@ migrate_argocd_reads_anonymously() {
   deadline=$(( $(date +%s) + MIGRATE_ARGOCD_TIMEOUT ))
   while (( $(date +%s) < deadline )); do
     sleep 5
-    state="$(kc -n "${ns}" get applications.argoproj.io app-of-apps -o json | jq -r '
+    state="$(kc -n "${ns}" get applications.argoproj.io app-of-apps -o json | "${MIGRATE_JQ}" -r '
         [(.status.reconciledAt // ""),
          ([(.status.conditions // [])[] | select(.type | test("Error$")) | .type] | join(",")),
          (.status.sync.status // ""),

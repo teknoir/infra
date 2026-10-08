@@ -73,9 +73,9 @@ harbor_session_begin() {
   HARBOR_HOST="${HARBOR_HOST:-harbor.${TEKNOIR_DOMAIN}}"
   HARBOR_API="${HARBOR_API:-https://${HARBOR_HOST}/api/v2.0}"
   HARBOR_REGISTRY="${HARBOR_REGISTRY:-${HARBOR_HOST}}"
-  HARBOR_CRANE="$(harbor_tool crane)"
-  HARBOR_HELM="$(harbor_tool helm)"
-  HARBOR_JQ="$(harbor_tool jq)"
+  HARBOR_CRANE="$(harbor_tool crane)" || exit 1
+  HARBOR_HELM="$(harbor_tool helm)" || exit 1
+  HARBOR_JQ="$(harbor_tool jq)" || exit 1
   HARBOR_PW="$(secret_value "${HARBOR_SECRET_NS}" "${HARBOR_SECRET_NAME}" HARBOR_ADMIN_PASSWORD)" \
     || die "cannot read the Harbor admin password from Secret ${HARBOR_SECRET_NS}/${HARBOR_SECRET_NAME}"
   [[ -n "${HARBOR_PW}" ]] || die "Secret ${HARBOR_SECRET_NS}/${HARBOR_SECRET_NAME} has an empty HARBOR_ADMIN_PASSWORD"
@@ -268,9 +268,10 @@ harbor_ensure_immutability() {
 
 harbor_robot_refs() {
   # ArgoCD Secrets that still log in as robot$argocd (names only leave jq)
-  kc get secrets -A -l argocd.argoproj.io/secret-type -o json \
-    | "${HARBOR_JQ}" -r '[.items[] | select(((.data.username // "") | @base64d) == "robot$argocd")
-                         | "\(.metadata.namespace)/\(.metadata.name)"] | join(" ")'
+  local all
+  all="$(kc get secrets -A -l argocd.argoproj.io/secret-type -o json)" || return 1
+  "${HARBOR_JQ}" -r '[.items[] | select(((.data.username // "") | @base64d) == "robot$argocd")
+                     | "\(.metadata.namespace)/\(.metadata.name)"] | join(" ")' <<<"${all}"
 }
 
 harbor_retire_robot() {
