@@ -30,10 +30,16 @@
 #       no PRIVATE KEY in the bundle tar; ~/.docker, ~/.config/helm unchanged
 #   E6  node rebuild: new host key -> up prints the ssh-keygen -R fix;
 #       --forget-host-key completes; optional restore check  [--allow-destroy]
-#   E10 migration rehearsal: old-style install (E2E_OLD_SETUP), migrate, up,
-#       k3s restart: nothing lost, CRDs Synced resources of their Applications
-#       (ArgoCD 3.5 writes no tracking-id on CRDs), no Teknoir K3s files,
-#       old secrets unchanged, Harbor stable                 [--allow-destroy]
+#   E10 migration rehearsal (OPERATE.md M3-M6): old-style install
+#       (E2E_OLD_SETUP), migrate --dry-run, migrate (keycloak-admin carried
+#       over: username + previous-password), up (the admin rotated to password;
+#       realm teknoir; admin-user + oauth2-proxy login), migrate --argo (no
+#       Teknoir K3s file or Addon left, argoproj CRDs protected, no old bundle
+#       copy), migrate again (robot repo-creds Secret and robot$argocd gone,
+#       app-of-apps still syncs), k3s restart (same inventory, Secrets keep
+#       their resourceVersion). Nothing lost but E2E_E10_EXPECTED_GONE, old
+#       secrets unchanged, CRDs Synced resources of their Applications (ArgoCD
+#       3.5 writes no tracking-id on CRDs), Harbor stable    [--allow-destroy]
 #
 # Usage: airgap/test/vm/e2e.sh [--list] [--allow-destroy] [--stop-on-fail] [E...]
 # Environment:
@@ -42,6 +48,11 @@
 #   E2E_E4_APPS      exactly the Applications B changes, e.g. "app-of-apps device-controller" (E4 needs it)
 #   E2E_OLD_SETUP    E10: command (run on vpro, VM_IP exported) that installs the
 #                    old (e9a3b7f) layout with dummy secrets on the fresh VM
+#                    (airgap/test/vm/old-setup.sh)
+#   E2E_E10_SECRETS  E10: ns/name of the Secrets that must stay unchanged
+#   E2E_E10_EXPECTED_GONE  E10: Kind/ns/name of the objects the migration removes
+#                    (default: the harbor-registry-htpasswd and argocd-harbor-repo Secrets)
+#   E2E_E10_STABLE_SECONDS  E10: how long Harbor must roll no new core ReplicaSet (3600)
 #   E2E_WORK         work dir (default ~/vmtest/e2e); LAN_HOME (default ~/vmtest/lanhome)
 #   E2E_UP_FLAGS     extra flags for every teknoir-airgap call
 #   E2E_ZERO_CHANGES_RE  regex that the E2 summary must match (default: "0 change|no change")
@@ -649,14 +660,22 @@ e8() {
 # E10
 # ---------------------------------------------------------------------------
 E10_SECRETS="${E2E_E10_SECRETS:-teknoir-system/harbor-secret teknoir-auth/keycloak-db-secret teknoir-auth/oauth2-proxy-secret teknoir-auth/oauth2-proxy-redis-secret teknoir-system/argocd-oidc-secret cert-manager/teknoir-root-ca teknoir-auth/teknoir-root-ca-bundle teknoir-system/teknoir-root-ca-bundle}"
+# Objects the migration removes on purpose, as Kind/namespace/name: harbor
+# 0.0.9 no longer renders the registry htpasswd Secret (its Job writes
+# harbor-registry-auth instead), and M6 deletes the robot's repo-creds Secret.
+# Every other object of the baseline must survive; these must be gone.
+E10_EXPECTED_GONE="${E2E_E10_EXPECTED_GONE:-Secret/teknoir-system/harbor-registry-htpasswd Secret/teknoir-system/argocd-harbor-repo}"
+# Teknoir K3s file and Addon names (lib/migrate.sh MIGRATE_ALLOW_RE)
+E10_TEKNOIR_RE='^(teknoir-.+|00-teknoir-.+|05-teknoir-.+|10-teknoir-.+|manifest-.+-secret|app-of-apps)$'
 
 e10_inventory() {
-  # every object of the kinds the migration touches, by name (no values), sorted for comm
+  # every object of the kinds the migration touches, by name (no values),
+  # one "Kind namespace name" (or kind/name) per line, sorted for comm
   {
     vm_kc get crd,ns -o name
     vm_kc get secrets,configmaps,virtualservices,gateways,destinationrules,authorizationpolicies,peerauthentications,certificates,clusterissuers,applications,appprojects \
       -A --no-headers -o custom-columns=K:.kind,NS:.metadata.namespace,N:.metadata.name 2>/dev/null
-  } | LC_ALL=C sort
+  } | awk '{$1 = $1; print}' | LC_ALL=C sort
 }
 
 e10_secret_hashes() {
@@ -672,43 +691,223 @@ EOF
   } | vm_root
 }
 
+e10_secret_rvs() {
+  local ref
+  for ref in ${E10_SECRETS}; do
+    printf '%s %s\n' "${ref}" "$(vm_kc -n "${ref%%/*}" get secret "${ref#*/}" -o jsonpath='{.metadata.resourceVersion}' 2>/dev/null || echo absent)"
+  done
+}
+
+e10_gone_lines() {
+  # the expected-gone objects in e10_inventory's line format
+  tr ' ' '\n' <<<"${E10_EXPECTED_GONE}" | grep . | tr '/' ' ' | LC_ALL=C sort
+}
+
+teknoir_addons() {
+  vm_kc -n kube-system get addons.k3s.cattle.io -o name | sed 's|.*/||' | grep -E "${E10_TEKNOIR_RE}" | tr '\n' ' ' || true
+}
+
+teknoir_k3s_files() {
+  # Teknoir files K3s would apply (the .skip guards do not count)
+  vmx sudo ls /opt/k3s/server/manifests | grep -E '\.(ya?ml|json)$' | sed -E 's/\.(ya?ml|json)$//' |
+    grep -E "${E10_TEKNOIR_RE}" | tr '\n' ' ' || true
+}
+
+secret_keys() {
+  # secret_keys <ns> <name> — the Secret's key names (no values), space-separated; empty when absent
+  # shellcheck disable=SC2016  # a go-template, not shell
+  vm_kc -n "$1" get secret "$2" --ignore-not-found -o go-template='{{range $k, $v := .data}}{{$k}} {{end}}' | sed 's/ $//'
+}
+
+kc_admin_codes() {
+  # "<password> <previous-password>": HTTP status of a master-realm token
+  # request as the admin of Secret teknoir-auth/keycloak-admin with each
+  # password key (none: key absent). Runs on the VM: the values go from
+  # kubectl to private files and to curl as @file, never to argv or output.
+  {
+    printf 'DOMAIN=%q NODE_IP=%q\n' "${DOMAIN}" "${NODE_IP}"
+    cat <<'EOF'
+set -eu
+k() { k3s kubectl "$@"; }
+d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
+chmod 700 "$d"
+k -n teknoir-system get secret teknoir-root-ca-bundle -o go-template='{{index .data "ca.crt" | base64decode}}' > "$d/ca"
+k -n teknoir-auth get secret keycloak-admin -o go-template='{{index .data "username" | base64decode}}' > "$d/u"
+out=""
+for key in password previous-password; do
+  if k -n teknoir-auth get secret keycloak-admin -o go-template="{{with index .data \"$key\"}}{{. | base64decode}}{{end}}" > "$d/p" && [ -s "$d/p" ]; then
+    c="$(curl -sS -o /dev/null -w '%{http_code}' -m 20 --cacert "$d/ca" --resolve "auth.${DOMAIN}:443:${NODE_IP}" \
+      --data-urlencode grant_type=password --data-urlencode client_id=admin-cli \
+      --data-urlencode "username@$d/u" --data-urlencode "password@$d/p" \
+      "https://auth.${DOMAIN}/auth/realms/master/protocol/openid-connect/token" 2>/dev/null)" || c="${c:-000}"
+  else
+    c=none
+  fi
+  out="${out}${out:+ }${c}"
+done
+echo "${out}"
+EOF
+  } | vm_root
+}
+kc_admin_rotated() { [[ "$(kc_admin_codes 2>/dev/null)" == "200 401" ]]; }
+
+robot_argocd_state() {
+  # "<http status> <number of robot$argocd accounts>" from the Harbor API as
+  # the Harbor admin; runs on the VM (the password reaches curl in a config
+  # file, never argv or output)
+  {
+    printf 'DOMAIN=%q NODE_IP=%q\n' "${DOMAIN}" "${NODE_IP}"
+    cat <<'EOF'
+set -eu
+k() { k3s kubectl "$@"; }
+d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
+chmod 700 "$d"
+k -n teknoir-system get secret teknoir-root-ca-bundle -o go-template='{{index .data "ca.crt" | base64decode}}' > "$d/ca"
+k -n teknoir-system get secret harbor-secret -o go-template='{{index .data "HARBOR_ADMIN_PASSWORD" | base64decode}}' > "$d/p"
+python3 - "$d/p" "$d/cfg" <<'PY'
+import sys
+p = open(sys.argv[1]).read().replace("\\", "\\\\").replace('"', '\\"')
+with open(sys.argv[2], "w") as f:
+    f.write('user = "admin:%s"\n' % p)
+PY
+c="$(curl -sS -o "$d/out" -w '%{http_code}' -m 20 --cacert "$d/ca" --resolve "harbor.${DOMAIN}:443:${NODE_IP}" -K "$d/cfg" \
+  "https://harbor.${DOMAIN}/api/v2.0/robots?q=name%3Dargocd&page_size=100" 2>/dev/null)" || c="${c:-000}"
+n="$(python3 -c 'import json, sys; print(sum(1 for r in (json.load(open(sys.argv[1])) or []) if r.get("name") in ("robot$argocd", "argocd")))' "$d/out" 2>/dev/null || echo unknown)"
+echo "${c} ${n}"
+EOF
+  } | vm_root
+}
+
+aoa_compared_since() {
+  # aoa_compared_since <UTC timestamp> — app-of-apps was compared after it
+  # (no pending refresh), is Synced and has no *Error condition
+  local s rec err sync ref
+  s="$(vm_kc -n teknoir-system get applications.argoproj.io app-of-apps -o json | jq -r '
+      [(.status.reconciledAt // ""),
+       ([(.status.conditions // [])[] | select(.type | test("Error$")) | .type] | join(",")),
+       (.status.sync.status // ""),
+       (.metadata.annotations["argocd.argoproj.io/refresh"] // "")] | join("|")')" || return 1
+  IFS='|' read -r rec err sync ref <<<"${s}"
+  [[ -z "${ref}" && -n "${rec}" && ! "${rec}" < "$1" && -z "${err}" && "${sync}" == Synced ]]
+}
+
+old_bundle_copies() {
+  vm_root <<'EOF'
+for d in /home/teknoir/teknoir-airgap-bundle-*; do [ -e "$d" ] && echo "$d"; done
+true
+EOF
+}
+
+argoproj_crds_unprotected() {
+  # argoproj.io CRDs without Prune=false and Delete=false ("none found" when there are none)
+  vm_kc get crd -o json | jq -r '
+      [.items[] | select(.spec.group == "argoproj.io")] as $c
+      | if ($c | length) == 0 then "none found"
+        else [$c[] | select(((.metadata.annotations["argocd.argoproj.io/sync-options"] // "") | split(",") | map(gsub("\\s"; ""))) as $o
+                            | ($o | index("Prune=false")) == null or ($o | index("Delete=false")) == null)
+                   | .metadata.name] | join(" ") end'
+}
+
 e10() {
-  tl_case E10 "migration rehearsal: old layout -> migrate -> up -> k3s restart"
+  tl_case E10 "migration rehearsal: old layout -> migrate -> up -> migrate --argo -> migrate (M6) -> k3s restart"
   [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
   [[ -n "${E2E_OLD_SETUP:-}" ]] || { skip_case "E2E_OLD_SETUP (old-tooling install command) not set"; return 0; }
   (( ALLOW_DESTROY )) || { skip_case "re-creates the VM: pass --allow-destroy"; return 0; }
   fresh_vm || return 0
-  rm -rf "${LAN_HOME:?}/.teknoir-airgap"
+  rm -rf "${LAN_HOME:?}/.teknoir-airgap" "${LAN_HOME}/e2e"/admin.*
   if VM_IP="${NODE_IP}" bash -c "${E2E_OLD_SETUP}"; then pass "old-style install completed"; else fail "E2E_OLD_SETUP failed"; return 0; fi
-  local dir inv0 hashes0 lost rs0 rs1 files addons
+  local dir inv0 hashes0 inv1 inv2 rvs1 gone lost unexpected g codes t0 st skips pw="${LAN_HOME}/e2e/admin.pw" mode
   dir="$(bundle_dir "${E2E_BUNDLE}")"
+
+  # --- baseline and M3 -------------------------------------------------------
   inv0="$(e10_inventory)" hashes0="$(e10_secret_hashes)"
+  assert_eq "the old layout has no Secret teknoir-auth/keycloak-admin yet" "" "$(secret_keys teknoir-auth keycloak-admin)"
   if tk "${dir}" migrate --dry-run; then pass "migrate --dry-run exits 0"; else fail "migrate --dry-run failed"; fi
   assert_eq "migrate --dry-run changed nothing" "${inv0}" "$(e10_inventory)"
   if tk "${dir}" migrate; then pass "migrate exits 0"; else fail "migrate failed"; return 0; fi
+  assert_eq "migrate created Secret keycloak-admin with exactly username and previous-password" \
+    "previous-password username" "$(secret_keys teknoir-auth keycloak-admin)"
+  assert_eq "after migrate no Teknoir Addon is left but teknoir-argo" "teknoir-argo " "$(teknoir_addons)"
+  assert_eq "after migrate no Teknoir K3s file is left but teknoir-argo" "teknoir-argo " "$(teknoir_k3s_files)"
+
+  # --- M4: up, the Keycloak admin rotation, realm teknoir, the first admin ------
   if up_in "${dir}"; then pass "up after migrate exits 0"; else fail "up after migrate failed"; return 0; fi
   wait_apps 2700 || true
+  assert_eq "up added password to Secret keycloak-admin" "password previous-password username" "$(secret_keys teknoir-auth keycloak-admin)"
+  wait_until 900 kc_admin_rotated || true
+  codes="$(kc_admin_codes)"
+  assert_eq "the master admin logs in with keycloak-admin password" 200 "${codes%% *}"
+  assert_eq "the master admin no longer logs in with previous-password (rotated)" 401 "${codes##* }"
+  assert_eq "Keycloak realm teknoir discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/auth/realms/teknoir/.well-known/openid-configuration")"
+  if tk "${dir}" admin-user --email "${ADMIN_EMAIL}" --out "${pw}"; then
+    mode="$(stat -c %a "${pw}" 2>/dev/null || echo missing)"
+    assert_eq "admin-user --out writes the temporary password to a 0600 file" 600 "${mode}"
+  else
+    fail "teknoir-airgap admin-user --email ${ADMIN_EMAIL} --out failed"
+  fi
+  if [[ -s "${pw}" ]]; then
+    login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} on the migrated node"
+  else
+    fail "admin-user wrote no temporary password to ${pw}"
+  fi
+
+  # --- M4b: migrate --argo ------------------------------------------------------
+  if tk "${dir}" migrate --argo --dry-run; then pass "migrate --argo --dry-run exits 0"; else fail "migrate --argo --dry-run failed"; fi
+  if tk "${dir}" migrate --argo; then pass "migrate --argo exits 0"; else fail "migrate --argo failed"; return 0; fi
+  assert_eq "no Teknoir Addon is left" "" "$(teknoir_addons)"
+  assert_eq "no Teknoir K3s file is left in /opt/k3s/server/manifests" "" "$(teknoir_k3s_files)"
+  skips="$(vmx sudo ls /opt/k3s/server/manifests | grep -E '^teknoir-(argo|app-of-apps)\.yaml\.skip$' | tr '\n' ' ' || true)"
+  assert_eq "the .skip guards of teknoir-app-of-apps and teknoir-argo are in place" "teknoir-app-of-apps.yaml.skip teknoir-argo.yaml.skip " "${skips}"
+  assert_eq "every argoproj.io CRD carries Prune=false,Delete=false" "" "$(argoproj_crds_unprotected)"
+  assert_eq "no ~teknoir/teknoir-airgap-bundle-* copy is left on the node" "" "$(old_bundle_copies)"
+
+  # --- M6: migrate again retires the robot ----------------------------------------
+  assert_eq "robot\$argocd exists in Harbor before M6 (HTTP status, count)" "200 1" "$(robot_argocd_state)"
+  if tk "${dir}" migrate; then pass "the second migrate (M6) exits 0"; else fail "the second migrate (M6) failed"; fi
+  assert_eq "Secret teknoir-system/argocd-harbor-repo is gone" "" \
+    "$(vm_kc -n teknoir-system get secret argocd-harbor-repo --ignore-not-found -o name)"
+  t0="$(vmx date -u +%Y-%m-%dT%H:%M:%SZ)"
+  vm_kc -n teknoir-system annotate applications.argoproj.io app-of-apps argocd.argoproj.io/refresh=hard --overwrite >/dev/null
+  if wait_until 300 aoa_compared_since "${t0}"; then pass "app-of-apps still syncs after a hard refresh without the robot credential"
+  else fail "app-of-apps is not Synced without errors after a hard refresh"; fi
+  assert_eq "robot\$argocd is gone from Harbor (HTTP status, count)" "200 0" "$(robot_argocd_state)"
+
+  # --- M5: k3s restart --------------------------------------------------------------
+  wait_apps 1800 || true
+  inv1="$(e10_inventory)" rvs1="$(e10_secret_rvs)"
   vmx sudo systemctl restart k3s
   wait_until 300 vm_kc get --raw /readyz >/dev/null 2>&1 || fail "API not ready after the k3s restart"
   sleep 60
   wait_apps 1800 || true
-  lost="$(LC_ALL=C comm -23 <(echo "${inv0}") <(e10_inventory) | tr '\n' ' ')"
-  assert_eq "no object lost (every pre-migration object still exists)" "" "${lost}"
+  inv2="$(e10_inventory)"
+  assert_eq "the k3s restart changed no object (inventory diff)" "" \
+    "$(diff <(printf '%s\n' "${inv1}") <(printf '%s\n' "${inv2}") | sed -n 's/^\([<>]\) /\1/p' | tr '\n' ' ' || true)"
+  assert_eq "no Teknoir Addon re-appeared after the restart" "" "$(teknoir_addons)"
+  assert_eq "no Teknoir K3s file re-appeared after the restart" "" "$(teknoir_k3s_files)"
+  assert_eq "the platform Secrets kept their resourceVersion over the restart" "${rvs1}" "$(e10_secret_rvs)"
+
+  # --- whole run: nothing lost but the expected, Secrets adopted, CRDs, Harbor -----
+  gone="$(e10_gone_lines)"
+  lost="$(LC_ALL=C comm -23 <(printf '%s\n' "${inv0}") <(printf '%s\n' "${inv2}"))"
+  unexpected="$(LC_ALL=C comm -23 <(printf '%s\n' "${lost}" | grep .) <(printf '%s\n' "${gone}") | tr '\n' ';' || true)"
+  assert_eq "no object lost but the expected ones (${E10_EXPECTED_GONE})" "" "${unexpected}"
+  while IFS= read -r g; do
+    [[ -n "${g}" ]] || continue
+    if grep -qxF -- "${g}" <<<"${inv0}"; then pass "expected-gone ${g// //} existed before the migration"
+    else fail "expected-gone ${g// //} was not in the baseline"; fi
+    if grep -qxF -- "${g}" <<<"${inv2}"; then fail "expected-gone ${g// //} still exists"
+    else pass "expected-gone ${g// //} is gone"; fi
+  done <<<"${gone}"
   assert_eq "the existing platform Secrets are unchanged (adopted by name and key)" "${hashes0}" "$(e10_secret_hashes)"
   # ArgoCD 3.5 writes no tracking-id on CRDs: a CRD is adopted when its
   # Application lists it as a Synced resource (k3d T6)
-  local app crd st
+  local app crd rs0 rs1
   for app in istio:gateways.networking.istio.io cert-manager:certificates.cert-manager.io; do
     crd="${app#*:}" app="${app%%:*}"
     st="$(vm_kc -n teknoir-system get applications.argoproj.io "${app}" -o json |
           jq -r --arg n "${crd}" '.status.resources[]? | select(.kind == "CustomResourceDefinition" and .name == $n) | .status')"
     assert_eq "CRD ${crd} is a Synced resource of Application ${app}" Synced "${st}"
   done
-  addons="$(vm_kc -n kube-system get addons.k3s.cattle.io -o name | sed 's|.*/||' |
-            grep -E '^(teknoir-.*|00-teknoir-.*|05-teknoir-.*|10-teknoir-.*|manifest-.*-secret|app-of-apps)$' | grep -vx teknoir-argo | tr '\n' ' ' || true)"
-  assert_eq "no Teknoir Addons left but teknoir-argo" "" "${addons}"
-  files="$(vmx sudo ls /opt/k3s/server/manifests | grep -E '\.ya?ml$' | grep -E '^(teknoir-|00-teknoir-|05-teknoir-|10-teknoir-|manifest-|app-of-apps)' | grep -vx teknoir-argo.yaml | tr '\n' ' ' || true)"
-  assert_eq "no Teknoir K3s files left but teknoir-argo.yaml" "" "${files}"
   rs0="$(vm_kc -n "${HARBOR_NS}" get rs -l component=core -o name | sort)"
   tl_log "watching harbor-core ReplicaSets for ${E2E_E10_STABLE_SECONDS:-3600}s"
   sleep "${E2E_E10_STABLE_SECONDS:-3600}"
