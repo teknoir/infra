@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  teknoir.server: |
+    __DOMAIN__:53 {
+        errors
+        hosts {
+            __HOSTS_ENTRIES__
+        }
+    }

@@ -1,0 +1,14 @@
+# /etc/rancher/k3s/config.yaml: written by teknoir-node (host phase) from
+# airgap/node/templates/config.yaml.tmpl on every converge. Local edits are
+# overwritten; a change restarts k3s once.
+data-dir: __K3S_DATA_DIR__
+node-ip: __NODE_IP__
+tls-san:
+  - "__DOMAIN__"
+disable:
+  - traefik
+kubelet-arg:
+  - "max-pods=250"
+node-label:
+  - "teknoir.org/storage=true"
+__SECRETS_ENCRYPTION__

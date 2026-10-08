@@ -1,0 +1,30 @@
+mirrors:
+  docker.io:
+    endpoint:
+      - "https://__HARBOR_HOST__"
+    rewrite:
+      "^(.*)$": "dockerhub/$1"
+  ghcr.io:
+    endpoint:
+      - "https://__HARBOR_HOST__"
+    rewrite:
+      "^(.*)$": "ghcr/$1"
+  gcr.io:
+    endpoint:
+      - "https://__HARBOR_HOST__"
+    rewrite:
+      "^(.*)$": "gcr/$1"
+  quay.io:
+    endpoint:
+      - "https://__HARBOR_HOST__"
+    rewrite:
+      "^(.*)$": "quay/$1"
+  registry.k8s.io:
+    endpoint:
+      - "https://__HARBOR_HOST__"
+    rewrite:
+      "^(.*)$": "k8s/$1"
+configs:
+  "__HARBOR_HOST__":
+    tls:
+      ca_file: __K3S_CA_FILE__
