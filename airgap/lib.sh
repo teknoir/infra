@@ -291,6 +291,63 @@ helm_dep_build() {
   (cd "${dir}" && { helm dependency build >/dev/null 2>&1 || helm dependency update >/dev/null; })
 }
 
+# ---------------------------------------------------------------------------
+# Image references (collect-images.sh, verify-offline.sh)
+# ---------------------------------------------------------------------------
+normalize_image() {
+  # canonicalize: add docker.io[/library] for registry-less refs, strip quotes;
+  # drop template/garbage refs (e.g. istiod's injection-template ConfigMap
+  # contains literal `image: {{ ... }}` and `image: auto` lines)
+  local ref="$1" first
+  ref="${ref%\"}"; ref="${ref#\"}"
+  ref="${ref%\'}"; ref="${ref#\'}"
+  [[ -n "${ref}" ]] || return 0
+  case "${ref}" in
+    *['{}$`, ']*) return 0 ;;   # helm/go-template leftovers or lists
+    auto|*/auto) return 0 ;;    # istio sidecar "auto" placeholder
+  esac
+  first="${ref%%/*}"
+  if [[ "${ref}" != */* ]]; then
+    ref="docker.io/library/${ref}"
+  elif [[ "${first}" != *.* && "${first}" != *:* && "${first}" != "localhost" ]]; then
+    ref="docker.io/${ref}"
+  fi
+  # docker.io official images live under library/ (containerd normalizes them
+  # before the registries.yaml rewrite, so the mirror path must match)
+  if [[ "${ref}" == docker.io/* ]]; then
+    local rest="${ref#docker.io/}"
+    if [[ "${rest}" != */* ]]; then
+      ref="docker.io/library/${rest}"
+    fi
+  fi
+  # require an explicit tag or digest — rendered charts always pin images;
+  # bare names are noise from embedded config blobs (istiod values, etc.)
+  if [[ "${ref##*/}" != *[:@]* ]]; then
+    return 0
+  fi
+  echo "${ref}"
+}
+
+extract_images() {
+  # read rendered manifests on stdin, print normalized image refs from
+  #   image: REF          containers / initContainers
+  #   - --<flag>=REF      container args whose flag names an image, e.g. the
+  #                       prometheus-operator's --prometheus-config-reloader=
+  #                       and --thanos-default-base-image= (the operator
+  #                       starts those images itself; they are in no image: field)
+  sed -n -E \
+    -e 's/^[[:space:]]*-?[[:space:]]*"?image"?:[[:space:]]*//p' \
+    -e 's/^[[:space:]]*-[[:space:]]*"?--[A-Za-z0-9-]*(image|reloader)[A-Za-z0-9-]*=([^"[:space:]]+)"?[[:space:]]*$/\2/p' \
+    | tr -d '"'"'" \
+    | while read -r ref; do normalize_image "${ref}"; done
+}
+
+extra_images() {
+  # images-extra.txt entries (comments / blank lines stripped), normalized
+  sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "${AIRGAP_DIR}/images-extra.txt" \
+    | while read -r ref; do normalize_image "${ref}"; done
+}
+
 # Sanitize an image reference into a filesystem-friendly name
 sanitize_ref() {
   echo "$1" | sed -e 's|/|_|g' -e 's|:|_|g' -e 's|@|_|g'

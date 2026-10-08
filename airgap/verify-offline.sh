@@ -7,7 +7,10 @@
 #      (teknoir.cloud | github.com | storage.googleapis.com | ghcr creds)
 #      => zero hits per chart = pass; and check that versions.env pins exactly
 #      what the pinned app-of-apps deploys
-#   3. optional (--live): diff the images running in the cluster against the
+#   3. image completeness: every image the pinned charts reference (image:
+#      fields and image-valued container args) plus images-extra.txt must be in
+#      the bundle image index (<bundle>/images/images.txt), else FAIL
+#   4. optional (--live): diff the images running in the cluster against the
 #      bundle image list (via KUBECONFIG kubectl, or ssh to $TEKNOIR_HOST)
 #
 # Usage: airgap/verify-offline.sh [--live] [--bundle DIR]
@@ -60,7 +63,7 @@ fail() {
 # ---------------------------------------------------------------------------
 # 1. bash -n on all shell scripts
 # ---------------------------------------------------------------------------
-log "== 1/3: bash -n syntax check (airgap/ + scripts/)"
+log "== 1/4: bash -n syntax check (airgap/ + scripts/)"
 shopt -s nullglob
 scripts=("${AIRGAP_DIR}/"*.sh "${REPO_ROOT}/scripts/"*.sh)
 shopt -u nullglob
@@ -84,7 +87,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. helm template every chart + forbidden-pattern grep
 # ---------------------------------------------------------------------------
-log "== 2/3: helm template + internet-dependency grep"
+log "== 2/4: helm template + internet-dependency grep"
 require_cmd helm
 
 tmpdir="$(mktemp -d)"
@@ -112,16 +115,44 @@ while read -r name version; do
     fail "${name}-${version}: ${hits} internet reference(s):"
     head -10 "${tmpdir}/${name}.hits" >&2
   fi
+  extract_images < "${tmpdir}/${name}.yaml" | sed "s|\$| ${name}-${version}|" >> "${tmpdir}/required-images"
 done < <(pinned_charts)
 
 # versions.env must pin exactly what the pinned app-of-apps deploys.
 ( check_app_of_apps_pins ) || fail "versions.env does not match the pinned app-of-apps"
 
 # ---------------------------------------------------------------------------
+# 3. image completeness: the bundle must carry every image the pins need
+# ---------------------------------------------------------------------------
+log "== 3/4: image completeness (pinned charts + images-extra.txt vs bundle index)"
+INDEX_FILE="$(bundle_dir)/images/images.txt"
+if [[ ! -f "${INDEX_FILE}" ]]; then
+  fail "no bundle image index at ${INDEX_FILE} (run collect-images.sh / make-bundle.sh)"
+else
+  # Plain file lookups: `awk | grep -q` can report a miss under pipefail when
+  # grep exits early and awk dies of SIGPIPE.
+  cut -d' ' -f1 "${INDEX_FILE}" > "${tmpdir}/bundle-images"
+  extra_images | sed 's|$| images-extra.txt|' >> "${tmpdir}/required-images"
+  : > "${tmpdir}/missing-images"
+  while read -r ref from; do
+    if ! grep -qxF -- "${ref}" "${tmpdir}/bundle-images"; then
+      warn "missing from the bundle: ${ref} (needed by ${from})"
+      echo "${ref}" >> "${tmpdir}/missing-images"
+    fi
+  done < <(sort -u "${tmpdir}/required-images")
+  missing_images="$(sort -u "${tmpdir}/missing-images" | wc -l | tr -d ' ')"
+  if [[ "${missing_images}" -eq 0 ]]; then
+    log "  pass: all $(cut -d' ' -f1 "${tmpdir}/required-images" | sort -u | wc -l | tr -d ' ') required images are in the bundle"
+  else
+    fail "${missing_images} required image(s) missing from the bundle — re-run collect-images.sh (or extend images-extra.txt)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 3. optional live-cluster image diff
 # ---------------------------------------------------------------------------
 if [[ "${LIVE}" == "1" ]]; then
-  log "== 3/3: live-cluster image diff vs bundle"
+  log "== 4/4: live-cluster image diff vs bundle"
   BUNDLE="$(bundle_dir)"
   INDEX_FILE="${BUNDLE}/images/images.txt"
   if [[ ! -f "${INDEX_FILE}" ]]; then
@@ -157,7 +188,7 @@ if [[ "${LIVE}" == "1" ]]; then
       while read -r img; do
         [[ -n "${img}" ]] || continue
         upstream_ref="$(normalize_live "${img}")"
-        if ! awk '{print $1}' "${INDEX_FILE}" | grep -qxF "${upstream_ref}"; then
+        if ! cut -d' ' -f1 "${INDEX_FILE}" | grep -xF -- "${upstream_ref}" >/dev/null; then
           warn "running image NOT in bundle: ${img} (upstream: ${upstream_ref})"
           missing=$((missing + 1))
         fi
@@ -170,7 +201,7 @@ if [[ "${LIVE}" == "1" ]]; then
     fi
   fi
 else
-  log "== 3/3: live-cluster image diff skipped (enable with --live)"
+  log "== 4/4: live-cluster image diff skipped (enable with --live)"
 fi
 
 # ---------------------------------------------------------------------------

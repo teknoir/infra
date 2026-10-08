@@ -18,6 +18,13 @@ docker.io/redis:7.2-alpine
 # Keycloak Postgres database (auth chart).
 docker.io/postgres:16
 
+# Config reloader sidecar that prometheus-operator v0.89.0 (monitoring 0.0.4,
+# kube-prometheus-stack 82.18.0) injects into Prometheus/Alertmanager pods. It
+# is passed as an operator arg (--prometheus-config-reloader=), which
+# collect-images.sh now extracts too; pinned here as well because without it
+# Prometheus and Alertmanager stay in ImagePullBackOff. Keep in step with the operator.
+quay.io/prometheus-operator/prometheus-config-reloader:v0.89.0
+
 # NOTE: harbor trivy adapter pulls its vulnerability database (trivy-db) from
 # ghcr.io/aquasecurity/trivy-db at scan time. That is an OCI *artifact*, not a
 # runnable image; mirror it manually with

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# collect-images.sh — extract every container image referenced by the charts,
+# collect-images.sh — extract every container image referenced by the pinned
+# charts (image: fields and image-valued container args, lib.sh:extract_images),
 # merge with images-extra.txt, and pull them (connected side):
 #   * all images        -> <bundle>/images/<name>/ as OCI layouts (digest-dedup)
 #   * bootstrap images  -> <bundle>/bootstrap/images/<name>.tar as
@@ -38,48 +39,6 @@ BUNDLE="$(bundle_dir)"
 IMAGES_OUT="${BUNDLE}/images"
 BOOTSTRAP_IMAGES_OUT="${BUNDLE}/bootstrap/images"
 
-# --- image reference normalization -------------------------------------------
-normalize_image() {
-  # canonicalize: add docker.io[/library] for registry-less refs, strip quotes;
-  # drop template/garbage refs (e.g. istiod's injection-template ConfigMap
-  # contains literal `image: {{ ... }}` and `image: auto` lines)
-  local ref="$1" first
-  ref="${ref%\"}"; ref="${ref#\"}"
-  ref="${ref%\'}"; ref="${ref#\'}"
-  [[ -n "${ref}" ]] || return 0
-  case "${ref}" in
-    *['{}$`, ']*) return 0 ;;   # helm/go-template leftovers or lists
-    auto|*/auto) return 0 ;;    # istio sidecar "auto" placeholder
-  esac
-  first="${ref%%/*}"
-  if [[ "${ref}" != */* ]]; then
-    ref="docker.io/library/${ref}"
-  elif [[ "${first}" != *.* && "${first}" != *:* && "${first}" != "localhost" ]]; then
-    ref="docker.io/${ref}"
-  fi
-  # docker.io official images live under library/ (containerd normalizes them
-  # before the registries.yaml rewrite, so the mirror path must match)
-  if [[ "${ref}" == docker.io/* ]]; then
-    local rest="${ref#docker.io/}"
-    if [[ "${rest}" != */* ]]; then
-      ref="docker.io/library/${rest}"
-    fi
-  fi
-  # require an explicit tag or digest — rendered charts always pin images;
-  # bare names are noise from embedded config blobs (istiod values, etc.)
-  if [[ "${ref##*/}" != *[:@]* ]]; then
-    return 0
-  fi
-  echo "${ref}"
-}
-
-extract_images() {
-  # read rendered manifests on stdin, print normalized image refs
-  sed -n -E 's/^[[:space:]]*-?[[:space:]]*"?image"?:[[:space:]]*//p' \
-    | tr -d '"'"'" \
-    | while read -r ref; do normalize_image "${ref}"; done
-}
-
 # --- collect image lists -------------------------------------------------------
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
@@ -114,9 +73,8 @@ while read -r name version; do
   fi
 done < <(pinned_charts)
 
-# extras (comments / blank lines stripped)
-sed -e 's/#.*//' -e '/^[[:space:]]*$/d' "${AIRGAP_DIR}/images-extra.txt" \
-  | while read -r ref; do normalize_image "${ref}"; done >> "${all_list}"
+# images the rendered charts do not reveal (images-extra.txt)
+extra_images >> "${all_list}"
 
 # bootstrap tier always includes the sidecar proxy and the pause image
 {
