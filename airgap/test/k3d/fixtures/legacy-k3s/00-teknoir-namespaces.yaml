@@ -1,0 +1,23 @@
+# Fixture: the legacy K3s file 00-teknoir-namespaces.yaml (render-bootstrap.sh)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: istio-system
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teknoir-system
+  labels:
+    istio-injection: enabled
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cert-manager
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teknoir-auth

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# TEST DRIVER standing in for airgap/node/bin/teknoir-node: sources the stub
+# common.sh and the node phase libraries, then calls one function.
+#   teknoir-node-stub <function> [args...]   e.g. cmd_migrate --dry-run
+# The environment supplies what the real runner and the site env would:
+# KUBECTL, NODE_ROOT, K3S_DATA_DIR, TEKNOIR_DOMAIN, NODE, DRY_RUN, ...
+# shellcheck source-path=SCRIPTDIR
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+lib="$(cd "${here}/../../node/lib" && pwd)"
+# shellcheck source=common.sh
+source "${here}/common.sh"
+for f in oneshot harbor migrate admin; do
+  # shellcheck disable=SC1090
+  if [[ -f "${lib}/${f}.sh" ]]; then source "${lib}/${f}.sh"; fi
+done
+[[ $# -ge 1 ]] || { echo "usage: $0 <function> [args...]" >&2; exit 2; }
+"$@"
+summary

@@ -1,0 +1,21 @@
+# Fixture: the K3s file teknoir-app-of-apps.yaml (and its older name app-of-apps.yaml)
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: teknoir-system
+spec:
+  sourceRepos: ['*']
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: teknoir-system
+spec:
+  project: default
+  source:
+    repoURL: harbor.teknoir.airgapped/teknoir
+    chart: app-of-apps
+    targetRevision: 0.0.3

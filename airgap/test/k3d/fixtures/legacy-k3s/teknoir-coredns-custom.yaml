@@ -1,0 +1,15 @@
+# Fixture: the K3s file teknoir-coredns-custom.yaml
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  teknoir.server: |
+    teknoir.airgapped:53 {
+      hosts {
+        10.77.0.10 teknoir.airgapped harbor.teknoir.airgapped
+        fallthrough
+      }
+    }
