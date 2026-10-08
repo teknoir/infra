@@ -13,25 +13,28 @@ USB, and served from the in-cluster Harbor registry.
 
 Two tiers:
 
-* **Bootstrap tier — Istio → ArgoCD → Harbor.** Installed as ordered static
-  manifests (`00-teknoir-istio.yaml`, `10-teknoir-argo.yaml`,
-  `20-teknoir-harbor.yaml`) via the K3s auto-deploy directory
-  (`/opt/k3s/server/manifests/`), with images shipped as containerd tarballs
-  (`/opt/k3s/agent/images/`). Istio comes first because *everything* — Harbor
-  included — is exposed only through the Istio ingressgateway, which
-  terminates TLS with a pre-issued `*.teknoir.airgapped` wildcard cert signed by
-  the local Teknoir Root CA.
+* **Bootstrap tier — Istio → ArgoCD → Harbor.** Installed by
+  `airgap/bootstrap-airgap.sh`: K3s auto-deploy files in
+  `/opt/k3s/server/manifests/` (namespaces, istio + cert-manager CRDs,
+  `teknoir-argo.yaml`, the root `teknoir-app-of-apps.yaml`, secrets; one file
+  per object), one-shot Istio and Harbor resources that ArgoCD then adopts,
+  and images shipped as containerd tarballs (`/opt/k3s/agent/images/`). Istio
+  comes first because *everything* — Harbor included — is exposed only through
+  the Istio ingressgateway, which terminates TLS with a pre-issued
+  `*.teknoir.airgapped` wildcard cert signed by the local Teknoir Root CA.
 * **GitOps tier — everything else.** ArgoCD pulls the `app-of-apps` chart and
   all platform charts from `oci://harbor.teknoir.airgapped/teknoir` and syncs
   auth (Keycloak/oauth2-proxy), cert-manager, monitoring, and the controllers.
   ArgoCD also **adopts** the bootstrap-installed Istio and Harbor via
   `ServerSideApply=true` Applications pinned to the same chart versions.
 
-Harbor hosts the charts (project `teknoir`) and mirrors the five public
-registries (`dockerhub`, `ghcr`, `gcr`, `quay`, `k8s` — wired into containerd
-via `/etc/rancher/k3s/registries.yaml`). ArgoCD pulls with the `robot$argocd`
-robot account. cert-manager renews the wildcard cert from the `teknoir-ca`
-`ClusterIssuer` once the GitOps tier runs.
+Harbor hosts the charts (project `teknoir`, every version released once and
+immutable) and mirrors the five public registries (`dockerhub`, `ghcr`, `gcr`,
+`quay`, `k8s` — wired into containerd via `/etc/rancher/k3s/registries.yaml`).
+ArgoCD pulls with the `robot$argocd` robot account, whose credential is never
+rotated implicitly. cert-manager renews the wildcard cert from the
+`teknoir-ca` `ClusterIssuer` once the GitOps tier runs. Ownership details:
+[README_infra.md § Ownership model](README_infra.md#ownership-model).
 
 ## Quick start
 
@@ -45,15 +48,18 @@ Condensed:
 ```sh
 # connected workstation
 ./scripts/gen-local-ca-secret.sh && ./scripts/gen-harbor-secrets.sh   # …and the other gen-*.sh
+export GITOPS_REPO_DIR=../platform-applications-gitops-teknoir-local  # branch teknoir-local
 ./airgap/make-bundle.sh
 ./airgap/verify-offline.sh
 
 # USB → LAN laptop
-./airgap/bootstrap-airgap.sh                       # Istio → ArgoCD → Harbor up
-HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh
-./scripts/gen-argocd-harbor-repo-secret.sh && ./scripts/deploy-secrets.sh
-./airgap/deploy-app-of-apps.sh                     # ArgoCD adopts istio+harbor, syncs the rest
+./airgap/bootstrap-airgap.sh                       # Istio → ArgoCD → Harbor → app-of-apps
+HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh   # robot account, pinned charts, images
+./scripts/deploy-secrets.sh                        # ArgoCD uses the robot; syncs the rest
 # then: Keycloak clients + Harbor OIDC (runbook §8)
+
+# later updates (AIRGAP-UPDATE.md): push-to-harbor.sh, deploy-secrets.sh,
+# update-airgap.sh <app-of-apps version>, bootstrap-airgap.sh --update
 ```
 
 ## Directory layout

@@ -12,34 +12,38 @@ Three machines are involved:
 ```
 [connected workstation]              [laptop on LAN]                  [teknoir@teknoir.airgapped (K3s)]
 make-bundle.sh ──► USB ──► bootstrap-airgap.sh ── ssh ──► CA + registries.yaml + /etc/hosts + image tarballs
-                                                          restart k3s
-                                                          secrets (incl. wildcard-tls) + coredns-custom
-                                                          istio manifests → argo + harbor manifests
-                                                          (auto-deploy → Istio gw :443, ArgoCD, Harbor up)
-                           push-to-harbor.sh ── https ──► projects + robot$argocd, push charts + images
-                           deploy-app-of-apps.sh ─ ssh ─► app-of-apps (oci://harbor…/teknoir/app-of-apps)
+                                                          restart k3s (only when something changed)
+                                                          namespaces, istio + cert-manager CRDs, coredns-custom
+                                                          secrets (only those that do not exist yet)
+                                                          istio (one-shot) → ArgoCD → harbor (one-shot)
+                                                          app-of-apps (oci://harbor…/teknoir/app-of-apps)
+                           push-to-harbor.sh ── https ──► projects, robot$argocd, pinned charts, images
+                           deploy-secrets.sh ─── ssh ───► ArgoCD switches to the robot credential;
                                                           ArgoCD adopts istio + harbor, syncs auth,
                                                           cert-manager, monitoring, controllers
                            runbook (manual) ────────────► Keycloak clients (argocd, harbor) + Harbor OIDC
 ```
 
-The **bootstrap tier** (Istio → ArgoCD → Harbor) is installed from static,
-pre-rendered manifests via the K3s auto-deploy directory, in that order, with
-health waits between tiers. Once Harbor is populated, ArgoCD **adopts** the
-running Istio and Harbor through its own `istio`/`harbor` Applications
-(`ServerSideApply=true`, same chart versions ⇒ no drift, no recreation) and
-syncs the GitOps tier (auth, cert-manager, monitoring, controllers) from
-`oci://harbor.teknoir.airgapped/teknoir`.
+The **bootstrap tier** (Istio → ArgoCD → Harbor) is installed with health
+waits between tiers. K3s owns the namespaces, the istio + cert-manager CRDs,
+ArgoCD, the secrets and the root `app-of-apps` (one file each in its
+auto-deploy directory). Istio and Harbor are applied once and then **adopted**
+by their own ArgoCD Applications (`ServerSideApply=true`, same chart versions,
+so no drift and no recreation). ArgoCD syncs the GitOps tier (auth,
+cert-manager, monitoring, controllers) from
+`oci://harbor.teknoir.airgapped/teknoir`. Who owns what:
+[README_infra.md § Ownership model](../README_infra.md#ownership-model).
 
 ## 2. Prerequisites
 
 ### Connected workstation (bundle build)
 
-* This repo (`infra`, branch `teknoir-local`) and the GitOps repo
-  (`platform-applications-gitops`, branch `teknoir-local`) checked out as
-  siblings — or set `GITOPS_REPO_DIR` (default: `../platform-applications-gitops`).
-* Tools: `helm`, `crane`, `curl`, `tar`, `openssl`, `python3` (with PyYAML, or
-  `yq`, for ArgoCD adoption labels).
+* This repo (`infra`, branch `teknoir-local`) and a GitOps checkout
+  (`platform-applications-gitops`) **on branch `teknoir-local`**, given as
+  `GITOPS_REPO_DIR` (default: `../platform-applications-gitops`). The build
+  refuses any other branch (`GITOPS_ALLOW_ANY_BRANCH=1` overrides).
+* Tools: `helm`, `crane`, `curl`, `tar`, `git`, `openssl`, `python3` with
+  PyYAML.
 * Internet access (to pull chart dependencies, images, and pinned tools).
 
 ### LAN laptop (air-gapped side)
@@ -147,7 +151,7 @@ Notes:
   written by `airgap/push-to-harbor.sh` to `airgap/.secrets/robot-argocd.env`.
   That file does not exist yet, so the first run falls back to the Harbor
   admin credential (parsed from `.secrets/manifest-harbor-secret.yaml`) — this is
-  expected; you replace it with the robot credential in §6.
+  expected; you replace it with the robot credential in §6.3.
 * Run `gen-harbor-secrets.sh` **before** `gen-argocd-harbor-repo-secret.sh`
   (the admin fallback parses its manifest).
 
@@ -156,12 +160,23 @@ Notes:
 Versions are pinned centrally in `airgap/versions.env` (chart versions, Istio /
 ArgoCD / Harbor versions, tool versions, mirrored registries, hostnames).
 Extra images that `helm template` cannot discover (Istio sidecar `proxyv2`,
-pause, busybox, redis, postgres) are listed in `airgap/images-extra.txt`.
+pause, busybox, redis, postgres, the prometheus config reloader) are listed in
+`airgap/images-extra.txt`.
 
 ```sh
+export GITOPS_REPO_DIR=../platform-applications-gitops-teknoir-local
 ./airgap/make-bundle.sh                 # add --dry-run to preview
 ./airgap/verify-offline.sh              # offline-readiness gate (see below)
 ```
+
+> **First bootstrap needs every pinned chart in the bundle.** Charts in
+> `RELEASED_CHARTS` (currently `harbor 0.0.5`, `auth 0.0.3`) are never
+> rebuilt from the working tree. Copy their `.tgz` into
+> `bundle/teknoir-airgap-bundle-<version>/charts/` (e.g. `helm pull` them from
+> an existing Harbor) before `make-bundle.sh`, or pin versions the working
+> tree carries. Without them `render-bootstrap.sh` leaves out
+> `bootstrap/apply/harbor.yaml`, and `bootstrap-airgap.sh` refuses to bootstrap
+> a node that has no Harbor yet.
 
 `make-bundle.sh` orchestrates eight steps and produces
 `bundle/teknoir-airgap-bundle-<version>/`:
@@ -171,10 +186,11 @@ teknoir-airgap-bundle-<version>/
 ├── bundle-manifest.yaml          # sha256 checksum of every file
 ├── bootstrap/
 │   ├── images/                   # containerd tarballs: istio (pilot, proxyv2), argo-cd, harbor, pause
-│   ├── manifests/                # 00-teknoir-istio.yaml, 10-teknoir-argo.yaml, 20-teknoir-harbor.yaml, app-of-apps.yaml
+│   ├── manifests/                # K3s files: 00-teknoir-namespaces.yaml, 00-teknoir-istio-crds.yaml, 05-teknoir-certmanager-crds.yaml, teknoir-argo.yaml, teknoir-app-of-apps.yaml
+│   ├── apply/                    # one-shot, adopted by ArgoCD: istio.yaml, harbor.yaml
 │   ├── secrets/                  # the manifest-*.yaml files from §3
 │   └── k3s/                      # registries.yaml, teknoir-root-ca.crt, coredns-custom.yaml
-├── charts/                       # <chart>-<version>.tgz for every GitOps chart (deps vendored)
+├── charts/                       # <chart>-<version>.tgz for every pinned chart (deps vendored)
 ├── images/                       # workload images as OCI layouts (crane), digest-deduplicated
 ├── tools/                        # pinned crane + helm binaries (linux-amd64, darwin-arm64)
 ├── k3s/                          # offline K3s install: k3s binary, install.sh, airgap-images tarball (see AIRGAP-HOST-SETUP.md)
@@ -185,20 +201,26 @@ teknoir-airgap-bundle-<version>/
 The individual steps can also be run standalone (each supports `--dry-run` and
 `--bundle-dir DIR`):
 
-* `airgap/collect-charts.sh` — `helm dependency build` + `helm package` every
-  GitOps chart plus the infra `argo` chart into `charts/`.
-* `airgap/collect-images.sh` — extracts image refs from the rendered charts,
-  merges `images-extra.txt`, pulls everything as OCI layouts; bootstrap-tier
-  images (istio, argo, harbor, pause) additionally as containerd tarballs.
-* `airgap/render-bootstrap.sh` — `helm template` of gitops `charts/istio`,
-  infra `charts/argo`, gitops `charts/harbor` with `teknoir.airgapped` values into
-  the ordered `00-`/`10-`/`20-` manifests (istio/harbor renders are labeled
-  `app.kubernetes.io/instance: <app>` for ArgoCD adoption); also emits
-  `registries.yaml`, `coredns-custom.yaml`, and copies `teknoir-root-ca.crt`.
+* `airgap/collect-charts.sh` — packages every pinned chart (exact
+  `Chart.yaml` version, gitops checkout on `teknoir-local`) plus the infra
+  `argo` chart into `charts/`, removes unpinned versions, and fails unless
+  `versions.env` pins exactly what the pinned `app-of-apps` deploys.
+* `airgap/collect-images.sh` — extracts image refs from the rendered pinned
+  charts (`image:` fields and image-valued container args), merges
+  `images-extra.txt`, pulls everything as OCI layouts; bootstrap-tier images
+  (istio, argo, harbor, pause) additionally as containerd tarballs.
+* `airgap/render-bootstrap.sh` — renders the pinned istio, cert-manager, argo
+  and harbor charts (bundle `.tgz`, never a different working-tree version)
+  with `teknoir.airgapped` values: K3s files under `bootstrap/manifests/`
+  (CRDs annotated `Prune=false,Delete=false`), one-shot istio/harbor resources
+  under `bootstrap/apply/` (with ArgoCD tracking-ids for adoption), plus
+  `registries.yaml`, `coredns-custom.yaml` and `teknoir-root-ca.crt`.
 
 `verify-offline.sh` syntax-checks every script (`bash -n` + `shellcheck`),
-templates every chart, and fails on any rendered reference to
-`teknoir.cloud`, `github.com`, or `storage.googleapis.com`.
+templates every pinned chart, fails on any rendered reference to
+`teknoir.cloud`, `github.com`, or `storage.googleapis.com`, on a `versions.env`
+/ `app-of-apps` mismatch, and on any image a pinned chart needs that is missing
+from the bundle.
 
 ## 5. Transfer via USB
 
@@ -237,21 +259,34 @@ The node's SSH private key is auto-detected at `.secrets/teknoir.airgapped.id_rs
 script preflights the SSH connection and aborts with a hint if publickey
 authentication fails.
 
-Over SSH this: installs the Root CA (`/etc/rancher/k3s/teknoir-root-ca.crt` +
-system trust), installs the K3s registry mirrors
-(`/etc/rancher/k3s/registries.yaml` — all five upstream registries rewritten to
-`https://harbor.teknoir.airgapped`), writes the `/etc/hosts` marker block on the
-node, copies the bootstrap image tarballs to `/opt/k3s/agent/images/`, restarts
-K3s (re-importing the tarballs), **waits until every bootstrap image is actually
-present in containerd** (K3s imports the tarballs asynchronously, *after* the
-node reports `Ready`), deploys all secret manifests plus the
-`coredns-custom` ConfigMap, and then lands the ordered bootstrap manifests in
-`/opt/k3s/server/manifests/` — waiting for health between tiers:
+Over SSH this:
 
-1. `00-teknoir-istio.yaml` → waits for `istiod` and `istio-ingressgateway`,
-2. `10-teknoir-argo.yaml` → waits for `argocd-server`,
-3. `20-teknoir-harbor.yaml` → waits for Harbor pods **and** verifies every
-   Harbor pod carries an `istio-proxy` sidecar (STRICT mTLS sanity check).
+1. installs the Root CA (`/etc/rancher/k3s/teknoir-root-ca.crt` + system
+   trust), the K3s registry mirrors (`/etc/rancher/k3s/registries.yaml`, all
+   five upstream registries rewritten to `https://harbor.teknoir.airgapped`) and
+   the `/etc/hosts` marker block;
+2. copies the bootstrap image tarballs to `/opt/k3s/agent/images/`, restarts
+   K3s if anything in 1–2 changed, and **waits until every bootstrap image is
+   present in containerd** (K3s imports the tarballs asynchronously, *after*
+   the node reports `Ready`);
+3. deploys the K3s files `00-teknoir-namespaces.yaml`,
+   `00-teknoir-istio-crds.yaml`, `05-teknoir-certmanager-crds.yaml` and
+   `teknoir-coredns-custom.yaml`, waiting until K3s has applied each one;
+4. deploys the bundle's secrets (`scripts/deploy-secrets.sh --create-only`:
+   only Secrets that do not exist yet, including the wildcard TLS placeholder);
+5. applies the istio resources once → waits for `istiod` and
+   `istio-ingressgateway`;
+6. deploys `teknoir-argo.yaml` → waits for the `Application` CRD and
+   `argocd-server` (after istio, so the ArgoCD pods get sidecars);
+7. applies the harbor resources once → waits for the Harbor pods **and**
+   verifies every Harbor pod carries an `istio-proxy` sidecar (STRICT mTLS);
+8. deploys `teknoir-app-of-apps.yaml` (ArgoCD retries until §6.2 has pushed
+   the charts).
+
+Re-running it is safe: unchanged files are not rewritten, K3s restarts only on
+a change, existing Secrets are kept, and the one-shot istio/harbor apply is
+skipped once ArgoCD's `istio`/`harbor` Application exists. For a running
+cluster use `--update` instead (see [AIRGAP-UPDATE.md](AIRGAP-UPDATE.md) §5).
 
 The node IP defaults to `NODE_IP` in `airgap/versions.env` (`192.168.5.181`); if
 that is unset it is auto-detected over SSH. Pass `--node-ip` to override either.
@@ -272,12 +307,10 @@ that is unset it is auto-detected over SSH. Pass `--node-ip` to override either.
 > `IfNotPresent` the already-present local image is used and no registry is
 > contacted.
 >
-> To recover a cluster that was bootstrapped from a pre-fix bundle: re-copy the
-> regenerated manifest and let the gateways restart with the new policy:
+> A cluster bootstrapped from a pre-fix bundle gets the policy from the
+> ArgoCD `istio` Application; restart the stuck gateway pods so they pick it up:
 >
 > ```sh
-> ./airgap/bootstrap-airgap.sh --update   # re-applies 00-teknoir-istio.yaml
-> # then force the stuck gateway pods to re-read the (now IfNotPresent) spec:
 > ssh teknoir@teknoir.airgapped sudo k3s kubectl -n istio-system \
 >   rollout restart deploy/istio-egressgateway deploy/istio-ingressgateway \
 >   deploy/istio-ingressgateway-public
@@ -289,39 +322,38 @@ that is unset it is auto-detected over SSH. Pass `--node-ip` to override either.
 HARBOR_ADMIN_PASSWORD='<from gen-harbor-secrets.sh>' ./airgap/push-to-harbor.sh [--dry-run]
 ```
 
-Idempotently: creates the six Harbor projects (`teknoir` private for charts;
-`dockerhub`, `ghcr`, `gcr`, `quay`, `k8s` public mirrors so containerd can pull
-unauthenticated), creates/rotates the system robot account **`robot$argocd`**
-(pull-only on all projects) and writes its credential to
-`airgap/.secrets/robot-argocd.env`, `helm push`es every chart to
-`oci://harbor.teknoir.airgapped/teknoir`, and `crane push`es every image into its
-mirror project. TLS uses the bundle's `teknoir-root-ca.crt` (or `--insecure`).
+Idempotently:
+
+* creates the six Harbor projects (`teknoir` private for charts; `dockerhub`,
+  `ghcr`, `gcr`, `quay`, `k8s` public mirrors so containerd can pull
+  unauthenticated);
+* ensures the system robot account **`robot$argocd`** (pull-only on all
+  projects). Its credential is generated once into
+  `airgap/.secrets/robot-argocd.env` and never rotated implicitly (only with
+  `--rotate-robot`); the script regenerates
+  `.secrets/manifest-argocd-harbor-repo-secret.yaml` from it;
+* creates a tag-immutability rule on `teknoir` and `helm push`es every pinned
+  chart version Harbor does not have yet (existing versions are never
+  overwritten);
+* `crane push`es every image into its mirror project.
+
+TLS uses the bundle's `teknoir-root-ca.crt` (or `--insecure`).
+`--robot-only` stops after the robot and the manifest (no bundle needed).
 
 ### 6.3 Switch ArgoCD to the robot credential
 
-The `argocd-harbor-repo` secret generated in §3 used the admin fallback.
-Regenerate it with the robot credential and redeploy:
+The `argocd-harbor-repo` secret generated in §3 used the admin fallback, and
+§6.2 regenerated it with the robot credential. Deploy it:
 
 ```sh
-./scripts/gen-argocd-harbor-repo-secret.sh    # now picks up airgap/.secrets/robot-argocd.env
-./scripts/deploy-secrets.sh                   # copies all manifest-*.yaml to the node's auto-deploy dir
+./scripts/deploy-secrets.sh        # installs .secrets/manifest-*.yaml as K3s files (unchanged ones are no-ops)
 ```
 
-> `push-to-harbor.sh` **rotates** the robot secret on every run — repeat this
-> step after each future push.
-
-### 6.4 Deploy the app-of-apps
-
-```sh
-./airgap/deploy-app-of-apps.sh [--dry-run]
-```
-
-Copies the bundle's `app-of-apps.yaml` (AppProject + Application with source
-`oci://harbor.teknoir.airgapped/teknoir`, chart `app-of-apps`, pinned
-`targetRevision`) to `/opt/k3s/server/manifests/teknoir-app-of-apps.yaml`.
-ArgoCD then adopts the bootstrap-installed `istio` and `harbor` (both
-Applications sync with `ServerSideApply=true`, project `teknoir-local`) and
-syncs `auth`, `cert-manager`, `monitoring`, and the controllers.
+ArgoCD then pulls `app-of-apps` (deployed in §6.1 step 8), adopts the
+bootstrap-installed `istio` and `harbor` (`ServerSideApply=true`, project
+`teknoir-local`), and syncs `auth`, `cert-manager`, `monitoring` and the
+controllers. `./airgap/deploy-app-of-apps.sh` redeploys the root manifest if
+ever needed (a no-op when unchanged).
 
 ## 7. Verification
 
@@ -330,7 +362,7 @@ syncs `auth`, `cert-manager`, `monitoring`, and the controllers.
 curl --cacert teknoir-root-ca.crt -sSI https://harbor.teknoir.airgapped/ | head -1
 curl --cacert teknoir-root-ca.crt -sSI https://argocd.teknoir.airgapped/ | head -1
 
-# All Applications Synced/Healthy
+# All Applications Synced/Healthy (full checklist: AIRGAP-UPDATE.md §7)
 ssh teknoir@teknoir.airgapped sudo k3s kubectl -n teknoir-system get applications
 
 # Istio adoption OK: empty diff = ArgoCD render matches the bootstrap render
@@ -453,7 +485,7 @@ that talks TLS to the gateway:
 |---|---|
 | Node containerd (image pulls via mirrors) | `/etc/rancher/k3s/registries.yaml` → `ca_file: /etc/rancher/k3s/teknoir-root-ca.crt` (installed by `bootstrap-airgap.sh`) |
 | Node OS trust store | `/usr/local/share/ca-certificates/` + `update-ca-certificates` (installed by `bootstrap-airgap.sh`) |
-| ArgoCD repo-server (Harbor OCI `helm registry login`) | `argocd-tls-certs-cm` keyed by `harbor.teknoir.airgapped`, populated from the argo-cd chart's `configs.tls.certificates` — injected at render time via `--set-file` by `scripts/deploy-argo.sh` and `airgap/render-bootstrap.sh`. Without it the repo-server fails with `x509: certificate signed by unknown authority` and `app-of-apps` stays `Unknown`. |
+| ArgoCD repo-server (Harbor OCI `helm registry login`) | `argocd-tls-certs-cm` keyed by `harbor.teknoir.airgapped`, populated from the argo-cd chart's `configs.tls.certificates` — injected at render time via `--set-file` by `airgap/lib.sh:helm_template_chart` (used by `airgap/render-bootstrap.sh` and `scripts/deploy-argo.sh`). Without it the repo-server fails with `x509: certificate signed by unknown authority` and `app-of-apps` stays `Unknown`. |
 | LAN-side scripts (`push-to-harbor.sh`) | automatic (`--cacert` / `SSL_CERT_FILE` from the bundle) |
 | Operator laptops / browsers | import `teknoir-root-ca.crt` into the OS keychain / browser trust store |
 | Harbor OIDC "Verify Certificate" | works because the in-cluster trust chain covers `auth.teknoir.airgapped` |
@@ -518,16 +550,11 @@ Referer:     https://argocd.teknoir.airgapped/
 `argocd.<domain>` (and `auth.<domain>`) vhost, and the lua rewrite now only
 applies to real top-level browser navigations (`sec-fetch-mode: navigate`, or
 an HTML `Accept` when that header is absent). XHR/`fetch` calls and API clients
-(`curl`, `argocd` CLI) always receive the true status code. Roll it out per
-[AIRGAP-UPDATE.md](AIRGAP-UPDATE.md) §2 — the pins (`auth 0.0.7`,
-`app-of-apps 0.0.2`) are already in `airgap/versions.env`:
-
-```sh
-./airgap/make-bundle.sh --diff && ./airgap/verify-offline.sh   # connected workstation
-HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh           # LAN laptop
-./scripts/gen-argocd-harbor-repo-secret.sh && ./scripts/deploy-secrets.sh
-./airgap/update-airgap.sh 0.0.2
-```
+(`curl`, `argocd` CLI) always receive the true status code. It is **not
+deployed yet**: app-of-apps 0.0.3 pins the running `auth 0.0.3`, because
+`auth` ≥ `0.0.6` needs oauth2-proxy v7.15.4, which is not mirrored yet. Once it
+is, pin a new `auth` version in a new app-of-apps release and roll it out per
+[AIRGAP-UPDATE.md](AIRGAP-UPDATE.md) §2.
 
 Verify from the LAN laptop — an unauthenticated API call must answer `401`,
 never `302`:

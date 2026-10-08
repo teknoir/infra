@@ -20,7 +20,7 @@ Argo CD is deployed behind the Istio ingress gateway.
 
 ## Prerequisites
 
-1.  **ArgoCD chart**: The `argocd` chart must be deployed with `[deploy-argo.sh](../../scripts/deploy-argo.sh)`.
+1.  **ArgoCD chart**: deployed by `airgap/bootstrap-airgap.sh` (from the bundle), or with `[deploy-argo.sh](../../scripts/deploy-argo.sh)` from a checkout. Both install the same K3s file, `teknoir-argo.yaml`.
 2.  **App-of-apps**: The `[app-of-apps](https://github.com/teknoir/platform-applications-gitops/tree/teknoir-cloud/charts/app-of-apps)` application must be deployed (providing Keycloak).
 3.  **Setup in Keycloak**
 * Client setup in master realm - Client ID: `argocd`
@@ -88,8 +88,9 @@ TLS trust — it does **not** consult the node OS trust store nor
 `argocd-tls-certs-cm` (that ConfigMap is repo-server-only, for Harbor OCI login).
 Without the CA it fails with `x509: certificate signed by unknown authority`.
 
-To fix this, both render paths — `[deploy-argo.sh](../../scripts/deploy-argo.sh)`
-and `airgap/lib.sh:helm_template_chart` — embed `teknoir-root-ca.crt` into
+To fix this, the render (`airgap/lib.sh:helm_template_chart`, used by
+`airgap/render-bootstrap.sh` and `[deploy-argo.sh](../../scripts/deploy-argo.sh)`)
+embeds `teknoir-root-ca.crt` into
 `oidc.config` as the `rootCA` field via `helm template --set-file`. The CA is
 generated per-deployment and gitignored, so it is injected at render time rather
 than hardcoded here. No cert files need to be mounted into the ArgoCD pod, and no
