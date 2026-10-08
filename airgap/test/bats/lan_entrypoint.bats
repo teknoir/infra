@@ -7,6 +7,8 @@
 # is tested by airgap/test/lan/run.sh against a real sshd in containers; the
 # VM e2e (airgap/test/vm/e2e.sh) runs it from the LAN namespace.
 
+# shellcheck disable=SC2016,SC2030,SC2031  # code strings for the inner shells; bats runs each test in a subshell
+
 load test_helper
 
 setup() {

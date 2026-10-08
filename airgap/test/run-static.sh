@@ -4,7 +4,9 @@
 #
 #   1. shellcheck -x on every shell script under airgap/ and scripts/
 #      (the pre-redesign scripts at airgap/*.sh and scripts/*.sh, which I-14
-#      deletes, are held to severity warning; everything else to the default)
+#      deletes, are held to severity warning; everything else to the default),
+#      and on the bats files (shellcheck -s bash knows bats: SC2314/SC2315
+#      flag a `! cmd` that cannot fail the test)
 #   2. the LAN entrypoint under docker bash:3.2 (macOS /bin/bash): syntax and help
 #   3. bats unit tests (airgap/test/bats/run.sh, pinned bats-core)
 #   4. the node runner's own unit tests (airgap/test/node/run.sh), when present
@@ -47,9 +49,9 @@ cd "${REPO}"
 
 # ---------------------------------------------------------------------------
 step "shellcheck"
-scripts=() legacy=()
+scripts=() legacy=() batsfiles=()
 while IFS= read -r f; do
-  case "${f}" in *.bats) continue ;; esac
+  case "${f}" in *.bats) batsfiles+=("${f}"); continue ;; esac
   if [[ "${f}" == *.sh || "${f}" == *.bash ]] || head -c 64 "${f}" 2>/dev/null | grep -qE '^#!.*(ba)?sh'; then
     if [[ "${f}" =~ ^(airgap|scripts)/[^/]+\.sh$ ]]; then legacy+=("${f}"); else scripts+=("${f}"); fi
   fi
@@ -60,6 +62,10 @@ if command -v shellcheck >/dev/null; then
   if (( ${#legacy[@]} )); then
     if shellcheck -x -P SCRIPTDIR -S warning "${legacy[@]}"; then result PASS "shellcheck -S warning (${#legacy[@]} legacy scripts)"
     else result FAIL "shellcheck (legacy scripts)"; fi
+  fi
+  if (( ${#batsfiles[@]} )); then
+    if shellcheck -s bash -x -P SCRIPTDIR "${batsfiles[@]}"; then result PASS "shellcheck -s bash (${#batsfiles[@]} bats files)"
+    else result FAIL "shellcheck (bats files)"; fi
   fi
 else
   missing shellcheck shellcheck

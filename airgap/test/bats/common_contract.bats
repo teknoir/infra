@@ -7,6 +7,8 @@
 # other phase libraries were developed against, so both stay equivalent.
 # Every kubectl call goes to the recording stub (airgap/test/stubs/bin).
 
+# shellcheck disable=SC2016,SC2030,SC2031,SC2154  # code strings for the inner shells; bats runs each test in a subshell; $stderr comes from run --separate-stderr
+
 load test_helper
 
 setup() {
@@ -286,5 +288,5 @@ EOF
 # never print
 # ---------------------------------------------------------------------------
 @test "common.sh never enables xtrace" {
-  ! grep -nE '^[^#]*set -[a-zA-Z]*x|set -o xtrace' "${COMMON_SH}"
+  refute_grep -nE '^[^#]*set -[a-zA-Z]*x|set -o xtrace' "${COMMON_SH}"
 }

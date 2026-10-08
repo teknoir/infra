@@ -7,11 +7,14 @@
 # systemctl, ip, crane and helm. The payload is staged where the LAN side puts
 # it: <root>/var/lib/teknoir-airgap/bundles/<bundleId>/node, with SHA256SUMS.
 
+# shellcheck disable=SC2016,SC2030,SC2031  # code strings for the inner shells; bats runs each test in a subshell
+
 load test_helper
 
 BID=teknoir-local-aoa0.0.4-20261009-iaaaaaaa-gbbbbbbb
 
 setup() {
+  # shellcheck disable=SC2153  # NODE_DIR comes from test_helper.bash (load)
   require_file "${NODE_DIR}/bin/teknoir-node"
   setup_stubs
   common_env

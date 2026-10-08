@@ -26,6 +26,21 @@ VMTEST_SITE="${REPO_ROOT}/airgap/site/vmtest.env"
 # Calls that change something. A kubectl call with --dry-run is not one.
 MUTATING_RE='^(kubectl|k3s kubectl) (.* )?(apply|create|delete|patch|replace|label|annotate|scale|edit|set|cordon|drain|taint|uncordon)( |$)|^(kubectl|k3s kubectl) (.* )?rollout restart|^k3s ctr .*( import| rm| delete)( |$)|^k3s (secrets-encrypt|etcd-snapshot save|server|agent)( |$)|^systemctl (start|stop|restart|reload|enable|disable|daemon-reload|mask|unmask)( |$)|^crane (push|copy|cp|tag|delete|mutate|append|rebase)( |$)|^helm (push|install|upgrade|uninstall|registry login)( |$)'
 
+refute_grep() {
+  # refute_grep <grep args...> — fail the test when grep matches (the matches
+  # are shown) or cannot run (exit 2, e.g. a missing file); stdin passes
+  # through. Use it instead of a bare `! grep ...`: bats runs tests under
+  # set -e, which ignores the status of a negated command, so `! cmd` fails a
+  # test only as its last command (shellcheck SC2314, static.bats checks).
+  local out rc=0
+  out="$(grep "$@" 2>&1)" || rc=$?
+  case "${rc}" in
+    1) return 0 ;;
+    0) printf 'unexpected match: grep %s\n%s\n' "$*" "${out}"; return 1 ;;
+    *) printf 'grep %s failed (exit %s): %s\n' "$*" "${rc}" "${out}"; return 1 ;;
+  esac
+}
+
 require_file() {
   # require_file <path> — skip the test while <path> does not exist
   [[ -e "$1" ]] || skip "not implemented yet: ${1#"${REPO_ROOT}/"}"

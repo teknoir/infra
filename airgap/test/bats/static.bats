@@ -3,6 +3,8 @@
 # executable scripts with a shebang, never-print rules, public site files,
 # no key material, no writes to the test host's /etc/hosts.
 
+# shellcheck disable=SC2016,SC2030,SC2031  # code strings for the inner shells; bats runs each test in a subshell
+
 load test_helper
 
 airgap_scripts() {
@@ -50,7 +52,7 @@ airgap_scripts() {
       [[ \"\${NODE}\" == *@* ]] || { echo bad NODE; exit 1; }
       [ \"\${K3S_DATA_DIR}\" = /opt/k3s ] || { echo bad K3S_DATA_DIR; exit 1; }"
     [ "${status}" -eq 0 ] || { echo "${f}: ${output}"; return 1; }
-    ! grep -nE '^[[:space:]]*[A-Z_]*(PASS|PASSWORD|SECRET|TOKEN|PRIVATE|CREDENTIAL)[A-Z_]*=' "${f}"
+    refute_grep -nE '^[[:space:]]*[A-Z_]*(PASS|PASSWORD|SECRET|TOKEN|PRIVATE|CREDENTIAL)[A-Z_]*=' "${f}"
   done
   [ "${n}" -ge 1 ]
 }
@@ -84,4 +86,26 @@ airgap_scripts() {
             airgap/test/k3d airgap/test/vm airgap/test/lib 2>/dev/null |
           grep -vE -- '--context|kc\(\)|^\S+:[0-9]+:[[:space:]]*#' || true)"
   [ -z "${hits}" ] || { echo "${hits}"; return 1; }
+}
+
+@test "no bats test relies on a bare negation (set -e ignores it unless it is the test's last command)" {
+  # `! cmd` never fails a bats test in the middle of it (shellcheck SC2314,
+  # also inside loops, which shellcheck does not see); use refute_grep,
+  # `run ! cmd` or an explicit check
+  local hits
+  hits="$(grep -nE '^[[:space:]]*![[:space:]]' "${BATS_TEST_DIRNAME}"/*.bats "${BATS_TEST_DIRNAME}"/*.bash || true)"
+  [ -z "${hits}" ] || { echo "${hits}"; return 1; }
+}
+
+@test "refute_grep fails a test on a match even when it is not the last command" {
+  local t="${BATS_TEST_TMPDIR}/planted.bats"
+  printf '%s\n' "load '${BATS_TEST_DIRNAME}/test_helper'" \
+    '@test "match in the middle" {' '  refute_grep -n needle <<<"hay needle hay"' '  true' '}' \
+    '@test "no match" {' '  refute_grep -n needle <<<"hay"' '  true' '}' \
+    '@test "missing file" {' '  refute_grep -n needle /no/such/file' '  true' '}' > "${t}"
+  run "${BATS_ROOT}/bin/bats" --tap "${t}"
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"not ok 1 match in the middle"* ]]
+  [[ "${output}" == *"ok 2 no match"* && "${output}" != *"not ok 2"* ]]
+  [[ "${output}" == *"not ok 3 missing file"* ]]
 }

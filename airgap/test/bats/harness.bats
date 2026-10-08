@@ -3,6 +3,8 @@
 # scripts, the LAN namespace and the e2e driver. None of these tests starts a
 # cluster or a VM, needs root, or touches the network.
 
+# shellcheck disable=SC2016,SC2030,SC2031  # code strings for the inner shells; bats runs each test in a subshell
+
 load test_helper
 
 K3D="${REPO_ROOT}/airgap/test/k3d/run.sh"
@@ -49,6 +51,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 }
 
 @test "k3d: gvk_resource maps Addon GVK strings to kubectl kind.version.group" {
+  # shellcheck source=../k3d/run.sh
   source "${K3D}"
   [ "$(gvk_resource '/v1, Kind=Secret')" = "Secret.v1." ]
   [ "$(gvk_resource 'apiextensions.k8s.io/v1, Kind=CustomResourceDefinition')" = "CustomResourceDefinition.v1.apiextensions.k8s.io" ]
@@ -56,6 +59,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 }
 
 @test "k3d: the T9 fixture reproduces the live canonical -> legacy secret file names" {
+  # shellcheck source=../k3d/run.sh
   source "${K3D}"
   local f legacy=""
   while read -r f _ _; do legacy+="$(legacy_name "${f}") "; done <<<"${T9_SECRETS}"
@@ -66,6 +70,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 }
 
 @test "k3d: the T9 fixture has the 14 istio, 6 cert-manager and 3 argoproj CRDs" {
+  # shellcheck source=../k3d/run.sh
   source "${K3D}"
   [ "$(grep -c . <<<"${ISTIO_CRDS}")" -eq 14 ]
   [ "$(grep -c . <<<"${CERTMANAGER_CRDS}")" -eq 6 ]
@@ -75,7 +80,10 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 
 @test "k3d: every kubectl call goes through kc with an explicit --context" {
   # kubectl in a command position (line start, after ; | & ( or $( ), other than kc() itself
-  ! grep -nE '(^[[:space:]]*|[;|&(][[:space:]]*|\$\([[:space:]]*)kubectl[[:space:]]' "${K3D}" | grep -v 'kc() { kubectl --context "${CTX}"'
+  local hits
+  hits="$(grep -nE '(^[[:space:]]*|[;|&(][[:space:]]*|\$\([[:space:]]*)kubectl[[:space:]]' "${K3D}" |
+          grep -v 'kc() { kubectl --context "${CTX}"' || true)"
+  [ -z "${hits}" ] || { echo "${hits}"; return 1; }
 }
 
 # ---------------------------------------------------------------------------
@@ -89,7 +97,9 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 @test "vm.sh: no hosts-up/hosts-down and no write to /etc/hosts" {
   run "${VM}" hosts-up
   [ "${status}" -ne 0 ]
-  ! grep -nE '/etc/hosts' "${VM}" | grep -vE '^[0-9]+:\s*#'
+  local hits
+  hits="$(grep -nE '/etc/hosts' "${VM}" | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+  [ -z "${hits}" ] || { echo "${hits}"; return 1; }
 }
 
 @test "vm.sh: VM state lives in VM_DIR, not in the repo" {
@@ -106,7 +116,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
            keycloak.teknoir.airgapped grafana.teknoir.airgapped; do
     [[ " ${line//$'\t'/ } " == *" ${n} "* ]] || { echo "missing ${n}"; return 1; }
   done
-  ! grep -q '192\.168\.' <<<"${output}"
+  refute_grep -n '192\.168\.' <<<"${output}"
   grep -qE '^127\.0\.0\.1[[:space:]]+localhost' <<<"${output}"
 }
 
@@ -118,8 +128,8 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 }
 
 @test "lan-netns.sh: never edits vpro's /etc/hosts, adds no default route" {
-  ! grep -nE '(>|tee|sed -i|install)[^#]* /etc/hosts' "${NETNS}"
-  ! grep -nE 'route add default|route replace default' "${NETNS}"
+  refute_grep -nE '(>|tee|sed -i|install)[^#]* /etc/hosts' "${NETNS}"
+  refute_grep -nE 'route add default|route replace default' "${NETNS}"
   grep -q 'ETC="/etc/netns/${NS}"' "${NETNS}"
 }
 
@@ -149,6 +159,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 }
 
 @test "e2e.sh: the VM-destroying scenarios need --allow-destroy" {
+  # shellcheck source=../vm/e2e.sh
   source "${E2E}"
   grep -q 'ALLOW_DESTROY=0' "${E2E}"
   for s in e1 e6 e10; do
@@ -175,6 +186,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 }
 
 @test "kc-login.sh: parses the Keycloak login and required-action forms" {
+  # shellcheck source=../vm/kc-login.sh
   source "${KCLOGIN}"
   page="${BATS_TEST_TMPDIR}/page.html"
   cat > "${page}" <<'EOF'
@@ -195,7 +207,7 @@ EOF
 }
 
 @test "kc-login.sh: passwords reach curl only as @file, never as an argument" {
-  ! grep -nE 'password=\$|password-new=\$|password-confirm=\$' "${KCLOGIN}"
+  refute_grep -nE 'password=\$|password-new=\$|password-confirm=\$' "${KCLOGIN}"
   grep -q 'password@' "${KCLOGIN}"
 }
 
