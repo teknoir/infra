@@ -67,7 +67,7 @@ HARBOR_ADMIN_PASSWORD='…' ./airgap/push-to-harbor.sh   # robot account, pinned
 | Path | Purpose |
 |---|---|
 | `airgap/` | Bundle build (connected side) + install/update tooling (LAN side); see script headers for usage |
-| `airgap/versions.env` | Central version/config pinning (charts, Istio/ArgoCD/Harbor, tools, hostnames) |
+| `airgap/versions.env` | Central version/config pinning (root app-of-apps, argo, Istio/ArgoCD/Harbor, tools, hostnames) |
 | `airgap/images-extra.txt` | Images `helm template` cannot discover (sidecars, runtime pulls) |
 | `charts/argo/` | Bootstrap ArgoCD umbrella chart (see [README_infra.md](README_infra.md)) |
 | `scripts/` | Secret generators (`gen-*.sh`) + deploy helpers (`deploy-argo.sh`, `deploy-secrets.sh`) |

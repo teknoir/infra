@@ -53,9 +53,12 @@ object:
   the automated syncs that failed under the exclusion are re-run afterwards
   ([AIRGAP-UPDATE.md §2.4](docs/AIRGAP-UPDATE.md)).
 
-**Charts are released once.** `airgap/versions.env` pins every chart version
-the root app-of-apps deploys: `GITOPS_CHARTS` (built from the gitops working
-tree at exactly that version) and `RELEASED_CHARTS` (already in Harbor, never
+**Charts are released once.** `airgap/versions.env` pins only the root
+`APP_OF_APPS_VERSION` and the infra chart (`INFRA_CHARTS`: argo). Every other
+chart version is the one that app-of-apps deploys, so GitOps owns it; the
+tooling reads it from the app-of-apps render (`lib.sh:load_chart_pins`, recorded
+in `<bundle>/charts/pins.txt`). Those charts are built from the gitops working
+tree at exactly that version, except `RELEASED_CHARTS` (already in Harbor, never
 rebuilt). `push-to-harbor.sh` pushes only versions Harbor does not have, and a
 tag-immutability rule on the project `teknoir` refuses overwrites. Changing a
 chart means bumping its version.

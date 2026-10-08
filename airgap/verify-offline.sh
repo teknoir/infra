@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # verify-offline.sh — offline-readiness verification (plan §8):
 #   1. bash -n every airgap/ + scripts/ shell script
-#   2. helm template every pinned chart version (versions.env; bundle .tgz,
-#      else the working tree at that version) and grep the rendered output for
-#      internet dependencies
+#   2. helm template every pinned chart version (lib.sh:load_chart_pins;
+#      bundle .tgz, else the working tree at that version) and grep the
+#      rendered output for internet dependencies
 #      (teknoir.cloud | github.com | storage.googleapis.com | ghcr creds)
-#      => zero hits per chart = pass; and check that versions.env pins exactly
-#      what the pinned app-of-apps deploys
+#      => zero hits per chart = pass; and check the pins against the pinned
+#      app-of-apps (lib.sh:check_app_of_apps_pins)
 #   3. image completeness: every image the pinned charts reference (image:
 #      fields and image-valued container args) plus images-extra.txt must be in
 #      the bundle image index (<bundle>/images/images.txt), else FAIL
@@ -88,7 +88,8 @@ fi
 # 2. helm template every chart + forbidden-pattern grep
 # ---------------------------------------------------------------------------
 log "== 2/4: helm template + internet-dependency grep"
-require_cmd helm
+require_cmd helm python3
+load_chart_pins
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
@@ -118,8 +119,8 @@ while read -r name version; do
   extract_images < "${tmpdir}/${name}.yaml" | sed "s|\$| ${name}-${version}|" >> "${tmpdir}/required-images"
 done < <(pinned_charts)
 
-# versions.env must pin exactly what the pinned app-of-apps deploys.
-( check_app_of_apps_pins ) || fail "versions.env does not match the pinned app-of-apps"
+# The pins (pins.txt) must be exactly what the pinned app-of-apps deploys.
+( check_app_of_apps_pins ) || fail "the chart pins do not match the pinned app-of-apps"
 
 # ---------------------------------------------------------------------------
 # 3. image completeness: the bundle must carry every image the pins need

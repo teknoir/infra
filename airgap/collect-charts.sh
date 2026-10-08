@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # collect-charts.sh — package the pinned charts into <bundle>/charts/
-# (connected side): every GITOPS_CHARTS entry from the gitops working tree and
-# the infra argo chart, with vendored dependencies.
+# (connected side), with vendored dependencies: app-of-apps
+# (APP_OF_APPS_VERSION) and every chart it deploys, at the version it deploys,
+# from the gitops working tree, plus the infra charts (INFRA_CHARTS). The
+# resolved pins are written to <bundle>/charts/pins.txt for the later steps
+# and the air-gapped side (lib.sh:load_chart_pins).
 #
 # Guards, all fatal:
 #   * GITOPS_REPO_DIR must be on GITOPS_BRANCH (teknoir-local), so a staging
 #     checkout can never be packaged for the air gap
 #   * each Chart.yaml must carry exactly the pinned version
-#   * versions.env must pin exactly what the pinned app-of-apps deploys
+#   * teknoir-local-app-of-apps.yaml must pin APP_OF_APPS_VERSION, and every
+#     chart app-of-apps deploys must come from Harbor's chart project
 # RELEASED_CHARTS are never rebuilt (see versions.env). Bundle .tgz files of
 # versions that are no longer pinned are removed, so push-to-harbor.sh only
 # ever sees pinned versions.
@@ -21,8 +25,8 @@ usage() {
   cat <<EOF
 Usage: $(basename "$0") [options]
 
-Packages the pinned GitOps charts + infra charts/argo (with vendored
-dependencies) into \$BUNDLE_DIR/charts/.
+Packages app-of-apps ${APP_OF_APPS_VERSION}, the chart versions it deploys and
+the infra charts (with vendored dependencies) into \$BUNDLE_DIR/charts/.
 
 Options:
   --dry-run          print what would be done, change nothing
@@ -53,6 +57,10 @@ CHARTS_OUT="${BUNDLE}/charts"
 [[ -d "${GITOPS_REPO_DIR}/charts" ]] \
   || die "GitOps repo not found at ${GITOPS_REPO_DIR} (set GITOPS_REPO_DIR)"
 require_gitops_branch
+# The pins come from the working tree's app-of-apps, never from a bundle left
+# by an earlier build.
+PINS_FROM_WORKTREE=1
+load_chart_pins
 
 run mkdir -p "${CHARTS_OUT}"
 
@@ -63,7 +71,7 @@ while read -r name version dir; do
 
   actual_version="$(chart_dir_version "${dir}")"
   [[ "${actual_version}" == "${version}" ]] \
-    || die "${name}: ${dir}/Chart.yaml has version ${actual_version:-<none>}, versions.env pins ${version} — bump the pin or check out the matching revision"
+    || die "${name}: ${dir}/Chart.yaml has version ${actual_version:-<none>}, but ${version} is pinned (app-of-apps ${APP_OF_APPS_VERSION} / versions.env) — check out the matching revision, or list ${name} in RELEASED_CHARTS"
   if [[ -n "$(git -C "${dir}" status --porcelain -- . 2>/dev/null)" ]]; then
     warn "${name}: uncommitted changes in ${dir} are packaged into ${name}-${version}"
   fi
@@ -99,7 +107,16 @@ for tgz in "${CHARTS_OUT}/"*.tgz; do
 done
 shopt -u nullglob
 
-# --- versions.env must match what app-of-apps deploys -----------------------------
+# --- record the resolved pins for the later steps and the air-gapped side --------
+if [[ "${DRY_RUN}" == "1" ]]; then
+  log "[dry-run] would write $(pins_file):"
+  printf '%s\n' "${CHART_PINS}" | sed 's/^/  /' >&2
+else
+  printf '%s\n' "${CHART_PINS}" > "$(pins_file)"
+  log "chart pins written to $(pins_file)"
+fi
+
+# --- root manifest and app-of-apps sources ----------------------------------------
 check_app_of_apps_pins
 
 if [[ "${DRY_RUN}" == "1" ]]; then

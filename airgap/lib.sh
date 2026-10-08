@@ -49,38 +49,133 @@ bundle_dir() {
   echo "${BUNDLE_DIR:-${REPO_ROOT}/bundle/teknoir-airgap-bundle-${BUNDLE_VERSION}}"
 }
 
-# Chart pins (versions.env), one "name version" entry each:
-#   GITOPS_CHARTS + INFRA_CHARTS  built from a working tree (collect-charts.sh)
-#   RELEASED_CHARTS               already in Harbor, never rebuilt
+# Chart pins, one "name version" each:
+#   app-of-apps    APP_OF_APPS_VERSION (versions.env)
+#   GitOps charts  every chart the pinned app-of-apps deploys, at the version
+#                  it deploys — GitOps owns those versions, infra does not
+#                  repeat them. Built from the gitops working tree, except
+#                  RELEASED_CHARTS (already in Harbor, never rebuilt).
+#   INFRA_CHARTS   built from this repo's charts/ (versions.env)
+# load_chart_pins resolves them once per run. collect-charts.sh renders the
+# working tree's app-of-apps and records the result in <bundle>/charts/pins.txt,
+# which later steps and the air-gapped side (push-to-harbor.sh) read: no helm
+# render, no PyYAML there.
+CHART_PINS=""
+APP_OF_APPS_APPS=""
+
+pins_file() {
+  echo "$(bundle_dir)/charts/pins.txt"
+}
+
+render_app_of_apps() {
+  # render_app_of_apps <chart-source> — print "<application> <chart|-> <targetRevision|-> <repoURL|->"
+  # for every Application the app-of-apps chart renders (python3 + PyYAML)
+  helm_template_chart app-of-apps "$1" | python3 -c '
+import sys, yaml
+for d in yaml.safe_load_all(sys.stdin):
+    if not d or d.get("kind") != "Application":
+        continue
+    spec = d.get("spec") or {}
+    for s in spec.get("sources") or [spec.get("source") or {}]:
+        print(d["metadata"]["name"], s.get("chart") or "-", s.get("targetRevision") or "-", s.get("repoURL") or "-")
+'
+}
+
+PINS_FROM_WORKTREE="${PINS_FROM_WORKTREE:-0}"
+
+load_chart_pins() {
+  # load_chart_pins — resolve the chart pins into CHART_PINS, once. Scripts
+  # call it after parsing their arguments (BUNDLE_DIR selects the bundle) and
+  # before any pin lookup, so a failure stops the script; inside $(...) or
+  # <(...) it could not. Source of the pins:
+  #   <bundle>/charts/pins.txt if it pins APP_OF_APPS_VERSION, else the
+  #   rendered app-of-apps from chart_source (bundle .tgz first);
+  #   with PINS_FROM_WORKTREE=1 always the gitops working tree's app-of-apps,
+  #   which must carry APP_OF_APPS_VERSION (collect-charts.sh builds from the
+  #   tree, so a bundle left from an earlier build must not decide).
+  local src dup entry
+  [[ -n "${CHART_PINS}" ]] && return 0
+  [[ -n "${APP_OF_APPS_VERSION:-}" ]] || die "APP_OF_APPS_VERSION is not set (versions.env)"
+  if [[ "${PINS_FROM_WORKTREE}" != "1" && -f "$(pins_file)" ]] \
+     && [[ "$(head -1 "$(pins_file)")" == "app-of-apps ${APP_OF_APPS_VERSION}" ]]; then
+    CHART_PINS="$(cat "$(pins_file)")"
+    return 0
+  fi
+  if [[ "${PINS_FROM_WORKTREE}" == "1" ]]; then
+    src="${GITOPS_REPO_DIR}/charts/app-of-apps"
+    [[ "$(chart_dir_version "${src}")" == "${APP_OF_APPS_VERSION}" ]] \
+      || die "${src}/Chart.yaml has version $(chart_dir_version "${src}"), versions.env pins app-of-apps ${APP_OF_APPS_VERSION}"
+  else
+    src="$(chart_source app-of-apps "${APP_OF_APPS_VERSION}")" \
+      || die "no pins for app-of-apps ${APP_OF_APPS_VERSION}: no $(pins_file) (written by collect-charts.sh / make-bundle.sh), and neither its .tgz nor ${GITOPS_REPO_DIR}/charts/app-of-apps at that version"
+  fi
+  APP_OF_APPS_APPS="$(render_app_of_apps "${src}")" \
+    || die "cannot render app-of-apps ${APP_OF_APPS_VERSION} from ${src} (needs helm and python3 with PyYAML)"
+  dup="$(awk '$2 != "-" {print $2, $3}' <<<"${APP_OF_APPS_APPS}" | sort -u | awk '{n[$1]++} END {for (c in n) if (n[c] > 1) print c}')"
+  [[ -z "${dup}" ]] || die "app-of-apps ${APP_OF_APPS_VERSION} deploys more than one version of: ${dup}"
+  CHART_PINS="$(
+    echo "app-of-apps ${APP_OF_APPS_VERSION}"
+    awk '$2 != "-" && !seen[$2]++ {print $2, $3}' <<<"${APP_OF_APPS_APPS}"
+    for entry in "${INFRA_CHARTS[@]}"; do echo "${entry}"; done
+  )"
+}
+
+is_released_chart() {
+  local name
+  for name in ${RELEASED_CHARTS[@]+"${RELEASED_CHARTS[@]}"}; do
+    [[ "${name}" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+infra_chart_version() {
+  # infra_chart_version <name> — the INFRA_CHARTS version of <name>, empty if none
+  local entry
+  for entry in "${INFRA_CHARTS[@]}"; do
+    [[ "${entry%% *}" == "$1" ]] && { echo "${entry##* }"; return 0; }
+  done
+  return 0
+}
+
+pinned_charts() {
+  # print "name version" for every pinned chart (see load_chart_pins)
+  load_chart_pins
+  printf '%s\n' "${CHART_PINS}"
+}
+
 built_charts() {
   # print "name version dir" for every chart collect-charts.sh packages
-  local entry
-  for entry in "${GITOPS_CHARTS[@]}"; do
-    echo "${entry} ${GITOPS_REPO_DIR}/charts/${entry%% *}"
-  done
-  for entry in "${INFRA_CHARTS[@]}"; do
-    echo "${entry} ${REPO_ROOT}/charts/${entry%% *}"
-  done
+  local name version
+  load_chart_pins
+  while read -r name version; do
+    if [[ -n "$(infra_chart_version "${name}")" ]]; then
+      echo "${name} ${version} ${REPO_ROOT}/charts/${name}"
+    elif ! is_released_chart "${name}"; then
+      echo "${name} ${version} ${GITOPS_REPO_DIR}/charts/${name}"
+    fi
+  done <<<"${CHART_PINS}"
 }
 
 released_charts() {
   # print "name version" for every released (not rebuilt) chart
-  local entry
-  for entry in ${RELEASED_CHARTS[@]+"${RELEASED_CHARTS[@]}"}; do
-    echo "${entry}"
-  done
-}
-
-pinned_charts() {
-  # print "name version" for every pinned chart (built + released)
-  built_charts | awk '{print $1, $2}'
-  released_charts
+  local name version
+  load_chart_pins
+  while read -r name version; do
+    if is_released_chart "${name}"; then echo "${name} ${version}"; fi
+  done <<<"${CHART_PINS}"
 }
 
 pinned_version() {
-  # pinned_version <name> — the pinned version of <name>, empty if not pinned
+  # pinned_version <name> — the pinned version of <name>, empty if not pinned.
+  # app-of-apps and the infra charts come straight from versions.env.
   # (no early exit: under pipefail the writer's SIGPIPE would fail the caller)
-  pinned_charts | awk -v n="$1" '$1 == n && !f {print $2; f = 1}'
+  if [[ "$1" == "app-of-apps" ]]; then
+    echo "${APP_OF_APPS_VERSION}"
+  elif [[ -n "$(infra_chart_version "$1")" ]]; then
+    infra_chart_version "$1"
+  else
+    pinned_charts | awk -v n="$1" '$1 == n && !f {print $2; f = 1}'
+  fi
 }
 
 chart_dir_version() {
@@ -118,47 +213,49 @@ require_gitops_branch() {
 }
 
 check_app_of_apps_pins() {
-  # check_app_of_apps_pins — fail unless versions.env pins exactly the chart
-  # versions the pinned app-of-apps deploys, and the root manifest
-  # (teknoir-local-app-of-apps.yaml) pins that app-of-apps version.
-  local version src root_rev apps app chart rev pinned bad=0
-  version="$(pinned_version app-of-apps)"
-  [[ -n "${version}" ]] || die "app-of-apps is not pinned in versions.env"
-  src="$(chart_source app-of-apps "${version}")" || die "no source for app-of-apps ${version}"
+  # check_app_of_apps_pins — fail unless the root manifest
+  # (teknoir-local-app-of-apps.yaml) pins APP_OF_APPS_VERSION, every chart the
+  # pinned app-of-apps deploys comes from Harbor's chart project, every
+  # RELEASED_CHARTS entry is one of them, and the pins in use (e.g. a bundle's
+  # pins.txt) are exactly what that app-of-apps deploys.
+  local version="${APP_OF_APPS_VERSION}" src root_rev app chart rev repo name rendered bad=0
+  load_chart_pins
   root_rev="$(awk '/^[[:space:]]*targetRevision:/{print $2; exit}' "${REPO_ROOT}/teknoir-local-app-of-apps.yaml" 2>/dev/null || true)"
   if [[ "${root_rev}" != "${version}" ]]; then
     warn "teknoir-local-app-of-apps.yaml pins app-of-apps ${root_rev:-<none>}, versions.env ${version}"
     bad=1
   fi
-  apps="$(helm_template_chart app-of-apps "${src}" | python3 -c '
-import sys, yaml
-for d in yaml.safe_load_all(sys.stdin):
-    if not d or d.get("kind") != "Application":
-        continue
-    spec = d.get("spec", {})
-    sources = spec.get("sources") or [spec.get("source") or {}]
-    for s in sources:
-        print(d["metadata"]["name"], s.get("chart") or "-", s.get("targetRevision") or "-")
-')" || die "cannot render app-of-apps ${version}"
-  while read -r app chart rev; do
+  if [[ -z "${APP_OF_APPS_APPS}" ]]; then
+    # pins came from pins.txt: render what will be shipped and compare
+    src="$(chart_source app-of-apps "${version}")" || die "no source for app-of-apps ${version}"
+    APP_OF_APPS_APPS="$(render_app_of_apps "${src}")" || die "cannot render app-of-apps ${version}"
+    rendered="$(echo "app-of-apps ${version}"
+                awk '$2 != "-" && !seen[$2]++ {print $2, $3}' <<<"${APP_OF_APPS_APPS}"
+                for name in "${INFRA_CHARTS[@]}"; do echo "${name}"; done)"
+    if [[ "${rendered}" != "${CHART_PINS}" ]]; then
+      warn "$(pins_file) differs from what app-of-apps ${version} deploys (re-run collect-charts.sh)"
+      bad=1
+    fi
+  fi
+  while read -r app chart rev repo; do
     [[ -n "${app}" ]] || continue
     if [[ "${chart}" == "-" ]]; then
       warn "app-of-apps ${version}: Application ${app} has no chart source (not checked)"
       continue
     fi
-    pinned="$(pinned_version "${chart}")"
-    if [[ "${pinned}" != "${rev}" ]]; then
-      warn "app-of-apps ${version} deploys ${chart} ${rev}, versions.env pins ${pinned:-nothing}"
+    if [[ "${repo#oci://}" != "${HARBOR_HOST}/${HARBOR_CHART_PROJECT}" ]]; then
+      warn "app-of-apps ${version}: Application ${app} pulls ${chart} ${rev} from ${repo}, not ${HARBOR_HOST}/${HARBOR_CHART_PROJECT}"
       bad=1
     fi
-  done <<<"${apps}"
-  while read -r chart rev; do
-    [[ "${chart}" == "app-of-apps" || "${chart}" == "argo" ]] && continue
-    awk -v c="${chart}" '$2 == c {f=1} END {exit !f}' <<<"${apps}" \
-      || warn "${chart} ${rev} is pinned but app-of-apps ${version} does not deploy it"
-  done < <(pinned_charts)
-  (( bad == 0 )) || die "versions.env does not match app-of-apps ${version} (see above)"
-  log "versions.env matches app-of-apps ${version} ($(grep -c . <<<"${apps}") Applications)"
+  done <<<"${APP_OF_APPS_APPS}"
+  for name in ${RELEASED_CHARTS[@]+"${RELEASED_CHARTS[@]}"}; do
+    if ! awk -v c="${name}" '$2 == c {f=1} END {exit !f}' <<<"${APP_OF_APPS_APPS}"; then
+      warn "RELEASED_CHARTS lists ${name}, which app-of-apps ${version} does not deploy"
+      bad=1
+    fi
+  done
+  (( bad == 0 )) || die "the chart pins do not match app-of-apps ${version} (see above)"
+  log "app-of-apps ${version} deploys $(grep -c . <<<"${APP_OF_APPS_APPS}") Applications: $(awk '$2 != "-" {print $2 "@" $3}' <<<"${APP_OF_APPS_APPS}" | sort -u | tr '\n' ' ')"
 }
 
 # Namespace a chart is installed into (bootstrap + gitops conventions).

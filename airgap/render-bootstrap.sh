@@ -19,8 +19,8 @@
 # annotation nor the instance label to them, so no ArgoCD app can prune them;
 # they are split into their own untracked manifests.
 #
-# Charts are rendered at their PINNED versions (versions.env): from the
-# bundle's packaged .tgz, else the working tree at exactly that version. A
+# Charts are rendered at their PINNED versions (lib.sh:load_chart_pins): from
+# the bundle's packaged .tgz, else the working tree at exactly that version. A
 # released chart without a source (harbor) is left out, so this bundle cannot
 # do a first bootstrap; the working tree's newer version is never used.
 #
@@ -61,9 +61,10 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-require_cmd helm
+require_cmd helm python3
 
 BUNDLE="$(bundle_dir)"
+load_chart_pins
 MANIFESTS_OUT="${BUNDLE}/bootstrap/manifests"
 APPLY_OUT="${BUNDLE}/bootstrap/apply"
 K3S_OUT="${BUNDLE}/bootstrap/k3s"
@@ -260,7 +261,7 @@ pinned_source() {
   # pinned_source <name> — chart source for the pinned version of <name>
   local version
   version="$(pinned_version "$1")"
-  [[ -n "${version}" ]] || die "$1 is not pinned in versions.env"
+  [[ -n "${version}" ]] || die "$1 is not pinned (app-of-apps ${APP_OF_APPS_VERSION} does not deploy it)"
   chart_source "$1" "${version}"
 }
 

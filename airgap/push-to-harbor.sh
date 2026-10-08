@@ -9,7 +9,8 @@
 #      --robot-env FILE) — generated only together with the robot, never
 #      rotated implicitly — and regenerate the ArgoCD repo secret manifest
 #      from it (scripts/gen-argocd-harbor-repo-secret.sh)
-#   3. push every pinned chart version (versions.env) from <bundle>/charts to
+#   3. push every pinned chart version (<bundle>/charts/pins.txt, see
+#      lib.sh:load_chart_pins) from <bundle>/charts to
 #      oci://harbor/teknoir that Harbor does not have yet. An existing version
 #      is never overwritten (OCI tags are mutable: on 2026-09-14 re-pushes
 #      silently changed app-of-apps 0.0.1/0.0.2), and a tag-immutability rule
@@ -129,6 +130,9 @@ elif [[ -n "${CA_FILE}" ]]; then
 else
   die "teknoir-root-ca.crt not found (bundle or repo root) — use --insecure to override"
 fi
+
+# Chart pins: the bundle's pins.txt (no render needed on this side).
+[[ "${ROBOT_ONLY}" == "1" ]] || load_chart_pins
 
 # --- dry-run: report the plan and exit ---------------------------------------
 if [[ "${DRY_RUN}" == "1" ]]; then

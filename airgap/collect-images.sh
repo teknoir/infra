@@ -32,10 +32,11 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-require_cmd helm
+require_cmd helm python3
 [[ "${DRY_RUN}" == "1" ]] || require_cmd crane
 
 BUNDLE="$(bundle_dir)"
+load_chart_pins
 IMAGES_OUT="${BUNDLE}/images"
 BOOTSTRAP_IMAGES_OUT="${BUNDLE}/bootstrap/images"
 

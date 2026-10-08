@@ -22,26 +22,30 @@ make-bundle.sh [--diff]  ──►  USB  ──►  push-to-harbor.sh ─► dep
 | A secret | `scripts/gen-*.sh` → `scripts/deploy-secrets.sh` |
 
 **Chart versions are released once.** `push-to-harbor.sh` pushes only the
-versions pinned in `airgap/versions.env` that Harbor does not have yet, and a
-tag-immutability rule on the Harbor project `teknoir` refuses any overwrite.
-Changing a chart therefore always means a new version:
+pinned versions that Harbor does not have yet, and a tag-immutability rule on
+the Harbor project `teknoir` refuses any overwrite. Changing a chart therefore
+always means a new version:
 
 1. gitops repo (branch `teknoir-local`): bump the chart's `version`, bump the
    matching `targetRevision` in `charts/app-of-apps/templates/`, bump the
    `app-of-apps` version; commit.
-2. this repo: update `GITOPS_CHARTS` (or `RELEASED_CHARTS`) in
-   `airgap/versions.env` and the `targetRevision` in
-   `teknoir-local-app-of-apps.yaml`; add runtime-only images to
-   `airgap/images-extra.txt`.
+2. this repo: set `APP_OF_APPS_VERSION` in `airgap/versions.env` and the
+   `targetRevision` in `teknoir-local-app-of-apps.yaml` to that app-of-apps
+   version; add runtime-only images to `airgap/images-extra.txt`.
 
-`collect-charts.sh` (run by `make-bundle.sh`) refuses to build when the gitops
-checkout is not on `teknoir-local`, when a `Chart.yaml` version differs from its
-pin, or when `versions.env` does not pin exactly what the pinned `app-of-apps`
-deploys. Pinned versions Harbor already has (today `auth 0.0.3`,
+The GitOps chart versions are not repeated in this repo: they are whatever the
+pinned app-of-apps deploys (`lib.sh:load_chart_pins`). `collect-charts.sh` (run
+by `make-bundle.sh`) renders the working tree's app-of-apps, packages exactly
+those versions and records them in `<bundle>/charts/pins.txt`, which the later
+steps and `push-to-harbor.sh` read. It refuses to build when the gitops checkout
+is not on `teknoir-local`, when a `Chart.yaml` version differs from the version
+app-of-apps deploys, when `teknoir-local-app-of-apps.yaml` pins another
+app-of-apps, or when an Application pulls its chart from anywhere but Harbor's
+`teknoir` project. Pinned versions Harbor already has (today `auth 0.0.3`,
 `cert-manager 0.0.1`, `harbor 0.0.5`) are still packaged, for rendering, image
 collection and a first bootstrap, but never re-pushed. `RELEASED_CHARTS`
-(empty today) is for versions that are in Harbor but no longer in the working
-tree; they are never rebuilt.
+(empty today) names charts whose pinned version is in Harbor but no longer in
+the working tree; they are never rebuilt.
 
 ## 2. Update procedure
 

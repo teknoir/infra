@@ -157,8 +157,9 @@ Notes:
 
 ## 4. Build the bundle (connected workstation)
 
-Versions are pinned centrally in `airgap/versions.env` (chart versions, Istio /
-ArgoCD / Harbor versions, tool versions, mirrored registries, hostnames).
+Versions are pinned centrally in `airgap/versions.env` (the root app-of-apps
+version, Istio / ArgoCD / Harbor versions, tool versions, mirrored registries,
+hostnames). The GitOps chart versions are the ones that app-of-apps deploys.
 Extra images that `helm template` cannot discover (Istio sidecar `proxyv2`,
 pause, busybox, redis, postgres, the prometheus config reloader) are listed in
 `airgap/images-extra.txt`.
@@ -190,7 +191,7 @@ teknoir-airgap-bundle-<version>/
 │   ├── apply/                    # one-shot, adopted by ArgoCD: istio.yaml, harbor.yaml
 │   ├── secrets/                  # the manifest-*.yaml files from §3
 │   └── k3s/                      # registries.yaml, teknoir-root-ca.crt, coredns-custom.yaml
-├── charts/                       # <chart>-<version>.tgz for every pinned chart (deps vendored)
+├── charts/                       # <chart>-<version>.tgz for every pinned chart (deps vendored), pins.txt
 ├── images/                       # workload images as OCI layouts (crane), digest-deduplicated
 ├── tools/                        # pinned crane + helm binaries (linux-amd64, darwin-arm64)
 ├── k3s/                          # offline K3s install: k3s binary, install.sh, airgap-images tarball (see AIRGAP-HOST-SETUP.md)
@@ -201,10 +202,11 @@ teknoir-airgap-bundle-<version>/
 The individual steps can also be run standalone (each supports `--dry-run` and
 `--bundle-dir DIR`):
 
-* `airgap/collect-charts.sh` — packages every pinned chart (exact
-  `Chart.yaml` version, gitops checkout on `teknoir-local`) plus the infra
-  `argo` chart into `charts/`, removes unpinned versions, and fails unless
-  `versions.env` pins exactly what the pinned `app-of-apps` deploys.
+* `airgap/collect-charts.sh` — packages app-of-apps (`APP_OF_APPS_VERSION`),
+  every chart version it deploys (exact `Chart.yaml` version, gitops checkout
+  on `teknoir-local`) and the infra `argo` chart into `charts/`, records the
+  resolved pins in `charts/pins.txt`, removes unpinned versions, and fails
+  unless `teknoir-local-app-of-apps.yaml` pins that app-of-apps.
 * `airgap/collect-images.sh` — extracts image refs from the rendered pinned
   charts (`image:` fields and image-valued container args), merges
   `images-extra.txt`, pulls everything as OCI layouts; bootstrap-tier images
@@ -218,9 +220,9 @@ The individual steps can also be run standalone (each supports `--dry-run` and
 
 `verify-offline.sh` syntax-checks every script (`bash -n` + `shellcheck`),
 templates every pinned chart, fails on any rendered reference to
-`teknoir.cloud`, `github.com`, or `storage.googleapis.com`, on a `versions.env`
-/ `app-of-apps` mismatch, and on any image a pinned chart needs that is missing
-from the bundle.
+`teknoir.cloud`, `github.com`, or `storage.googleapis.com`, when `pins.txt`
+differs from what the pinned `app-of-apps` deploys, and on any image a pinned
+chart needs that is missing from the bundle.
 
 ## 5. Transfer via USB
 
