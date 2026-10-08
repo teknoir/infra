@@ -166,7 +166,7 @@ works with your key) and you hold a checked bundle (section 2).
    ./teknoir-airgap credentials platform-admin --out ~/teknoir-platform-admin.txt
    ```
 
-   Sign in at `https://auth.teknoir.airgapped/realms/teknoir/account` as
+   Sign in at `https://auth.teknoir.airgapped/auth/realms/teknoir/account` as
    `platform-admin` with that password. Keycloak asks for a new password at
    once. Then delete the file. The auth chart's realm import creates
    `platform-admin` (e-mail `platform-admin@teknoir.airgapped`) in the Keycloak
