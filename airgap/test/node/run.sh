@@ -435,6 +435,10 @@ KMODE=refused tn converge --site "${REMOTE_SITE}" --lan-time "$(date +%s)" --lan
   --rollback --sync-clock --reapply istio --force-images --dry-run
 check "teknoir-airgap up's exact converge argv is accepted" [ "${RC}" == 0 ]
 check "the operator is recorded" grep -q 'operator anders' "${T}/out"
+# The dry-run above has no reachable cluster, so the real oneshot and harbor
+# phases stop at their offline plan; check the flag plumbing on a reachable one.
+tn converge --site "${REMOTE_SITE}" --lan-time "$(date +%s)" --lan-user anders \
+  --only oneshot,harbor --reapply istio --force-images
 check "--reapply istio reaches oneshot_tier istio with force=1, and only istio" \
   bash -c "grep -q 'oneshot_tier istio ns=istio-system force=1' '${T}/out' && [ \$(grep -c 'oneshot_tier .* force=1' '${T}/out') = 1 ] && [ \$(grep -c 'oneshot_tier ' '${T}/out') = 4 ]"
 check "--force-images reaches the harbor phase" grep -q 'harbor_push_images force=1' "${T}/out"

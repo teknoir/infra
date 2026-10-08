@@ -21,7 +21,7 @@ airgap_scripts() {
 @test "every executable-style script under airgap/ has a shell shebang and the x bit" {
   local f bad=""
   while IFS= read -r f; do
-    case "${f}" in *.bash|*/lib/*.sh|*/stubs/common.sh) continue ;; esac   # sourced libraries
+    case "${f}" in *.bash|*/lib/*.sh|*/lib.sh|*/lib-*.sh|*/stubs/common.sh) continue ;; esac   # sourced libraries
     head -1 "${REPO_ROOT}/${f}" | grep -qE '^#!(/usr/bin/env (ba)?sh|/bin/(ba)?sh)' || bad+=" ${f}(shebang)"
     [ -x "${REPO_ROOT}/${f}" ] || bad+=" ${f}(mode)"
   done < <(airgap_scripts)
