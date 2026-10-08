@@ -1,0 +1,8 @@
+#!/bin/sh
+# Fake age for the LAN tests: needs a terminal (like the passphrase prompt),
+# "encrypts" stdin to the -o file by prefixing a header.
+out=
+while [ $# -gt 0 ]; do case $1 in -o) out=$2; shift ;; esac; shift; done
+[ -n "$out" ] || { echo "fake age: -o required" >&2; exit 1; }
+if ! (: </dev/tty) 2>/dev/null; then echo "fake age: no terminal for the passphrase" >&2; exit 1; fi
+{ echo "age-encryption.org/v1 (fake)"; cat; } >"$out"

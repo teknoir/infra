@@ -1,0 +1,11 @@
+#!/bin/sh
+# Fake k3s for the node container of the LAN tests.
+case "$*" in
+  --version) echo "k3s version v1.33.5+k3s1 (fake)" ;;
+  "kubectl get --raw=/readyz") echo ok ;;
+  "kubectl get nodes -o wide") printf 'NAME      STATUS   ROLES\nteknoir   Ready    control-plane\n' ;;
+  *"get configmap teknoir-airgap-release"*) printf '{"bundleId":"fake-deployed"}' ;;
+  *"get applications.argoproj.io"*) printf 'NAME          SYNC STATUS   HEALTH STATUS\napp-of-apps   Synced        Healthy\n' ;;
+  *"get secret teknoir-root-ca-bundle"*) base64 -w0 /etc/fake-k3s/ca.crt ;;
+  *) echo "fake k3s: unsupported: $*" >&2; exit 1 ;;
+esac

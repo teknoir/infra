@@ -1,0 +1,11 @@
+# tty.exp CMD [ARG...] - run CMD on a terminal (for the LAN tests), answering
+# a sudo password prompt with $PW; exits with CMD's exit status.
+set timeout 180
+log_user 1
+spawn -noecho {*}$argv
+expect {
+  -re "password for teknoir" { send -- "$env(PW)\r"; exp_continue }
+  eof
+}
+catch wait result
+exit [lindex $result 3]

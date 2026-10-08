@@ -1,0 +1,31 @@
+#!/bin/sh
+# Fake node runner for the teknoir-airgap LAN tests: records how it was called
+# and answers like the real one (secrets on stdout only when stdout is a pipe).
+log=/var/log/teknoir-airgap-fake-runner.log
+printf '%s uid=%s %s\n' "$(date -u +%H:%M:%S)" "$(id -u)" "$*" >>"$log"
+[ "$(id -u)" = 0 ] || { echo "fake teknoir-node: not root" >&2; exit 1; }
+cmd=$1; shift
+site=
+prev=
+for a in "$@"; do [ "$prev" = --site ] && site=$a; prev=$a; done
+if [ -n "$site" ] && [ ! -f "$site" ]; then echo "fake teknoir-node: no site file $site" >&2; exit 1; fi
+case $cmd in
+  converge)
+    echo "fake converge $*"
+    echo "summary: 0 changes" ;;
+  status) echo "fake status $*" ;;
+  credentials)
+    if [ -t 1 ]; then echo "refusing to print a secret to a terminal" >&2; exit 1; fi
+    printf 's3cr3t-%s-value\n' "$1" ;;
+  admin-user)
+    if [ -t 1 ]; then echo "refusing to print a secret to a terminal" >&2; exit 1; fi
+    echo "creating the admin user" >&2
+    printf 's3cr3t-temporary-password\n' ;;
+  backup)
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    mkdir -p "/var/lib/teknoir-airgap/backups/$ts"
+    echo "s3cr3t-backup-content" >"/var/lib/teknoir-airgap/backups/$ts/dump.sql"
+    echo "fake backup $ts" ;;
+  rotate|migrate) echo "fake $cmd $*" ;;
+  *) echo "fake teknoir-node: unknown command $cmd" >&2; exit 2 ;;
+esac
