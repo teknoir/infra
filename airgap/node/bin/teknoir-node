@@ -354,7 +354,7 @@ phase_preflight() {
   fi
 }
 
-ensure_namespaces() {
+base_ensure_namespaces() {
   # Create-if-absent. The initial labels only matter until GitOps owns the
   # namespace (sidecar injection must be on before the one-shot Harbor tier).
   local entry ns label
@@ -376,7 +376,7 @@ ensure_namespaces() {
   done
 }
 
-ensure_storage_label() {
+base_ensure_storage_label() {
   # teknoir.org/storage=true marks the server node that holds the hostPath
   # PVs (G-06 nodeAffinity). config.yaml sets it at registration; this keeps
   # it on nodes registered before.
@@ -400,8 +400,8 @@ phase_cluster_base() {
   ensure_work_dir
   render_template "${NODE_ROOT}/templates/coredns-custom.yaml.tmpl" > "${WORK_DIR}/coredns-custom.yaml"
   apply_ssa "${WORK_DIR}/coredns-custom.yaml"
-  ensure_namespaces
-  ensure_storage_label
+  base_ensure_namespaces
+  base_ensure_storage_label
 }
 
 # ---------------------------------------------------------------------------

@@ -179,7 +179,7 @@ release_status() {
 # ---------------------------------------------------------------------------
 # post
 # ---------------------------------------------------------------------------
-_applications_json() {
+_release_applications_json() {
   kc -n "${RELEASE_NS}" get "${APP_CRD}" -o json || die "cannot list Applications"
 }
 
@@ -191,7 +191,7 @@ post_application_table() {
     printf 'apps:      ArgoCD is not installed\n'
     return 0
   fi
-  json="$(_applications_json)"
+  json="$(_release_applications_json)"
   "${JQ}" -r '
     def rev: (.status.sync.revision // .spec.source.targetRevision // "-");
     .items | sort_by(.metadata.name)[] |
@@ -203,7 +203,7 @@ post_application_table() {
     "  \(.metadata.name): \((.status.operationState.phase // "no operation")) \((.status.operationState.message // (.status.conditions // [] | map(.message) | join("; ")) // "") | .[0:300])"' <<<"${json}"
 }
 
-_post_not_ready() {
+_release_post_not_ready() {
   # Names of Applications not Synced/Healthy (all names when none exist).
   "${JQ}" -r 'if (.items | length) == 0 then "(no Applications yet)" else
     .items[] | select((.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy") | .metadata.name end' <<<"$1"
@@ -224,8 +224,8 @@ post_wait_applications() {
   fi
   deadline=$(( SECONDS + timeout ))
   while :; do
-    json="$(_applications_json)"
-    bad="$(_post_not_ready "${json}")"
+    json="$(_release_applications_json)"
+    bad="$(_release_post_not_ready "${json}")"
     if [[ -z "${bad}" ]]; then
       post_application_table >&2
       log "every Application is Synced/Healthy"
@@ -255,8 +255,8 @@ post_wait_applications() {
   done
 }
 
-_mirror_ref() {
-  # _mirror_ref <normalized ref> - where the node pulls it from: Harbor's
+_release_mirror_ref() {
+  # _release_mirror_ref <normalized ref> - where the node pulls it from: Harbor's
   # mirror project for the upstream registry (registries.yaml), else itself.
   local ref="$1" reg rest
   reg="${ref%%/*}"
@@ -283,10 +283,10 @@ post_image_check() {
   images="$(kc get pods -A -o json | "${JQ}" -r '.items[] | select(.status.phase == "Running") |
               (.spec.containers[].image, (.spec.initContainers // [])[].image)' | sort -u)" \
     || die "cannot list pod images"
-  present="$(containerd_images)"
+  present="$(host_containerd_images)"
   for ref in ${images}; do
-    norm="$(normalize_image_ref "${ref}")"
-    if [[ -x "${CRANE}" ]] && "${CRANE}" digest --platform linux/amd64 "$(_mirror_ref "${norm}")" >/dev/null 2>&1; then
+    norm="$(host_normalize_image_ref "${ref}")"
+    if [[ -x "${CRANE}" ]] && "${CRANE}" digest --platform linux/amd64 "$(_release_mirror_ref "${norm}")" >/dev/null 2>&1; then
       ok=$(( ok + 1 ))
     elif grep -qxF "${norm}" <<<"${present}"; then
       local_only=$(( local_only + 1 ))

@@ -41,15 +41,15 @@ HOST_FILES_CHANGED=0
 K3S_JUST_STARTED=0
 declare -A _BUNDLE_SUMS=()
 
-k3s_data_path() { printf '%s%s%s' "${HOST_ROOT}" "${K3S_DATA_DIR}" "${1:-}"; }
-k3s_images_dir() { k3s_data_path /agent/images; }
+host_k3s_data_path() { printf '%s%s%s' "${HOST_ROOT}" "${K3S_DATA_DIR}" "${1:-}"; }
+host_k3s_images_dir() { host_k3s_data_path /agent/images; }
 
-k3s_datastore_exists() {
-  [[ -e "$(k3s_data_path /server/db/state.db)" || -d "$(k3s_data_path /server/db/etcd)" ]]
+host_k3s_datastore_exists() {
+  [[ -e "$(host_k3s_data_path /server/db/state.db)" || -d "$(host_k3s_data_path /server/db/etcd)" ]]
 }
 
-bundle_sha() {
-  # bundle_sha <path relative to node/> - the sha256 recorded in
+host_bundle_sha() {
+  # host_bundle_sha <path relative to node/> - the sha256 recorded in
   # node/SHA256SUMS (verified by the verify phase), else computed.
   local rel="$1" line p
   if (( ${#_BUNDLE_SUMS[@]} == 0 )) && [[ -f "${NODE_ROOT}/SHA256SUMS" ]]; then
@@ -74,7 +74,7 @@ host_check_k3s_payload() {
     [[ -f "${NODE_ROOT}/k3s/${f}" ]] || die "missing ${NODE_ROOT}/k3s/${f}"
     want="$(awk -v f="${f}" '$2 == f || $2 == "*" f {print $1; exit}' "${sums}")"
     [[ -n "${want}" ]] || die "${sums} has no checksum for ${f}"
-    got="$(bundle_sha "k3s/${f}")"
+    got="$(host_bundle_sha "k3s/${f}")"
     [[ "${want}" == "${got}" ]] || die "k3s/${f} does not match the upstream ${sums}"
   done
   [[ -f "${NODE_ROOT}/k3s/install.sh" ]] || die "missing ${NODE_ROOT}/k3s/install.sh"
@@ -86,8 +86,8 @@ host_check_k3s_payload() {
 host_secrets_encryption_line() {
   # secrets-encryption only for NEW installs (D6). An existing cluster keeps
   # what it has; enabling it there is an explicit later step (I-17).
-  if ! k3s_datastore_exists \
-     || [[ -f "$(k3s_data_path /server/cred/encryption-config.json)" ]] \
+  if ! host_k3s_datastore_exists \
+     || [[ -f "$(host_k3s_data_path /server/cred/encryption-config.json)" ]] \
      || grep -qE '^secrets-encryption:[[:space:]]*"?true"?[[:space:]]*$' "${K3S_CONFIG_FILE}" 2>/dev/null; then
     printf 'secrets-encryption: true'
   fi
@@ -136,8 +136,8 @@ host_hosts_block() {
   changed "managed block in ${HOSTS_FILE}: ${NODE_IP} $(teknoir_fqdns)"
 }
 
-ipv4_network() {
-  # ipv4_network <ip> <prefix> - the network address of ip/prefix.
+host_ipv4_network() {
+  # host_ipv4_network <ip> <prefix> - the network address of ip/prefix.
   local ip="$1" prefix="$2" a b c d n mask
   IFS=. read -r a b c d <<<"${ip}"
   n=$(( (a << 24) | (b << 16) | (c << 8) | d ))
@@ -159,7 +159,7 @@ host_chrony() {
   cidr="$(ip -o -4 addr show 2>/dev/null | awk -v ip="${NODE_IP}" '{split($4, a, "/"); if (a[1] == ip) {print $4; exit}}')"
   [[ -n "${cidr}" ]] || die "cannot find the prefix length of ${NODE_IP} for chrony's allow rule"
   prefix="${cidr#*/}"
-  net="$(ipv4_network "${NODE_IP}" "${prefix}")/${prefix}"
+  net="$(host_ipv4_network "${NODE_IP}" "${prefix}")/${prefix}"
   {
     printf '# Managed by teknoir-node (host phase): serve time to the airgapped LAN.\n'
     if [[ -n "${TIME_SOURCE}" ]]; then
@@ -181,14 +181,14 @@ host_chrony() {
 # ---------------------------------------------------------------------------
 # Bootstrap image tarballs
 # ---------------------------------------------------------------------------
-_tarball_cache_file() { printf '%s/cache/agent-images.sums' "${STATE_DIR}"; }
+_host_tarball_cache_file() { printf '%s/cache/agent-images.sums' "${STATE_DIR}"; }
 
-_tarball_dest_sha() {
-  # _tarball_dest_sha <file> - sha256 of a file in agent/images, cached by
+_host_tarball_dest_sha() {
+  # _host_tarball_dest_sha <file> - sha256 of a file in agent/images, cached by
   # (size, mtime) so an unchanged multi-GB set is not re-hashed every run.
   local f="$1" key cache sha
   key="$(stat -c '%s %Y' "${f}")"
-  cache="$(_tarball_cache_file)"
+  cache="$(_host_tarball_cache_file)"
   if [[ -f "${cache}" ]]; then
     sha="$(awk -v n="$(basename "${f}")" -v k="${key}" '$1 == n && ($2 " " $3) == k {print $4; exit}' "${cache}")"
     if [[ -n "${sha}" ]]; then
@@ -220,9 +220,9 @@ host_bundle_tarballs() {
 host_sync_tarballs() {
   local dir rel name dst want have f n=0
   local -A desired=()
-  dir="$(k3s_images_dir)"
-  ensure_dir "$(k3s_data_path)" 0755
-  ensure_dir "$(k3s_data_path /agent)" 0755
+  dir="$(host_k3s_images_dir)"
+  ensure_dir "$(host_k3s_data_path)" 0755
+  ensure_dir "$(host_k3s_data_path /agent)" 0755
   ensure_dir "${dir}" 0755
   while IFS= read -r rel; do
     [[ -n "${rel}" ]] || continue
@@ -230,9 +230,9 @@ host_sync_tarballs() {
     desired["${name}"]=1
     n=$(( n + 1 ))
     dst="${dir}/${name}"
-    want="$(bundle_sha "${rel}")"
+    want="$(host_bundle_sha "${rel}")"
     have=""
-    [[ -f "${dst}" ]] && have="$(_tarball_dest_sha "${dst}")"
+    [[ -f "${dst}" ]] && have="$(_host_tarball_dest_sha "${dst}")"
     [[ "${have}" == "${want}" ]] && continue
     if dry_run; then
       changed "copy image tarball ${name} -> ${dir}"
@@ -254,8 +254,8 @@ host_sync_tarballs() {
   log "image tarballs: ${n} in this bundle, synced to ${dir}"
 }
 
-normalize_image_ref() {
-  # normalize_image_ref <ref> - containerd's name for a docker reference.
+host_normalize_image_ref() {
+  # host_normalize_image_ref <ref> - containerd's name for a docker reference.
   local ref="$1" first rest
   first="${ref%%/*}"
   if [[ "${ref}" != */* ]]; then
@@ -271,41 +271,41 @@ normalize_image_ref() {
   printf '%s' "${ref}"
 }
 
-tarball_image_refs() {
-  # tarball_image_refs <relpath> - the RepoTags of a docker-archive tarball,
+host_tarball_image_refs() {
+  # host_tarball_image_refs <relpath> - the RepoTags of a docker-archive tarball,
   # normalized; cached by the tarball's sha256.
   local rel="$1" sha cache ref
-  sha="$(bundle_sha "${rel}")"
+  sha="$(host_bundle_sha "${rel}")"
   cache="${STATE_DIR}/cache/refs-${sha}"
   if [[ ! -f "${cache}" ]]; then
     local refs
     refs="$(tar -xOf "${NODE_ROOT}/${rel}" manifest.json 2>/dev/null | "${JQ}" -r '.[].RepoTags[]?' 2>/dev/null)" || refs=""
     if dry_run; then
-      for ref in ${refs}; do normalize_image_ref "${ref}"; printf '\n'; done
+      for ref in ${refs}; do host_normalize_image_ref "${ref}"; printf '\n'; done
       return 0
     fi
     mkdir -p "$(dirname "${cache}")"
-    for ref in ${refs}; do normalize_image_ref "${ref}"; printf '\n'; done > "${cache}.tmp"
+    for ref in ${refs}; do host_normalize_image_ref "${ref}"; printf '\n'; done > "${cache}.tmp"
     mv -f "${cache}.tmp" "${cache}"
   fi
   cat "${cache}"
 }
 
-containerd_images() {
-  # containerd_images - every image name in containerd's k8s.io namespace.
+host_containerd_images() {
+  # host_containerd_images - every image name in containerd's k8s.io namespace.
   # Dies when containerd cannot be queried (never read as "no images").
   "${K3S_BIN}" ctr -n k8s.io images ls -q || die "cannot list containerd images (k3s ctr)"
 }
 
-missing_bootstrap_tarballs() {
-  # missing_bootstrap_tarballs - relpaths of bootstrap tarballs with at least
+host_missing_bootstrap_tarballs() {
+  # host_missing_bootstrap_tarballs - relpaths of bootstrap tarballs with at least
   # one image not in containerd.
   local present rel refs ref
-  present="$(containerd_images)"
+  present="$(host_containerd_images)"
   shopt -s nullglob
   for rel in "${NODE_ROOT}"/bootstrap-images/*.tar; do
     rel="bootstrap-images/$(basename "${rel}")"
-    refs="$(tarball_image_refs "${rel}")"
+    refs="$(host_tarball_image_refs "${rel}")"
     if [[ -z "${refs}" ]]; then
       warn "${rel}: no RepoTags in manifest.json (not a docker archive?); import not checked"
       continue
@@ -326,14 +326,14 @@ host_import_images() {
     dry_run && { log "[dry-run] bootstrap images would be imported once k3s runs"; return 0; }
     die "k3s is not running: cannot check the bootstrap images"
   fi
-  missing="$(missing_bootstrap_tarballs)"
+  missing="$(host_missing_bootstrap_tarballs)"
   if [[ -n "${missing}" && "${K3S_JUST_STARTED}" == "1" ]] && ! dry_run; then
     # k3s imports agent/images itself after a start, asynchronously.
     log "waiting up to ${K3S_IMPORT_WAIT}s for k3s to import $(grep -c . <<<"${missing}") bootstrap tarball(s) ..."
     deadline=$(( SECONDS + K3S_IMPORT_WAIT ))
     while [[ -n "${missing}" ]] && (( SECONDS < deadline )); do
       sleep 10
-      missing="$(missing_bootstrap_tarballs)"
+      missing="$(host_missing_bootstrap_tarballs)"
     done
   fi
   for rel in ${missing}; do
@@ -344,7 +344,7 @@ host_import_images() {
     "${K3S_BIN}" ctr -n k8s.io images import "${NODE_ROOT}/${rel}" >/dev/null \
       || die "k3s ctr images import ${rel} failed"
     # Pin like k3s pins its own airgap imports, so kubelet image GC keeps them.
-    for ref in $(tarball_image_refs "${rel}"); do
+    for ref in $(host_tarball_image_refs "${rel}"); do
       "${K3S_BIN}" ctr -n k8s.io images label "${ref}" io.cri-containerd.pinned=pinned >/dev/null 2>&1 \
         || warn "could not pin ${ref}"
     done
@@ -356,7 +356,7 @@ host_import_images() {
 # ---------------------------------------------------------------------------
 # k3s install / upgrade / restart
 # ---------------------------------------------------------------------------
-_sha_or_absent() {
+_host_sha_or_absent() {
   if [[ -f "$1" ]]; then sha256_file "$1"; else printf 'absent'; fi
 }
 
@@ -364,9 +364,9 @@ host_stamp_value() {
   # What the running k3s must have loaded: config.yaml, registries.yaml and
   # the registry CA (k3s may skip a ca_file that did not exist at start).
   printf 'config=%s registries=%s ca=%s' \
-    "$(_sha_or_absent "${K3S_CONFIG_FILE}")" \
-    "$(_sha_or_absent "${K3S_REGISTRIES_FILE}")" \
-    "$(_sha_or_absent "${K3S_CA_FILE}")"
+    "$(_host_sha_or_absent "${K3S_CONFIG_FILE}")" \
+    "$(_host_sha_or_absent "${K3S_REGISTRIES_FILE}")" \
+    "$(_host_sha_or_absent "${K3S_CA_FILE}")"
 }
 
 host_restart_state() {
@@ -382,7 +382,7 @@ host_restart_state() {
   fi
 }
 
-_k3s_started_after_files() {
+_host_k3s_started_after_files() {
   # 0 when k3s (active) started after the last change of every stamped file:
   # it has loaded them. Used only to adopt a node that has no stamp yet.
   local ts started f m
@@ -397,7 +397,7 @@ _k3s_started_after_files() {
   return 0
 }
 
-k3s_wait_ready() {
+host_k3s_wait_ready() {
   wait_for "the k3s API" "${K3S_READY_TIMEOUT}" cluster_up
   wait_for "the k3s node to be Ready" "${K3S_READY_TIMEOUT}" kc wait --for=condition=Ready node --all --timeout=10s
 }
@@ -414,7 +414,7 @@ host_k3s_install() {
   # k3s keeps its old inode), then install.sh writes the unit and (re)starts.
   local from="$1"
   if dry_run; then
-    changed "install k3s $(_k3s_bundle_version) (${from}) with INSTALL_K3S_SKIP_DOWNLOAD"
+    changed "install k3s $(_host_k3s_bundle_version) (${from}) with INSTALL_K3S_SKIP_DOWNLOAD"
     return 0
   fi
   mkdir -p "$(dirname "${K3S_BIN}")"
@@ -438,11 +438,11 @@ host_k3s_install() {
     INSTALL_K3S_SYSTEMD_DIR="${HOST_ROOT}/etc/systemd/system" \
     sh "${NODE_ROOT}/k3s/install.sh" >&2 \
     || die "k3s install.sh failed (see: journalctl -u k3s --no-pager -n 100)"
-  changed "installed k3s $(_k3s_bundle_version) (${from})"
+  changed "installed k3s $(_host_k3s_bundle_version) (${from})"
   K3S_JUST_STARTED=1
 }
 
-_k3s_bundle_version() {
+_host_k3s_bundle_version() {
   "${NODE_ROOT}/k3s/k3s" --version 2>/dev/null | awk 'NR == 1 {print $3}' || true
 }
 
@@ -450,7 +450,7 @@ host_k3s_reconcile() {
   # Install, upgrade, start or restart k3s - each only when needed - then wait
   # for it and record the stamp.
   local want have stamp_now stamp_want action=""
-  want="$(bundle_sha k3s/k3s)"
+  want="$(host_bundle_sha k3s/k3s)"
   have=""
   [[ -f "${K3S_BIN}" ]] && have="$(sha256_file "${K3S_BIN}")"
   if [[ -z "${have}" ]]; then
@@ -467,7 +467,7 @@ host_k3s_reconcile() {
     if dry_run && (( HOST_FILES_CHANGED )); then
       action="restart"
     elif [[ "${stamp_now}" != "${stamp_want}" ]]; then
-      if [[ -z "${stamp_now}" ]] && (( HOST_FILES_CHANGED == 0 )) && _k3s_started_after_files; then
+      if [[ -z "${stamp_now}" ]] && (( HOST_FILES_CHANGED == 0 )) && _host_k3s_started_after_files; then
         log "k3s started after its config files were last written: recording the restart stamp, no restart"
         host_write_stamp
         return 0
@@ -498,7 +498,7 @@ host_k3s_reconcile() {
       ;;
   esac
   dry_run && return 0
-  k3s_wait_ready
+  host_k3s_wait_ready
   host_write_stamp
 }
 
@@ -534,7 +534,7 @@ host_trust_ca() {
       run systemctl restart k3s
       changed "restarted k3s (the registry CA changed since its start)"
       dry_run && return 0
-      k3s_wait_ready
+      host_k3s_wait_ready
       host_write_stamp
     fi
   fi

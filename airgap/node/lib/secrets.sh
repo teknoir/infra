@@ -40,7 +40,7 @@ MANAGED_BY_LABEL="app.kubernetes.io/managed-by=teknoir-node"
 # Public CA certificate of this run (WORK_DIR/ca.crt), once known.
 CA_PEM=""
 
-wildcard_secret_name() { printf '%s-wildcard-tls' "${TEKNOIR_DOMAIN//./-}"; }
+secrets_wildcard_name() { printf '%s-wildcard-tls' "${TEKNOIR_DOMAIN//./-}"; }
 
 _secrets_tmp() {
   # _secrets_tmp - a fresh private dir under WORK_DIR for key material
@@ -49,21 +49,21 @@ _secrets_tmp() {
   (umask 077 && mktemp -d "${WORK_DIR}/keys.XXXXXX")
 }
 
-_shred_dir() {
+_secrets_shred_dir() {
   [[ -n "$1" && -d "$1" ]] || return 0
   find "$1" -type f -exec shred -u {} + 2>/dev/null || true
   rm -rf "$1"
 }
 
-_openssl() {
-  # _openssl <args...> - run openssl; its output (never key material: keys
+_secrets_openssl() {
+  # _secrets_openssl <args...> - run openssl; its output (never key material: keys
   # always go to files) is shown only when it fails.
   local out
   out="$(openssl "$@" 2>&1)" || die "openssl $1 failed: ${out}"
 }
 
-_create_tls_secret() {
-  # _create_tls_secret <ns> <name> <dir> - create a kubernetes.io/tls Secret
+_secrets_create_tls() {
+  # _secrets_create_tls <ns> <name> <dir> - create a kubernetes.io/tls Secret
   # from <dir>/{tls.crt,tls.key[,ca.crt]}. Create, never apply: an existing
   # Secret makes it fail instead of being overwritten. Content flows through
   # a pipe only.
@@ -77,8 +77,8 @@ _create_tls_secret() {
     || die "cannot create Secret ${ns}/${name}"
 }
 
-_replace_tls_secret() {
-  # _replace_tls_secret <ns> <name> <dir> - replace the data of an existing
+_secrets_replace_tls() {
+  # _secrets_replace_tls <ns> <name> <dir> - replace the data of an existing
   # TLS Secret (rotate only).
   local ns="$1" name="$2" d="$3"
   local -a files=(--from-file=tls.crt="${d}/tls.crt" --from-file=tls.key="${d}/tls.key")
@@ -90,7 +90,7 @@ _replace_tls_secret() {
     || die "cannot replace Secret ${ns}/${name}"
 }
 
-_fetch_ca_cert() {
+_secrets_fetch_ca_cert() {
   # Write the CA's public certificate to WORK_DIR/ca.crt and set CA_PEM.
   ensure_work_dir
   CA_PEM="${WORK_DIR}/ca.crt"
@@ -99,8 +99,8 @@ _fetch_ca_cert() {
   grep -q 'BEGIN CERTIFICATE' "${CA_PEM}" || die "${CA_NS}/${CA_SECRET} tls.crt is not a PEM certificate"
 }
 
-_fetch_ca_key() {
-  # _fetch_ca_key <dir> - the CA key into <dir>/ca.key (0600, tmpfs).
+_secrets_fetch_ca_key() {
+  # _secrets_fetch_ca_key <dir> - the CA key into <dir>/ca.key (0600, tmpfs).
   ( umask 077 && secret_value "${CA_NS}" "${CA_SECRET}" tls.key > "$1/ca.key" ) \
     || die "cannot read the CA key from ${CA_NS}/${CA_SECRET}"
 }
@@ -108,8 +108,8 @@ _fetch_ca_key() {
 # ---------------------------------------------------------------------------
 # Root CA
 # ---------------------------------------------------------------------------
-_generate_ca() {
-  # _generate_ca <dir> - a 10y RSA-4096 root, CA:TRUE pathlen:0, name
+_secrets_generate_ca() {
+  # _secrets_generate_ca <dir> - a 10y RSA-4096 root, CA:TRUE pathlen:0, name
   # constraints permitted DNS:<domain> and DNS:.<domain> (D1).
   local d="$1"
   cat > "${d}/ca.cnf" <<EOF
@@ -126,17 +126,17 @@ keyUsage = critical,keyCertSign,cRLSign
 subjectKeyIdentifier = hash
 nameConstraints = critical,permitted;DNS:${TEKNOIR_DOMAIN},permitted;DNS:.${TEKNOIR_DOMAIN}
 EOF
-  _openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "${d}/tls.key"
-  _openssl req -x509 -new -sha256 -key "${d}/tls.key" -out "${d}/tls.crt" \
+  _secrets_openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "${d}/tls.key"
+  _secrets_openssl req -x509 -new -sha256 -key "${d}/tls.key" -out "${d}/tls.crt" \
     -days "${CA_DAYS}" -config "${d}/ca.cnf" -extensions v3_ca
   cp "${d}/tls.crt" "${d}/ca.crt"
 }
 
-ensure_ca() {
+secrets_ensure_ca() {
   local d
   if in_cluster secret "${CA_SECRET}" "${CA_NS}"; then
     log "Root CA ${CA_NS}/${CA_SECRET}: present (kept; never replaced by converge)"
-    _fetch_ca_cert
+    _secrets_fetch_ca_cert
     if ! openssl x509 -in "${CA_PEM}" -noout -ext nameConstraints 2>/dev/null | grep -q 'Permitted'; then
       log "Root CA has no name constraints (pre-redesign CA, kept per D1)"
     fi
@@ -151,37 +151,37 @@ ensure_ca() {
   fi
   log "generating the Root CA (RSA 4096, ${CA_DAYS} days, permitted DNS ${TEKNOIR_DOMAIN} and .${TEKNOIR_DOMAIN})"
   d="$(_secrets_tmp)"
-  _generate_ca "${d}"
-  _create_tls_secret "${CA_NS}" "${CA_SECRET}" "${d}"
-  _shred_dir "${d}"
+  _secrets_generate_ca "${d}"
+  _secrets_create_tls "${CA_NS}" "${CA_SECRET}" "${d}"
+  _secrets_shred_dir "${d}"
   changed "created the Root CA ${CA_NS}/${CA_SECRET}"
-  _fetch_ca_cert
+  _secrets_fetch_ca_cert
 }
 
 # ---------------------------------------------------------------------------
 # Wildcard placeholder and Harbor token-service TLS
 # ---------------------------------------------------------------------------
-_generate_wildcard() {
-  # _generate_wildcard <dir> - *.<domain> + <domain>, signed by the CA.
+_secrets_generate_wildcard() {
+  # _secrets_generate_wildcard <dir> - *.<domain> + <domain>, signed by the CA.
   local d="$1"
-  _fetch_ca_key "${d}"
+  _secrets_fetch_ca_key "${d}"
   cat > "${d}/leaf.cnf" <<EOF
 basicConstraints = critical,CA:FALSE
 keyUsage = critical,digitalSignature,keyEncipherment
 extendedKeyUsage = serverAuth
 subjectAltName = DNS:*.${TEKNOIR_DOMAIN},DNS:${TEKNOIR_DOMAIN}
 EOF
-  _openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${d}/tls.key"
-  _openssl req -new -sha256 -key "${d}/tls.key" -out "${d}/tls.csr" -subj "/CN=*.${TEKNOIR_DOMAIN}"
-  _openssl x509 -req -sha256 -in "${d}/tls.csr" -CA "${CA_PEM}" -CAkey "${d}/ca.key" \
+  _secrets_openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "${d}/tls.key"
+  _secrets_openssl req -new -sha256 -key "${d}/tls.key" -out "${d}/tls.csr" -subj "/CN=*.${TEKNOIR_DOMAIN}"
+  _secrets_openssl x509 -req -sha256 -in "${d}/tls.csr" -CA "${CA_PEM}" -CAkey "${d}/ca.key" \
     -CAcreateserial -CAserial "${d}/ca.srl" -out "${d}/tls.crt" -days "${WILDCARD_DAYS}" -extfile "${d}/leaf.cnf"
   cp "${CA_PEM}" "${d}/ca.crt"
   shred -u "${d}/ca.key"
 }
 
-ensure_wildcard_placeholder() {
+secrets_ensure_wildcard() {
   local name d
-  name="$(wildcard_secret_name)"
+  name="$(secrets_wildcard_name)"
   if in_cluster secret "${name}" "${WILDCARD_NS}"; then
     log "gateway TLS ${WILDCARD_NS}/${name}: present (cert-manager owns it)"
     return 0
@@ -191,22 +191,22 @@ ensure_wildcard_placeholder() {
     return 0
   fi
   d="$(_secrets_tmp)"
-  _generate_wildcard "${d}"
-  _create_tls_secret "${WILDCARD_NS}" "${name}" "${d}"
-  _shred_dir "${d}"
+  _secrets_generate_wildcard "${d}"
+  _secrets_create_tls "${WILDCARD_NS}" "${name}" "${d}"
+  _secrets_shred_dir "${d}"
   changed "created the gateway TLS placeholder ${WILDCARD_NS}/${name}"
 }
 
-_generate_token_tls() {
-  # _generate_token_tls <dir> - Harbor's token-service key pair: self-signed,
+_secrets_generate_token_tls() {
+  # _secrets_generate_token_tls <dir> - Harbor's token-service key pair: self-signed,
   # only its public key matters to the registry.
   local d="$1"
-  _openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "${d}/tls.key"
-  _openssl req -x509 -new -sha256 -key "${d}/tls.key" -out "${d}/tls.crt" \
+  _secrets_openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "${d}/tls.key"
+  _secrets_openssl req -x509 -new -sha256 -key "${d}/tls.key" -out "${d}/tls.crt" \
     -days "${TOKEN_DAYS}" -subj "/CN=harbor-token-ca"
 }
 
-ensure_harbor_token_tls() {
+secrets_ensure_harbor_token_tls() {
   local d
   if in_cluster secret "${TOKEN_SECRET}" "${TOKEN_NS}"; then
     log "Harbor token-service TLS ${TOKEN_NS}/${TOKEN_SECRET}: present"
@@ -217,16 +217,16 @@ ensure_harbor_token_tls() {
     return 0
   fi
   d="$(_secrets_tmp)"
-  _generate_token_tls "${d}"
-  _create_tls_secret "${TOKEN_NS}" "${TOKEN_SECRET}" "${d}"
-  _shred_dir "${d}"
+  _secrets_generate_token_tls "${d}"
+  _secrets_create_tls "${TOKEN_NS}" "${TOKEN_SECRET}" "${d}"
+  _secrets_shred_dir "${d}"
   changed "created the Harbor token-service TLS ${TOKEN_NS}/${TOKEN_SECRET}"
 }
 
 # ---------------------------------------------------------------------------
 # Derived trust objects (public certificate only), reconciled every run
 # ---------------------------------------------------------------------------
-reconcile_ca_bundles() {
+secrets_reconcile_ca_bundles() {
   local ns f
   for ns in "${CA_BUNDLE_NAMESPACES[@]}"; do
     f="${WORK_DIR}/ca-bundle-${ns}.json"
@@ -239,7 +239,7 @@ reconcile_ca_bundles() {
   done
 }
 
-reconcile_argocd_tls_certs() {
+secrets_reconcile_argocd_tls_certs() {
   local f="${WORK_DIR}/argocd-tls-certs-cm.json"
   "${JQ}" -n --rawfile pem "${CA_PEM}" --arg ns "${ARGOCD_NS}" --arg name "${ARGOCD_TLS_CM}" --arg host "${HARBOR_HOST}" '{
     apiVersion: "v1", kind: "ConfigMap",
@@ -254,15 +254,15 @@ phase_secrets() {
   require_cluster secrets || return 0
   ensure_work_dir
   CA_PEM=""
-  ensure_ca
-  ensure_wildcard_placeholder
-  ensure_harbor_token_tls
+  secrets_ensure_ca
+  secrets_ensure_wildcard
+  secrets_ensure_harbor_token_tls
   if [[ -z "${CA_PEM}" ]]; then
     log "[dry-run] CA-bundle copies, ${ARGOCD_TLS_CM} and the node trust would be derived from the new CA"
     return 0
   fi
-  reconcile_ca_bundles
-  reconcile_argocd_tls_certs
+  secrets_reconcile_ca_bundles
+  secrets_reconcile_argocd_tls_certs
   if phase_wanted host; then
     host_trust_ca "${CA_PEM}"
   else
@@ -274,7 +274,7 @@ secrets_status() {
   # For `teknoir-node status`: certificate subjects and expiry (public data).
   ensure_work_dir
   local name f
-  for name in "${CA_NS}/${CA_SECRET}" "${WILDCARD_NS}/$(wildcard_secret_name)" "${TOKEN_NS}/${TOKEN_SECRET}"; do
+  for name in "${CA_NS}/${CA_SECRET}" "${WILDCARD_NS}/$(secrets_wildcard_name)" "${TOKEN_NS}/${TOKEN_SECRET}"; do
     f="${WORK_DIR}/status.crt"
     if in_cluster secret "${name#*/}" "${name%%/*}" \
        && ( secret_value "${name%%/*}" "${name#*/}" tls.crt ) > "${f}" 2>/dev/null; then
@@ -290,8 +290,8 @@ secrets_status() {
 # ---------------------------------------------------------------------------
 # credentials
 # ---------------------------------------------------------------------------
-credential_ref() {
-  # credential_ref <name> - "namespace secret key" of a named credential.
+secrets_credential_ref() {
+  # secrets_credential_ref <name> - "namespace secret key" of a named credential.
   case "$1" in
     keycloak-admin)          echo "teknoir-auth keycloak-admin password" ;;
     keycloak-admin-username) echo "teknoir-auth keycloak-admin username" ;;
@@ -316,7 +316,7 @@ cmd_credentials() {
     shift
   done
   [[ -n "${name}" ]] || die "credentials: NAME required (keycloak-admin keycloak-admin-username platform-admin harbor-admin argocd-admin grafana-admin)"
-  ref="$(credential_ref "${name}")" || die "credentials: unknown NAME ${name}"
+  ref="$(secrets_credential_ref "${name}")" || die "credentials: unknown NAME ${name}"
   read -r ns secret key <<<"${ref}"
   if [[ -z "${out}" && -t 1 ]]; then
     die "credentials: refusing to print a credential to a terminal; use --out FILE or redirect stdout"
@@ -340,8 +340,8 @@ cmd_credentials() {
 # ---------------------------------------------------------------------------
 # rotate
 # ---------------------------------------------------------------------------
-_restart_workloads() {
-  # _restart_workloads <ns> <kind/name>... - rollout restart + wait; absent
+_secrets_restart_workloads() {
+  # _secrets_restart_workloads <ns> <kind/name>... - rollout restart + wait; absent
   # workloads are skipped with a note.
   local ns="$1" w
   shift
@@ -357,8 +357,8 @@ _restart_workloads() {
   done
 }
 
-_patch_secret_key() {
-  # _patch_secret_key <ns> <name> <key> <value-var> - set one key from a
+_secrets_patch_key() {
+  # _secrets_patch_key <ns> <name> <key> <value-var> - set one key from a
   # variable, through a 0600 patch file (never argv).
   local ns="$1" name="$2" key="$3" var="$4" f
   ensure_work_dir
@@ -370,8 +370,8 @@ _patch_secret_key() {
   shred -u "${f}" 2>/dev/null || rm -f "${f}"
 }
 
-_rotate_random() {
-  # _rotate_random <ns> <name> <key> <generator> - replace one key with a new
+_secrets_rotate_random() {
+  # _secrets_rotate_random <ns> <name> <key> <generator> - replace one key with a new
   # random value (generator: alnum<N> or b64url<N>).
   local ns="$1" name="$2" key="$3" gen="$4" newval=""
   in_cluster secret "${name}" "${ns}" || die "rotate: Secret ${ns}/${name} does not exist"
@@ -386,12 +386,12 @@ _rotate_random() {
   esac
   [[ -n "${newval}" ]] || die "rotate: could not generate a value"
   mark_sensitive "${newval}"
-  _patch_secret_key "${ns}" "${name}" "${key}" newval
+  _secrets_patch_key "${ns}" "${name}" "${key}" newval
   newval=""
   changed "replaced ${ns}/${name} key ${key}"
 }
 
-_rotate_keycloak_db() {
+_secrets_rotate_keycloak_db() {
   # New Keycloak DB password: ALTER USER inside keycloak-db (SQL on stdin),
   # then the Secret, then Keycloak restarts with it.
   local user="" newval=""
@@ -408,10 +408,10 @@ _rotate_keycloak_db() {
   printf 'ALTER USER "%s" WITH PASSWORD '"'"'%s'"'"';\n' "${user}" "${newval}" \
     | kc -n teknoir-auth exec -i keycloak-db-0 -c postgres -- psql -U "${user}" -d postgres -v ON_ERROR_STOP=1 -q -f - >/dev/null \
     || die "rotate: ALTER USER failed; the Secret was not changed"
-  _patch_secret_key teknoir-auth keycloak-db-secret password newval
+  _secrets_patch_key teknoir-auth keycloak-db-secret password newval
   newval=""
   changed "replaced teknoir-auth/keycloak-db-secret password (database user updated)"
-  _restart_workloads teknoir-auth statefulset/keycloak
+  _secrets_restart_workloads teknoir-auth statefulset/keycloak
 }
 
 cmd_rotate() {
@@ -429,12 +429,12 @@ cmd_rotate() {
   ensure_work_dir
   case "${name}" in
     oauth2-proxy-cookie)
-      _rotate_random teknoir-auth oauth2-proxy-secret cookie-secret b64url32
-      _restart_workloads teknoir-auth deployment/oauth2-proxy
+      _secrets_rotate_random teknoir-auth oauth2-proxy-secret cookie-secret b64url32
+      _secrets_restart_workloads teknoir-auth deployment/oauth2-proxy
       ;;
     oauth2-proxy-redis)
-      _rotate_random teknoir-auth oauth2-proxy-redis-secret password alnum32
-      _restart_workloads teknoir-auth statefulset/oauth2-proxy-redis deployment/oauth2-proxy
+      _secrets_rotate_random teknoir-auth oauth2-proxy-redis-secret password alnum32
+      _secrets_restart_workloads teknoir-auth statefulset/oauth2-proxy-redis deployment/oauth2-proxy
       ;;
     harbor-token-service)
       in_cluster secret "${TOKEN_SECRET}" "${TOKEN_NS}" || die "rotate: ${TOKEN_NS}/${TOKEN_SECRET} does not exist (converge creates it)"
@@ -442,21 +442,21 @@ cmd_rotate() {
         changed "replace ${TOKEN_NS}/${TOKEN_SECRET} with a new key pair"
       else
         d="$(_secrets_tmp)"
-        _generate_token_tls "${d}"
-        _replace_tls_secret "${TOKEN_NS}" "${TOKEN_SECRET}" "${d}"
-        _shred_dir "${d}"
+        _secrets_generate_token_tls "${d}"
+        _secrets_replace_tls "${TOKEN_NS}" "${TOKEN_SECRET}" "${d}"
+        _secrets_shred_dir "${d}"
         changed "replaced ${TOKEN_NS}/${TOKEN_SECRET}"
       fi
-      _restart_workloads teknoir-system deployment/harbor-core deployment/harbor-registry
+      _secrets_restart_workloads teknoir-system deployment/harbor-core deployment/harbor-registry
       ;;
     harbor-secret-key)
       (( iknow )) || die "rotate harbor-secret-key: Harbor encrypts stored credentials (e.g. the OIDC client secret) with it; they must be re-entered afterwards. Read OPERATE.md (rotate), then re-run with --i-know"
-      _rotate_random teknoir-system harbor-secret secretKey alnum16
-      _restart_workloads teknoir-system deployment/harbor-core deployment/harbor-jobservice
+      _secrets_rotate_random teknoir-system harbor-secret secretKey alnum16
+      _secrets_restart_workloads teknoir-system deployment/harbor-core deployment/harbor-jobservice
       ;;
     keycloak-db)
       (( iknow )) || die "rotate keycloak-db: changes the Keycloak database password and restarts Keycloak (sign-ins fail meanwhile). Read OPERATE.md (rotate), then re-run with --i-know"
-      _rotate_keycloak_db
+      _secrets_rotate_keycloak_db
       ;;
     *)
       die "rotate: ${name} is not rotatable here (rotatable: oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service harbor-secret-key keycloak-db); the Root CA, the Keycloak admin and the client secrets follow OPERATE.md"
