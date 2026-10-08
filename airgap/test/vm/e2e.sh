@@ -591,8 +591,12 @@ for ns in $(k get ns -o jsonpath='{.items[*].metadata.name}'); do
   case "$ns" in teknoir-*|cert-manager|istio-system) ;; *) continue ;; esac
   for s in $(k -n "$ns" get secrets -o jsonpath='{range .items[?(@.type!="kubernetes.io/service-account-token")]}{.metadata.name}{"\n"}{end}'); do
     case "$s" in sh.helm.release.*) continue ;; esac
+    # ArgoCD repository Secrets: url, type, name, ... are the repository's
+    # address and settings (logged by design); only their credentials count
+    stype="$(k -n "$ns" get secret "$s" -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}')"
     for key in $(k -n "$ns" get secret "$s" -o json | python3 -c 'import json,sys; print("\n".join((json.load(sys.stdin).get("data") or {}).keys()))'); do
       case "$key" in *.crt|ca.pem|*_USER|*USERNAME|username|user|KEYCLOAK_REALM|KEYCLOAK_CLIENTID) continue ;; esac
+      case "$stype:$key" in repository:url|repository:type|repository:name|repository:project|repository:enableOCI|repository:insecure|repo-creds:url|repo-creds:type|repo-creds:enableOCI) continue ;; esac
       # probes: the longest line of the value (PEM markers dropped) and the
       # base64 of the whole value (how `get secret -o yaml` would print it)
       k -n "$ns" get secret "$s" -o go-template="{{index .data \"$key\" | base64decode}}" > "$val"
