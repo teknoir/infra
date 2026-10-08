@@ -363,9 +363,12 @@ while IFS= read -r -d '' f; do
   fi
 done < <(find "${TREE}/teknoir-airgap" "${TREE}/node/bin" "${TREE}/node/lib" -type f ! -name helm ! -name crane ! -name jq ! -name age -print0)
 
-# 6f. no symlinks, no special files, no hardlinks
+# 6f. no symlinks, no special files, no hardlinks; plain path names (the
+# MANIFEST.yaml readers on the LAN host and the node split "path: sha256")
 [[ -z "$(find "${TREE}" ! -type f ! -type d -print -quit)" ]] || gate_fail "the bundle holds symlinks or special files"
 [[ -z "$(find "${TREE}" -type f -links +1 -print -quit)" ]] || gate_fail "the bundle holds hardlinked files"
+odd="$(find "${TREE}" -mindepth 1 -printf '%P\n' | grep -vE '^[A-Za-z0-9][A-Za-z0-9._+/-]*$' | head -3 || true)"
+[[ -z "${odd}" ]] || gate_fail "path names outside [A-Za-z0-9._+/-]: $(tr '\n' ' ' <<<"${odd}")"
 
 (( GATE_FAIL == 0 )) || die "the bundle failed the gate (see GATE: lines above)"
 log "gate passed"
