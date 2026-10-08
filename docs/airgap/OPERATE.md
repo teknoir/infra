@@ -679,7 +679,7 @@ realm import fails and every login breaks. If Keycloak refuses that password
 because it was changed by hand, run
 `./teknoir-airgap migrate --keycloak-admin-password-file FILE` (the current
 password, mode 0600, no trailing newline). Then it detaches (the orphan Addons, the 8 legacy
-`manifest-*-secret` files, the 10 `teknoir-*-secret` files, the namespaces, the
+`manifest-*-secret` files, the 9 `teknoir-*-secret` files, the namespaces, the
 CRDs, `coredns-custom` and the root app-of-apps; `teknoir-argo` stays until M4b).
 Each file gets a `.skip` guard, is moved to
 `/opt/k3s/server/manifests-retired/<UTC>/`, its objects lose the k3s ownership

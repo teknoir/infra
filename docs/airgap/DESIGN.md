@@ -162,7 +162,7 @@ RANKED CRITIQUE (the 5 reviews merged; contested points checked read-only on 202
    - They travel in plaintext inside the bundle (airgap/make-bundle.sh:89-118).
    - upload-bundle.sh copies them into the node's home directory. Verified: /home/teknoir/teknoir-airgap-bundle-0.1.0/bootstrap/secrets/ holds 6 files at mode 0644, manifest-teknoir-ca-secret.yaml among them, which contains the CA tls.key. This also contradicts AIRGAP-BOOTSTRAP.md:498.
    - Secrets then live for good as K3s auto-deploy files, and K3s re-applies those on every restart.
-     - Verified: 10 teknoir-*-secret Addons plus 8 legacy manifest-*-secret duplicates sit on the node, plus 3 orphan Addons: 10-teknoir-argo, app-of-apps and manifest-argocd-harbor-repo-secret.
+     - Verified: 9 teknoir-*-secret Addons (corrected 2026-10-08; the wildcard Secret is applied with kubectl) plus 8 legacy manifest-*-secret duplicates sit on the node, plus 3 orphan Addons: 10-teknoir-argo, app-of-apps and manifest-argocd-harbor-repo-secret.
      - Correction to the reviews: the canonical teknoir-*-secret files are 0644 and the legacy ones 0600. The directory is 0700.
    - The generators are not idempotent. A re-run gives Harbor a new secretKey and Keycloak a new DB password, and an empty CWD gets a new CA. Four generators also print secrets (gen-harbor-secrets.sh:50-51, gen-keycloak-db-secret.sh:41, gen-oauth2-proxy-redis-secret.sh:38, gen-oauth2-proxy-secrets.sh:34,54).
    - The built bundle holds 1 of the 10 secret manifests (verified: bootstrap/secrets contains only manifest-argocd-harbor-repo-secret.yaml). A first bootstrap from it cannot succeed, and the default-mode re-run, which the docs call safe, dies in deploy-secrets after it has already changed the node.
