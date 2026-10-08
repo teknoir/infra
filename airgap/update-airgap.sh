@@ -11,6 +11,9 @@
 # The legacy duplicate app-of-apps.yaml is retired on the way, so it can never
 # flip the revision back. ArgoCD then syncs the new chart versions from Harbor.
 #
+# Only the app-of-apps version pinned in versions.env is deployed unless
+# --force is given; the versions in BROKEN_APP_OF_APPS_VERSIONS never are.
+#
 # Usage: airgap/update-airgap.sh [options] <app-of-apps-version>
 #        airgap/update-airgap.sh [options] --from-bundle
 set -euo pipefail
@@ -23,11 +26,15 @@ Usage: $(basename "$0") [options] <app-of-apps-version>
        $(basename "$0") [options] --from-bundle
 
 Deploys the bundle's app-of-apps manifest with targetRevision set to
-<app-of-apps-version> (rollback: pass an older version). --from-bundle keeps
-the bundle's own targetRevision.
+<app-of-apps-version>, which must be the pinned version
+($(pinned_version app-of-apps), versions.env) unless --force is given.
+--from-bundle keeps the bundle's own targetRevision. Never deployed, not even
+with --force: ${BROKEN_APP_OF_APPS_VERSIONS[*]}.
 
 Options:
   --from-bundle  deploy the bundle's manifest unchanged
+  --force        allow another app-of-apps version than the pinned one
+                 (a deliberate rollback to an earlier, good release)
   --refresh      also ask ArgoCD to refresh app-of-apps right away
   --host H       ssh target (default: ${TEKNOIR_HOST})
   --ssh-key FILE ssh identity file, e.g. .secrets/teknoir.airgapped.id_rsa
@@ -46,6 +53,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --from-bundle) FROM_BUNDLE=1 ;;
     --refresh) args+=(--refresh) ;;
+    --force) args+=(--force) ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
     --ssh-key) SSH_KEY="$2"; shift ;;
     --bundle) BUNDLE_DIR="$2"; shift ;;

@@ -155,18 +155,37 @@ rebuild and push.
 ## 4. Rollback
 
 Charts are never overwritten or deleted in Harbor, so a GitOps-tier rollback is
-a re-pin of an older app-of-apps version:
+a re-pin of an earlier, known-good app-of-apps version (0.0.3 or later):
 
 ```sh
-./airgap/update-airgap.sh <previous version>
+./airgap/update-airgap.sh --force <previous version>
 ```
 
-> **Do not roll back to app-of-apps 0.0.1 or 0.0.2.** Their Harbor contents
-> were overwritten on 2026-09-14: both pin harbor 0.0.8 (Harbor 2.15.2, a
-> one-way database migration, images not mirrored) and auth 0.0.6/0.0.7.
+`update-airgap.sh` / `deploy-app-of-apps.sh` deploy only the app-of-apps
+version pinned in `airgap/versions.env` unless `--force` is given, and refuse
+app-of-apps **0.0.1 and 0.0.2** even then (`BROKEN_APP_OF_APPS_VERSIONS`):
+their Harbor contents were overwritten on 2026-09-14, and both pin harbor 0.0.8
+(Harbor 2.15.2, a one-way database migration, images not mirrored) and auth
+0.0.6/0.0.7. Harbor is ArgoCD's only chart source, so a broken Harbor cannot be
+rolled forward from the cluster.
 
-A bootstrap-tier rollback is `bootstrap-airgap.sh --update` run from the
-previous bundle.
+A bootstrap-tier rollback is `bootstrap-airgap.sh --update` run from an
+earlier bundle, but **only from a bundle built with this tooling or later**:
+its `airgap/versions.env` defines `BROKEN_APP_OF_APPS_VERSIONS`
+(`grep -q BROKEN_APP_OF_APPS_VERSIONS <bundle>/airgap/versions.env`). Never
+run `bootstrap-airgap.sh`, `update-airgap.sh` or `deploy-app-of-apps.sh` from
+an older bundle, such as the 2026-09-14 build. Its scripts cannot be fixed
+after the fact, and its `--update`:
+
+* recreates `app-of-apps.yaml` with app-of-apps 0.0.2 and automated sync, which
+  K3s applies over the current root Application, so ArgoCD syncs harbor 0.0.8;
+* one-shot applies its `harbor.yaml` (Harbor 2.15.2) and istio resources over
+  what ArgoCD owns;
+* overwrites cert-manager's issued wildcard certificate with the bootstrap
+  placeholder;
+* puts `10-teknoir-argo.yaml` back next to `teknoir-argo.yaml`, and re-adds the
+  bundle's `manifest-argocd-harbor-repo-secret.yaml`, which may carry a stale
+  Harbor credential.
 
 ## 5. Bootstrap-tier updates (ArgoCD, CRDs, image tarballs)
 

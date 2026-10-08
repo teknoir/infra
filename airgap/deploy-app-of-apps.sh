@@ -12,11 +12,14 @@
 # no-op.
 #
 # Source: the bundle's bootstrap/manifests/teknoir-app-of-apps.yaml, else this
-# checkout's teknoir-local-app-of-apps.yaml. --revision deploys it with another
-# app-of-apps chart version (update or rollback; see update-airgap.sh).
+# checkout's teknoir-local-app-of-apps.yaml. Only the app-of-apps version
+# pinned in versions.env is deployed; --revision V --force deploys another one
+# deliberately (e.g. a rollback). Versions in BROKEN_APP_OF_APPS_VERSIONS are
+# always refused.
 #
-# Usage: airgap/deploy-app-of-apps.sh [--bundle DIR] [--revision V] [--refresh]
-#                                     [--host user@host] [--ssh-key FILE] [--dry-run]
+# Usage: airgap/deploy-app-of-apps.sh [--bundle DIR] [--revision V [--force]]
+#                                     [--refresh] [--host user@host]
+#                                     [--ssh-key FILE] [--dry-run]
 set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -28,6 +31,8 @@ Usage: $(basename "$0") [options]
 Options:
   --bundle DIR    bundle directory (default: $(bundle_dir))
   --revision V    app-of-apps chart version to deploy (default: the manifest's)
+  --force         allow a version other than the pinned app-of-apps
+                  ($(pinned_version app-of-apps)); never one of: ${BROKEN_APP_OF_APPS_VERSIONS[*]}
   --refresh       also ask ArgoCD to refresh the Application right away
   --host H        ssh target (default: ${TEKNOIR_HOST})
   --ssh-key FILE  ssh identity file, e.g. .secrets/teknoir.airgapped.id_rsa
@@ -39,10 +44,12 @@ EOF
 
 REVISION=""
 REFRESH=0
+FORCE=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bundle) BUNDLE_DIR="$2"; shift ;;
     --revision) REVISION="$2"; shift ;;
+    --force) FORCE=1 ;;
     --refresh) REFRESH=1 ;;
     --host) TEKNOIR_HOST="$2"; shift ;;
     --ssh-key) SSH_KEY="$2"; shift ;;
@@ -66,6 +73,19 @@ done
 [[ "$(grep -cE '^[[:space:]]*targetRevision:' "${SRC}")" == "1" ]] \
   || die "expected exactly one targetRevision in ${SRC}"
 current="$(awk '/^[[:space:]]*targetRevision:/{print $2; exit}' "${SRC}")"
+
+# Never a broken version; another version than the pin only with --force.
+target="${REVISION:-${current}}"
+for broken in ${BROKEN_APP_OF_APPS_VERSIONS[@]+"${BROKEN_APP_OF_APPS_VERSIONS[@]}"}; do
+  [[ "${target}" != "${broken}" ]] \
+    || die "app-of-apps ${target} must never be deployed: its Harbor content was overwritten on 2026-09-14 (harbor 0.0.8 = Harbor 2.15.2 with a one-way DB migration and unmirrored images; see versions.env)"
+done
+pinned="$(pinned_version app-of-apps)"
+if [[ "${target}" != "${pinned}" ]]; then
+  [[ "${FORCE}" == "1" ]] \
+    || die "app-of-apps ${target} is not the pinned version ${pinned:-<none>} (versions.env); pass --force to deploy it deliberately (e.g. a rollback)"
+  warn "--force: deploying app-of-apps ${target}, not the pinned ${pinned:-<none>}"
+fi
 
 tmpdir="$(mktemp -d)"
 trap 'rm -rf "${tmpdir}"' EXIT
