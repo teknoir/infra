@@ -138,7 +138,8 @@ admin_kc() {
 
 admin_keycloak_group() {
   local email="$1" realm user pass resp code uid gid member body
-  ADMIN_KC_URL="${ADMIN_KEYCLOAK_URL:-https://auth.${TEKNOIR_DOMAIN}}"
+  # Keycloak serves under /auth (KC_HTTP_RELATIVE_PATH in the auth chart)
+  ADMIN_KC_URL="${ADMIN_KEYCLOAK_URL:-https://auth.${TEKNOIR_DOMAIN}/auth}"
   realm="${ADMIN_KEYCLOAK_REALM:-teknoir}"
   user="$(secret_value teknoir-auth keycloak-admin username)" || die "cannot read Secret teknoir-auth/keycloak-admin"
   pass="$(secret_value teknoir-auth keycloak-admin password)" || die "cannot read Secret teknoir-auth/keycloak-admin"

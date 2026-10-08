@@ -339,8 +339,8 @@ e1() {
   if [[ -n "$(ca_file)" ]]; then pass "the CA certificate was fetched to ${LAN_HOME}/.teknoir-airgap/<site>/"; else fail "no teknoir-root-ca.crt under ${LAN_HOME}/.teknoir-airgap"; return 0; fi
   assert_eq "https://harbor.${DOMAIN}/api/v2.0/health with the CA" 200 "$(lan_https "https://harbor.${DOMAIN}/api/v2.0/health")"
   assert_eq "https://argocd.${DOMAIN} with the CA" 200 "$(lan_https "https://argocd.${DOMAIN}/")"
-  assert_eq "Keycloak master realm discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/realms/master/.well-known/openid-configuration")"
-  assert_eq "Keycloak realm teknoir discovery with the CA (D2)" 200 "$(lan_https "https://auth.${DOMAIN}/realms/teknoir/.well-known/openid-configuration")"
+  assert_eq "Keycloak master realm discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/auth/realms/master/.well-known/openid-configuration")"
+  assert_eq "Keycloak realm teknoir discovery with the CA (D2)" 200 "$(lan_https "https://auth.${DOMAIN}/auth/realms/teknoir/.well-known/openid-configuration")"
   # the first platform admin (DESIGN C.5): a superadmin User CR, its Keycloak
   # user (realm teknoir, group admin) and a temporary password in a 0600 file
   local pw="${LAN_HOME}/e2e/admin.pw" mode
