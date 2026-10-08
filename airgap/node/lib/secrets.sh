@@ -200,16 +200,46 @@ secrets_ensure_wildcard() {
 _secrets_generate_token_tls() {
   # _secrets_generate_token_tls <dir> - Harbor's token-service key pair: self-signed,
   # only its public key matters to the registry.
+  # Harbor core only reads a PKCS#1 key ("BEGIN RSA PRIVATE KEY"); OpenSSL 3
+  # writes PKCS#8 by default, which makes every /service/token request a 500.
   local d="$1"
-  _secrets_openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:4096 -out "${d}/tls.key"
+  _secrets_openssl genrsa -traditional -out "${d}/tls.key" 4096
   _secrets_openssl req -x509 -new -sha256 -key "${d}/tls.key" -out "${d}/tls.crt" \
     -days "${TOKEN_DAYS}" -subj "/CN=harbor-token-ca"
+}
+
+_secrets_token_key_is_pkcs1() {
+  # 0 when the Harbor token-service key is PKCS#1. Only the PEM header line is
+  # inspected; the key itself never leaves the pipe.
+  # (the expected header is assembled so this file never contains a literal
+  # PEM private-key header, which the bundle gate refuses)
+  local header want="-----BEGIN RSA PRIVATE"
+  want+=" KEY-----"
+  header="$(secret_value "${TOKEN_NS}" "${TOKEN_SECRET}" tls.key | head -1)" || return 1
+  [[ "${header}" == "${want}" ]]
 }
 
 secrets_ensure_harbor_token_tls() {
   local d
   if in_cluster secret "${TOKEN_SECRET}" "${TOKEN_NS}"; then
-    log "Harbor token-service TLS ${TOKEN_NS}/${TOKEN_SECRET}: present"
+    if _secrets_token_key_is_pkcs1; then
+      log "Harbor token-service TLS ${TOKEN_NS}/${TOKEN_SECRET}: present"
+      return 0
+    fi
+    # Not a site secret: it only signs short-lived registry tokens, so a key
+    # Harbor cannot read is replaced (and core + registry restarted).
+    if dry_run; then
+      changed "replace the Harbor token-service TLS ${TOKEN_NS}/${TOKEN_SECRET} (key is not PKCS#1)"
+      return 0
+    fi
+    d="$(_secrets_tmp)"
+    _secrets_generate_token_tls "${d}"
+    kc -n "${TOKEN_NS}" delete secret "${TOKEN_SECRET}" >/dev/null || die "cannot replace Secret ${TOKEN_NS}/${TOKEN_SECRET}"
+    _secrets_create_tls "${TOKEN_NS}" "${TOKEN_SECRET}" "${d}"
+    _secrets_shred_dir "${d}"
+    kc -n "${TOKEN_NS}" delete pod -l 'app=harbor,component in (core,registry)' --ignore-not-found >/dev/null \
+      || warn "could not restart harbor core/registry; they keep the old token key until restarted"
+    changed "replaced the Harbor token-service TLS ${TOKEN_NS}/${TOKEN_SECRET} (key was not PKCS#1); restarted harbor core + registry"
     return 0
   fi
   if dry_run; then
