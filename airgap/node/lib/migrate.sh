@@ -43,6 +43,13 @@ MIGRATE_EXCLUDED="teknoir-argo"
 MIGRATE_STRIP_PATCH='{"metadata":{"labels":{"objectset.rio.cattle.io/hash":null},"annotations":{"objectset.rio.cattle.io/applied":null,"objectset.rio.cattle.io/id":null,"objectset.rio.cattle.io/owner-gvk":null,"objectset.rio.cattle.io/owner-name":null,"objectset.rio.cattle.io/owner-namespace":null}}}'
 MIGRATE_REPO_CREDS_NS="teknoir-system"
 MIGRATE_REPO_CREDS="argocd-harbor-repo"
+# The master-realm admin carried over to the auth chart (gitops charts/auth
+# README, "Keycloak admin"): Secret teknoir-auth/keycloak-admin with the live
+# password as previous-password, created before the first up.
+MIGRATE_KC_NS="teknoir-auth"
+MIGRATE_KC_SECRET="keycloak-admin"
+MIGRATE_KC_STS="keycloak"
+MIGRATE_KC_PASSWORD=""
 MIGRATE_ARGOCD_TIMEOUT="${MIGRATE_ARGOCD_TIMEOUT:-180}"
 MIGRATE_ONLY=""
 # counted in the baseline besides CRDs, Namespaces and Secrets per namespace (DESIGN M2)
@@ -58,6 +65,13 @@ cmd_migrate() {
     case "$1" in
       --dry-run) DRY_RUN=1; shift ;;
       --argo) argo=1; shift ;;
+      --keycloak-admin-password-stdin)
+        # the master admin's current password, when it is no longer the one in
+        # the Keycloak StatefulSet (changed by hand): read once, never printed
+        IFS= read -r MIGRATE_KC_PASSWORD || [[ -n "${MIGRATE_KC_PASSWORD}" ]] \
+          || die "--keycloak-admin-password-stdin: nothing on stdin"
+        mark_sensitive "${MIGRATE_KC_PASSWORD}"
+        shift ;;
       --undo) [[ $# -ge 2 ]] || die "--undo needs a name"; undo+=("$2"); shift 2 ;;
       --undo=*) undo+=("${1#*=}"); shift ;;
       -h|--help) migrate_usage; return 0 ;;
@@ -77,6 +91,7 @@ cmd_migrate() {
     migrate_argo
     return 0
   fi
+  migrate_keycloak_admin
   migrate_detach_all
   migrate_remove_old_bundles
   migrate_retire_robot
@@ -84,10 +99,14 @@ cmd_migrate() {
 
 migrate_usage() {
   cat >&2 <<'EOF'
-Usage: teknoir-node migrate [--dry-run]
+Usage: teknoir-node migrate [--dry-run] [--keycloak-admin-password-stdin]
        teknoir-node migrate --argo [--dry-run]
        teknoir-node migrate --undo NAME [--undo NAME]...
 
+First carries the Keycloak master admin over to the auth chart: when Secret
+teknoir-auth/keycloak-admin is absent, it is created with the admin's current
+password as previous-password (from the keycloak StatefulSet, or from stdin with
+--keycloak-admin-password-stdin), checked against Keycloak first.
 Detaches the Teknoir K3s auto-deploy files (DESIGN M3): .skip guard, file moved to
 <data-dir>/server/manifests-retired/<UTC>/, K3s labels stripped, Addon deleted,
 object UIDs and counts compared with a baseline after every name. Then removes
@@ -635,6 +654,99 @@ migrate_argocd_reads_anonymously() {
   done
   warn "ArgoCD did not compare app-of-apps within ${MIGRATE_ARGOCD_TIMEOUT}s"
   return 1
+}
+
+# --- Keycloak master admin (gitops charts/auth README) -----------------------------
+
+migrate_keycloak_admin() {
+  # The auth chart takes the master admin from Secret teknoir-auth/keycloak-admin;
+  # on this existing install Keycloak only knows its current password. Create the
+  # Secret with that password as previous-password (and the user name) before the
+  # first up: platform-secrets adds a random password and the keycloak-config
+  # Job rotates the admin to it. Absent Keycloak or an existing Secret: nothing to do.
+  local sts user pass="" ref code
+  if in_cluster secrets "${MIGRATE_KC_SECRET}" "${MIGRATE_KC_NS}"; then
+    log "keycloak-admin: Secret ${MIGRATE_KC_NS}/${MIGRATE_KC_SECRET} exists (left as it is)"
+    return 0
+  fi
+  if ! in_cluster statefulsets "${MIGRATE_KC_STS}" "${MIGRATE_KC_NS}"; then
+    log "keycloak-admin: no StatefulSet ${MIGRATE_KC_NS}/${MIGRATE_KC_STS}, so no admin to carry over"
+    return 0
+  fi
+  sts="$(kc -n "${MIGRATE_KC_NS}" get statefulset "${MIGRATE_KC_STS}" -o json)" \
+    || die "cannot read StatefulSet ${MIGRATE_KC_NS}/${MIGRATE_KC_STS}"
+  user="$(migrate_kc_env "${sts}" KC_BOOTSTRAP_ADMIN_USERNAME)"
+  [[ -n "${user}" ]] || user="admin"
+  if [[ -n "${MIGRATE_KC_PASSWORD}" ]]; then
+    pass="${MIGRATE_KC_PASSWORD}"
+  else
+    pass="$(migrate_kc_env "${sts}" KC_BOOTSTRAP_ADMIN_PASSWORD)"
+    mark_sensitive "${pass}"
+    [[ -n "${pass}" ]] || die "keycloak-admin: the keycloak StatefulSet has no KC_BOOTSTRAP_ADMIN_PASSWORD; pass the admin's current password with --keycloak-admin-password-file FILE"
+  fi
+  code="$(migrate_kc_login "${user}" "${pass}")"
+  case "${code}" in
+    200) log "keycloak-admin: the master admin's current password works" ;;
+    401) die "keycloak-admin: Keycloak refuses the master admin's password from $( [[ -n "${MIGRATE_KC_PASSWORD}" ]] && echo "--keycloak-admin-password-file" || echo "the keycloak StatefulSet") (it was changed by hand?); run migrate again with --keycloak-admin-password-file FILE (the current password, mode 0600, no trailing newline)" ;;
+    *) die "keycloak-admin: cannot check the master admin's password against Keycloak (HTTP ${code:-none}); is Keycloak running?" ;;
+  esac
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    log "[dry-run] keycloak-admin: would create Secret ${MIGRATE_KC_NS}/${MIGRATE_KC_SECRET} with username and previous-password (the current password; never shown)"
+    return 0
+  fi
+  ref="$(umask 077 && mktemp "${WORK_DIR}/kc-prev.XXXXXX")" || die "cannot create a private temp file"
+  printf '%s' "${pass}" > "${ref}"
+  pass=""
+  kc -n "${MIGRATE_KC_NS}" create secret generic "${MIGRATE_KC_SECRET}" \
+    --from-literal=username="${user}" --from-file=previous-password="${ref}" >/dev/null \
+    || { rm -f "${ref}"; die "cannot create Secret ${MIGRATE_KC_NS}/${MIGRATE_KC_SECRET}"; }
+  rm -f "${ref}"
+  changed "created Secret ${MIGRATE_KC_NS}/${MIGRATE_KC_SECRET} (username, previous-password = the admin's current password); the first up adds a random password and the auth sync rotates the admin to it"
+}
+
+migrate_kc_env() {
+  # migrate_kc_env <statefulset-json> <VAR> — the value of env VAR of the
+  # Keycloak container: a literal, or the Secret key it references. Prints the
+  # value (capture only). Empty when unset.
+  local ref ns="${MIGRATE_KC_NS}" _kind name key
+  ref="$("${MIGRATE_JQ}" -r --arg v "$2" '
+      [.spec.template.spec.containers[] | (.env // [])[] | select(.name == $v)][0] // {}
+      | if .valueFrom.secretKeyRef then "secret \(.valueFrom.secretKeyRef.name) \(.valueFrom.secretKeyRef.key)"
+        elif has("value") then "literal" else "none" end' <<<"$1")" || die "cannot parse StatefulSet ${ns}/${MIGRATE_KC_STS}"
+  case "${ref}" in
+    literal) "${MIGRATE_JQ}" -r --arg v "$2" '[.spec.template.spec.containers[] | (.env // [])[] | select(.name == $v)][0].value' <<<"$1" ;;
+    secret\ *) read -r _kind name key <<<"${ref}"; secret_value "${ns}" "${name}" "${key}" ;;
+    *) printf '' ;;
+  esac
+}
+
+migrate_kc_login() {
+  # migrate_kc_login <user> <password> — HTTP status of a master-realm token
+  # request at https://auth.<domain>/auth through the gateway on NODE_IP, with
+  # the platform CA from the cluster. Credentials go to curl in a config file
+  # on a pipe, never on argv.
+  local ca code
+  ca="$(umask 077 && mktemp "${WORK_DIR}/kc-ca.XXXXXX")" || die "cannot create a temp file"
+  if in_cluster secrets teknoir-root-ca-bundle teknoir-system; then
+    secret_value teknoir-system teknoir-root-ca-bundle ca.crt > "${ca}"
+  else
+    secret_value cert-manager teknoir-root-ca tls.crt > "${ca}"
+  fi
+  grep -q 'BEGIN CERTIFICATE' "${ca}" || { rm -f "${ca}"; die "keycloak-admin: no platform CA certificate in teknoir-system/teknoir-root-ca-bundle or cert-manager/teknoir-root-ca"; }
+  # shellcheck disable=SC2086  # MIGRATE_CURL_OPTS: extra curl flags (tests)
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -m 30 --cacert "${ca}" \
+      --resolve "auth.${TEKNOIR_DOMAIN}:443:${NODE_IP}" ${MIGRATE_CURL_OPTS:-} \
+      -K <(printf 'data-urlencode = "grant_type=password"\ndata-urlencode = "client_id=admin-cli"\ndata-urlencode = "username=%s"\ndata-urlencode = "password=%s"\n' \
+             "$(migrate_cfg_escape "$1")" "$(migrate_cfg_escape "$2")") \
+      "${MIGRATE_KC_URL:-https://auth.${TEKNOIR_DOMAIN}/auth}/realms/master/protocol/openid-connect/token" 2>/dev/null)" || code="${code:-000}"
+  rm -f "${ca}"
+  printf '%s' "${code}"
+}
+
+migrate_cfg_escape() {
+  # curl config quoting: backslash and double quote escaped
+  local v="${1//\\/\\\\}"
+  printf '%s' "${v//\"/\\\"}"
 }
 
 # --- DESIGN M7a: teknoir-argo ------------------------------------------------------

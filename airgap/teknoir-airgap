@@ -33,7 +33,7 @@
 #               teknoir-backup-<ts>.tar.age
 #   backup      --stream FILE --keep --site FILE   that export on stdout
 #   rotate      NAME --site FILE [--i-know]
-#   migrate     --site FILE [--dry-run | --undo NAME]
+#   migrate     --site FILE [--dry-run] [--keycloak-admin-password-stdin | --argo | --undo NAME]
 # Every command that runs teknoir-node first copies the site config to
 # /var/lib/teknoir-airgap/site/<site>.env (when it differs) and the payload
 # when the node lacks it (node_prepare), so each works on a node that never
@@ -162,7 +162,13 @@ Options for rotate:
 
 Options for migrate:
   --dry-run             List what would be detached; change nothing.
+  --argo                Detach teknoir-argo, once the Application argo is
+                        Synced/Healthy (right after the first up; M4b).
   --undo NAME           Re-attach one detached K3s manifest file.
+  --keycloak-admin-password-file FILE
+                        The Keycloak master admin's current password (mode
+                        0600, no trailing newline), when it is no longer the
+                        one in the keycloak StatefulSet. Sent over ssh stdin.
 
 Files: ~/.teknoir-airgap/<site>/ holds the pinned host key, the CA certificate,
 the ssh control socket and logs; deleting it is safe. Exit status: 0 success,
@@ -977,6 +983,8 @@ OPT_EMAIL=
 OPT_PRINT=0
 OPT_I_KNOW=0
 OPT_UNDO=
+OPT_ARGO=0
+OPT_KC_PW_FILE=
 
 # Options a command accepts (beyond the global ones).
 allowed() {
@@ -986,7 +994,7 @@ allowed() {
     trust:--print) return 0 ;;
     credentials:--out|admin-user:--out|admin-user:--email|backup:--out) return 0 ;;
     rotate:--i-know) return 0 ;;
-    migrate:--dry-run|migrate:--undo) return 0 ;;
+    migrate:--dry-run|migrate:--undo|migrate:--argo|migrate:--keycloak-admin-password-file) return 0 ;;
   esac
   return 1
 }
@@ -1001,7 +1009,7 @@ parse_args() {
     esac
     case "${a}" in
       -h|--help) usage; exit 0 ;;
-      --site|--node|--host-key|--reapply|--context|--kubeconfig|--out|--email|--undo)
+      --site|--node|--host-key|--reapply|--context|--kubeconfig|--out|--email|--undo|--keycloak-admin-password-file)
         if [ -z "${v}" ]; then
           [ $# -ge 2 ] || usage_error "${a} needs a value"
           v=$2; shift
@@ -1016,6 +1024,7 @@ parse_args() {
           --out) OPT_OUT=${v} ;;
           --email) OPT_EMAIL=${v} ;;
           --undo) OPT_UNDO=${v} ;;
+          --keycloak-admin-password-file) OPT_KC_PW_FILE=${v} ;;
         esac
         case "${a}" in --site|--node|--host-key) ;; *) PARSED_OPTS="${PARSED_OPTS} ${a}" ;; esac ;;
       --local) LOCAL=1 ;;
@@ -1024,6 +1033,7 @@ parse_args() {
       --rollback|--sync-clock|--force-images) UP_ARGS[${#UP_ARGS[@]}]=${a}; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
       --print) OPT_PRINT=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
       --i-know) OPT_I_KNOW=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
+      --argo) OPT_ARGO=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
       --) shift; while [ $# -gt 0 ]; do PASS[${#PASS[@]}]=$1; shift; done; PARSED_OPTS="${PARSED_OPTS} --"; break ;;
       -*) usage_error "unknown option ${a}" ;;
       *)
@@ -1511,17 +1521,35 @@ cmd_rotate() {
 }
 
 cmd_migrate() {
-  [ "$(npos)" -eq 0 ] || usage_error "migrate takes no arguments besides --dry-run or --undo NAME"
+  local dry=
+  [ "$(npos)" -eq 0 ] || usage_error "migrate takes no arguments besides its options"
   if [ "${DRY_RUN}" = 1 ] && [ -n "${OPT_UNDO}" ]; then usage_error "migrate takes --dry-run or --undo, not both"; fi
+  if [ "${OPT_ARGO}" = 1 ] && [ -n "${OPT_UNDO}" ]; then usage_error "migrate takes --argo or --undo, not both"; fi
+  if [ -n "${OPT_KC_PW_FILE}" ] && { [ "${OPT_ARGO}" = 1 ] || [ -n "${OPT_UNDO}" ]; }; then
+    usage_error "--keycloak-admin-password-file goes with a plain migrate (or --dry-run)"
+  fi
   case "${OPT_UNDO}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid name for --undo: '${OPT_UNDO}'" ;; esac
+  if [ -n "${OPT_KC_PW_FILE}" ]; then
+    if ! { [ -f "${OPT_KC_PW_FILE}" ] && [ -r "${OPT_KC_PW_FILE}" ] && [ -s "${OPT_KC_PW_FILE}" ]; }; then
+      usage_error "--keycloak-admin-password-file: ${OPT_KC_PW_FILE} is not a readable, non-empty file"
+    fi
+    # group/other permission bits must be clear (find -perm works on GNU and BSD)
+    if [ -n "$(find "${OPT_KC_PW_FILE}" -prune -perm -001 -o -prune -perm -002 -o -prune -perm -004 -o -prune -perm -010 -o -prune -perm -020 -o -prune -perm -040)" ]; then
+      die "${OPT_KC_PW_FILE} is open to other users: chmod 600 it first"
+    fi
+  fi
+  [ "${DRY_RUN}" = 0 ] || dry=--dry-run
   common_open
   node_prepare
-  if [ "${DRY_RUN}" = 1 ]; then
-    run_runner tty migrate --site "${REMOTE_SITE}" --dry-run
-  elif [ -n "${OPT_UNDO}" ]; then
+  if [ -n "${OPT_UNDO}" ]; then
     run_runner tty migrate --site "${REMOTE_SITE}" --undo "${OPT_UNDO}"
+  elif [ "${OPT_ARGO}" = 1 ]; then
+    run_runner tty migrate --site "${REMOTE_SITE}" --argo ${dry}
+  elif [ -n "${OPT_KC_PW_FILE}" ]; then
+    # the password travels on ssh's stdin (pipe mode: no tty), never in argv or a file on the node
+    run_runner pipe migrate --site "${REMOTE_SITE}" --keycloak-admin-password-stdin ${dry} <"${OPT_KC_PW_FILE}"
   else
-    run_runner tty migrate --site "${REMOTE_SITE}"
+    run_runner tty migrate --site "${REMOTE_SITE}" ${dry}
   fi
 }
 

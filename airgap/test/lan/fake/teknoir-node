@@ -71,6 +71,12 @@ case $cmd in
       tar -C "$b" -cf - "$ts" | "$here/age" -p -o "$e/teknoir-backup-$ts.tar.age" || exit 1
       echo "$e/teknoir-backup-$ts.tar.age"
     fi ;;
-  rotate|migrate) echo "fake $cmd $*" ;;
+  migrate)
+    # the Keycloak admin password arrives on stdin: report its size, never the value
+    for a in "$@"; do
+      case $a in --keycloak-admin-password-stdin) n=$(wc -c | tr -d ' '); echo "fake migrate $* stdin=${n}"; exit 0 ;; esac
+    done
+    echo "fake migrate $*" ;;
+  rotate) echo "fake $cmd $*" ;;
   *) echo "fake teknoir-node: unknown command $cmd" >&2; exit 2 ;;
 esac

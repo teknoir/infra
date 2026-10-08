@@ -148,6 +148,18 @@ passthrough)
   expect_rc 0 "migrate --undo NAME" "${T}" migrate --undo teknoir-coredns-custom
   expect_rc 0 "migrate" "${T}" migrate
   expect_rc 2 "migrate --dry-run --undo" "${T}" migrate --dry-run --undo x
+  expect_rc 0 "migrate --argo --dry-run" "${T}" migrate --argo --dry-run
+  expect_rc 0 "migrate --argo" "${T}" migrate --argo
+  expect_rc 2 "migrate --argo --undo" "${T}" migrate --argo --undo x
+  ( umask 077; printf 'kc-admin-s3cr3t' >/tmp/kcpw )
+  expect_rc 0 "migrate --keycloak-admin-password-file (0600)" "${T}" migrate --keycloak-admin-password-file /tmp/kcpw
+  expect_out "stdin=15$" "the password reaches teknoir-node on stdin"
+  expect_no_out "kc-admin-s3cr3t" "the password is never shown"
+  expect_rc 2 "--keycloak-admin-password-file with --argo" "${T}" migrate --argo --keycloak-admin-password-file /tmp/kcpw
+  chmod 644 /tmp/kcpw
+  expect_rc 1 "--keycloak-admin-password-file readable by others" "${T}" migrate --keycloak-admin-password-file /tmp/kcpw
+  expect_out "chmod 600" "says how to fix the mode"
+  rm -f /tmp/kcpw
   expect_rc 0 "up with every converge flag" "${T}" up --dry-run --rollback --sync-clock --reapply istio --force-images -- --extra-flag
   expect_out "dry run complete" "dry run says nothing changed"
   ;;

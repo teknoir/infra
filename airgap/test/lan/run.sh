@@ -176,6 +176,8 @@ EOF
   node_check "rotate passes --i-know" 'grep -q "rotate oauth2-proxy-cookie --site /var/lib/teknoir-airgap/site/teknoir-local.env --i-know$" /var/log/teknoir-airgap-fake-runner.log'
   node_check "migrate passes --dry-run" 'grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --dry-run$" /var/log/teknoir-airgap-fake-runner.log'
   node_check "migrate passes --undo NAME" 'grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --undo teknoir-coredns-custom$" /var/log/teknoir-airgap-fake-runner.log'
+  node_check "migrate passes --argo and --argo --dry-run" 'grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --argo$" /var/log/teknoir-airgap-fake-runner.log && grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --argo --dry-run$" /var/log/teknoir-airgap-fake-runner.log'
+  node_check "migrate passes --keycloak-admin-password-stdin, and the password is not in the runner log" 'grep -q "migrate --site /var/lib/teknoir-airgap/site/teknoir-local.env --keycloak-admin-password-stdin$" /var/log/teknoir-airgap-fake-runner.log && ! grep -q kc-admin-s3cr3t /var/log/teknoir-airgap-fake-runner.log'
   node_check "up passes every converge flag in order" \
     'grep -q "converge --site /var/lib/teknoir-airgap/site/teknoir-local.env --lan-time [0-9]* --lan-user root --rollback --sync-clock --reapply istio --force-images --dry-run --extra-flag$" /var/log/teknoir-airgap-fake-runner.log'
   node_check "admin-user passes --email in lower case, --out in the private tmp dir, --site" \
