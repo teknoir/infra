@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # gate-test.sh — fixture tests for the bundle build's secret-material gates
 # (airgap/build/lib-build.sh, render-oneshot.sh). Offline once the pinned build
-# tools are in the cache (~/.cache/teknoir-airgap/tools); bash >= 4.4.
+# tools are in the cache (~/.cache/teknoir-airgap/tools); bash >= 4.4, openssl.
 #
 #   1. secret_gate: credential-less ArgoCD repository Secrets for
 #      harbor.<domain>/<project> pass; any other Secret with data, any
 #      credential key, a foreign url, a missing label or url, and undecodable
 #      data are refused (fixtures/secrets/{allow,deny,clean,error}-*.yaml)
-#   2. render-oneshot.sh: a tier rendering the credential-less repository
+#   2. pem_private_keys: real keys (generated here, never committed) in a YAML
+#      block, commented out, escaped on one line, legacy-encrypted, and the
+#      base64 form are found; the upstream documentation examples are not
+#   3. chart_secret_findings: a clean chart is clean; credential-like member
+#      names, key blocks in any member (also inside a .bz2) and base64 keys
+#      in a planted chart are all reported; upstream template names such as
+#      templates/repository-credentials-secret.yaml are not
+#   4. render-oneshot.sh: a tier rendering the credential-less repository
 #      Secret passes; with basic-auth keys, or for another domain, it fails
 #
 # Usage: airgap/test/build/gate-test.sh        (exit 0 = every check passed)
@@ -18,6 +25,7 @@ BUILD="$(cd "${HERE}/../../build" && pwd)"
 SITE="$(cd "${HERE}/../../site" && pwd)/teknoir-local.env"
 # shellcheck source-path=SCRIPTDIR source=../../build/lib-build.sh
 source "${BUILD}/lib-build.sh"
+require_cmd openssl bzip2
 
 T="$(mktemp -d)"
 trap 'rm -rf -- "${T}"' EXIT
@@ -58,7 +66,53 @@ has "secret_gate refuses the right Secret for another domain" "${out}" "deny tek
 lacks "secret_gate never prints a url value" \
   "$(secret_gate "${REPO}" "${FIX}/secrets/deny-repo-url-override.yaml" "${FIX}/secrets/deny-repo-wrong-domain.yaml")" "github.com"
 
-# --- 2. render-oneshot.sh ------------------------------------------------------------------------
+# --- 2. pem_private_keys --------------------------------------------------------------------
+P="${T}/pem"
+mkdir -p "${P}"
+openssl genpkey -algorithm ed25519 -out "${P}/k.pem" 2>/dev/null
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:1024 2>/dev/null \
+  | openssl rsa -traditional -aes128 -passout pass:x -out "${P}/enc.pem" 2>/dev/null
+{ echo 'tls.key: |'; sed 's/^/  /' "${P}/k.pem"; } > "${P}/block.yaml"
+{ echo '# tls.key: |'; sed 's/^/#   /' "${P}/k.pem"; } > "${P}/commented.yaml"
+printf 'key: "%s"\n' "$(awk '{printf "%s\\n", $0}' "${P}/k.pem")" > "${P}/oneline.yaml"
+for f in block commented oneline; do
+  check "pem_private_keys finds a key (${f})" "$(pem_private_keys "${P}/${f}.yaml" | wc -l)" "1"
+done
+check "pem_private_keys finds a legacy encrypted key (Proc-Type/DEK-Info)" "$(pem_private_keys "${P}/enc.pem" | wc -l)" "1"
+check "pem_private_keys ignores the documentation examples" "$(pem_private_keys "${FIX}/pem/doc-examples.yaml")" ""
+base64 -w0 "${P}/k.pem" > "${P}/b64.txt"
+if grep -qE "${PEM_B64_RE}" "${P}/b64.txt"; then ok "PEM_B64_RE finds a base64-encoded key"; else not_ok "PEM_B64_RE finds a base64-encoded key"; fi
+check "pem_private_keys_tree scans a directory" "$(pem_private_keys_tree "${P}" | wc -l)" "5"
+
+# --- 3. chart_secret_findings ------------------------------------------------------------------
+C="${T}/charts"
+mkdir -p "${C}"
+cp -r "${FIX}/chart-src/repo-secret" "${C}/src"
+helm_package_reproducible "${C}/src" "${C}"
+check "chart_secret_findings: the clean fixture chart" "$(chart_secret_findings "${C}/fixture-repo-0.0.1.tgz" "${C}/scan-clean")" ""
+# planted: what an untracked file under --allow-dirty could carry
+cp -r "${FIX}/chart-src/repo-secret" "${C}/planted"
+mkdir -p "${C}/planted/files"
+cp "${P}/k.pem" "${C}/planted/files/ca.key"
+cp "${P}/k.pem" "${C}/planted/files/notes.txt"
+bzip2 -c "${P}/k.pem" > "${C}/planted/files/crds.bz2"
+base64 -w0 "${P}/k.pem" > "${C}/planted/files/blob.txt"
+sed 's/^/# /' "${P}/k.pem" >> "${C}/planted/values.yaml"
+echo 'apiVersion: v1' > "${C}/planted/files/kubeconfig"
+echo '{{/* a manifest template with an upstream-style name */}}' > "${C}/planted/templates/kubeconfig-secret.yaml"
+tar -czf "${C}/planted.tgz" -C "${C}" planted
+out="$(chart_secret_findings "${C}/planted.tgz" "${C}/scan-planted")"
+for want in "name planted/files/ca.key" "name planted/files/kubeconfig" "pem planted/files/ca.key:1" \
+            "pem planted/files/notes.txt:1" "pem planted/files/crds.bz2.unpacked:1" "pem planted/values.yaml:" \
+            "b64 planted/files/blob.txt"; do
+  has "chart_secret_findings reports ${want}" "${out}" "${want}"
+done
+lacks "chart_secret_findings: upstream template names are not credential files" "${out}" "templates/"
+printf 'not gzip' > "${C}/broken.tgz"
+has "chart_secret_findings: an unreadable archive is an error, never clean" \
+  "$(chart_secret_findings "${C}/broken.tgz" "${C}/scan-broken")" "error "
+
+# --- 4. render-oneshot.sh ------------------------------------------------------------------------
 render_tier() {
   # render_tier <fixture-dir> <chart-name> <site> — rc of render-oneshot.sh; output in ${T}/render.log
   local src="$1" chart="$2" site="$3" s

@@ -34,7 +34,7 @@
 #   --dry-run           check inputs and print the plan; download and write nothing
 #   -h, --help
 #
-# Needs bash >= 4.4, git, curl, tar (GNU), gzip, sha256sum; helm, crane, jq
+# Needs bash >= 4.4, git, curl, tar (GNU), gzip, bzip2, sha256sum; helm, crane, jq
 # and yq come pinned and verified from the tool cache. No python.
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib-build.sh
@@ -61,7 +61,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "${GITOPS}" ]] || die "--gitops DIR is required (see --help)"
 [[ -z "${IMAGES_LIMIT_ARG}" || "${IMAGES_LIMIT_ARG}" =~ ^[0-9]+$ ]] || die "--images-limit must be a number"
-require_cmd git curl tar gzip sha256sum awk sort find split stat du
+require_cmd git curl tar gzip bzip2 sha256sum awk sort find split stat du
 tar --version 2>/dev/null | grep -q 'GNU tar' || die "GNU tar is required on the build machine"
 umask 022
 
@@ -230,37 +230,81 @@ GATE_FAIL=0
 gate_fail() { warn "GATE: $*"; GATE_FAIL=1; }
 gate_warn() { warn "gate: $*"; }
 
-# 6a. secret material. PEM private keys nowhere (binaries and docs included;
-# image layers are upstream content and compressed). The bare phrase
-# "PRIVATE KEY" is legitimate in binaries (crypto libraries) and prose, so it
-# is refused only in the plain-text config the bundle ships.
+# 6a. secret material.
+#  - PEM private key headers nowhere in the plain files of the tree (binaries
+#    and docs included; image layers and the k3s images are upstream content
+#    and compressed). The bare phrase "PRIVATE KEY" is legitimate in binaries
+#    (crypto libraries) and prose, so it is refused only in the plain-text
+#    config the bundle ships.
+#  - Inside every chart archive (gzip, so the tree scan cannot see into it;
+#    chart_secret_findings): credential-like member names, PEM private key
+#    blocks (a header plus a base64 body, so the upstream documentation
+#    examples "-----BEGIN ... PRIVATE KEY-----\n...\n" in the argo-cd and
+#    redis-ha values pass) and base64-encoded keys. The same key checks run
+#    over every Application render.
+#  - No Secret with data in what the node applies as is (the one-shot tiers),
+#    except a credential-less ArgoCD repository Secret for the Harbor chart
+#    project (secret_gate); Secrets with data in the other renders are
+#    ArgoCD's to apply from the chart and only warned about.
 pem_re='-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----'
-while IFS= read -r -d '' f; do
-  rc=0
-  grep -qaE -- "${pem_re}" "${f}" || rc=$?
+HITS=()
+grep_hits() {
+  # grep_hits <what> <ERE> <file|dir>... — HITS=(matching files); runs in this
+  # shell (never in $(...)) so that a grep error fails the gate
+  local what="$1" re="$2" out rc=0
+  shift 2
+  HITS=()
+  (( $# > 0 )) || return 0   # grep -r without a path would search the cwd
+  out="$(grep -rlaE -- "${re}" "$@")" || rc=$?
   case "${rc}" in
-    0) gate_fail "PEM private key in ${f#"${TREE}"/}" ;;
+    0) mapfile -t HITS <<<"${out}" ;;
     1) ;;
-    *) gate_fail "cannot scan ${f#"${TREE}"/} (grep rc ${rc})" ;;
+    *) gate_fail "cannot scan ${what} (grep rc ${rc})" ;;
   esac
-done < <(find "${TREE}" -type f \
-           ! -path "${TREE}/node/images/*/blobs/*" ! -path "${TREE}/node/bootstrap-images/*" \
-           ! -name 'k3s-airgap-images-*' -print0)
-# base64 of "PRIVATE KEY" at the three byte alignments (a key inside Secret data)
-b64_re='UFJJVkFURSBLRVk|BSSVZBVEUgS0VZ|QUklWQVRFIEtFW'
+}
+mapfile -d '' tree_plain < <(find "${TREE}" -type f \
+  ! -path "${TREE}/node/images/*/blobs/*" ! -path "${TREE}/node/bootstrap-images/*" \
+  ! -name 'k3s-airgap-images-*' -print0)
+grep_hits "the bundle tree" "${pem_re}" "${tree_plain[@]}"
+for f in "${HITS[@]}"; do gate_fail "PEM private key in ${f#"${TREE}"/}"; done
 plain_cfg=()
 while IFS= read -r -d '' f; do plain_cfg+=("${f}"); done < <(
   find "${TREE}/node/oneshot" "${TREE}/node/templates" "${TREE}/site" "${TREE}/node/site" -type f -print0
   printf '%s\0' "${TREE}/node/charts/pins.txt" "${TREE}/node/images/images.lock"
 )
-for f in "${plain_cfg[@]}"; do
-  if grep -qE "PRIVATE KEY|${b64_re}" "${f}"; then gate_fail "private key material in ${f#"${TREE}"/}"; fi
+grep_hits "the plain-text config" "PRIVATE KEY|${PEM_B64_RE}" "${plain_cfg[@]}"
+for f in "${HITS[@]}"; do gate_fail "private key material in ${f#"${TREE}"/}"; done
+
+# every member of every packaged chart, by name and by content
+CHART_SCAN="${WORK}/chart-scan"
+[[ ! -e "${CHART_SCAN}" ]] || rm_build_dir "${CHART_SCAN}"
+mkdir -p "${CHART_SCAN}"
+for t in "${TREE}/node/charts/"*.tgz; do
+  c="$(basename "${t}")"
+  findings="$(chart_secret_findings "${t}" "${CHART_SCAN}/${c}")" || findings="error the scan failed"
+  while read -r kind what; do
+    case "${kind}" in
+      "") ;;
+      name) gate_fail "credential-like file in node/charts/${c}: ${what}" ;;
+      pem) gate_fail "PEM private key block in node/charts/${c}: ${what}" ;;
+      b64) gate_fail "base64-encoded private key in node/charts/${c}: ${what}" ;;
+      *) gate_fail "node/charts/${c}: ${what}" ;;
+    esac
+  done <<<"${findings}"
 done
-# Secrets with data in anything the node applies as is; the one exception is a
-# credential-less ArgoCD repository Secret for the Harbor chart project
-# (secret_gate in lib-build.sh)
+
+# every Application render (what ArgoCD will apply) and the one-shot tiers
 CHART_REPO="harbor.${TEKNOIR_DOMAIN}/${HARBOR_CHART_PROJECT}"
+hits="$(pem_private_keys "${WORK}/renders/"*.yaml "${TREE}/node/oneshot/"*.yaml)" || gate_fail "cannot scan the renders for PEM keys"
+while IFS= read -r h; do
+  [[ -z "${h}" ]] || gate_fail "PEM private key block in the render ${h}"
+done <<<"${hits}"
+grep_hits "the renders" "${PEM_B64_RE}" "${WORK}/renders" "${TREE}/node/oneshot"
+for f in "${HITS[@]}"; do gate_fail "base64-encoded private key in the render ${f}"; done
 secret_gate_report gate_fail "node/oneshot" "${CHART_REPO}" "${TREE}/node/oneshot/"*.yaml
+for f in "${WORK}/renders/"*.yaml; do
+  secret_gate_report gate_warn "the $(basename "${f}" .yaml) render (applied by ArgoCD from the chart)" "${CHART_REPO}" "${f}"
+done
 for f in "${TREE}/node/templates/"*; do
   if grep -qE '^kind:[[:space:]]*Secret[[:space:]]*$' "${f}"; then gate_fail "node/templates/$(basename "${f}") contains a Secret"; fi
 done
@@ -268,20 +312,16 @@ done
 cred_re='change-me|changeit|Harbor12345|harbor_registry_password|prom-operator'
 cred_b64_re="$(for w in change-me changeit Harbor12345 harbor_registry_password prom-operator; do
   printf '%s' "${w}" | base64 -w0 | tr -d '='; printf '|'; done | sed 's/|$//')"
-for f in "${plain_cfg[@]}"; do
-  if grep -qE "${cred_re}|${cred_b64_re}" "${f}"; then gate_fail "known default credential literal in ${f#"${TREE}"/}"; fi
+grep_hits "the plain-text config" "${cred_re}|${cred_b64_re}" "${plain_cfg[@]}"
+for f in "${HITS[@]}"; do gate_fail "known default credential literal in ${f#"${TREE}"/}"; done
+grep_hits "the renders" "${cred_re}|${cred_b64_re}" "${WORK}/renders"
+for f in "${HITS[@]}"; do
+  gate_warn "the $(basename "${f}" .yaml) render carries a known default credential literal (G-08 territory: fix it in the gitops chart)"
 done
-for f in "${WORK}/renders/"*.yaml; do
-  if grep -qE "${cred_re}|${cred_b64_re}" "${f}"; then
-    gate_warn "the $(basename "${f}" .yaml) render carries a known default credential literal (G-08 territory: fix it in the gitops chart)"
-  fi
-  secret_gate_report gate_warn "the $(basename "${f}" .yaml) render (applied by ArgoCD from the chart)" "${CHART_REPO}" "${f}"
-done
-# no credential-like files
+# no credential-like files in the tree
 while IFS= read -r -d '' f; do
-  gate_fail "credential-like file in the bundle: ${f#"${TREE}"/}"
-done < <(find "${TREE}" -type f \( -name '*.key' -o -name '*.pem' -o -name 'id_rsa*' -o -name 'id_ed25519*' \
-                                  -o -name 'kubeconfig*' -o -name '*credentials*' -o -name '.env' -o -path '*/.secrets/*' \) -print0)
+  if credential_name "${f#"${TREE}"/}"; then gate_fail "credential-like file in the bundle: ${f#"${TREE}"/}"; fi
+done < <(find "${TREE}" -type f ! -path "${TREE}/node/images/*/blobs/*" -print0)
 
 # 6b. node IPs are a run-time input: none in the one-shot renders or templates
 for f in "${TREE}/node/oneshot/"* "${TREE}/node/templates/"*; do

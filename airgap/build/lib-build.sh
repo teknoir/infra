@@ -397,8 +397,136 @@ is_immutable_tag() {
 }
 
 # ---------------------------------------------------------------------------
-# Secret gate (yq and jq from the build tools)
+# Secret-material detectors (the bundle gate; secret_gate needs yq and jq
+# from the build tools)
 # ---------------------------------------------------------------------------
+# base64 of "PRIVATE KEY" at the three byte alignments: a PEM key inside
+# Secret data or any other base64 blob
+PEM_B64_RE='UFJJVkFURSBLRVk|BSSVZBVEUgS0VZ|QUklWQVRFIEtFW'
+
+# File names that hold credentials by convention; never part of the bundle
+# (applied to files in the tree and to the members of every chart archive)
+credential_name() {
+  # credential_name <path> [chart] — 0 when the base name or a directory looks
+  # like a credential store. With "chart", a manifest template
+  # (.../templates/*.yaml|yml|tpl) may carry "credentials" or "kubeconfig" in
+  # its name: upstream charts name Secret templates that way
+  # (argo-cd repository-credentials-secret.yaml, kube-state-metrics
+  # kubeconfig-secret.yaml), and their content goes through the PEM, base64
+  # and Secret gates like every other file.
+  local p="$1" mode="${2:-}" b="${1##*/}"
+  case "${b}" in
+    *.key|*.pem|*.p12|*.pfx|id_rsa*|id_ecdsa*|id_ed25519*|id_dsa*|.env|.netrc|.htpasswd)
+      return 0 ;;
+    kubeconfig*|*credentials*)
+      if [[ "${mode}" == chart && "/${p}" == */templates/* && "${b}" =~ \.(ya?ml|tpl)$ ]]; then
+        return 1
+      fi
+      return 0 ;;
+  esac
+  [[ "/${p}/" == */.secrets/* || "/${p}/" == */.ssh/* ]]
+}
+
+# pem_private_keys <file>... — print "<file>:<line>" for every PEM private
+# key block: a "-----BEGIN [<ALG> ]PRIVATE KEY-----" header followed by a
+# base64 body line of 16+ characters, either on one of the next lines
+# (after up to three blank or RFC 1421 "Proc-Type:"/"DEK-Info:" lines) or
+# on the same line after an escaped \n or whitespace (a key in a quoted
+# string). Indentation and '#' comment markers are stripped first, so a
+# commented-out real key still counts, while the documentation examples in
+# chart values and READMEs ("-----BEGIN RSA PRIVATE KEY-----\n...\n...")
+# have no base64 body and do not. Never prints the body. Binary-safe; no
+# awk regex intervals (mawk).
+# shellcheck disable=SC2016  # an awk program, not shell
+PEM_AWK='
+    function strip(s) {
+      sub(/^[[:space:]]+/, "", s)
+      while (s ~ /^#/) sub(/^#+[[:space:]]*/, "", s)
+      return s
+    }
+    function body(s,   r) {
+      if (!match(s, /^[A-Za-z0-9+\/]+=*/) || RLENGTH < 16) return 0
+      r = substr(s, RLENGTH + 1)
+      return r ~ /^((\\+[rn])|["\047,]|[[:space:]])*$/
+    }
+    FNR == 1 { pending = 0 }
+    {
+      line = strip($0)
+      if (pending) {
+        if (body(line)) { print FILENAME ":" hdr; pending = 0 }
+        else if ((line == "" || line ~ /^(Proc-Type|DEK-Info):/) && ++skipped <= 3) { }
+        else pending = 0
+      }
+      if (match(line, /-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----/)) {
+        rest = substr(line, RSTART + RLENGTH)
+        after = rest
+        sub(/^((\\+[rn])|[[:space:]])+/, "", after)
+        if (after != rest) {
+          if (match(after, /^[A-Za-z0-9+\/]+/) && RLENGTH >= 16) { print FILENAME ":" FNR; next }
+        }
+        pending = 1; skipped = 0; hdr = FNR
+      }
+    }
+'
+
+pem_private_keys() {
+  # pem_private_keys <file>... — see PEM_AWK
+  LC_ALL=C awk "${PEM_AWK}" "$@"
+}
+
+pem_private_keys_tree() {
+  # pem_private_keys_tree <dir>... — pem_private_keys over every file below <dir>
+  find "$@" -type f -print0 | LC_ALL=C xargs -0 -r awk "${PEM_AWK}"
+}
+
+chart_secret_findings() {
+  # chart_secret_findings <chart.tgz> <scratch-dir> — scan every member of a
+  # packaged chart (gzip: no tree-wide grep sees into it). Extracts into
+  # <scratch-dir> (created; must not exist) and prints one line per finding,
+  # nothing when clean:
+  #   name <member>          credential-like member name (credential_name ... chart)
+  #   pem <member>:<line>    PEM private key block (pem_private_keys)
+  #   b64 <member>           base64-encoded private key (PEM_B64_RE)
+  #   error <reason>         cannot list, extract, unpack or scan: never "clean"
+  # Compressed members (kube-prometheus-stack ships crds.bz2) are scanned
+  # unpacked; an archive type it cannot unpack is an error.
+  local tgz="$1" dir="$2" members m z rc out
+  local -a unpack
+  [[ ! -e "${dir}" ]] || { echo "error scratch dir ${dir} exists"; return 0; }
+  members="$(tar -tzf "${tgz}" 2>/dev/null)" || { echo "error cannot list the archive"; return 0; }
+  while IFS= read -r m; do
+    [[ -z "${m}" ]] || ! credential_name "${m}" chart || echo "name ${m}"
+  done <<<"${members}"
+  mkdir -p "${dir}"
+  tar -xzf "${tgz}" -C "${dir}" --no-same-owner --no-same-permissions 2>/dev/null \
+    || { echo "error cannot extract the archive"; return 0; }
+  [[ "$(find "${dir}" -type f | wc -l)" == "$(grep -cv '/$' <<<"${members}")" ]] \
+    || echo "error the extracted files differ from the archive listing"
+  while IFS= read -r -d '' z; do
+    case "${z}" in
+      *.gz|*.tgz) unpack=(gzip -dc) ;;
+      *.bz2) unpack=(bzip2 -dc) ;;
+      *.xz) unpack=(xz -dc) ;;
+      *.zst) unpack=(zstd -dc) ;;
+      *) echo "error ${z#"${dir}/"} is an archive the gate cannot scan"; continue ;;
+    esac
+    "${unpack[@]}" "${z}" > "${z}.unpacked" 2>/dev/null \
+      || echo "error cannot unpack ${z#"${dir}/"} to scan it (${unpack[0]})"
+  done < <(find "${dir}" -type f \( -name '*.gz' -o -name '*.tgz' -o -name '*.bz2' -o -name '*.xz' \
+                                    -o -name '*.zst' -o -name '*.zip' -o -name '*.jar' \) -print0)
+  out="$(pem_private_keys_tree "${dir}")" || { echo "error cannot scan for PEM keys"; return 0; }
+  while IFS= read -r m; do
+    [[ -z "${m}" ]] || echo "pem ${m#"${dir}/"}"
+  done <<<"${out}"
+  rc=0
+  out="$(grep -rlaE -- "${PEM_B64_RE}" "${dir}")" || rc=$?
+  case "${rc}" in
+    0) while IFS= read -r m; do echo "b64 ${m#"${dir}/"}"; done <<<"${out}" ;;
+    1) ;;
+    *) echo "error cannot scan for base64 keys (grep rc ${rc})" ;;
+  esac
+}
+
 # Keys a credential-less ArgoCD repository Secret may carry (D3: the Harbor
 # chart project is public, so ArgoCD needs only where, never who).
 ARGOCD_REPO_SECRET_KEYS="url type name enableOCI project insecure"

@@ -1,0 +1,15 @@
+# Upstream documentation examples: a PEM header without a base64 body. The
+# gate's PEM block matcher must not report any of these.
+configs:
+  credentialTemplates: {}
+    # ssh-creds:
+    #  url: git@github.com:argoproj-labs
+    #  sshPrivateKey: |
+    #    -----BEGIN OPENSSH PRIVATE KEY-----
+    #    ...
+    #    -----END OPENSSH PRIVATE KEY-----
+# i.e. `-----BEGIN RSA PRIVATE KEY-----\n...\n...\n-----END RSA PRIVATE KEY-----`
+| `restore.ssh.key` | i.e. `-----BEGIN RSA PRIVATE KEY-----\n...\n...\n-----END RSA PRIVATE KEY-----` | string | `""` |
+tls.key: |
+  -----BEGIN PRIVATE KEY-----
+  {{ .Values.tls.key | nindent 2 }}

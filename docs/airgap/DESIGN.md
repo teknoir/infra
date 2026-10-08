@@ -411,7 +411,11 @@ Layout inside teknoir-airgap-<bundleId>/:
     images/images.lock          ref@sha256 lines
 
 NOT in the bundle:
-- any Secret, private key, password or robot credential (the build gate greps for "PRIVATE KEY", kind: Secret with data/stringData, and known literal credentials).
+- any Secret, private key, password or robot credential. The build gate (make-bundle.sh step 6a, render-oneshot.sh) checks:
+  - PEM private key headers in every plain file of the tree; "PRIVATE KEY" and its base64 forms in the plain-text config (oneshot, templates, site, pins, images.lock);
+  - inside every chart .tgz (gzip, invisible to a tree-wide grep; compressed members such as kube-prometheus-stack's crds.bz2 are unpacked first) and in every Application render: credential-like file names (`*.key`, `*.pem`, `id_rsa*`, `kubeconfig*`, `*credentials*`, ...; inside a chart, manifest templates such as argo-cd's `templates/.../repository-credentials-secret.yaml` may carry those words), PEM private key blocks (a BEGIN ... PRIVATE KEY header followed by a base64 body line, also when commented out or escaped on one line, so the upstream documentation examples `-----BEGIN RSA PRIVATE KEY-----\n...\n` in the argo-cd and redis-ha values pass) and base64-encoded keys;
+  - kind: Secret with data/stringData: fatal in the one-shot tiers, a warning in the other renders (ArgoCD applies those from the chart);
+  - known literal default credentials.
   One exception, by design (D3): an ArgoCD repository Secret (label `argocd.argoproj.io/secret-type: repository` or `repo-creds`) whose data/stringData keys are all in {url, type, name, enableOCI, project, insecure} and whose decoded url is `harbor.<domain>/<HARBOR_CHART_PROJECT>` (optionally with `oci://`). It tells ArgoCD where the public chart project is and holds no credential; the argo chart renders it as `teknoir-system/argocd-repo-harbor-teknoir`. Any other key (username, password, sshPrivateKey, tlsClientCert*, githubApp*, bearerToken, ...), another url, or a Secret without that label still fails. The gate prints key names only, never values (not even a non-matching url);
 - per-site mutable state;
 - python;
@@ -539,7 +543,7 @@ M8. CLEAN-UP: once the live env is migrated, delete the migrate subcommand and t
   - host-key mismatch message.
 - Build-gate tests on a real build:
   - MANIFEST verifies, and an unlisted file fails;
-  - no 'PRIVATE KEY', no `kind: Secret` with data/stringData apart from the credential-less ArgoCD repository Secret, and no known literal credentials anywhere in the tar (fixtures: airgap/test/build/gate-test.sh);
+  - no PEM private key (also inside the chart archives and the renders), no `kind: Secret` with data/stringData apart from the credential-less ArgoCD repository Secret, and no known literal credentials anywhere in the tar (fixtures: airgap/test/build/gate-test.sh);
   - every image in images/ has exactly one linux/amd64 manifest;
   - every image referenced by the rendered charts is in images.lock;
   - the bundle is under 3.5 GB;
