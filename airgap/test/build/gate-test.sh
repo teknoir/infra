@@ -16,6 +16,14 @@
 #      templates/repository-credentials-secret.yaml are not
 #   4. render-oneshot.sh: a tier rendering the credential-less repository
 #      Secret passes; with basic-auth keys, or for another domain, it fails
+#   5. teamspace plugin supply (TS-C3): plugin_chart_config, fetch_plugin_chart
+#      (pin vs index vs file, cache), collect-charts.sh end to end on a fixture
+#      gitops tree with the real 9 plugin pins (downloaded once into the build
+#      cache), plugin_supply_gate (missing image, tampered archive, github.io)
+#   6. image pin policy (G-09): teknoir_pin_ok, image_policy, collect-images.sh
+#      stopping before any pull, and the pinned-index refusal
+#   7. node packages (TIME-T1): debs_gate (tampered, unlisted, lock mismatch)
+#   8. make-bundle.sh --dry-run lists the 9 plugin pins and the 2 debs
 #
 # Usage: airgap/test/build/gate-test.sh        (exit 0 = every check passed)
 set -euo pipefail
@@ -324,6 +332,29 @@ FAILS=() WARNS=()
 printf '%s\n' "docker.io/library/busybox:1.36.1@sha256:${D64}" > "${LISTS}/oneshot-bad"
 image_policy pfail pwarn "${LISTS}/platform-ok" /dev/null "${LISTS}/oneshot-bad"
 has "image_policy: a digest in a one-shot tier fails" "${FAILS[*]:-}" "one-shot tier image docker.io/library/busybox:1.36.1@sha256:${D64} carries a digest"
+
+# collect-images.sh applies the policy before it resolves or pulls anything
+# (an isolated image cache; the build tools from this test's work dir)
+ci_run() {
+  # ci_run <name> <platform render image> <oneshot render image> — rc of collect-images.sh
+  local d="${T}/ci-$1" rc=0
+  mkdir -p "${d}/work/renders" "${d}/stage/node/oneshot" "${d}/cache"
+  cp -r "${T}/work/bin" "${d}/work/bin"
+  printf 'kind: Pod\nspec:\n  containers:\n    - image: %s\n' "$2" > "${d}/work/renders/app.yaml"
+  printf 'kind: Pod\nspec:\n  containers:\n    - image: ghcr.io/teknoir/plugin:latest\n' > "${d}/work/renders/teamspace-x.yaml"
+  echo t > "${d}/stage/node/oneshot/TIERS"
+  printf 'kind: Pod\nspec:\n  containers:\n    - image: %s\n' "$3" > "${d}/stage/node/oneshot/t.yaml"
+  TEKNOIR_AIRGAP_CACHE="${d}/cache" "${BUILD}/collect-images.sh" --stage "${d}/stage" --work "${d}/work" > "${T}/ci.log" 2>&1 || rc=$?
+  echo "${rc}"
+}
+check "collect-images: an unpinned Teknoir image in a platform render stops the build" \
+  "$(ci_run teknoir ghcr.io/teknoir/backstage:robot docker.io/library/busybox:1.36.1)" "1"
+has "collect-images: ... before any pull, naming the image" "$(cat "${T}/ci.log")" "G-09: unpinned Teknoir image ghcr.io/teknoir/backstage:robot"
+lacks "collect-images: ... and no image was resolved" "$(cat "${T}/ci.log")" "pull "
+has "collect-images: the teamspace :latest image only warns" "$(cat "${T}/ci.log")" "teamspace plugin image on a mutable tag (accepted for r5, pinned by digest in images.lock only): ghcr.io/teknoir/plugin:latest"
+check "collect-images: a digest in a one-shot tier stops the build" \
+  "$(ci_run oneshot "ghcr.io/teknoir/x:sha-1234567@sha256:${D64}" "docker.io/library/busybox:1.36.1@sha256:${D64}")" "1"
+has "collect-images: ... naming it" "$(cat "${T}/ci.log")" "one-shot tier image docker.io/library/busybox:1.36.1@sha256:${D64} carries a digest"
 
 # a pinned index digest (collect-images.sh resolve): the amd64 child is the pin
 IDX="${T}/index.json"
