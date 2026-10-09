@@ -998,6 +998,20 @@ plan and the facts behind it are in the r5 hardening plan.
   Profiles not declared in GitOps get the same entry, reported only. Only
   names, uids, run times and plugin kind/enabled/chart/status are read; never
   a plugin's configuration. `status` prints one `profile:` line per Profile.
+- **The wait (TS-C6).** Without `--wait-timeout`, post waits
+  POST_WAIT_DEFAULT (1200 s) on an update and POST_WAIT_FIRST_INSTALL (2700 s)
+  on a first install. An update that creates a teamspace declared in GitOps
+  gets 2700 s too, counted from the start of the wait, as soon as one poll
+  sees it being created (`_release_post_creating`): a strict Profile that
+  profile-controller has not run for, or whose Applications are not all
+  created yet (a run in progress alone does not count), or a strict teamspace
+  Application that is not ready and has an empty `status.history` (ArgoCD adds
+  an entry per successful sync, so it has never synced). The r5 update creates
+  `teknoir-default` this way: the root pin, the profile-controller sync, its
+  reconcile and the first sync of 9 charts (MongoDB's init included) all fall
+  in one `up`, next to Keycloak, Harbor and Backstage restarts, which can take
+  longer than 20 min. An explicit `--wait-timeout` is never extended. The
+  timeout error says that re-running `up` is safe.
 - **Failed last sync (HYG-C3).** `why()` reports `last sync to <rev> <phase>:
   <message>` when `.status.operationState.phase` is Failed or Error, its
   revision (`syncResult.revision[s]`, else `operation.sync.revision[s]`) equals
@@ -1024,7 +1038,13 @@ plan and the facts behind it are in the r5 hardening plan.
   auto-sync. Setting `.operation` alone makes the controller merge the new
   operation into the stale state (it writes operationState with a JSON merge
   patch and the empty fields are omitempty) and fail at once (live, 05:40).
-  Dry-run records the re-sync as a would-change.
+  Dry-run records the re-sync as a would-change. Teamspace (and other)
+  Applications are never re-synced (R2). ArgoCD never retries a failed
+  revision either, so `why()` adds to such an Application's failed-sync reason
+  that post re-syncs platform Applications only and how to sync it (ArgoCD UI,
+  or the OPERATE section 12 patch). Otherwise a strict teamspace Application
+  whose first sync spent its retries would fail every `up` with no way out
+  named.
 - **keycloak-admin `previous-password` (SEC-C10).** After the wait, post reads
   only the resourceVersion and the key names of `teknoir-auth/keycloak-admin`.
   With `previous-password` and `password` present, it logs in to realm master

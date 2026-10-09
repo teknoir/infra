@@ -92,13 +92,24 @@ Which Applications the post phase waits for:
   Backstage (such as `teknoir-demo`) and Applications without a Teknoir owner. A
   `WARN` line lists the ones that are not ready.
 
+How long the post phase waits: up to 20 minutes on an update and 45 minutes on
+a first install. An update that creates a teamspace declared in GitOps waits 45
+minutes too, counted from the start of the wait, and logs "this run creates
+teamspace(s) declared in GitOps". The r5 update creates `teknoir-default` this
+way: its 9 charts sync for the first time while Keycloak, Harbor and Backstage
+restart. If the wait runs out, `up` fails and names what is not ready. Running
+`up` again is safe: every phase skips what is already done, and post waits again.
+
 A platform Application whose last sync of its current revision failed is not
 ready even when it shows Synced and Healthy, because ArgoCD never retries a sync
 that has failed for the same revision. The post phase re-syncs such an
 Application once per run, the way ArgoCD's own UI does: one patch that sets the
 sync operation and clears the old operation state. The patch never sets the
 operation alone (see section 12). If that sync fails again, `up` fails and
-names the error. Right after `up` pins a new release, an Application can still
+names the error. Post re-syncs platform Applications only. A teamspace
+Application whose sync failed (for example one of `teknoir-default`'s, if its
+first sync spent its retries while MongoDB or EMQX was starting) blocks `up`
+until you sync it yourself; its reason says so (section 12). Right after `up` pins a new release, an Application can still
 show the failure of its previous version until ArgoCD has applied and compared
 the new one; post does not re-sync that old failure, it waits for the new
 version's own sync.
@@ -245,7 +256,9 @@ An update is the same command with a newer bundle:
 That is all. The node takes a backup first, then converges k3s and the node
 files, the secrets, Harbor's content and the app-of-apps pin; ArgoCD then rolls
 out the new chart versions. A bundle older than the deployed release is refused
-(section 5).
+(section 5). The post phase waits up to 20 minutes for the rollout, or 45 when
+the update creates a teamspace declared in GitOps (section 1). If it times out,
+run `up` again.
 
 Verification checklist:
 
@@ -627,9 +640,10 @@ not click through it.
 retries with back-off. Once the retries are spent, ArgoCD does not sync that
 revision again on its own, even when the Application shows Synced and Healthy
 (its last operation reads `Failed`). The next `up` re-syncs a platform
-Application in that state once. To retry at once, use the ArgoCD UI
-(`https://argocd.teknoir.airgapped`, Sync), or set the operation and clear the
-old operation state in the same patch:
+Application in that state once. It never re-syncs a teamspace Application
+(such as `teknoir-default-mongodb`): retry that one yourself. To retry at once,
+use the ArgoCD UI (`https://argocd.teknoir.airgapped`, Sync), or set the
+operation and clear the old operation state in the same patch:
 
 ```sh
 kubectl --context teknoir-local -n teknoir-system patch application <name> --type merge \
@@ -640,10 +654,22 @@ Never patch `operation` alone. The controller merges the new operation into the
 old state, sees the old failed task and the spent retry count, and fails again
 within a second.
 
-**`up` fails in post with "last sync to ... Failed".** The once-per-run re-sync of
-that Application failed too. The message after the colon is ArgoCD's; check that
-Application in the ArgoCD UI (its failing resource and events), fix the cause,
-and run `up` again: each run re-syncs it once more.
+**`up` fails in post with "last sync to ... Failed".** The message after the colon
+is ArgoCD's; check that Application in the ArgoCD UI (its failing resource and
+events) and fix the cause. Then:
+
+- A platform Application: the once-per-run re-sync of it failed too. Run `up`
+  again; each run re-syncs it once more.
+- A teamspace Application (its reason goes on with "post re-syncs platform
+  Applications only"): `up` never re-syncs it, so running `up` again alone does
+  not help. Sync it in the ArgoCD UI, or with the patch above, then run `up`
+  again.
+
+**`up` fails in post with "after ... s these Applications are not Synced/Healthy"
+and no failed sync.** The rollout was slower than the wait (section 1), for
+example while a new teamspace's databases initialise. Run `up` again: it skips
+what is done and waits again. If the same Applications stay not ready, check
+them in the ArgoCD UI.
 
 **post warns "not ready, not waited for".** These are Applications of a teamspace
 that is not declared in GitOps (created in Backstage), Applications without a
@@ -932,9 +958,14 @@ part of the release.
   webhooks); its 0.0.5 chart also starts a clean sync.
 - The manual retry in section 12 now clears the old operation state in the same
   patch.
+- `up` creates `teknoir-default`, so its post phase waits up to 45 minutes, not
+  20 (section 1). If it times out, run `up` again.
+- A failed sync of a teamspace Application is not re-synced by `up`; its reason
+  says to sync it in the ArgoCD UI (section 12).
 - The post phase removes `previous-password` from `teknoir-auth/keycloak-admin`
   once the master admin logs in with `password`, and warns while
-  `argocd-initial-admin-secret` exists.
+  `argocd-initial-admin-secret` exists. After a migration this happens in the
+  first `up` whose auth sync has rotated the admin, often that same `up`.
 - `migrate --finalize` (section 14, M6b) shreds `manifests-retired` once the
   migration is accepted; new retirements are mode 0600. `migrate --argo` no
   longer reports the argoproj CRDs and `argocd-tls-certs-cm` as ownerless.

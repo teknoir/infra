@@ -19,7 +19,11 @@ reasons for the redesign are kept here. The git history of `infra` and
   (`teknoir-default`); other Applications are reported in a `WARN`. For such a
   teamspace it also waits until the profile-controller has created its
   Applications, so a controller that cannot create them fails `up` instead of
-  passing with an empty teamspace.
+  passing with an empty teamspace. An update that creates such a teamspace
+  (r5 creates `teknoir-default`) waits 45 minutes instead of 20, because its
+  first chart syncs come on top of the platform's own restarts. A failed sync
+  of a teamspace Application is not re-synced by post; its reason says to sync
+  it in the ArgoCD UI, since re-running `up` alone would never clear it.
 - **A failed sync is no longer missed or left behind.** On 2026-10-08
   `monitoring`'s first sync failed while its 1-replica Prometheus had no ready
   pod; ArgoCD spent its 5 retries, then never retried that revision. The
