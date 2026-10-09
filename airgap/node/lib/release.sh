@@ -24,6 +24,9 @@
 #   enabled chart plugin); failed plugins (e.g. EMQX before its pod answers)
 #   are only reported. Other teamspaces (created in Backstage, e.g.
 #   teknoir-demo) and any other Application are reported, never waited for.
+#   An update that creates such a teamspace waits as long as a first install.
+#   post never re-syncs a teamspace Application; the reason of its failed sync
+#   says how to retry it.
 #   A platform Application whose last sync of its current revision Failed (or
 #   Errored) and that has no operation pending is not ready, and post re-syncs
 #   it once per run the way ArgoCD's own API does: one merge patch that sets
@@ -60,8 +63,11 @@ APP_CRD="applications.argoproj.io"
 # (brokenAppOfApps).
 BROKEN_APP_OF_APPS_DEFAULT="0.0.1 0.0.2"
 RELEASE_HISTORY_MAX=10
-POST_WAIT_DEFAULT=1200
-POST_WAIT_FIRST_INSTALL=2700
+# post's wait without --wait-timeout: an update, and a first install (also
+# used when this run creates a teamspace declared in GitOps, see
+# post_wait_applications). Environment overrides are test knobs.
+POST_WAIT_DEFAULT="${POST_WAIT_DEFAULT:-1200}"
+POST_WAIT_FIRST_INSTALL="${POST_WAIT_FIRST_INSTALL:-2700}"
 POST_POLL="${POST_POLL:-15}"
 BUNDLES_KEEP_PREVIOUS=1
 # Epoch second just before this run applied the root pin (0: not this run).
@@ -87,7 +93,9 @@ ARGOCD_INITIAL_ADMIN_SECRET="argocd-initial-admin-secret"
 # when its failed operation is about the spec it has now - its own status is
 # not stale and, for a child, the root is Synced with a status that is not
 # stale either (else the child's spec may be about to change: right after a
-# pin, the old revision's failure must never be re-applied).
+# pin, the old revision's failure must never be re-applied). resync_hint: post
+# never re-syncs a teamspace (or other) Application (R2) and ArgoCD never
+# retries a failed revision, so the reason of such a failure says how to retry.
 RELEASE_JQ_READY='
 def exactver: test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$");
 def epoch: (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0);
@@ -115,6 +123,10 @@ def specwhy($root; $pinAt):
     (if .metadata.name == $root and $pinAt > 0 and ((.status.reconciledAt // "") | epoch) <= $pinAt
      then "not reconciled since this run pinned it" else empty end);
 def stale($root; $pinAt): [opwhy, specwhy($root; $pinAt)];
+def resync_hint:
+  if failedop and (.teknoirPost.class // "platform") != "platform"
+  then "post re-syncs platform Applications only: Sync this one in the ArgoCD UI (or with the patch in OPERATE section 12), then run up again"
+  else empty end;
 def why($root; $pinAt):
   [ (if (.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy"
      then "\(.status.sync.status // "Unknown")/\(.status.health.status // "Unknown")" else empty end),
@@ -122,6 +134,7 @@ def why($root; $pinAt):
     (if failedop
      then "last sync to \(oprev | revstr) \(.status.operationState.phase): \((.status.operationState.message // "no message") | .[0:200])"
      else empty end),
+    resync_hint,
     specwhy($root; $pinAt)
   ] | join("; ");
 def resync_candidate($root; $pinAt; $rootapp):
@@ -162,21 +175,28 @@ def profile_owned($apps):
   .name as $n | .uid as $uid
   | [$apps[] | select(any(.metadata.ownerReferences[]?; .kind == "Profile" and .name == $n
                           and ((.uid // "") == "" or $uid == "" or .uid == $uid))) | .metadata.name];
-def profile_why($apps):
+def profile_create_why($apps):
+  # the Applications profile-controller has not created yet (empty: all there,
+  # or it has not run at all)
   . as $p
   | ($p | profile_owned($apps)) as $owned
   | ([$p.plugins[] | select(.enabled and .chart != "") | "\($p.name)-\(.chart)"] | unique) as $expected
   | ($expected - $owned) as $missing
-  | [ (if $p.lastRunStart == "" then "not reconciled by profile-controller yet"
-       elif ($p.lastRunEnd | epoch) < ($p.lastRunStart | epoch)
-       then "profile-controller run in progress (started \($p.lastRunStart))"
-       else empty end),
-      (if $p.lastRunStart == "" then empty
-       elif ($owned | length) == 0 and (($p.plugins | length) == 0 or ($expected | length) > 0)
-       then "no Applications yet\(if ($expected | length) > 0 then " (expected \($expected | length): \($expected | join(", ")))" else "" end)"
-       elif ($missing | length) > 0 then "Applications not created yet: \($missing | join(", "))"
-       else empty end)
-    ] | join("; ");
+  | if $p.lastRunStart == "" then empty
+    elif ($owned | length) == 0 and (($p.plugins | length) == 0 or ($expected | length) > 0)
+    then "no Applications yet\(if ($expected | length) > 0 then " (expected \($expected | length): \($expected | join(", ")))" else "" end)"
+    elif ($missing | length) > 0 then "Applications not created yet: \($missing | join(", "))"
+    else empty end;
+def profile_why($apps):
+  [ (if .lastRunStart == "" then "not reconciled by profile-controller yet"
+     elif (.lastRunEnd | epoch) < (.lastRunStart | epoch)
+     then "profile-controller run in progress (started \(.lastRunStart))"
+     else empty end),
+    profile_create_why($apps)
+  ] | join("; ");
+# being created: profile-controller has not run for it or not created all its
+# Applications yet (a run in progress alone is not creation)
+def profile_creating($apps): .lastRunStart == "" or ([profile_create_why($apps)] | length) > 0;
 def profile_note:
   [.plugins[] | select(.enabled and .status != "Success") | "\(.kind) \(if .status == "" then "not applied" else .status end)"]
   | if length > 0 then "plugin(s) not applied: \(join(", "))" else "" end;
@@ -402,8 +422,9 @@ _release_classify() {
   # _release_classify <applications-list-json> <profiles-list-json> - the
   # Application list with .teknoirPost = {class, strict, profile} on every item,
   # plus .teknoirProfiles: one pseudo-entry per Profile {name, strict (declared
-  # in GitOps), apps (owned), why (not ready: blocks post when strict), note
-  # (plugin failures: reported only)}.
+  # in GitOps), apps (owned), why (not ready: blocks post when strict),
+  # creating (its Applications are not all created yet), note (plugin
+  # failures: reported only)}.
   local profiles
   profiles="$(_release_profiles_summary "$2")"
   "${JQ}" -c --arg root "${ROOT_APP}" --argjson profiles "${profiles}" "${RELEASE_JQ_READY}${RELEASE_JQ_CLASSIFY}"'
@@ -411,7 +432,8 @@ _release_classify() {
     | .items |= map(. + {teknoirPost: classify($root; $pmap)})
     | .items as $apps
     | .teknoirProfiles = [$profiles[] | {name, strict: .tracked, apps: (profile_owned($apps) | length),
-                                         why: profile_why($apps), note: profile_note}]' <<<"$1"
+                                         why: profile_why($apps), creating: profile_creating($apps),
+                                         note: profile_note}]' <<<"$1"
 }
 
 _release_applications_json() {
@@ -463,6 +485,20 @@ _release_post_not_ready() {
     (if any(.items[]; .metadata.name == $root) | not then "\($root)\tnot created yet (waiting for the release phase or ArgoCD)" else
      .items[] | select(.teknoirPost.strict) | why($root; $pinAt) as $w | select($w != "") | "\(.metadata.name)\t\($w)" end),
     (.teknoirProfiles[]? | select(.strict and .why != "") | "profile/\(.name)\t\(.why)")' <<<"$1"
+}
+
+_release_post_creating() {
+  # The teamspaces declared in GitOps that this run is creating, space
+  # separated (empty: none): a strict Profile whose Applications
+  # profile-controller has not all created yet (or not run for it at all), or
+  # a strict teamspace Application that is not ready and has never completed a
+  # sync (empty .status.history: ArgoCD adds an entry per successful sync).
+  "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
+    [ (.teknoirProfiles[]? | select(.strict and .creating) | .name),
+      (.items[] | select(.teknoirPost.strict and .teknoirPost.class == "teamspace")
+       | select((.status.history // []) | length == 0)
+       | select(why($root; $pinAt) != "") | .teknoirPost.profile)
+    ] | unique | join(" ")' <<<"$1"
 }
 
 _release_post_reported() {
@@ -526,19 +562,29 @@ post_resync_failed() {
 }
 
 post_wait_applications() {
-  local timeout json bad names last_report=0 refreshed=0 deadline
+  # Waits up to --wait-timeout, else POST_WAIT_DEFAULT on an update and
+  # POST_WAIT_FIRST_INSTALL on a first install. An update that creates a
+  # teamspace declared in GitOps (r5: teknoir-default) gets the first-install
+  # wait too, counted from the start, as soon as a poll sees it being created
+  # (_release_post_creating): the root pin, the profile-controller sync, its
+  # reconcile and the first sync of every plugin chart (MongoDB's init
+  # included) all happen in this run, next to the platform's own restarts.
+  local timeout json bad names creating last_report=0 refreshed=0 deadline start explicit=0
   if ! crd_established "${APP_CRD}"; then
     dry_run && { log "[dry-run] ArgoCD is not installed yet: post would wait for the Applications"; return 0; }
     die "post: CRD ${APP_CRD} is not Established"
   fi
   timeout="${WAIT_TIMEOUT:-}"
-  if [[ -z "${timeout}" ]]; then
+  if [[ -n "${timeout}" ]]; then
+    explicit=1
+  else
     timeout="${POST_WAIT_DEFAULT}"
     if [[ "${REC_SOURCE}" == "none" || "${REC_MODE}" == "install" ]]; then
       timeout="${POST_WAIT_FIRST_INSTALL}"
     fi
   fi
-  deadline=$(( SECONDS + timeout ))
+  start=${SECONDS}
+  deadline=$(( start + timeout ))
   while :; do
     json="$(_release_applications_json)"
     post_resync_failed "${json}"
@@ -550,6 +596,14 @@ post_wait_applications() {
       return 0
     fi
     names="$(cut -f1 <<<"${bad}" | tr '\n' ' ')"
+    if (( explicit == 0 && timeout < POST_WAIT_FIRST_INSTALL )); then
+      creating="$(_release_post_creating "${json}")"
+      if [[ -n "${creating}" ]]; then
+        timeout="${POST_WAIT_FIRST_INSTALL}"
+        deadline=$(( start + timeout ))
+        log "this run creates teamspace(s) declared in GitOps (${creating}): post waits up to ${timeout}s in all, as on a first install"
+      fi
+    fi
     if dry_run; then
       post_application_table >&2
       log "[dry-run] would wait up to ${timeout}s for: ${names}"
@@ -566,7 +620,7 @@ post_wait_applications() {
     if (( SECONDS >= deadline )); then
       post_application_table >&2
       post_report_unwaited "${json}"
-      die "post: after ${timeout}s these Applications are not Synced/Healthy at this release: $(awk -F'\t' '{printf "%s (%s) ", $1, $2}' <<<"${bad}")"
+      die "post: after ${timeout}s these Applications are not Synced/Healthy at this release: $(awk -F'\t' '{printf "%s (%s) ", $1, $2}' <<<"${bad}")(running up again is safe: every phase skips what is done and post waits again)"
     fi
     if (( SECONDS - last_report >= 60 )); then
       log "waiting for Synced/Healthy ($(( deadline - SECONDS ))s left): ${names}"

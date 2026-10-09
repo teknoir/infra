@@ -31,7 +31,14 @@
 #   4. post_wait_applications: exactly one patch per run even when the
 #      re-sync fails again (then post fails, naming the reason); a re-sync
 #      that succeeds lets post pass; teamspaces not in GitOps are reported in
-#      one WARN; dry-run patches nothing;
+#      one WARN; dry-run patches nothing; a failed teamspace Application is
+#      never patched and its reason says how to retry it;
+#  4b. the wait: an update that creates a teamspace declared in GitOps (its
+#      Profile not reconciled, Applications missing, or a not-ready one that
+#      never synced) waits POST_WAIT_FIRST_INSTALL from the start; an
+#      explicit --wait-timeout, a first install, a teamspace that synced
+#      before, a run in progress alone and a Profile not in GitOps do not
+#      extend it; the timeout error says re-running up is safe;
 #   5. post_keycloak_admin_cleanup: previous-password is removed (JSON patch
 #      with a resourceVersion test) only after a 200 login with key password;
 #      401 keeps it with a WARN; dry-run and a Secret without the key change
@@ -205,6 +212,9 @@ check "a stale Failed operation of the current revision gives the reason" \
 check "a Failed operation of an older revision gives none (auth is ready)" bash -c "! grep -q '^auth' '${WORK}/out'"
 check "teknoir-demo-jwks (Profile not in GitOps) does not block" bash -c "! grep -q '^teknoir-demo-jwks' '${WORK}/out'"
 check "teknoir-default-jwks Unknown (Profile in GitOps) is not ready" grep -qE '^teknoir-default-jwks	Unknown/Healthy' "${WORK}/out"
+check "a failed teamspace Application: the reason says post never re-syncs it and how to retry" \
+  grep -qxF 'teknoir-default-grafana	last sync to 0.0.99 Failed: one or more synchronization tasks completed unsuccessfully (retried 5 times).; post re-syncs platform Applications only: Sync this one in the ArgoCD UI (or with the patch in OPERATE section 12), then run up again' "${WORK}/out"
+check "a failed platform Application: no such hint (post re-syncs it)" bash -c "! grep '^monitoring' '${WORK}/out' | grep -q 'platform Applications only'"
 run_lib '_release_post_reported "$(_release_classify "$(cat "${W}/apps.json")" "$(cat "${W}/profiles.json")")"'
 check "reported only: teknoir-demo-jwks (not in GitOps), the stale-uid teamspace, stray, teknoir-default's failed plugin" \
   eq "profile/teknoir-default stray teknoir-demo-jwks teknoir-stale-mongodb" "$(grep -v '^rc=' "${WORK}/out" | cut -f1 | sort | tr '\n' ' ' | sed 's/ $//')"
@@ -350,6 +360,54 @@ CTRL=succeed run_lib 'WAIT_TIMEOUT=2; REC_SOURCE=configmap; post_wait_applicatio
 check "a teamspace declared in GitOps that stays Unknown fails post, named" \
   grep -qE 'ERROR: post: after 2s .*teknoir-default-jwks \(Unknown/Healthy' "${WORK}/out"
 check "a teamspace Application with a failed op is never re-synced by post" bash -c "! grep -q '^teknoir-default-grafana' '${WORK}/patches.log'"
+check "... and the error says how to retry it" \
+  grep -qF 'teknoir-default-grafana (last sync to 0.0.99 Failed: one or more synchronization tasks completed unsuccessfully (retried 5 times).; post re-syncs platform Applications only: Sync this one in the ArgoCD UI' "${WORK}/out"
+check "the timeout error says re-running up is safe" grep -qF '(running up again is safe: every phase skips what is done and post waits again)' "${WORK}/out"
+
+echo "# 4b. the wait: an update that creates a teamspace declared in GitOps waits as long as a first install"
+cp "${WORK}/profiles.json" "${WORK}/profiles.json.orig"
+# history: ArgoCD's record of successful syncs (an Application that never synced has none)
+synced_before() { jq -c '.items |= map(if .metadata.name | test("^teknoir-default-") then .status.history = [{id: 0, revision: .status.sync.revision}] else . end)' "$1"; }
+wait_case() {
+  # wait_case <apps-file> <profiles-file> <script-prefix> - post_wait_applications
+  # on an update with POST_WAIT_DEFAULT=1 and POST_WAIT_FIRST_INSTALL=3; output in ${WORK}/out
+  cp "${WORK}/$1" "${WORK}/apps.json"; cp "${WORK}/$2" "${WORK}/profiles.json"; : > "${WORK}/patches.log"
+  CTRL=succeed run_lib 'POST_WAIT_DEFAULT=1; POST_WAIT_FIRST_INSTALL=3; REC_SOURCE=configmap; REC_MODE=update; '"$3"' post_wait_applications'
+  cp "${WORK}/profiles.json.orig" "${WORK}/profiles.json"
+}
+waited() { grep -oE 'ERROR: post: after [0-9]+s' "${WORK}/out" | grep -oE '[0-9]+s'; }
+jq -c '.items |= map(select(.metadata.name | test("^teknoir-default-") | not))' "${WORK}/apps.json.orig2" > "${WORK}/w-nodefault.json"
+profiles_json "$(profile teknoir-default u-default 1 - -)" > "${WORK}/w-unreconciled.json"
+profiles_json "$(profile teknoir-default u-default 1 "${T0}" "${T0}" "${DEFAULT_PLUGINS[@]}")" > "${WORK}/w-reconciled.json"
+profiles_json "$(profile teknoir-default u-default 1 "${T1}" "${T0}" "${DEFAULT_PLUGINS[@]}")" > "${WORK}/w-running.json"
+profiles_json "$(profile teknoir-default u-default 0 - -)" > "${WORK}/w-untracked.json"
+wait_case w-nodefault.json w-unreconciled.json ''
+check "Profile not reconciled yet: the wait grows to the first-install one (3s, not 1s)" eq 3s "$(waited)"
+check "... and says so once, naming the teamspace" \
+  eq 1 "$(grep -c 'this run creates teamspace(s) declared in GitOps (teknoir-default): post waits up to 3s in all, as on a first install' "${WORK}/out")"
+wait_case w-nodefault.json w-reconciled.json ''
+check "Profile reconciled, no Application yet: first-install wait" eq 3s "$(waited)"
+# every teknoir-default Application created, jwks Unknown and never synced
+jq -c '.items |= map(if .metadata.name == "teknoir-default-jwks" then .status.sync.status = "Unknown" else . end)' "${WORK}/apps.json.orig2" > "${WORK}/w-new.json"
+wait_case w-new.json w-reconciled.json ''
+check "all Applications created, one not ready that never synced: first-install wait" eq 3s "$(waited)"
+synced_before "${WORK}/w-new.json" > "${WORK}/w-old.json"
+wait_case w-old.json w-reconciled.json ''
+check "the same Application with a successful sync before: the update wait (1s)" eq 1s "$(waited)"
+check "... and no extension logged" eq 0 "$(grep -c 'this run creates teamspace' "${WORK}/out" || true)"
+wait_case w-old.json w-running.json ''
+check "a profile-controller run in progress alone (Applications there, synced before): the update wait" eq 1s "$(waited)"
+wait_case w-nodefault.json w-unreconciled.json 'WAIT_TIMEOUT=1;'
+check "an explicit --wait-timeout is never extended" eq "1s 0" "$(waited) $(grep -c 'this run creates teamspace' "${WORK}/out" || true)"
+wait_case w-nodefault.json w-unreconciled.json 'release_load_record() { :; }; REC_SOURCE=none; REC_MODE=;'
+check "a first install already waits the first-install time (no extension logged)" eq "3s 0" "$(waited) $(grep -c 'this run creates teamspace' "${WORK}/out" || true)"
+# a Profile not in GitOps without Applications, plus a stray platform blocker: never extends
+jq -c '(.items[] | select(.metadata.name == "auth")) |= (.status.health.status = "Degraded")' "${WORK}/w-nodefault.json" > "${WORK}/w-degraded.json"
+wait_case w-degraded.json w-untracked.json ''
+check "a Profile not declared in GitOps being created: the update wait" eq 1s "$(waited)"
+DRY_RUN=1 wait_case w-nodefault.json w-unreconciled.json ''
+check "dry-run: reports the first-install wait it would make" grep -qF '[dry-run] would wait up to 3s for: ' "${WORK}/out"
+check "every 4b case left profiles.json as it was" cmp -s "${WORK}/profiles.json" "${WORK}/profiles.json.orig"
 
 echo "# 5. post_keycloak_admin_cleanup"
 reset_state
