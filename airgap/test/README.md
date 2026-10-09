@@ -111,8 +111,29 @@ ArgoCD runs in the fixture); T6 and E10 do.
   Example: `E2E_BUNDLE=dist/teknoir-airgap-<id>.tar airgap/test/vm/e2e.sh --allow-destroy E1 E2 E3`.
   A release (r5) runs, each on a re-created VM:
   - fresh: `E2E_BUNDLE=<B> e2e.sh --allow-destroy E1 E11 E12 E13 E14 E2 E3 E7 E8`;
-  - upgrade: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS="..." e2e.sh --allow-destroy E1 E4`
-    (`E2E_E4_ROLLBACK=0` stops after the refused A);
+  - upgrade, with A = the deployed `dist/teknoir-airgap-teknoir-local-aoa0.0.4-….tar`:
+    `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto e2e.sh --allow-destroy E1 E4`.
+    - E1 installs A. A predates r5 (its app-of-apps, from `MANIFEST.yaml` or
+      `node/charts/pins.txt`, is below `E2E_R5_AOA`, default 0.0.5), so E1 treats it as a
+      baseline. The r5-only checks warn instead of failing: platform operations, caBundle,
+      digest pins, the temporary-password handover, the Update Profile form (the baseline
+      login fills it in), the Backstage identity and backstage-api restarts.
+      `E2E_E1_BASELINE=0|1` overrides the detection.
+    - E4 updates to B and asserts the release checks there. That includes the legacy
+      password field, which r5's user-controller clears.
+    - `E2E_E4_APPS=auto` expects app-of-apps, each Application whose chart pin differs
+      between A and B, and the nine teknoir-default plugin Applications that B's GitOps
+      Profile adds.
+    - By default E4 does not run the rollback from r5 B to the pre-r5 A, and its summary
+      row says so. This is an open design gap:
+      - after the rollback, B's Profile teknoir-default and Namespace
+        teknoir-user-credentials remain (Prune=false,Delete=false, without
+        IgnoreExtraneous), so profile-controller and user-controller stay OutOfSync;
+      - A's profile-controller points the teknoir-default Applications back at github.io;
+      - A's post waits for every Application.
+
+      `E2E_E4_ROLLBACK=1` runs the rollback and asserts each part of the expected state.
+      `E2E_E4_ROLLBACK=0` stops after the refused A.
   - live rehearsal: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_OLD_SETUP="$PWD/airgap/test/vm/old-setup.sh"
     e2e.sh --allow-destroy E15`.
 - `vm/vm.sh age-key [--check SITE]`: the two test age identities behind `vmtest.env`'s

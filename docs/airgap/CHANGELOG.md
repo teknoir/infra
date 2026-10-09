@@ -29,7 +29,12 @@ live node.
     restart.
   - E2: teknoir-default is not synced again, its Secrets keep their
     resourceVersions, and profile-controller does not restart.
-  - E4: the same release checks after the update.
+  - E1 with a pre-r5 bundle (app-of-apps below 0.0.5, the upgrade run's A) is a
+    baseline: the r5-only checks warn instead of failing (`E2E_E1_BASELINE`).
+  - E4: the same release checks after the update, and A's legacy password field
+    cleared. `E2E_E4_APPS=auto` derives the expected Applications from the pins.
+    The rollback from r5 to a pre-r5 A is not run by default (an open design
+    gap, DESIGN.md); `E2E_E4_ROLLBACK=1` runs it and asserts each part.
   - E7: the passwords the LAN side holds and the test age identities appear in no
     log.
   - E8: the pre-rotation cookie gets a login redirect.

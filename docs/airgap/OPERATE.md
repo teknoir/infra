@@ -823,7 +823,11 @@ Before an r5 bundle reaches teknoir-local, it must pass the VM test on vpro
 (`airgap/test/README.md`), each run on a freshly created VM:
 
 - fresh install: E1, E11, E12, E13, E14, E2, E3, E7 and E8;
-- update from the deployed bundle: E4;
+- update from the deployed bundle: E1 with the deployed bundle as a baseline,
+  then E4 to the new one (`airgap/test/README.md` has the command). E4 does not
+  rehearse a rollback to the pre-r5 bundle: that is an open design gap (DESIGN.md,
+  r5), so do not count on `up --rollback` to app-of-apps 0.0.4 converging until it
+  is settled;
 - live rehearsal: E15. It reproduces the live node's history and state, then
   runs `up` with the new bundle.
 

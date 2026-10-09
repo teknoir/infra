@@ -673,8 +673,32 @@ Each run uses a freshly created VM. The VM's Harbor keeps the first push of
 every version.
 
 - Fresh: `E1 E11 E12 E13 E14 E2 E3 E7 E8` with bundle B.
-- Upgrade: E4, A (aoa0.0.4) to B.
+- Upgrade: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto e2e.sh --allow-destroy E1 E4`,
+  with A = aoa0.0.4.
+  - E1 installs A as a baseline. A bundle whose app-of-apps is below 0.0.5 is a baseline,
+    and the r5-only E1 checks below only warn there.
+  - E4 then asserts the release checks on B. It also asserts that r5 clears A's legacy
+    password field.
+  - `E2E_E4_APPS=auto` derives the expected changes from the two bundles' pins, plus the
+    teknoir-default plugin Applications.
 - Live rehearsal: E15.
+
+Rollback from r5 to a pre-r5 bundle is an open design gap, so E4 does not run that leg by
+default. B's GitOps Profile teknoir-default and Namespace teknoir-user-credentials carry
+Prune=false,Delete=false but no `argocd.argoproj.io/compare-options: IgnoreExtraneous`.
+Once A no longer renders them, three things happen:
+- profile-controller and user-controller stay OutOfSync, because a skipped prune keeps an
+  Application OutOfSync;
+- A's profile-controller points the teknoir-default Applications back at github.io
+  (Unknown offline);
+- A's post waits for every Application.
+
+The plan's rollback, an r5-built 0.0.4 bundle, has the same problem: under R2 the kept,
+tracked Profile keeps its teamspace Applications strict. `E2E_E4_ROLLBACK=1` runs the leg.
+It asserts each part separately (up exits 0; every Application except teknoir-default-*
+Synced/Healthy; profile-controller and user-controller Synced; Profile and Namespace kept;
+release record A rollback; revisions back), and it reports the teknoir-default
+Applications. The decision belongs to WP-G-CTRL, WP-I-RELEASE and WP-I-BUNDLE.
 
 The first admin is the owner of the GitOps Profile teknoir-default, so E11 can
 check its grants.
