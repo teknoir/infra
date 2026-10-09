@@ -830,8 +830,8 @@ code.
   ([BUILD.md](BUILD.md#rollback-bundles)).
 - A rollback to 0.0.4 does not remove what r5 added: the node packages stay
   installed, and the plugin charts and images stay in Harbor (unused).
-  0.0.4's profile-controller has no `PLUGIN_CHART_REPO`, so teamspaces cannot
-  install their plugins offline again, as before r5. Database changes need the
+  0.0.4's profile-controller has no `PLUGIN_CHART_REPO`, so, as before r5,
+  teamspaces cannot install their plugins offline. Database changes need the
   backup taken before the update (section 10).
 
 ## 15. Command reference
