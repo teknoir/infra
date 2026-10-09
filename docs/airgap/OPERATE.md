@@ -779,6 +779,32 @@ datastore move to embedded etcd.
 **M8. Clean-up.** Remove the `migrate` command, this section and the legacy
 code.
 
+## r5 (app-of-apps 0.0.5)
+
+### Bundle content: teamspace plugins, node packages, pinned images
+
+- The first `up` with an r5 bundle pushes 9 more charts (`profile-plugin-*`)
+  to Harbor's `teknoir` project and about 20 teamspace images to the mirror
+  projects (`./teknoir-airgap up --dry-run` lists them). Teamspaces then
+  install from Harbor; their plugin Applications point at
+  `harbor.<domain>/teknoir`.
+- Airgap teamspaces must not enable plugins the bundle does not carry
+  (postgres, claims) or set another plugin chart version: their Applications
+  would stay `Unknown`. `MANIFEST.yaml` (`teamspacePlugins`) lists what a
+  bundle carries.
+- 11 teamspace images are still on `:latest` (`MANIFEST.yaml`
+  `teamspace_mutable_images`). If a later bundle carries a newer build of one
+  of them, the harbor phase refuses to move the mirror tag; run
+  `./teknoir-airgap up --force-images` once.
+- The node's time packages ship in `node/debs` (`debs.lock`); the host phase
+  installs them.
+- Pinned images: when the harbor phase stops with "the bundle holds manifest
+  X, not the pinned Y", the bundle is broken (a chart pins a digest the bundle
+  does not hold); build a new bundle, do not work around it. The post check
+  reports `live image check: N pullable from Harbor, 0 only in containerd,
+  0 missing` when every running image, pinned ones included, can be pulled
+  again.
+
 ## 15. Command reference
 
 `./teknoir-airgap help` prints this with every option. Options that every command

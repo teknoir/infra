@@ -15,7 +15,7 @@ implementation differs, update this file in the same commit.
 | D5 | **Toolbox image** for in-cluster Jobs (platform-secrets, Harbor OIDC config, misc): `docker.io/alpine/k8s:1.34.11` (sh, kubectl, curl, jq). Mirrored like every other image. |
 | D6 | Datastore stays sqlite for now (etcd later). New installs set `secrets-encryption: true`; the live node gets it in a later window. Time: chrony on the node when installed; `up` refuses when node/LAN skew > 30 s unless `--sync-clock`. |
 | D7 | The bundle ships `kubectl` for the LAN host (linux-amd64, darwin-arm64) as a convenience; `up` itself needs only ssh, tar and sha256sum/shasum. |
-| D8 | Teknoir image tags stay mutable for now (warn only); `images.lock` records digests. Immutable image tags need CI changes in the image repos (out of scope). |
+| D8 | Teknoir image tags stay mutable for now (warn only); `images.lock` records digests. Immutable image tags need CI changes in the image repos (out of scope). **Superseded in r5 by G-09** (section "r5 (app-of-apps 0.0.5)"): platform charts pin `<repo>:<immutable tag>@sha256:<linux/amd64 manifest>` with the CI's existing `sha-<hex>` tags, and the build fails otherwise; only the teamspace plugin images still warn. |
 | D9 | No tag immutability on the mirror projects (only on `teknoir`). |
 | D10 | ArgoCD becomes **self-managed** (argo chart moves to gitops, G-07). Local admin is kept as break-glass; `argocd-initial-admin-secret` is deleted after SSO works. |
 | D11 | Multi-node: keep the `role=server|agent` parameter in the host phase, but do not implement/test agent join in this round. |
@@ -35,14 +35,27 @@ Verified facts and agreed deviations that supersede the text below where they di
 - **Credentials**: `platform-admin` (realm `teknoir`, group `admin`, temporary password from `teknoir-auth/keycloak-platform-admin`, forced change at first login) is the break-glass/initial admin; `admin-user --email` creates the Backstage superadmin User CR.
 - **Payload layout**: the LAN entrypoint copies `MANIFEST.yaml` next to `node/` (`/var/lib/teknoir-airgap/bundles/<id>/MANIFEST.yaml`) and the site file to `/var/lib/teknoir-airgap/site/<site>.env`; converge takes `--lan-user` (alias `--operator`).
 - **Image digests**: Harbor comparisons use the linux/amd64 image config digest (old pushes left multi-arch indexes; crane rewrites docker-archive manifests); charts compare the content layer digest, then the unpacked files.
-- **Size gate**: 4.5 GiB (backstage, keycloak-config-cli and the toolbox add ~650 MiB).
+- **Size gate**: 4.5 GiB (backstage, keycloak-config-cli and the toolbox add ~650 MiB); 6.5 GiB since r5 (the teamspace plugin images add ~1.8 GiB).
 - **VM e2e findings (E0/E1, 2026-10-08)**, all fixed in the converge:
   - A node with no default route made flannel fail to pick an interface (k3s crash-loop): the host phase pins `flannel-iface` to the interface that holds `NODE_IP`.
   - A node with no resolver made k3s hand CoreDNS `8.8.8.8`; every external lookup (ArgoCD repo-server's health checks among them) then hung until timeout. The host phase writes `/etc/rancher/k3s/resolv.conf`: `UPSTREAM_DNS` from the site config, else nothing when the node has its own resolvers, else systemd-resolved exposed on `NODE_IP` (`DNSStubListenerExtra`), which answers at once. A change restarts k3s and re-creates the CoreDNS pods.
   - Harbor's token service needs the token key in PKCS#1 (the traditional RSA PEM type, `openssl genrsa -traditional`); a PKCS#8 key gave HTTP 500 on every token request. The secrets phase generates PKCS#1 and replaces a PKCS#8 key (rolling core and registry).
   - Istio gateway pods created before istiod answered its injection webhook keep `image: auto` and never start; after the istio tier the converge waits for istiod and re-creates those pods.
   - The Backstage postgres StatefulSet stayed OutOfSync on client-side diff (defaulted fields); every Application, the root one included, uses `ServerSideDiff=true`.
-- Known residuals: over HTTP/2 the ingress gateway resets the stream (RST_STREAM PROTOCOL_ERROR) right after ext_authz's 302 to `/oauth2/start` (`content-length: 0`), on staging and production as well; browsers tolerate it, curl does not (the e2e login uses HTTP/1.1); `grafana.<domain>` is in the hosts list but has no route (Grafana is at `/teknoir-system/grafana/`); Backstage logout hard-codes realm `master` (backstage repo `Header.tsx`, needs an image rebuild); Keycloak asks for Update Profile at first login (user-controller sets no lastName); teamspace creation needs the profile-plugins charts mirrored (out of scope).
+- Known residuals: over HTTP/2 the ingress gateway resets the stream (RST_STREAM PROTOCOL_ERROR) right after ext_authz's 302 to `/oauth2/start` (`content-length: 0`), on staging and production as well; browsers tolerate it, curl does not (the e2e login uses HTTP/1.1); `grafana.<domain>` is in the hosts list but has no route (Grafana is at `/teknoir-system/grafana/`); Backstage logout hard-codes realm `master` (backstage repo `Header.tsx`, needs an image rebuild); Keycloak asks for Update Profile at first login (user-controller sets no lastName); teamspace creation needs the profile-plugins charts mirrored (out of scope; r5 carries them).
+
+## r5 (app-of-apps 0.0.5)
+
+### Bundle supply: teamspace plugins, node packages, pinned images
+
+- **Teamspaces are in scope.** profile-controller creates one ArgoCD Application per plugin and Profile at run time, so app-of-apps never renders them. The bundle therefore carries the published archives of the plugins the controller enables by default (`PROFILE_PLUGIN_CHARTS`: deadend, emqx, prometheus, jwks, fleet-metrics, grafana, mongodb, historian, observatory), byte for byte from teknoir.github.io/profile-plugins-helm, each pinned by sha256 (equal to the gh-pages index digest). Postgres and claims are disabled by default and are not carried; airgap Profiles must not enable them or set another version.
+- **One source of truth for repo and version.** The build reads `PLUGIN_CHART_REPO` and `PLUGIN_CHART_VERSION` from the ConfigMap `profile-controller-config` in the profile-controller render (contract K2) and refuses anything but `harbor.<domain>/teknoir` and an exact version, so the bundle and the controller cannot disagree. Each plugin becomes an `apps.jsonl` line `{app: teamspace-<plugin>, chart: profile-plugin-<plugin>, version, namespace: <first GitOps Profile, else teknoir-default>, release: <plugin>, overrides: {values: "domain: <domain>"}, deployed: false}` (contract K8), so pins.txt, the Harbor chart push, the renders (`teamspace-<plugin>.yaml`) and the image collection cover the plugins with no special case. The make-bundle gate re-checks the repo, every plugin archive against its pin and every plugin image against images.lock; `MANIFEST.yaml` lists the plugin pins (`teamspacePlugins`).
+- **Accepted limitations in r5:** the plugin charts list 11 `ghcr.io/teknoir/*:latest` images and `alpine:latest` (warned, listed as `teamspace_mutable_images`, locked by digest in images.lock), `imagePullSecrets: ghcr-token` and Google Cloud Storage settings (the internet-reference gate only warns for `teamspace-*` renders), and Grafana's plugin installer calls grafana.com (non-fatal). A plugin chart release with pinned images is the follow-up.
+- **Node packages.** `NODE_DEBS` (chrony, util-linux-extra) ship as `node/debs/*.deb` with `debs.lock` lines `<pkg> <version> <arch> <sha256> <file>` (contract K8), pinned by sha256 (D12) with the snapshot.debian.org sha1 as the fallback source. The gate requires exactly `NODE_DEBS`, each file equal to its lock line and pin, and (with dpkg-deb on the build host) the package's own Package/Version/Architecture. The host phase installs them.
+- **G-09 in force** for platform renders (see G-09 below); teamspace renders only warn (R3).
+- **Size**: `BUNDLE_MAX_BYTES` 6.5 GiB (about 5.8 GiB measured); USB media must be exFAT/ext4 or use `--split`.
+- **Rollback builds** of an app-of-apps whose profile-controller predates K2 set `PROFILE_PLUGIN_CHARTS=""` (committed): no plugins, teamspaces do not work offline with that bundle.
+- **Release branches.** `make-bundle.sh` accepts `r<N>[-name]` branches besides the env branch and `airgap-redesign*`, so the r5 bundle is built from the r5 integration branches before they are merged.
 
 ## Backstage + user-controller (folded into the redesign)
 
@@ -151,7 +164,7 @@ KNOWN RESIDUALS (not blockers)
 - oauth2-proxy gets `--provider-ca-file` from the CA bundle; istiod mounts the CA as `/cacerts/extra.pem` (JWKS for RequestAuthentication). The CA-bundle Secrets are reconciled by the node secrets phase (I-07), not K3s files.
 - Backstage chart 0.0.83: GitHub integration gated off, keycloak envFrom optional, `NODE_EXTRA_CA_CERTS`, issuer/JWKS of realm `teknoir`, Application retry.
 - First admin user: `teknoir-airgap admin-user --email <addr>` creates the `users.teknoir.org` User CR (metadata.name = lowercased email with `@` → `-at-`, claims_v0.role superadmin, email_verified true, enabled true), ensures Keycloak group `admin` membership via the Keycloak admin API (realm `teknoir`), restarts backstage-api once so the catalog ingests the user immediately, and writes the temporary password to a 0600 file (never to the terminal).
-- Teamspace creation (profile-controller plugin charts from GitHub) is OUT OF SCOPE: Backstage sign-in and the catalog work, but creating a teamspace is a follow-up.
+- Teamspace creation (profile-controller plugin charts from GitHub) is OUT OF SCOPE: Backstage sign-in and the catalog work, but creating a teamspace is a follow-up. (r5 brings it in scope: see "r5 (app-of-apps 0.0.5)".)
 
 ## Critique (what is wrong today)
 
@@ -918,6 +931,8 @@ For every chart: helm template must succeed; every CRD carries Prune=false,Delet
 Replace :latest, :applicationset and :teknoir-cloud with released version tags and use pullPolicy IfNotPresent. This needs each image repo to publish version tags; that part is an open decision. Turn the G-08 and I-02 gates from warn to error.
 
 **Test:** Render check: no Teknoir image without a semver or sha tag. A re-pin of app-of-apps to the previous version restores the previous image digests.
+
+**r5 implementation (infra side; the gitops side is tests/render.sh):** no CI change was needed. The pin is `<repo>:<immutable tag>@sha256:<linux/amd64 manifest>`, where the immutable tag is `^sha-[0-9a-f]{7,}$`, `<branch>-YYYYMMDD-HHMMSS` or semver (`lib-build.sh` `IMMUTABLE_TAG_RE`, `teknoir_pin_ok`), and the digest is the amd64 manifest, never the index (`airgap/build/pin-images.sh` prints and verifies pins). `collect-images.sh` fails an unpinned Teknoir image in a platform render (`ALLOW_MUTABLE_TEKNOIR_TAGS=1` warns and marks the bundle `-mutable`), fails a pinned index and a digest in a one-shot tier, and only warns for the teamspace plugin renders and for floating non-Teknoir tags. On the node, `harbor_push_images` fails when a pin is not the bundle's manifest and verifies `<repo>@<pin>` in Harbor after the push; `post_image_check` checks `<repo>@<pin>` in the mirror and in containerd (whose ParseDockerRef drops the tag of a tag+digest reference).
 
 ### L-02 — Execute the live migration (M0-M6) in a maintenance window
 - repo: live-env (teknoir-local)
