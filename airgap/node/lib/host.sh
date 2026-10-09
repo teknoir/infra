@@ -380,11 +380,28 @@ clock_chrony_active() {
   clock_chrony_installed && systemctl is-active --quiet chrony 2>/dev/null
 }
 
+clock_mono_cs() {
+  # clock_mono_cs - centiseconds of a clock that no setting of the wall clock
+  # moves (CLOCK_BOOTTIME, /proc/uptime). bash's SECONDS follows the wall
+  # clock, so after preflight steps the clock it would carry the step into the
+  # LAN-time estimate. SECONDS only when /proc/uptime cannot be read.
+  local up
+  if { read -r up _ < "${HOST_ROOT}/proc/uptime"; } 2>/dev/null && [[ "${up}" =~ ^([0-9]+)\.([0-9]{2}) ]]; then
+    printf '%s' "$(( 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]} ))"
+  else
+    printf '%s' "$(( SECONDS * 100 ))"
+  fi
+}
+
 clock_lan_now() {
-  # clock_lan_now - the LAN host's clock now (--lan-time plus the seconds
-  # since it was parsed); empty without --lan-time
+  # clock_lan_now - the LAN host's clock now: --lan-time plus the time since
+  # it was parsed (LAN_TIME_MONO, clock_mono_cs), rounded to whole seconds.
+  # Setting the node clock does not change it. Empty without --lan-time.
   [[ -n "${LAN_TIME:-}" ]] || return 0
-  printf '%s' "$(( LAN_TIME + SECONDS - ${LAN_TIME_AT:-0} ))"
+  local now_cs at_cs
+  now_cs="$(clock_mono_cs)"
+  at_cs="${LAN_TIME_MONO:-${now_cs}}"
+  printf '%s' "$(( LAN_TIME + (now_cs - at_cs + 50) / 100 ))"
 }
 
 clock_tracking() {
@@ -459,15 +476,21 @@ clock_settime() {
 }
 
 clock_step() {
-  # clock_step <epoch> <skew> - set the node clock to the LAN host's time now:
-  # through chrony when it runs (sample + makestep), else with date -u -s
-  local lan="$1" skew="$2"
+  # clock_step <epoch> <skew> <sync|auto> - set the node clock to the LAN
+  # host's time now: through chrony when it runs (sample + makestep), else
+  # with date -u -s. A clock that cannot be set stops the run only for
+  # --sync-clock (sync); in the automatic correction (auto) it is a WARN, as
+  # time must not block a platform update.
+  local lan="$1" skew="$2" mode="$3"
   if clock_chrony_active && clock_settime "${lan}"; then
     run "${CHRONYC}" makestep >/dev/null || warn "chronyc makestep failed (chrony slews the rest)"
     changed "node clock set from the LAN host through chrony (skew was ${skew}s)"
-  else
-    run "${DATE_BIN}" -u -s "@${lan}" >/dev/null || die "cannot set the node clock (date -u -s)"
+  elif run "${DATE_BIN}" -u -s "@${lan}" >/dev/null; then
     changed "node clock set from the LAN host with date (skew was ${skew}s)"
+  elif [[ "${mode}" == sync ]]; then
+    die "cannot set the node clock (date -u -s)"
+  else
+    warn "cannot set the node clock (date -u -s): it stays ${skew}s off the LAN host; chrony corrects it once it runs, or re-run with --sync-clock"
   fi
 }
 
@@ -517,11 +540,18 @@ host_time() {
       log "[dry-run] chrony (reference ${label}) would get a LAN-time sample"
     else
       skew=$(( $(date +%s) - lan ))
-      if clock_settime "${lan}" && (( ${skew#-} > CLOCK_OK_SKEW )); then
-        # apply the correction now: slewing 20 s at chrony's maximum rate
-        # takes about 4 minutes
+      if ! clock_settime "${lan}"; then
+        :
+      elif (( skew < -CLOCK_OK_SKEW )); then
+        # a node behind: apply the correction now (slewing 20 s at chrony's
+        # maximum rate takes about 4 minutes); a step forward only
         run "${CHRONYC}" makestep >/dev/null || warn "chronyc makestep failed (chrony slews the rest)"
-        changed "node clock corrected through chrony (was ${skew}s off the LAN host)"
+        changed "node clock set forward through chrony (was ${skew}s off the LAN host)"
+      elif (( skew > CLOCK_OK_SKEW )); then
+        # a node ahead: teknoir-node does not step a running node back without
+        # --sync-clock; chrony slews it (or steps it itself under its own
+        # 'makestep' rule in its first updates after a start)
+        changed "node clock ${skew}s ahead of the LAN host: chrony corrects it from the sample (no step back by teknoir-node)"
       fi
     fi
   elif clock_chrony_installed; then

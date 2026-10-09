@@ -129,7 +129,8 @@ WAIT_TIMEOUT=""
 BACKUP_MODE="auto"
 ROLE="server"
 SYNC_CLOCK=0
-LAN_TIME_AT=0
+# --lan-time's arrival on a step-proof clock (centiseconds, clock_mono_cs)
+LAN_TIME_MONO=""
 CMD_ARGS=()
 
 usage_die() { printf 'teknoir-node: %s (see teknoir-node help)\n' "$*" >&2; exit 2; }
@@ -139,7 +140,7 @@ while (( $# > 0 )); do
   case "$1" in
     --site) need_value "$@"; SITE_ARG="$2"; shift ;;
     --dry-run) DRY_RUN=1 ;;
-    --lan-time) need_value "$@"; LAN_TIME="$2"; LAN_TIME_AT="${SECONDS}"; shift ;;
+    --lan-time) need_value "$@"; LAN_TIME="$2"; LAN_TIME_MONO="$(clock_mono_cs)"; shift ;;
     --lan-user|--operator) need_value "$@"; LAN_USER="$2"; shift ;;
     --sync-clock) SYNC_CLOCK=1 ;;
     --rollback) ROLLBACK=1 ;;
@@ -315,15 +316,19 @@ preflight_disk() {
 }
 
 preflight_clock() {
-  # Clock policy (DESIGN D6, r5), against the LAN host's clock (--lan-time):
+  # Clock policy (DESIGN D6, r5), against the LAN host's clock (--lan-time);
+  # skew = node - LAN host:
   #   |skew| <= CLOCK_OK_SKEW (2 s)   nothing to do;
-  #   <= MAX_CLOCK_SKEW (30 s)        corrected by this run: chrony gets a
-  #                                   LAN-time sample in the host phase, or,
-  #                                   without an active chrony, the clock is
-  #                                   stepped now with date;
+  #   <= MAX_CLOCK_SKEW (30 s)        corrected by this run, never by a step
+  #                                   back: with an active chrony from the
+  #                                   host phase's LAN-time sample (makestep
+  #                                   for a node behind, a slew for one ahead);
+  #                                   without, a node behind is stepped forward
+  #                                   now with date (a failure is a WARN), one
+  #                                   ahead is left to chrony (WARN);
   #   more                            refused unless --sync-clock, which steps
-  #                                   now (chrony settime + makestep, or date)
-  #                                   and writes the RTC.
+  #                                   now in either direction (chrony settime +
+  #                                   makestep, or date) and writes the RTC.
   # The limit protects against a LAN host whose own clock is wrong.
   local now lan skew abs sync=""
   if have_tool timedatectl; then
@@ -344,14 +349,16 @@ preflight_clock() {
   if (( abs <= MAX_CLOCK_SKEW )); then
     if clock_chrony_active; then
       log "clock: ${skew}s from the LAN host; chrony corrects it from the LAN-time sample of the host phase"
+    elif (( skew < 0 )); then
+      log "clock: ${skew}s from the LAN host (behind) and chrony is not active: setting the clock forward now"
+      clock_step "${lan}" "${skew}" auto
     else
-      log "clock: ${skew}s from the LAN host and chrony is not active: setting the clock now"
-      clock_step "${lan}" "${skew}"
+      warn "clock: the node is ${skew}s ahead of the LAN host and chrony is not active: up sets a clock back only with --sync-clock; chrony corrects it once it runs (host phase)"
     fi
     return 0
   fi
   if (( SYNC_CLOCK == 1 )); then
-    clock_step "${lan}" "${skew}"
+    clock_step "${lan}" "${skew}" sync
     if have_tool "${HWCLOCK}"; then
       clock_write_rtc "after --sync-clock"
     else
