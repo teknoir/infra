@@ -8,6 +8,32 @@ reasons for the redesign are kept here. The git history of `infra` and
 
 ## r5 (app-of-apps 0.0.5)
 
+### Encrypted backups and the ArgoCD break-glass
+
+- **Backups encrypted on the node.** New optional site key
+  `BACKUP_AGE_RECIPIENTS` (age public keys). With it every node backup is also
+  encrypted to those keys in `/var/lib/teknoir-airgap/exports/<ts>.tar.age`, and
+  the node keeps the 3 newest encrypted backups but only the newest unencrypted
+  one (older ones are encrypted before they are removed). Before, the node kept
+  3 unencrypted sets, and old copies piled up in `/root`.
+- **`teknoir-airgap backup --out DIR` without a terminal.** With recipients the
+  node encrypts and the LAN host only copies (sha256-checked, 0600); no
+  passphrase, no plaintext export. `--name TS` copies an existing backup.
+  Without recipients the passphrase flow is unchanged.
+- **`rotate argocd-admin`.** A new ArgoCD local admin password in
+  `teknoir-system/argocd-admin-break-glass` (read by `credentials argocd-admin`,
+  included in backups); `argocd-initial-admin-secret` is deleted once the new
+  password logs in. `rotate argocd-admin --out FILE` writes it to a 0600 file.
+- **One-time clean-up runbook** (OPERATE.md, r5): encrypted backup first, then
+  the plaintext copies on the node and on vpro, the world-readable cloud-init
+  seed, finalize and rotations.
+- vpro: `~/.config/teknoir/install-devtools.sh` installs `age` and `age-keygen`
+  v1.3.1 (sha256-pinned) for decryption.
+- **One recipient check.** The build, the node and the LAN tool check
+  `BACKUP_AGE_RECIPIENTS` with the same function; an age private key pasted
+  there (or anywhere in a site file, for the build) is refused as such and
+  never printed, so it reaches no log or build output.
+
 ### Node time, RTC, teamspace DNS and site keys
 
 Found on the live node on 2026-10-09: no chrony and no `hwclock` were

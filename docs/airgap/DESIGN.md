@@ -17,7 +17,7 @@ implementation differs, update this file in the same commit.
 | D7 | The bundle ships `kubectl` for the LAN host (linux-amd64, darwin-arm64) as a convenience; `up` itself needs only ssh, tar and sha256sum/shasum. |
 | D8 | Teknoir image tags stay mutable for now (warn only); `images.lock` records digests. Immutable image tags need CI changes in the image repos (out of scope). |
 | D9 | No tag immutability on the mirror projects (only on `teknoir`). |
-| D10 | ArgoCD becomes **self-managed** (argo chart moves to gitops, G-07). Local admin is kept as break-glass; `argocd-initial-admin-secret` is deleted after SSO works. |
+| D10 | ArgoCD becomes **self-managed** (argo chart moves to gitops, G-07). Local admin is kept as break-glass; `argocd-initial-admin-secret` is deleted after SSO works. r5: `teknoir-node rotate argocd-admin` sets a new local admin password (bcrypt inside argocd-server, stored in `teknoir-system/argocd-admin-break-glass`, which `credentials argocd-admin` reads and every backup includes) and deletes `argocd-initial-admin-secret` after a successful login with it. |
 | D11 | Multi-node: keep the `role=server|agent` parameter in the host phase, but do not implement/test agent join in this round. |
 | D12 | Bundle authenticity: sha256 only for now (signing later). |
 | D13 | Domain stays per env branch (`teknoir.airgapped`). The VM e2e test uses the same domain inside an isolated LAN network namespace, so vpro's real /etc/hosts and the live env are never touched. |
@@ -45,6 +45,66 @@ Verified facts and agreed deviations that supersede the text below where they di
 - Known residuals: over HTTP/2 the ingress gateway resets the stream (RST_STREAM PROTOCOL_ERROR) right after ext_authz's 302 to `/oauth2/start` (`content-length: 0`), on staging and production as well; browsers tolerate it, curl does not (the e2e login uses HTTP/1.1); `grafana.<domain>` is in the hosts list but has no route (Grafana is at `/teknoir-system/grafana/`); Backstage logout hard-codes realm `master` (backstage repo `Header.tsx`, needs an image rebuild); Keycloak asks for Update Profile at first login (user-controller sets no lastName); teamspace creation needs the profile-plugins charts mirrored (out of scope).
 
 ## r5 (app-of-apps 0.0.5)
+
+Changes of release r5 that supersede the text below where they differ. Each
+package adds its own subsection.
+
+### Encrypted backups and the ArgoCD break-glass (WP-I-BACKUP: SEC-C8, SEC-C9, SEC-C12)
+
+- **Site key `BACKUP_AGE_RECIPIENTS`** (optional): space-separated age X25519
+  public keys, each `^age1[0-9a-z]{58}$`; public values in the committed site
+  file. One validator, `site_age_recipients_check VALUE [LABEL]`, checks it
+  everywhere: the build (`site_values_check`), the node (`load_site`, and
+  again in `lib/backup.sh` before a backup and for `backup --recipient`) and
+  the LAN tool (`site_load`, `backup`). The three runtimes share no sourced
+  code (the LAN tool is a self-contained bash 3.2 script), so the function is
+  the same text in `lib/common.sh`, `teknoir-airgap` and `build/lib-build.sh`,
+  and `airgap/test/unit/site-age-recipients-test.sh` fails when the copies
+  differ or a caller checks the format itself. It uses case patterns only
+  (bash 3.2, no locale-dependent ranges). A value holding `SECRET-KEY` (any
+  case, anywhere) is refused with "holds an age PRIVATE key
+  (AGE-SECRET-KEY-...) ... treat that identity as exposed" and nothing of the
+  value is printed; any other bad entry is shown with at most its first 8
+  characters (control and glob characters as `?`), so neither the run logs nor
+  the build output ever hold a key. The build's `site_check` also refuses an
+  age identity (`AGE-SECRET-KEY-1` and key characters; a comment that only
+  names the prefix passes) anywhere else in a site file, a comment included.
+  The message texts are WP-I-HOST's, so both packages' tests check one text.
+  Decision:
+  two recipients, the operator's key and an offline recovery key; no identity
+  ever goes onto the node or into a repo.
+- **Node backups** (I-12 superseded): with recipients, `backup_take` also writes
+  `exports/<ts>.tar.age` (0600; `tar` of `backups/<ts>` piped into
+  `age -r R1 -r R2 ...`; written as `.partial` and renamed). Retention:
+  `BACKUP_KEEP_PLAIN` (default 1) plaintext sets and `BACKUP_KEEP` (default 3)
+  encrypted exports; a plaintext set without an export is encrypted before it
+  is pruned (kept when that fails). An age failure fails the backup (and so
+  the converge) with the complete plaintext set in place and nothing pruned.
+  Without recipients the old keep-3 plaintext rotation stays, with a warning.
+  Recipients and the age binary are checked before k3s is stopped. One
+  plaintext set is a deliberate trade-off: the live datastore is unencrypted
+  anyway (D6), and it keeps a fast local rollback.
+- **Off-node copy**: `teknoir-airgap backup --out DIR [--name TS]` uses
+  `teknoir-node backup --recipient-site --take` (or `--name TS`) when the site
+  has recipients: no terminal, no passphrase, the node's export is copied with
+  a sha256 check into a 0600 file and stays on the node; no plaintext export
+  exists. `--name` of a set pruned to its export hands that export out as it
+  is. Without recipients the passphrase flow (`--export`, tty) is unchanged.
+- **`rotate argocd-admin`** (D10): `random_alnum 32`; `argocd account bcrypt`
+  (no `--password`: ArgoCD v3.5.1 reads it from a non-terminal stdin and
+  prints `Password: <hash>`) runs in `deploy/argo-argocd-server` (container
+  `server`) with the value on `kubectl exec -i` stdin, so it is in no argv (node
+  or container) and no log. Order: store in `argocd-admin-break-glass` (create or merge
+  patch, never apply: no last-applied annotation), merge-patch `argocd-secret`
+  `admin.password` and `admin.passwordMtime` (ends older admin sessions) from a
+  0600 file, then up to `ARGOCD_LOGIN_ATTEMPTS` (4) spaced logins on
+  `/api/v1/session` (ArgoCD locks a user for 5 minutes after 5 failures), and
+  only after a 200 delete `argocd-initial-admin-secret`. The LAN
+  `rotate argocd-admin --out FILE` reads the new value back with
+  `credentials argocd-admin`.
+- **Runbook**: OPERATE.md "r5 (app-of-apps 0.0.5)" orders the one-time clean-up:
+  verified encrypted backup first, then deleting plaintext copies (node, vpro,
+  cloud-init seed mode), then finalize and rotations.
 
 ### Node time, RTC, teamspace DNS and site keys (WP-I-HOST)
 
@@ -145,12 +205,14 @@ resolve (coredns-custom knew only the platform names).
   addresses or host names; `NODE_IP_DHCP_RESERVED` is `yes`, `no` or empty;
   `BACKUP_AGE_RECIPIENTS` is a space-separated list of age public keys
   (`^age1[0-9a-z]{58}$`, consumed by the backup work). The build
-  (`site_check`), the node (`load_site`) and the LAN tool check all three.
-  None of them prints a recipient whole: an age private key
-  (`AGE-SECRET-KEY-...`, any case) is refused with "remove it now ... and
-  treat that identity as exposed", any other bad entry is named by its first
-  8 characters; the build also refuses a private key anywhere else in the
-  site file, comments included.
+  (`site_check`), the node (`load_site`) and the LAN tool check all three;
+  `BACKUP_AGE_RECIPIENTS` through the one validator
+  `site_age_recipients_check` (see the backup subsection above). None of them
+  prints a recipient whole: an age private key (`AGE-SECRET-KEY-...`, any
+  case) is refused with "remove it now ... and treat that identity as
+  exposed", any other bad entry is named by its first 8 characters; the build
+  also refuses a private key anywhere else in the site file, comments
+  included.
 - **Not in r5:** the `teknoir-node net` tool for a static or keep-lease netplan
   with a dead-man revert (TIME-T6). teknoir-local keeps its DHCP address,
   pinned by a UniFi reservation (HOST-SETUP "Fixed address").
@@ -837,7 +899,7 @@ A bash runner, executed as root on the node, with the subcommands converge|statu
 #### Node runner interface (addendum to shared contract #3)
 `teknoir-airgap` runs `teknoir-node` as root from /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/ with these argument lists. The two sides change together; airgap/test/node/run.sh runs the exact `up` argv.
 - `converge --site FILE --lan-time EPOCH --lan-user USER [--rollback] [--sync-clock] [--reapply TIER]... [--force-images] [--dry-run]`. `--operator USER` is an alias of `--lan-user`. For tests and break-glass only: `--only`/`--skip PHASE[,PHASE]`, `--no-backup`, `--backup`, `--wait-timeout SECONDS`. Unknown arguments are a usage error (exit 2).
-- `status --site FILE [--lan-time EPOCH]`, `verify`, `credentials NAME --site FILE [--out FILE]` (without --out: stdout, never a terminal), `rotate NAME --site FILE [--i-know]`, `backup --site FILE [--list | --export [--take] | --stream FILE [--keep] | --recipient AGE1...]` (no option: take a backup now), `migrate --site FILE [--dry-run | --undo NAME]`, `admin-user --site FILE --email ADDR --out FILE`.
+- `status --site FILE [--lan-time EPOCH]`, `verify`, `credentials NAME --site FILE [--out FILE]` (without --out: stdout, never a terminal), `rotate NAME --site FILE [--i-know]`, `backup --site FILE [--list | --recipient-site | --export | --stream FILE [--keep] | --recipient AGE1...] [--take | --name TS]` (no option: take a backup now; `--recipient-site` encrypts to the site's `BACKUP_AGE_RECIPIENTS` and prints the export's path; `--recipient` is repeatable), `migrate --site FILE [--dry-run | --undo NAME]`, `admin-user --site FILE --email ADDR --out FILE`.
 - Phase functions (`phase_<name>`, one per lib file) take no arguments. The break-glass flags reach them as environment variables, set by `converge` from its command line: `ONESHOT_REAPPLY` (space-separated tier names; each must be listed in oneshot/TIERS, otherwise converge exits 2 before any phase runs) for lib/oneshot.sh, and `HARBOR_FORCE_IMAGES` (0|1) for lib/harbor.sh. Further inputs: `DRY_RUN`, `ROLLBACK`, `LAN_TIME`, `LAN_USER`, `WAIT_TIMEOUT`, `BACKUP_MODE`.
 - Exit codes: 0 ok, 1 error, 2 usage, 70 the leak check found a secret value or a private key in the run log, 75 another run holds /run/teknoir-airgap.lock.
 

@@ -175,8 +175,7 @@ ADDR_DHCP='ADDR=2: enp4s0    inet 10.0.0.1/24 metric 100 brd 10.0.0.255 scope gl
 @test "site keys: an invalid TIME_SOURCE, NODE_IP_DHCP_RESERVED or age recipient stops before ssh" {
   lan_world
   local bad
-  for bad in 'TIME_SOURCE="a;b"' 'TIME_SOURCE="ntp..lan"' 'TIME_SOURCE="10.0.0.256"' 'NODE_IP_DHCP_RESERVED=maybe' \
-             'BACKUP_AGE_RECIPIENTS="AGE1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE"'; do
+  for bad in 'TIME_SOURCE="a;b"' 'TIME_SOURCE="ntp..lan"' 'TIME_SOURCE="10.0.0.256"' 'NODE_IP_DHCP_RESERVED=maybe'; do
     lan_world "${bad}"
     run bash "${LAN}" status --site "${SITE}"
     [ "${status}" -eq 1 ] || { echo "accepted: ${bad}"; return 1; }
@@ -184,12 +183,18 @@ ADDR_DHCP='ADDR=2: enp4s0    inet 10.0.0.1/24 metric 100 brd 10.0.0.255 scope gl
     [ -z "$(stub_calls ssh)" ] || { echo "${bad}: ssh was called"; return 1; }
   done
   # an age recipient that is not a public key is named by at most its first
-  # 8 characters
+  # 8 characters (site_age_recipients_check)
   lan_world 'BACKUP_AGE_RECIPIENTS="age1shortxyz0123456789"'
   run bash "${LAN}" status --site "${SITE}"
   [ "${status}" -eq 1 ]
   [[ "${output}" == *"BACKUP_AGE_RECIPIENTS entry 'age1shor...' is not an age public key"* ]]
   refute_grep -qF 'age1shortx' <<<"${output}"
+  [ -z "$(stub_calls ssh)" ]
+  lan_world 'BACKUP_AGE_RECIPIENTS="AGE1QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE"'
+  run bash "${LAN}" status --site "${SITE}"
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"BACKUP_AGE_RECIPIENTS entry 'AGE1QPZR...' is not an age public key"* ]]
+  refute_grep -qF 'AGE1QPZRY' <<<"${output}"
   [ -z "$(stub_calls ssh)" ]
   lan_world 'TIME_SOURCE="ntp.lan 10.0.0.5"' NODE_IP_DHCP_RESERVED=yes \
     'BACKUP_AGE_RECIPIENTS="age1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce age1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce"'

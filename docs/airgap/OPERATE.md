@@ -358,7 +358,7 @@ when you no longer need it, and never paste a credential into a chat or ticket.
 | `platform-admin` | the initial Keycloak administrator in realm `teknoir` (group `admin`: ArgoCD, Harbor), created by the realm import; its password must be changed at the first sign-in. No Backstage user: use `admin-user` (section 9) |
 | `keycloak-admin`, `keycloak-admin-username` | the Keycloak master realm administrator (break-glass) |
 | `harbor-admin` | Harbor's local `admin` (break-glass; also `https://harbor.teknoir.airgapped/account/sign-in` when OIDC is on) |
-| `argocd-admin` | ArgoCD's local `admin` (break-glass) |
+| `argocd-admin` | ArgoCD's local `admin` (break-glass), from `teknoir-system/argocd-admin-break-glass` once `rotate argocd-admin` ran (section 11); before that ArgoCD's initial password, with a warning |
 | `grafana-admin` | Grafana's local administrator |
 
 The node runner defines these names (`teknoir-node help` on the node lists
@@ -415,9 +415,9 @@ charts are not mirrored yet).
 
 Before a converge that changes the deployed bundle (an update, a rollback, or the
 first `up` on an existing cluster), the node writes a backup to
-`/var/lib/teknoir-airgap/backups/<UTC>/` (mode 0700, the last 3 are kept).
-Re-running the deployed bundle takes none, so the backups from before the last
-update survive. `./teknoir-airgap backup` takes one on demand. A backup holds:
+`/var/lib/teknoir-airgap/backups/<UTC>/` (mode 0700). Re-running the deployed
+bundle takes none, so the backups from before the last update survive.
+`./teknoir-airgap backup` takes one on demand. A backup holds:
 
 | Path in the backup | Content |
 |---|---|
@@ -425,26 +425,91 @@ update survive. `./teknoir-airgap backup` takes one on demand. A backup holds:
 | `k3s/db/` | the k3s datastore (copied during a brief `systemctl stop k3s`; running pods keep running) |
 | `k3s/server/token`, `k3s/server/tls/`, `k3s/server/cred/` | the cluster token and certificates |
 | `k3s/etc/config.yaml`, `k3s/etc/registries.yaml` | the k3s configuration |
-| `secrets/bootstrap-secrets.json` | the Secrets a restore needs first: the CA, Harbor, Keycloak, the client secrets, oauth2-proxy, Backstage |
+| `secrets/bootstrap-secrets.json` | the Secrets a restore needs first: the CA, Harbor, Keycloak, the client secrets, oauth2-proxy, Backstage, the ArgoCD break-glass password |
 | `BACKUP.info`, `SHA256SUMS` | what was backed up, and checksums |
 
 Container images and Harbor's registry blobs are not in the backup: every bundle
 carries them and `up` pushes them again.
 
+**Encrypted on the node.** When the site config sets `BACKUP_AGE_RECIPIENTS`
+(next section), the node also encrypts every backup with `age` to all those
+public keys, into `/var/lib/teknoir-airgap/exports/<UTC>.tar.age` (mode 0600).
+It then keeps the 3 newest encrypted backups and only the newest unencrypted
+one; an older unencrypted backup is encrypted before it is removed, so nothing
+is lost. The node holds no private key: it can encrypt, only you can decrypt.
+Without `BACKUP_AGE_RECIPIENTS` the node keeps the last 3 backups unencrypted
+and every backup warns about it.
+
+List what the node holds (names, sizes and labels only):
+
+```sh
+ssh teknoir@192.168.5.181 sudo /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/teknoir-node \
+  backup --list --site /var/lib/teknoir-airgap/site/teknoir-local.env
+```
+
+### Encryption keys
+
+Use two `age` identities: yours, and a recovery identity kept offline, so that
+losing one does not lose the backups. On your machine (the `age` and
+`age-keygen` tools; vpro has them from `~/.config/teknoir/install-devtools.sh`):
+
+```sh
+install -d -m 0700 ~/.config/teknoir/age
+age-keygen -o ~/.config/teknoir/age/teknoir-local.key            # mode 0600; prints "Public key: age1..."
+age-keygen -o ~/.config/teknoir/age/teknoir-local-recovery.key
+```
+
+Move `teknoir-local-recovery.key` to offline storage (for example on paper or an
+encrypted USB stick in a safe), check that the stored copy is readable
+(`age-keygen -y <copy>` prints its public key), then delete it from the machine
+(`shred -u ~/.config/teknoir/age/teknoir-local-recovery.key`). Keep your own key
+in your password manager as well.
+
+Put both public keys (`age1...`, from `age-keygen -y FILE`) into the site
+config, space separated. They are public values; the site file is committed:
+
+```sh
+BACKUP_AGE_RECIPIENTS="age1<yours> age1<recovery>"
+```
+
+The next `./teknoir-airgap` command copies the site config to the node. A
+private key (`AGE-SECRET-KEY-...`) never belongs there or on the node: the tools
+refuse it. To replace a key, change the list; new backups use it, and
+`backup --name` re-encrypts an existing unencrypted backup to the current list.
+
 ### A copy off the node
 
 ```sh
 ./teknoir-airgap backup --out /media/usb/teknoir-backups
+./teknoir-airgap backup --out /media/usb/teknoir-backups --name 20261009T051050Z   # an existing backup
 ```
 
-This takes a fresh backup on the node, encrypts it there with `age` (you choose a
-passphrase; it is asked twice) and copies
-`teknoir-backup-<site>-<ts>.tar.age` into the `--out` directory (mode 0600). The
-encrypted copy on the node is removed once the local file's sha256 matches it;
-if the copy fails, it stays in `/var/lib/teknoir-airgap/exports/`. The
-unencrypted backup never leaves the node. Keep the passphrase apart from the
-file, for example in your password manager: without it the backup is useless. Run
-it in a terminal; it needs one for the passphrase.
+With `BACKUP_AGE_RECIPIENTS` set, this takes a fresh backup, which the node
+encrypts to the site's recipients, and copies
+`teknoir-backup-<site>-<ts>.tar.age` into the `--out` directory (mode 0600) after
+checking its sha256 against the node's copy. It needs no terminal and no
+passphrase, the unencrypted backup never leaves the node, and the node keeps
+its encrypted copy. `--name` copies an existing backup instead of taking a new
+one (one kept only encrypted on the node is copied as it is).
+
+Without recipients, the node encrypts the copy with a passphrase you choose
+(asked twice), so run it in a terminal; the encrypted file on the node is
+removed once the local copy's sha256 matches it. Keep the passphrase apart from
+the file, for example in your password manager: without it the backup is
+useless.
+
+Check a copy on your machine. The listing alone proves the key works; the full
+check extracts into memory (`/dev/shm`) and removes it again:
+
+```sh
+age -d -i ~/.config/teknoir/age/teknoir-local.key teknoir-backup-teknoir-local-<ts>.tar.age | tar -t
+d=$(mktemp -d /dev/shm/teknoir-backup.XXXXXX)
+age -d -i ~/.config/teknoir/age/teknoir-local.key teknoir-backup-teknoir-local-<ts>.tar.age | tar -C "$d" -xf -
+(cd "$d/<ts>" && sha256sum -c --quiet SHA256SUMS && cat BACKUP.info)
+rm -rf "$d"
+```
+
+Keep a second copy on another medium.
 
 ### Restore
 
@@ -453,7 +518,18 @@ the next. The restore commands run in a root shell on the node; the node's
 bundle payload provides `age` at
 `/var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/age`.
 
-1. Put the backup on the node and decrypt it there:
+1. Put the backup on the node, decrypted. A backup encrypted to the site's
+   recipients is decrypted on your machine (the node has no private key) and
+   streamed into the node, so no plaintext lands on your disk:
+
+   ```sh
+   age -d -i ~/.config/teknoir/age/teknoir-local.key teknoir-backup-teknoir-local-<ts>.tar.age \
+     | ssh teknoir@192.168.5.181 'sudo sh -c "install -d -m 0700 /root/restore && tar -C /root/restore -xf -"'
+   ssh -t teknoir@192.168.5.181 sudo -i
+   cd /root/restore/<ts> && sha256sum -c SHA256SUMS && cat BACKUP.info
+   ```
+
+   A passphrase-encrypted backup is decrypted on the node:
 
    ```sh
    scp teknoir-backup-teknoir-local-<ts>.tar.age teknoir@192.168.5.181:/tmp/
@@ -466,8 +542,11 @@ bundle payload provides `age` at
    cd /root/restore/<ts> && sha256sum -c SHA256SUMS && cat BACKUP.info
    ```
 
-   A backup still on the node needs no decryption: use
-   `/var/lib/teknoir-airgap/backups/<ts>/` instead of `/root/restore/<ts>/`.
+   The newest backup is also on the node unencrypted and needs no decryption:
+   use `/var/lib/teknoir-airgap/backups/<ts>/` instead of `/root/restore/<ts>/`.
+   An older one exists there only encrypted (`exports/<ts>.tar.age`): copy it
+   off with `./teknoir-airgap backup --out DIR --name <ts>` and stream it in as
+   above.
 
 2. Lost data inside a running cluster (for example a Keycloak realm or users, or
    a Harbor project): restore only that database. The dumps are `pg_dumpall`
@@ -522,6 +601,7 @@ Finally remove the decrypted files: `rm -rf /root/restore` (root shell).
 ```sh
 ./teknoir-airgap rotate <name>
 ./teknoir-airgap rotate <name> --i-know
+./teknoir-airgap rotate argocd-admin --out ~/teknoir-argocd-admin.txt
 ```
 
 `rotate` replaces exactly one generated secret and restarts what uses it; the
@@ -535,11 +615,12 @@ never changes an existing secret.
 | `harbor-token-service` | new Harbor token certificate; harbor-core restarts | safe at any time |
 | `harbor-secret-key` | new Harbor `secretKey`; Harbor can no longer decrypt values it stored with the old key (the OIDC client secret and similar) and they must be set again | refused without `--i-know`; take a backup first |
 | `keycloak-db` | new Keycloak database password; it must also change inside PostgreSQL | refused without `--i-know`; take a backup first |
+| `argocd-admin` | new password for ArgoCD's local `admin` (break-glass), kept in `teknoir-system/argocd-admin-break-glass`; older admin sessions end; `argocd-initial-admin-secret` is deleted once a login with the new password works | safe at any time; SSO users are not affected. `--out FILE` also writes the password to FILE (0600) |
 
 Not rotatable with `rotate` in this release: the Keycloak client secrets (the
-realm import and their consumers would need a coordinated change), the admin
-passwords (change them in the application; Harbor and Keycloak keep theirs in
-their databases after the first start) and the platform CA (the live
+realm import and their consumers would need a coordinated change), the Harbor
+and Keycloak admin passwords (change them in the application; Harbor and
+Keycloak keep theirs in their databases after the first start) and the platform CA (the live
 teknoir-local keeps its current CA; a new CA means running
 `./teknoir-airgap trust` on every LAN host again).
 
@@ -871,8 +952,8 @@ from a bundle copied there), `--forget-host-key`, `--host-key FINGERPRINT`.
 | `./teknoir-airgap trust` | `/etc/hosts` block and CA trust on this LAN host (`--print`) |
 | `./teknoir-airgap credentials NAME --out FILE` | One credential into a 0600 file |
 | `./teknoir-airgap admin-user --email ADDRESS --out FILE` | A named admin; temporary password into a 0600 file |
-| `./teknoir-airgap backup --out DIR` | Encrypted node backup copied to this host |
-| `./teknoir-airgap rotate NAME` | Replace one generated secret (`--i-know`) |
+| `./teknoir-airgap backup --out DIR` | Encrypted node backup copied to this host (`--name TS`: an existing one) |
+| `./teknoir-airgap rotate NAME` | Replace one generated secret (`--i-know`; `--out FILE` for `argocd-admin`) |
 | `./teknoir-airgap migrate` | One-time move off the legacy k3s files (`--dry-run`, `--argo`, `--undo NAME`, `--keycloak-admin-password-file FILE`) |
 | `./teknoir-airgap doctor` | Check this LAN host and the node |
 | `./teknoir-airgap help` | The full reference |
@@ -892,6 +973,132 @@ sudo ./teknoir-airgap up --local
 ```
 
 ## r5 (app-of-apps 0.0.5)
+
+What the r5 update changes on the live `teknoir-local`, and the steps that run
+once around it. Each package of r5 adds its own subsection here.
+
+### Encrypted backup, plaintext clean-up and ArgoCD break-glass (SEC-C12)
+
+Before r5, the node and vpro hold unencrypted copies of the platform's secrets:
+the three backup sets in `/var/lib/teknoir-airgap/backups`, copies in `/root`,
+the retired k3s files, the cloud-init seed, and files on vpro. This removes them
+in a safe order: first an encrypted backup that has been proven to decrypt,
+then the deletions, then the rotations. Never delete before step 2 is verified,
+and never touch the `.skip` guards in `/opt/k3s/server/manifests/`. Commands
+print names only; never `cat` a secret file. (`shred` is best effort on ext4 and
+SSDs; encryption is what really protects the remaining copies.)
+
+**1. Keys (vpro).** Create the two identities and keep the recovery one offline,
+as in [Encryption keys](#encryption-keys). Both public keys go into
+`BACKUP_AGE_RECIPIENTS` in `airgap/site/teknoir-local.env`, which takes effect
+with the r5 bundle.
+
+**2. Encrypted backup, with the deployed payload (vpro; no bundle, no restart
+besides the k3s stop of about a minute during `--take`; pods keep running).** The
+0.0.4 payload encrypts to one recipient per run, and its `--take` prunes the
+oldest of its 3 sets, so stream the pre-migration set `20261009T041534Z` first:
+
+```sh
+P=/var/lib/teknoir-airgap/bundles/teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af/node
+ME=$(age-keygen -y ~/.config/teknoir/age/teknoir-local.key)
+REC=age1<recovery public key>
+install -d -m 0700 ~/teknoir-backups && cd ~/teknoir-backups
+ssh teknoir@192.168.5.181 "sudo sh -c 'tar -C /var/lib/teknoir-airgap/backups -cf - 20261009T041534Z | $P/bin/age -r $ME'" \
+  > teknoir-local-20261009T041534Z.tar.age
+ssh teknoir@192.168.5.181 "sudo $P/bin/teknoir-node backup --recipient $ME --take --site /var/lib/teknoir-airgap/site/teknoir-local.env" \
+  > "teknoir-local-$(date -u +%Y%m%dT%H%M%SZ).tar.age"
+chmod 600 ./*.tar.age
+# copies for the recovery key, re-encrypted without plaintext on disk
+for f in teknoir-local-*.tar.age; do
+  age -d -i ~/.config/teknoir/age/teknoir-local.key "$f" | age -r "$REC" > "${f%.tar.age}.recovery.tar.age"
+done
+```
+
+Verify every file before step 3: decrypt into `/dev/shm`, run `sha256sum -c`,
+remove the plaintext (section 10, "A copy off the node"; for the `.recovery`
+files this needs the offline key, or at least `age-keygen -y` on it matching
+`REC`). Then copy all files to a second medium.
+
+**3. Node clean-up (after step 2 is verified).** In a root shell on the node
+(`ssh -t teknoir@192.168.5.181 sudo -i`):
+
+```sh
+cd /root && ls -d teknoir-local-*      # names only: the old copies
+find /root/teknoir-local-backup-20261008 /root/teknoir-local-premigration-* /root/teknoir-local-postmigration-* -type f -exec shred -u {} +
+rm -rf /root/teknoir-local-backup-20261008 /root/teknoir-local-premigration-* /root/teknoir-local-postmigration-*
+cd /var/lib/teknoir-airgap/backups && ls      # names only
+find 20261009T041534Z 20261009T044252Z -type f -exec shred -u {} + 2>/dev/null; rm -rf 20261009T041534Z 20261009T044252Z
+chmod 0600 /var/lib/cloud/seed/nocloud/user-data
+```
+
+The `/root/teknoir-local-backup-20261008` copy holds every old secret file,
+including the CA key. `20261009T051050Z` and the set step 2 took stay; the r5
+`up` encrypts them and keeps only the newest unencrypted set. Keep
+`/opt/k3s/server/manifests-retired/` until step 6; the cloud-init seed holds a
+plaintext console password, rotated in step 7.
+
+**4. vpro clean-up** (and any other machine with an infra checkout; `ME` and
+`REC` as in step 2). Shred `~/teknoir-local-migration/teknoir-local-admin.txt`
+and the dead `robot$argocd` copies under `/home/anders/git/ai/infra-teknoir-local/`
+(`.secrets/manifest-argocd-harbor-repo-secret.yaml`, `airgap/.secrets/robot-argocd.env`,
+`bundle/teknoir-airgap-bundle-0.1.0/bootstrap/secrets/manifest-argocd-harbor-repo-secret.yaml`).
+Review `~/teknoir-local-migration/env.sh`. Encrypt, verify, then delete the
+infra `.secrets` directories (the CA key's source):
+
+```sh
+cd /home/anders/git/ai/infra-teknoir-local
+tar -cf - .secrets airgap/.secrets | age -r "$ME" -r "$REC" > ~/teknoir-backups/infra-teknoir-local-secrets.tar.age
+age -d -i ~/.config/teknoir/age/teknoir-local.key ~/teknoir-backups/infra-teknoir-local-secrets.tar.age | tar -t
+find .secrets airgap/.secrets -type f -exec shred -u {} + && rm -rf .secrets airgap/.secrets
+```
+
+**5. After the r5 `up`.** Every backup is now encrypted on the node, and the node
+keeps one unencrypted set. Rotate the ArgoCD local admin; this deletes
+`argocd-initial-admin-secret` once the new password works:
+
+```sh
+./teknoir-airgap rotate argocd-admin --out ~/teknoir-argocd-admin.txt
+```
+
+Check: `kubectl --context teknoir-local -n teknoir-system get secret argocd-initial-admin-secret`
+is NotFound, the file's password signs in at `https://argocd.teknoir.airgapped`
+(local login), SSO still works with role admin. Move the password into your
+password manager and delete the file.
+
+**6. Finalize the migration** (ends `migrate --undo`; it refuses without an
+encrypted backup newer than the migration):
+
+```sh
+ssh -t teknoir@192.168.5.181 sudo /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/teknoir-node \
+  migrate --finalize --site /var/lib/teknoir-airgap/site/teknoir-local.env
+```
+
+**7. Rotate what sat in the plaintext copies** (everyone signs in again; Keycloak
+is down for about a minute):
+
+```sh
+./teknoir-airgap rotate oauth2-proxy-cookie
+./teknoir-airgap rotate oauth2-proxy-redis
+./teknoir-airgap rotate keycloak-db --i-know
+```
+
+Then the console password from the cloud-init seed. Look up the account name in
+the seed's `chpasswd` block (`sudo grep -E 'name:' /var/lib/cloud/seed/nocloud/user-data`
+prints names only), then set a new password from a 0600 file; it travels on
+stdin only:
+
+```sh
+umask 077; openssl rand -base64 18 > ~/teknoir-local-console-password.txt
+{ printf '%s:' '<account>'; cat ~/teknoir-local-console-password.txt; } | ssh teknoir@192.168.5.181 'sudo chpasswd'
+```
+
+Keep that password in your password manager as last-resort console access and
+delete the file. The teknoir and argocd client secrets are rotated in the next
+release (they need a platform-secrets change). The CA stays (D1).
+
+Verify after each step with names and counts only: `sudo find <path> | wc -l`
+is 0 for every deleted path, `teknoir-node backup --list` shows one unencrypted
+set, and the browser sign-in plus ArgoCD and Harbor SSO still work.
 
 ### Node time, RTC and teamspace DNS
 

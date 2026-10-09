@@ -83,13 +83,20 @@ Commands:
   rotate NAME [--i-know]   replace one secret value and restart its consumers;
                            NAME: oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service
                            harbor-secret-key (--i-know) keycloak-db (--i-know)
-  backup [--list | --export | --stream FILE [--keep] | --recipient AGE_RECIPIENT]
-                           no option: take a full backup now; --export: passphrase-
-                           encrypt the latest backup (needs a terminal: ssh -t) into
-                           /var/lib/teknoir-airgap/exports and print its path;
-                           --stream FILE: write that export to stdout (not a terminal)
-                           and delete it; --recipient: stream the latest backup
-                           encrypted to an age public key, no terminal needed
+                           argocd-admin (new local admin password, kept in
+                           teknoir-system/argocd-admin-break-glass; deletes
+                           argocd-initial-admin-secret after a login check)
+  backup [--list | --recipient-site | --export | --stream FILE [--keep] |
+          --recipient AGE_RECIPIENT...] [--take | --name TS]
+                           no option: take a full backup now (encrypted to the site's
+                           BACKUP_AGE_RECIPIENTS into /var/lib/teknoir-airgap/exports
+                           when set); --recipient-site: encrypt a backup to those
+                           recipients and print the export's path, no terminal needed;
+                           --export: passphrase-encrypt a backup (needs a terminal:
+                           ssh -t) and print its path; --stream FILE: write an export
+                           to stdout (not a terminal) and delete it; --recipient:
+                           stream a backup encrypted to age public keys; --take: a new
+                           backup, --name TS: that one (default: the latest)
   migrate [...]            one-time K3s file detach of the live env (lib/migrate.sh)
   admin-user --email ADDR --out FILE
                            create the first platform admin (a superadmin User; its

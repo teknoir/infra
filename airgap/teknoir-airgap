@@ -28,8 +28,12 @@
 #               in /var/lib/teknoir-airgap/tmp (0700) that teknoir-airgap then
 #               copies to the LAN host and deletes. The runner's stdout is its
 #               log here, never data.
-#   backup     --export --take --site FILE   (tty: age asks for a passphrase)
-#               new backup, encrypted to /var/lib/teknoir-airgap/exports/
+#   backup      --recipient-site (--take | --name TS) --site FILE
+#               (the site sets BACKUP_AGE_RECIPIENTS; no tty) a new or the
+#               named backup, encrypted to those age public keys into
+#               /var/lib/teknoir-airgap/exports/<ts>.tar.age; stdout: that path
+#   backup      --export (--take | --name TS) --site FILE   (tty: age asks for
+#               a passphrase) encrypted to /var/lib/teknoir-airgap/exports/
 #               teknoir-backup-<ts>.tar.age
 #   backup      --stream FILE --keep --site FILE   that export on stdout
 #   rotate      NAME --site FILE [--i-know]
@@ -108,8 +112,11 @@ Commands:
                         User) for --email; the temporary password goes to the
                         --out file, mode 0600.
   backup                Take a backup on the node and copy it into the --out
-                        directory, encrypted with age (you choose a passphrase).
-  rotate NAME           Replace one generated secret and restart what uses it.
+                        directory, encrypted with age: to the site's
+                        BACKUP_AGE_RECIPIENTS public keys (no terminal needed),
+                        else with a passphrase you choose.
+  rotate NAME           Replace one generated secret and restart what uses it;
+                        argocd-admin sets a new ArgoCD admin password.
   migrate               One-time detach of the legacy K3s manifest files on the
                         live teknoir-local node (docs/OPERATE.md, migration).
   doctor                Check this computer and the node: tools, name
@@ -154,6 +161,9 @@ Options for trust:
 Options for credentials, admin-user and backup:
   --out FILE|DIR        Where to write: a file for credentials and admin-user, a
                         directory for backup. Required.
+  --name TS             backup: copy the existing node backup TS (a UTC
+                        timestamp such as 20261009T051050Z) instead of taking
+                        a new one.
   --email ADDRESS       admin-user: the new admin's e-mail address (the login),
                         used in lower case: letters, digits, '.' and '-'
                         around one '@' (no '_' or '+').
@@ -161,6 +171,8 @@ Options for credentials, admin-user and backup:
 Options for rotate:
   --i-know              Confirm a rotation with side effects (Harbor secretKey,
                         Keycloak database password); see docs/OPERATE.md.
+  --out FILE            argocd-admin: also write the new password to FILE
+                        (mode 0600).
 
 Options for migrate:
   --dry-run             List what would be detached; change nothing.
@@ -480,17 +492,7 @@ site_load() {
     site_time_source_ok "${h}" || die "${SITE_FILE}: invalid TIME_SOURCE entry '${h}' (space-separated IPv4 addresses or host names)"
   done
   case "${NODE_IP_DHCP_RESERVED}" in ''|yes|no) ;; *) die "${SITE_FILE}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)" ;; esac
-  # BACKUP_AGE_RECIPIENTS is never printed whole: it may hold a pasted private
-  # key. The same messages as the node's load_site.
-  case "${BACKUP_AGE_RECIPIENTS}" in
-    *[Aa][Gg][Ee]-[Ss][Ee][Cc][Rr][Ee][Tt]-[Kk][Ee][Yy]-*)
-      die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed" ;;
-    *[!a-z0-9\ ]*) die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS: only space-separated age public keys (age1 followed by 58 lower-case letters and digits)" ;;
-  esac
-  for h in ${BACKUP_AGE_RECIPIENTS}; do
-    age_recipient_ok "${h}" \
-      || die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS entry '$(printf '%s' "${h}" | cut -c1-8)...' is not an age public key (age1 followed by 58 lower-case letters and digits)"
-  done
+  h=$(site_age_recipients_check "${BACKUP_AGE_RECIPIENTS}") || die "${SITE_FILE}: ${h}"
   mdomain=$(manifest_get domain)
   if [ -n "${mdomain}" ] && [ "${mdomain}" != "${TEKNOIR_DOMAIN}" ]; then
     die "site ${SITE_NAME} is for domain ${TEKNOIR_DOMAIN}, but this bundle was built for ${mdomain}"
@@ -514,12 +516,40 @@ site_time_source_ok() {
   [ "$(printf '%s' "${t}" | awk -F. 'NF == 4 && $1 != "" && $2 != "" && $3 != "" && $4 != "" && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 { print "ok" }')" = ok ]
 }
 
-# age_recipient_ok KEY: an age X25519 public key (age1 and 58 lowercase characters).
-age_recipient_ok() {
-  local rest
-  case "$1" in age1*) rest=${1#age1} ;; *) return 1 ;; esac
-  [ "${#rest}" -eq 58 ] || return 1
-  case "${rest}" in *[!0-9a-z]*) return 1 ;; esac
+site_age_recipients_check() {
+  # site_age_recipients_check VALUE [LABEL] - the one check of an age recipient
+  # list (R9; LABEL names it, default BACKUP_AGE_RECIPIENTS): empty, or age
+  # X25519 public keys (^age1[0-9a-z]{58}$) separated by spaces. Valid: prints
+  # nothing, returns 0. Otherwise prints one line about the first problem and
+  # returns 1. It never prints a private key (SECRET-KEY anywhere in VALUE,
+  # any case: AGE-SECRET-KEY-1...) and shows at most the first 8 characters of
+  # any other bad entry. The same text is in airgap/node/lib/common.sh,
+  # airgap/teknoir-airgap and airgap/build/lib-build.sh: bash 3.2, no regex
+  # (locale-independent); airgap/test/unit/site-age-recipients-test.sh keeps
+  # the three identical.
+  local v=$1 label=${2:-BACKUP_AGE_RECIPIENTS} rest w key shown
+  case "${v}" in
+    *[Ss][Ee][Cc][Rr][Ee][Tt]-[Kk][Ee][Yy]*)
+      printf '%s\n' "${label} holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed"
+      return 1 ;;
+  esac
+  rest="${v} "
+  while [ -n "${rest}" ]; do
+    w=${rest%% *}
+    rest=${rest#* }
+    [ -n "${w}" ] || continue
+    key=${w#age1}
+    if [ "${key}" != "${w}" ] && [ "${#key}" -eq 58 ]; then
+      case "${key}" in
+        *[!0123456789abcdefghijklmnopqrstuvwxyz]*) ;;
+        *) continue ;;
+      esac
+    fi
+    shown=${w:0:8}
+    shown=${shown//[![:alnum:]._-]/?}
+    printf '%s\n' "${label} entry '${shown}...' is not an age public key (age1 followed by 58 lower-case letters and digits, separated by spaces)"
+    return 1
+  done
   return 0
 }
 
@@ -1031,6 +1061,7 @@ OPT_I_KNOW=0
 OPT_UNDO=
 OPT_ARGO=0
 OPT_KC_PW_FILE=
+OPT_NAME=
 
 # Options a command accepts (beyond the global ones).
 allowed() {
@@ -1039,7 +1070,8 @@ allowed() {
     kubeconfig:--context|kubeconfig:--kubeconfig) return 0 ;;
     trust:--print) return 0 ;;
     credentials:--out|admin-user:--out|admin-user:--email|backup:--out) return 0 ;;
-    rotate:--i-know) return 0 ;;
+    backup:--name) return 0 ;;
+    rotate:--i-know|rotate:--out) return 0 ;;
     migrate:--dry-run|migrate:--undo|migrate:--argo|migrate:--keycloak-admin-password-file) return 0 ;;
   esac
   return 1
@@ -1055,7 +1087,7 @@ parse_args() {
     esac
     case "${a}" in
       -h|--help) usage; exit 0 ;;
-      --site|--node|--host-key|--reapply|--context|--kubeconfig|--out|--email|--undo|--keycloak-admin-password-file)
+      --site|--node|--host-key|--reapply|--context|--kubeconfig|--out|--email|--undo|--keycloak-admin-password-file|--name)
         if [ -z "${v}" ]; then
           [ $# -ge 2 ] || usage_error "${a} needs a value"
           v=$2; shift
@@ -1071,6 +1103,7 @@ parse_args() {
           --email) OPT_EMAIL=${v} ;;
           --undo) OPT_UNDO=${v} ;;
           --keycloak-admin-password-file) OPT_KC_PW_FILE=${v} ;;
+          --name) OPT_NAME=${v} ;;
         esac
         case "${a}" in --site|--node|--host-key) ;; *) PARSED_OPTS="${PARSED_OPTS} ${a}" ;; esac ;;
       --local) LOCAL=1 ;;
@@ -1537,12 +1570,53 @@ cmd_admin_user() {
   log "sign in at https://${TEKNOIR_DOMAIN}/ ; Keycloak asks for a new password at the first login"
 }
 
+# backup_recipients_count: BACKUP_RECIPIENTS_N = the number of age public keys
+# in the site's BACKUP_AGE_RECIPIENTS (0 when unset). site_load has checked
+# them with site_age_recipients_check; checked again here, so this never
+# counts what that check refuses (and never echoes a private key).
+BACKUP_RECIPIENTS_N=0
+backup_recipients_count() {
+  local problem
+  problem=$(site_age_recipients_check "${BACKUP_AGE_RECIPIENTS:-}") || die "${SITE_FILE}: ${problem}"
+  # (valid: only a-z, 0-9 and spaces, so no glob can expand here)
+  # shellcheck disable=SC2086
+  set -- ${BACKUP_AGE_RECIPIENTS:-}
+  BACKUP_RECIPIENTS_N=$#
+}
+
+# backup_fetch EXPORT OUT: copy the node file EXPORT (an encrypted export in
+# NODE_STATE_DIR/exports) to OUT (0600) through OUT.partial; the node's
+# sha256 must match the copy. The node keeps EXPORT. Sets BACKUP_SHA256.
+BACKUP_SHA256=
+backup_fetch() {
+  local exp=$1 out=$2 rsum lsum
+  rsum=$(node_sh pipe 'sha256sum "$1"' "${exp}" </dev/null | awk '{ print $1 }' | tail -n 1) || rsum=
+  [ -n "${rsum}" ] || die "the encrypted backup ${exp} is not on the node"
+  log "copying the encrypted backup to ${out}"
+  LOCAL_TMP=${out}.partial
+  run_runner pipe backup --stream "${exp}" --keep --site "${REMOTE_SITE}" </dev/null >"${out}.partial" \
+    || die "copying the backup failed; the encrypted export stays on the node: ${exp}"
+  chmod 600 "${out}.partial"
+  lsum=$(sha256_of "${out}.partial")
+  [ "${rsum}" = "${lsum}" ] || die "the copied backup does not match the node's copy (sha256); the export stays on the node: ${exp}"
+  mv -f "${out}.partial" "${out}"
+  LOCAL_TMP=
+  BACKUP_SHA256=${lsum}
+}
+
 cmd_backup() {
-  local dir latest exp out rsum lsum
-  [ "$(npos)" -eq 0 ] || usage_error "backup takes no arguments besides --out"
+  local dir latest exp out recips
+  [ "$(npos)" -eq 0 ] || usage_error "backup takes no arguments besides --out and --name"
   [ -n "${OPT_OUT}" ] || usage_error "backup needs --out DIR"
-  [ -t 0 ] || die "backup asks for an encryption passphrase: run it in a terminal"
+  if [ -n "${OPT_NAME}" ] && ! printf '%s\n' "${OPT_NAME}" | grep -Eq '^[0-9]{8}T[0-9]{6}Z$'; then
+    usage_error "--name ${OPT_NAME}: a backup name is a UTC timestamp such as 20261009T051050Z"
+  fi
   common_open
+  backup_recipients_count
+  recips=${BACKUP_RECIPIENTS_N}
+  if [ "${recips}" -eq 0 ] && [ ! -t 0 ]; then
+    die "backup asks for an encryption passphrase: run it in a terminal (with BACKUP_AGE_RECIPIENTS in the site config it needs none)"
+  fi
   case "${OPT_OUT}" in /*) dir=${OPT_OUT} ;; *) dir=$(pwd -P)/${OPT_OUT} ;; esac
   refuse_inside_bundle "${dir}"
   mkdir -p "${OPT_OUT}" || die "cannot create ${OPT_OUT}"
@@ -1550,27 +1624,47 @@ cmd_backup() {
   dir=$(abs_dir "${OPT_OUT}") || die "cannot use ${OPT_OUT}"
   refuse_inside_bundle "${dir}"
   node_prepare
-  log "taking a backup on the node and encrypting it there with age: choose a passphrase and keep it; a restore needs it"
-  run_runner tty backup --export --take --site "${REMOTE_SITE}" || die "teknoir-node backup --export failed on the node"
-  latest=$(node_sh pipe 'ls -1 "$1" 2>/dev/null | grep "^2.*Z$" | LC_ALL=C sort | tail -n 1' "${NODE_STATE_DIR}/backups" </dev/null | tail -n 1) || latest=
-  case "${latest}" in ''|*[!A-Za-z0-9._:-]*) die "found no backup in ${NODE_STATE_DIR}/backups on the node" ;; esac
-  exp=${NODE_STATE_DIR}/exports/teknoir-backup-${latest}.tar.age
-  rsum=$(node_sh pipe 'sha256sum "$1"' "${exp}" </dev/null | awk '{ print $1 }' | tail -n 1) || rsum=
-  [ -n "${rsum}" ] || die "the encrypted backup ${exp} is not on the node"
-  out=${dir}/teknoir-backup-${SITE_NAME}-${latest}.tar.age
-  log "copying the encrypted backup to ${out}"
-  run_runner pipe backup --stream "${exp}" --keep --site "${REMOTE_SITE}" </dev/null >"${out}.partial" \
-    || { rm -f "${out}.partial"; die "copying the backup failed; the encrypted export stays on the node: ${exp}"; }
-  lsum=$(sha256_of "${out}.partial")
-  if [ "${rsum}" != "${lsum}" ]; then
-    rm -f "${out}.partial"
-    die "the copied backup does not match the node's copy (sha256); the export stays on the node: ${exp}"
+  if [ "${recips}" -gt 0 ]; then
+    # The node encrypts to the site's public keys: no terminal, and no
+    # plaintext ever leaves the node.
+    if [ -n "${OPT_NAME}" ]; then
+      log "encrypting the node backup ${OPT_NAME} to the ${recips} age recipient(s) of site ${SITE_NAME} (BACKUP_AGE_RECIPIENTS)"
+      set -- --name "${OPT_NAME}"
+    else
+      log "taking a backup on the node; the node encrypts it to the ${recips} age recipient(s) of site ${SITE_NAME} (BACKUP_AGE_RECIPIENTS)"
+      set -- --take
+    fi
+    exp=$(run_runner pipe backup --recipient-site "$@" --site "${REMOTE_SITE}" </dev/null | tail -n 1) \
+      || die "teknoir-node backup --recipient-site failed on the node"
+    case "${exp}" in
+      *[!A-Za-z0-9._/-]*) die "unexpected answer from teknoir-node backup --recipient-site" ;;
+      "${NODE_STATE_DIR}/exports/"2*Z.tar.age) ;;
+      *) die "unexpected answer from teknoir-node backup --recipient-site: ${exp}" ;;
+    esac
+    latest=${exp##*/}
+    latest=${latest%.tar.age}
+    out=${dir}/teknoir-backup-${SITE_NAME}-${latest}.tar.age
+    backup_fetch "${exp}" "${out}"
+    log "backup saved: ${out} (age-encrypted to the site's recipients, sha256 ${BACKUP_SHA256}); decrypt it with: age -d -i KEYFILE ${out} | tar -t"
+    log "the node keeps this encrypted copy in ${NODE_STATE_DIR}/exports and only its newest unencrypted backup in ${NODE_STATE_DIR}/backups"
+    return 0
   fi
-  chmod 600 "${out}.partial"
-  mv -f "${out}.partial" "${out}"
+  if [ -n "${OPT_NAME}" ]; then
+    log "encrypting the node backup ${OPT_NAME} there with age: choose a passphrase and keep it; a restore needs it"
+    run_runner tty backup --export --name "${OPT_NAME}" --site "${REMOTE_SITE}" || die "teknoir-node backup --export failed on the node"
+    latest=${OPT_NAME}
+  else
+    log "taking a backup on the node and encrypting it there with age: choose a passphrase and keep it; a restore needs it"
+    run_runner tty backup --export --take --site "${REMOTE_SITE}" || die "teknoir-node backup --export failed on the node"
+    latest=$(node_sh pipe 'ls -1 "$1" 2>/dev/null | grep "^2.*Z$" | LC_ALL=C sort | tail -n 1' "${NODE_STATE_DIR}/backups" </dev/null | tail -n 1) || latest=
+    case "${latest}" in ''|*[!A-Za-z0-9._:-]*) die "found no backup in ${NODE_STATE_DIR}/backups on the node" ;; esac
+  fi
+  exp=${NODE_STATE_DIR}/exports/teknoir-backup-${latest}.tar.age
+  out=${dir}/teknoir-backup-${SITE_NAME}-${latest}.tar.age
+  backup_fetch "${exp}" "${out}"
   node_sh pipe 'rm -f "$1"' "${exp}" </dev/null || warn "could not remove the encrypted export ${exp} on the node"
-  log "backup saved: ${out} (age-encrypted, sha256 ${lsum})"
-  log "the unencrypted backup stays on the node in ${NODE_STATE_DIR}/backups/${latest} (the node keeps the last 3)"
+  log "backup saved: ${out} (age-encrypted, sha256 ${BACKUP_SHA256})"
+  log "the unencrypted backup stays on the node in ${NODE_STATE_DIR}/backups/${latest}"
 }
 
 cmd_rotate() {
@@ -1578,12 +1672,20 @@ cmd_rotate() {
   [ "$(npos)" -eq 1 ] || usage_error "rotate needs exactly one NAME"
   name=${POS[0]}
   case "${name}" in -*|*[!A-Za-z0-9._-]*) usage_error "invalid secret name '${name}'" ;; esac
+  if [ -n "${OPT_OUT}" ] && [ "${name}" != argocd-admin ]; then
+    usage_error "rotate takes --out only for argocd-admin (its new password goes to that file)"
+  fi
   common_open
+  if [ -n "${OPT_OUT}" ]; then out_file_prepare "${OPT_OUT}"; fi
   node_prepare
   if [ "${OPT_I_KNOW}" = 1 ]; then
     run_runner tty rotate "${name}" --site "${REMOTE_SITE}" --i-know
   else
     run_runner tty rotate "${name}" --site "${REMOTE_SITE}"
+  fi
+  if [ -n "${OPT_OUT}" ]; then
+    secret_run "${OUT_ABS}" credentials argocd-admin --site "${REMOTE_SITE}"
+    log "wrote the new ArgoCD admin password to ${OUT_ABS} (mode 0600); the node keeps it in teknoir-system/argocd-admin-break-glass (credentials argocd-admin)"
   fi
 }
 

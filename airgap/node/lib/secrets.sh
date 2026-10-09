@@ -36,6 +36,12 @@ CA_BUNDLE_NAMESPACES=(teknoir-auth teknoir-system)
 ARGOCD_NS="teknoir-system"
 ARGOCD_TLS_CM="argocd-tls-certs-cm"
 MANAGED_BY_LABEL="app.kubernetes.io/managed-by=teknoir-node"
+# rotate argocd-admin (DESIGN D10, SEC-C9)
+ARGOCD_SERVER_DEPLOY="${ARGOCD_SERVER_DEPLOY:-argo-argocd-server}"
+ARGOCD_BREAK_GLASS_SECRET="argocd-admin-break-glass"
+ARGOCD_INITIAL_SECRET="argocd-initial-admin-secret"
+ARGOCD_LOGIN_ATTEMPTS="${ARGOCD_LOGIN_ATTEMPTS:-4}"
+ARGOCD_LOGIN_DELAY="${ARGOCD_LOGIN_DELAY:-5}"
 
 # Public CA certificate of this run (WORK_DIR/ca.crt), once known.
 CA_PEM=""
@@ -329,7 +335,7 @@ secrets_credential_ref() {
     keycloak-admin-username) echo "teknoir-auth keycloak-admin username public" ;;
     platform-admin)          echo "teknoir-auth keycloak-platform-admin password secret" ;;
     harbor-admin)            echo "teknoir-system harbor-secret HARBOR_ADMIN_PASSWORD secret" ;;
-    argocd-admin)            echo "teknoir-system argocd-initial-admin-secret password secret" ;;
+    argocd-admin)            echo "teknoir-system argocd-admin-break-glass password secret" ;;
     grafana-admin)           echo "teknoir-system monitoring-grafana admin-password secret" ;;
     *) return 1 ;;
   esac
@@ -355,7 +361,15 @@ cmd_credentials() {
     die "credentials: refusing to print a credential to a terminal; use --out FILE or redirect stdout"
   fi
   require_cluster credentials || return 0
-  in_cluster secret "${secret}" "${ns}" || die "credentials: Secret ${ns}/${secret} does not exist (yet)"
+  if ! in_cluster secret "${secret}" "${ns}"; then
+    # argocd-admin before its first rotation: ArgoCD's own initial password
+    if [[ "${name}" == "argocd-admin" ]] && in_cluster secret "${ARGOCD_INITIAL_SECRET}" "${ns}"; then
+      warn "credentials argocd-admin: not rotated yet, so this is ArgoCD's initial password from ${ns}/${ARGOCD_INITIAL_SECRET} (run: rotate argocd-admin)"
+      secret="${ARGOCD_INITIAL_SECRET}"
+    else
+      die "credentials: Secret ${ns}/${secret} does not exist (yet)"
+    fi
+  fi
   dry_run && { log "[dry-run] would write ${name} (${ns}/${secret} ${key}) to ${out:-stdout}"; return 0; }
   if [[ "${class}" == "secret" ]]; then
     read_secret value "${ns}" "${secret}" "${key}"
@@ -454,6 +468,141 @@ _secrets_rotate_keycloak_db() {
   _secrets_restart_workloads teknoir-auth statefulset/keycloak
 }
 
+_secrets_cfg_escape() {
+  # a value for a double-quoted curl config entry: backslash and quote escaped
+  local v="${1//\\/\\\\}"
+  printf '%s' "${v//\"/\\\"}"
+}
+
+_secrets_platform_ca() {
+  # _secrets_platform_ca <file> - the platform CA certificate (public) into <file>.
+  if in_cluster secret "${CA_BUNDLE_SECRET}" "${ARGOCD_NS}"; then
+    secret_value "${ARGOCD_NS}" "${CA_BUNDLE_SECRET}" ca.crt > "$1"
+  else
+    secret_value "${CA_NS}" "${CA_SECRET}" tls.crt > "$1"
+  fi
+  grep -q 'BEGIN CERTIFICATE' "$1" || die "no platform CA certificate in ${ARGOCD_NS}/${CA_BUNDLE_SECRET} or ${CA_NS}/${CA_SECRET}"
+}
+
+_secrets_argocd_login() {
+  # _secrets_argocd_login <password-var> - HTTP status of an ArgoCD local
+  # `admin` login (POST https://argocd.<domain>/api/v1/session) through the
+  # gateway on NODE_IP, verified with the platform CA. The password reaches
+  # curl in a config on a pipe (never argv); the session token is discarded.
+  local var="$1" ca body code
+  ensure_work_dir
+  ca="$(umask 077 && mktemp "${WORK_DIR}/argocd-ca.XXXXXX")"
+  _secrets_platform_ca "${ca}"
+  body="$(printf '%s' "${!var}" | "${JQ}" -Rc '{username: "admin", password: .}')"
+  # shellcheck disable=SC2086  # SECRETS_CURL_OPTS: extra curl flags (tests)
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -m 30 --cacert "${ca}" \
+      --resolve "argocd.${TEKNOIR_DOMAIN}:443:${NODE_IP}" ${SECRETS_CURL_OPTS:-} \
+      -K <(printf 'header = "Content-Type: application/json"\ndata = "%s"\n' "$(_secrets_cfg_escape "${body}")") \
+      "${ARGOCD_URL:-https://argocd.${TEKNOIR_DOMAIN}}/api/v1/session" 2>/dev/null)" || code="${code:-000}"
+  body=""
+  rm -f "${ca}"
+  printf '%s' "${code}"
+}
+
+_secrets_argocd_break_glass_write() {
+  # _secrets_argocd_break_glass_write <password-var> - create or update
+  # teknoir-system/argocd-admin-break-glass (key password; label managed-by
+  # teknoir-node; annotation teknoir.org/rotated-at). The value reaches jq on
+  # stdin and kubectl through a pipe or a 0600 patch file, never argv. Create
+  # or merge patch, never apply: no last-applied annotation holds the value.
+  local var="$1" now f
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  ensure_work_dir
+  if in_cluster secret "${ARGOCD_BREAK_GLASS_SECRET}" "${ARGOCD_NS}"; then
+    f="$(umask 077 && mktemp "${WORK_DIR}/patch.XXXXXX")"
+    printf '%s' "${!var}" | "${JQ}" -Rs --arg t "${now}" \
+      '{metadata: {annotations: {"teknoir.org/rotated-at": $t}}, data: {password: (. | @base64)}}' > "${f}"
+    kc -n "${ARGOCD_NS}" patch secret "${ARGOCD_BREAK_GLASS_SECRET}" --type merge --patch-file "${f}" >/dev/null \
+      || { shred -u "${f}" 2>/dev/null || rm -f "${f}"; die "rotate argocd-admin: cannot update ${ARGOCD_NS}/${ARGOCD_BREAK_GLASS_SECRET}; nothing was changed, the current admin password stays valid"; }
+    shred -u "${f}" 2>/dev/null || rm -f "${f}"
+  else
+    printf '%s' "${!var}" | "${JQ}" -Rs --arg ns "${ARGOCD_NS}" --arg name "${ARGOCD_BREAK_GLASS_SECRET}" \
+        --arg lk "${MANAGED_BY_LABEL%%=*}" --arg lv "${MANAGED_BY_LABEL#*=}" --arg t "${now}" '{
+          apiVersion: "v1", kind: "Secret", type: "Opaque",
+          metadata: {name: $name, namespace: $ns, labels: {($lk): $lv},
+                     annotations: {"teknoir.org/rotated-at": $t}},
+          data: {password: (. | @base64)}}' \
+      | kc create -f - >/dev/null \
+      || die "rotate argocd-admin: cannot create ${ARGOCD_NS}/${ARGOCD_BREAK_GLASS_SECRET}; nothing was changed, the current admin password stays valid"
+  fi
+  changed "stored the new ArgoCD admin password in ${ARGOCD_NS}/${ARGOCD_BREAK_GLASS_SECRET}"
+}
+
+_secrets_rotate_argocd_admin() {
+  # New password for ArgoCD's local `admin` (DESIGN D10 break-glass):
+  #   1. bcrypt it inside the argocd-server container with `argocd account
+  #      bcrypt`, which reads the password from stdin when no --password is
+  #      given (checked in ArgoCD v3.5.1, the deployed version; it prints
+  #      "Password: " before the hash; an ArgoCD without it fails here): the
+  #      value travels only on kubectl exec's stdin, never in any argv (node
+  #      or container) or log;
+  #   2. store it in Secret argocd-admin-break-glass, BEFORE it becomes active,
+  #      so an active password is never one that is stored nowhere;
+  #   3. patch argocd-secret admin.password + admin.passwordMtime (now, which
+  #      ends the sessions of the old password) from a 0600 patch file;
+  #   4. check a login with it (HTTP 200), and only then delete
+  #      argocd-initial-admin-secret.
+  # A failed step stops the run before the next one; until step 3 the old
+  # password stays valid. argocd-server watches argocd-secret, so nothing
+  # restarts. A login check that keeps failing never deletes anything.
+  local newval="" out="" hash="" mtime f code="" i re='(\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53})'
+  in_cluster deployment "${ARGOCD_SERVER_DEPLOY}" "${ARGOCD_NS}" \
+    || die "rotate argocd-admin: Deployment ${ARGOCD_NS}/${ARGOCD_SERVER_DEPLOY} does not exist"
+  in_cluster secret argocd-secret "${ARGOCD_NS}" || die "rotate argocd-admin: Secret ${ARGOCD_NS}/argocd-secret does not exist"
+  if dry_run; then
+    changed "set a new ArgoCD admin password (bcrypt in ${ARGOCD_SERVER_DEPLOY}, stored in ${ARGOCD_NS}/${ARGOCD_BREAK_GLASS_SECRET}, argocd-secret admin.password + admin.passwordMtime), check the login, then delete ${ARGOCD_NS}/${ARGOCD_INITIAL_SECRET}"
+    return 0
+  fi
+  ensure_work_dir
+  newval="$(random_alnum 32)"
+  [[ ${#newval} -eq 32 ]] || die "rotate argocd-admin: could not generate a password"
+  mark_sensitive "${newval}"
+  # 1. bcrypt (stdin -> the container; "Password: <hash>" comes back on stdout)
+  out="$(printf '%s\n' "${newval}" \
+    | kc -n "${ARGOCD_NS}" exec -i "deploy/${ARGOCD_SERVER_DEPLOY}" -c server -- argocd account bcrypt)" \
+    || die "rotate argocd-admin: argocd account bcrypt in ${ARGOCD_NS}/${ARGOCD_SERVER_DEPLOY} failed; nothing was changed"
+  [[ "${out}" =~ ${re} ]] || die "rotate argocd-admin: argocd account bcrypt returned no bcrypt hash; nothing was changed"
+  hash="${BASH_REMATCH[1]}"
+  out=""
+  mark_sensitive "${hash}"
+  # 2. store the new value
+  _secrets_argocd_break_glass_write newval
+  # 3. activate it
+  mtime="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  f="$(umask 077 && mktemp "${WORK_DIR}/patch.XXXXXX")"
+  printf '%s' "${hash}" | "${JQ}" -Rs --arg m "${mtime}" \
+    '{data: {"admin.password": (. | @base64), "admin.passwordMtime": ($m | @base64)}}' > "${f}"
+  if ! kc -n "${ARGOCD_NS}" patch secret argocd-secret --type merge --patch-file "${f}" >/dev/null; then
+    shred -u "${f}" 2>/dev/null || rm -f "${f}"
+    die "rotate argocd-admin: cannot patch ${ARGOCD_NS}/argocd-secret; the old admin password stays valid, but ${ARGOCD_BREAK_GLASS_SECRET} now holds the new, inactive one: run rotate argocd-admin again"
+  fi
+  shred -u "${f}" 2>/dev/null || rm -f "${f}"
+  hash=""
+  changed "set the new ArgoCD admin password (${ARGOCD_NS}/argocd-secret admin.password, admin.passwordMtime ${mtime}: older admin sessions end)"
+  # 4. prove it, then remove ArgoCD's initial password. ArgoCD locks a user
+  # for 5 minutes after 5 failed logins, so the attempts are few and spaced.
+  for (( i = 1; i <= ARGOCD_LOGIN_ATTEMPTS; i++ )); do
+    sleep "${ARGOCD_LOGIN_DELAY}"
+    code="$(_secrets_argocd_login newval)"
+    [[ "${code}" == "200" ]] && break
+    log "rotate argocd-admin: login check ${i}/${ARGOCD_LOGIN_ATTEMPTS}: HTTP ${code}"
+  done
+  newval=""
+  [[ "${code}" == "200" ]] \
+    || die "rotate argocd-admin: the login check with the new password got HTTP ${code} (https://argocd.${TEKNOIR_DOMAIN}/api/v1/session); the new password is set and stored in ${ARGOCD_NS}/${ARGOCD_BREAK_GLASS_SECRET}, and ${ARGOCD_INITIAL_SECRET} was kept. Check ArgoCD, then run rotate argocd-admin again (after 5 minutes if ArgoCD locked the admin login)"
+  log "rotate argocd-admin: login with the new password: HTTP 200"
+  if in_cluster secret "${ARGOCD_INITIAL_SECRET}" "${ARGOCD_NS}"; then
+    kc -n "${ARGOCD_NS}" delete secret "${ARGOCD_INITIAL_SECRET}" >/dev/null \
+      || die "rotate argocd-admin: the new password works, but deleting ${ARGOCD_NS}/${ARGOCD_INITIAL_SECRET} failed; delete it by hand"
+    changed "deleted ${ARGOCD_NS}/${ARGOCD_INITIAL_SECRET} (it no longer works)"
+  fi
+}
+
 cmd_rotate() {
   local name="" iknow=0 d
   while (( $# > 0 )); do
@@ -464,7 +613,7 @@ cmd_rotate() {
     esac
     shift
   done
-  [[ -n "${name}" ]] || die "rotate: NAME required (oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service harbor-secret-key keycloak-db)"
+  [[ -n "${name}" ]] || die "rotate: NAME required (oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service harbor-secret-key keycloak-db argocd-admin)"
   require_cluster rotate || return 0
   ensure_work_dir
   case "${name}" in
@@ -498,8 +647,11 @@ cmd_rotate() {
       (( iknow )) || die "rotate keycloak-db: changes the Keycloak database password and restarts Keycloak (sign-ins fail meanwhile). Read OPERATE.md (rotate), then re-run with --i-know"
       _secrets_rotate_keycloak_db
       ;;
+    argocd-admin)
+      _secrets_rotate_argocd_admin
+      ;;
     *)
-      die "rotate: ${name} is not rotatable here (rotatable: oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service harbor-secret-key keycloak-db); the Root CA, the Keycloak admin and the client secrets follow OPERATE.md"
+      die "rotate: ${name} is not rotatable here (rotatable: oauth2-proxy-cookie oauth2-proxy-redis harbor-token-service harbor-secret-key keycloak-db argocd-admin); the Root CA, the Keycloak admin and the client secrets follow OPERATE.md"
       ;;
   esac
   summary
