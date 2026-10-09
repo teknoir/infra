@@ -113,6 +113,7 @@ LANHOME="${OLD_SETUP_DIR}/lanhome"
 BIN="${OLD_SETUP_DIR}/bin"
 LOG="${OLD_SETUP_DIR}/old-setup.log"
 DIR_TAG="${OLD_SETUP_DIR}/.old-setup-dir"
+VM_ID_FILE="${OLD_SETUP_DIR}/vm-machine-id"
 BUNDLE_NAME="teknoir-airgap-bundle-0.1.0"
 BUNDLE="${INFRA}/bundle/${BUNDLE_NAME}"
 NODE_USER="teknoir"
@@ -713,7 +714,7 @@ clean() {
 }
 
 main() {
-  local build_only=0 do_clean=0 t0 hosts
+  local build_only=0 do_clean=0 t0 hosts vm_id
   if [[ "${1:-}" == __push ]]; then shift; push_with_dummy_admin "$@"; fi
   while (( $# )); do
     case "$1" in
@@ -730,6 +731,15 @@ main() {
   need git helm crane python3 openssl sha256sum cmp tar curl
   python3 -c 'import yaml' 2>/dev/null || die "python3 without PyYAML (the old render needs it)"
   umask 077
+  if (( ! build_only )) && [[ -f "${VM_ID_FILE}" ]]; then
+    # the dummy secrets of phase 2 (the robot$argocd token) belong to the VM
+    # they were made for: a re-created VM starts from a clean work dir
+    vm_id="$("${VM}" ssh cat /etc/machine-id 2>/dev/null)" || die "the VM ${VM_IP} does not answer on ssh (vm.sh start)"
+    if [[ "${vm_id}" != "$(cat "${VM_ID_FILE}")" ]]; then
+      log "the VM was re-created since the last run (machine-id changed): starting from a clean ${OLD_SETUP_DIR}"
+      do_clean=1
+    fi
+  fi
   if (( do_clean )); then clean; fi
   install -d -m 0700 "${OLD_SETUP_DIR}" "${LANHOME}"
   : > "${DIR_TAG}"
@@ -757,6 +767,7 @@ main() {
   write_ssh_wrapper
 
   check_fresh
+  "${VM}" ssh cat /etc/machine-id > "${VM_ID_FILE}" || die "cannot read the VM's machine-id"
   stage upload do_upload
   stage k3s do_k3s
   stage bootstrap do_bootstrap
