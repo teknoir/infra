@@ -139,7 +139,23 @@ secrets)
   check "no temporary file left next to --out" sh -c '! ls -A /tmp/out | grep -q "^\.teknoir-airgap\."'
   expect_rc 0 "admin-user for a user without a temporary password" "${T}" admin-user --email existing@teknoir.ai --out /tmp/out/existing.txt
   expect_out "recorded no temporary password" "says that no password was written"
+  expect_out "reset-password --out NEW-FILE" "names --reset-password"
   check "no --out file without a password" test ! -e /tmp/out/existing.txt
+  expect_rc 1 "admin-user with a non-empty --out" "${T}" admin-user --email anders.aslund@teknoir.ai --out /tmp/out/admin.txt
+  expect_out "never overwrites a file" "refuses to overwrite"
+  check "the existing file is kept" grep -qx 's3cr3t-temporary-password' /tmp/out/admin.txt
+  expect_rc 2 "admin-user --reset-password without --out" "${T}" admin-user --email anders.aslund@teknoir.ai --reset-password
+  expect_rc 0 "admin-user --reset-password --teamspace NAME --out" "${T}" admin-user --email anders.aslund@teknoir.ai --reset-password --teamspace teknoir-default --out /tmp/out/reset.txt
+  expect_out "fake admin-user flags: --teamspace teknoir-default --reset-password" "both flags reach teknoir-node"
+  expect_out "the new temporary password of anders.aslund@teknoir.ai is in /tmp/out/reset.txt" "names the file"
+  check "the new temporary password is in the file" grep -qx 's3cr3t-reset-password' /tmp/out/reset.txt
+  check "the reset file is 0600" test "$(mode_of /tmp/out/reset.txt)" = 600
+  expect_no_out "s3cr3t" "the new password is not printed"
+  expect_rc 1 "admin-user that fails on the node after the handover" "${T}" admin-user --email late@teknoir.ai --out /tmp/out/late.txt
+  expect_out "after it handed out the temporary password, which is in /tmp/out/late.txt" "says where the password is"
+  check "the password handed out before the failure is kept" grep -qx 's3cr3t-temporary-password' /tmp/out/late.txt
+  check "the kept file is 0600" test "$(mode_of /tmp/out/late.txt)" = 600
+  check "no temporary file left next to --out after the failures" sh -c '! ls -A /tmp/out | grep -q "^\.teknoir-airgap\."'
   ;;
 passthrough)
   section "rotate, migrate and up flags reach teknoir-node"
