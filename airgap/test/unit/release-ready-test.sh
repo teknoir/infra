@@ -221,6 +221,15 @@ check "reported only: teknoir-demo-jwks (not in GitOps), the stale-uid teamspace
 check "the report names the teamspace and why" grep -qF 'teknoir-demo-jwks	teamspace teknoir-demo, not declared in GitOps	Unknown/Healthy' "${WORK}/out"
 check "a failed plugin of a teamspace declared in GitOps is reported, not waited for" \
   grep -qxF 'profile/teknoir-default	teamspace teknoir-default, plugin status (profile-controller retries)	plugin(s) not applied: EMQX Fail' "${WORK}/out"
+# a failed sync of a teamspace not in GitOps: how to retry it, but not "run up
+# again" (it never blocks up)
+jq -c '(.items[] | select(.metadata.name == "teknoir-demo-jwks"))
+       |= (.status.sync.status = "Synced" | del(.status.conditions)
+           | .status.operationState = {phase: "Failed", message: "boom", syncResult: {revision: .status.sync.revision}})' \
+  "${WORK}/apps.json" > "${WORK}/demo-failed.json"
+run_lib '_release_post_reported "$(_release_classify "$(cat "${W}/demo-failed.json")" "$(cat "${W}/profiles.json")")"'
+check "a failed reported-only teamspace Application: how to retry it, without 'run up again'" \
+  grep -qxF 'teknoir-demo-jwks	teamspace teknoir-demo, not declared in GitOps	last sync to 0.0.99 Failed: boom; post re-syncs platform Applications only: Sync this one in the ArgoCD UI (or with the patch in OPERATE section 12)' "${WORK}/out"
 jq -c '.items |= map(select(.metadata.name != "app-of-apps"))' "${WORK}/apps.json" > "${WORK}/noroot.json"
 run_lib '_release_post_not_ready "$(_release_classify "$(cat "${W}/noroot.json")" "$(cat "${W}/profiles.json")")"'
 check "a missing root is not ready" grep -qF 'app-of-apps	not created yet' "${WORK}/out"

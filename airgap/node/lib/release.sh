@@ -95,7 +95,8 @@ ARGOCD_INITIAL_ADMIN_SECRET="argocd-initial-admin-secret"
 # stale either (else the child's spec may be about to change: right after a
 # pin, the old revision's failure must never be re-applied). resync_hint: post
 # never re-syncs a teamspace (or other) Application (R2) and ArgoCD never
-# retries a failed revision, so the reason of such a failure says how to retry.
+# retries a failed revision, so the reason of such a failure says how to retry
+# (and, when it blocks post, to run up again afterwards).
 RELEASE_JQ_READY='
 def exactver: test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$");
 def epoch: (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0);
@@ -125,7 +126,8 @@ def specwhy($root; $pinAt):
 def stale($root; $pinAt): [opwhy, specwhy($root; $pinAt)];
 def resync_hint:
   if failedop and (.teknoirPost.class // "platform") != "platform"
-  then "post re-syncs platform Applications only: Sync this one in the ArgoCD UI (or with the patch in OPERATE section 12), then run up again"
+  then "post re-syncs platform Applications only: Sync this one in the ArgoCD UI (or with the patch in OPERATE section 12)\(
+        if .teknoirPost.strict == true then ", then run up again" else "" end)"
   else empty end;
 def why($root; $pinAt):
   [ (if (.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy"
