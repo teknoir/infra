@@ -34,7 +34,9 @@
 # --out is never overwritten); --reset-password (one temporary=true call, the
 # file 0600, a refused reset removes the file, a superseded Secret or legacy
 # value is deleted afterwards); resume with an --out that already holds the
-# recorded value; a Secret or legacy value replaced between read and delete
+# recorded value; an existing EMPTY 0600 --out (what the LAN tool passes from
+# node_mktemp) is filled by a handover and by --reset-password, leaving no
+# .teknoir-admin-user.* temp file; a Secret or legacy value replaced between read and delete
 # survives (uid/resourceVersion preconditions, the legacy sha256 guard); owner
 # claims on the user's own teamspaces only, existing claims kept, claim_set
 # absent (a null is pruned to that), a conflicting change retried,
@@ -111,6 +113,11 @@ no_legacy() { ! has_legacy "$1"; }
 unchanged_and_on_record() { [[ "$(fstate "$1")" == "$2" ]] && has_legacy "$3"; }
 fstate() { [[ -e "$1" ]] && printf '%s %s' "$(sha256sum < "$1" | cut -c1-64)" "$(stat -c %Y "$1")"; }
 same_file() { cmp -s "$1" "$2"; }
+dir_holds() {
+  # dir_holds <dir> <file...> — <dir> holds exactly these files (nothing else, no dot files)
+  local d="$1"; shift
+  [[ "$(find "${d}" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" == "$(for f in "$@"; do basename "${f}"; done | sort)" ]]
+}
 wait_until() { local n="$1"; shift; while ! "$@"; do (( n-- > 0 )) || return 1; sleep 1; done; }
 has_k1() { [[ -n "$(K -n "${CRED_NS}" get secret "user-initial-password-$1" --ignore-not-found -o name)" ]]; }
 no_k1() { ! has_k1 "$1"; }
@@ -531,6 +538,40 @@ check "  ... it says the file already holds the password" grep -q "pwE.txt alrea
 check "  ... the Secret is gone afterwards" no_k1 "${E}"
 check "  ... the file is not rewritten" test "$(fstate "${WORK}/files/pwE.txt")" == "${pwE0}"
 
+say "an existing EMPTY --out, as the LAN tool passes it (node_mktemp: a new 0600 file in a 0700 directory)"
+# The LAN tool always hands the node a fresh empty file from node_mktemp in
+# /var/lib/teknoir-airgap/tmp; admin-user must fill it, not refuse it as existing.
+NT="${WORK}/files/node-tmp"
+( umask 077; mkdir "${NT}" )
+M=empty.out-at-teknoir.ai
+new_user "${M}" empty.out@teknoir.ai
+check "the stand-in recorded a Secret for ${M}" wait_until 30 has_k1 "${M}"
+outM="$(umask 077; mktemp "${NT}/admin-user.XXXXXX")"
+check "  ... the pre-created --out exists, is empty and has mode 0600" bash -c "[[ -f '${outM}' && ! -s '${outM}' && \$(stat -c %a '${outM}') == 600 ]]"
+if admin_user --email empty.out@teknoir.ai --out "${outM}" > "${WORK}/out/runM.log" 2>&1; then
+  ok "admin-user into an empty --out (Secret on record) exits 0"
+else
+  bad "admin-user into an empty --out (Secret on record) exits 0"; cat "${WORK}/out/runM.log"
+fi
+check "  ... the file (0600) holds exactly the recorded value" bash -c "cmp -s '${outM}' '${WORK}/rec/${M}' && [[ \$(stat -c %a '${outM}') == 600 ]]"
+check "  ... it wrote the file (not 'already holds') and deleted the Secret" bash -c "grep -q 'written to ${outM} (mode 0600, not shown); deleted Secret ${CRED_NS}/user-initial-password-${M}' '${WORK}/out/runM.log' && ! grep -q 'already holds' '${WORK}/out/runM.log'"
+check "  ... the Secret is gone" no_k1 "${M}"
+check "  ... no .teknoir-admin-user.* temp file is left, only the --out file" dir_holds "${NT}" "${outM}"
+# the same User again, now with nothing on record: the usual "lost the temporary password" reset
+uidM="$(kc_uid empty.out@teknoir.ai)"
+outM2="$(umask 077; mktemp "${NT}/admin-user.XXXXXX")"
+check "  ... the second pre-created --out is empty, mode 0600" bash -c "[[ -f '${outM2}' && ! -s '${outM2}' && \$(stat -c %a '${outM2}') == 600 ]]"
+if admin_user --email empty.out@teknoir.ai --reset-password --out "${outM2}" > "${WORK}/out/resetM.log" 2>&1; then
+  ok "--reset-password into an empty --out exits 0"
+else
+  bad "--reset-password into an empty --out exits 0"; cat "${WORK}/out/resetM.log"
+fi
+check "  ... exactly one reset-password call for ${M}, temporary=true, length 20" bash -c "curl -fsS http://127.0.0.1:${KC_PORT}/test/state | jq -e --arg u '${uidM}' '[.resets[] | select(.user == \$u)] == [{user: \$u, type: \"password\", temporary: true, length: 20}]' >/dev/null"
+check "  ... the file (0600) holds exactly the password Keycloak got" bash -c "cmp -s '${outM2}' '${WORK}/rec/reset-${uidM}.txt' && [[ \$(stat -c %a '${outM2}') == 600 ]]"
+check "  ... the first --out is untouched" same_file "${outM}" "${WORK}/rec/${M}"
+check "  ... no .teknoir-admin-user.* temp file is left, only the two --out files" dir_holds "${NT}" "${outM}" "${outM2}"
+check "  ... no password in the output" no_secret_in "${WORK}/out/runM.log" "${WORK}/out/resetM.log"
+
 say "--reset-password while a temporary password is still on record"
 F=reset.secret-at-teknoir.ai
 new_user "${F}" reset.secret@teknoir.ai
@@ -643,8 +684,10 @@ check "the password was still handed over before (0600, equal)" bash -c "cmp -s 
 check "a user owning no teamspace gets no claim" bash -c "grep -q 'owns no teamspace' '${WORK}/out/runC.log' && kubectl --context ${CTX} get users.teknoir.org ${C} -o json | jq -e '.spec | has(\"claim_set\") | not' >/dev/null"
 check "backstage-api was never restarted" test "$(K -n teknoir-system get deploy backstage-api -o jsonpath='{.metadata.generation}')" == "${gen0}"
 
-say "no secret value in any output"
+say "no secret value in any output, no temp file left"
 check "no password (temporary, reset, Keycloak admin) in any log" no_secret_in "${WORK}"/out/*.log
+check "no .teknoir-admin-user.* temp file left by any run (failed ones included)" \
+  test -z "$(find "${WORK}/files" -name '.teknoir-admin-user.*' -print)"
 
 say "result: ${PASS} passed, ${FAIL} failed"
 if (( FAIL > 0 )); then
