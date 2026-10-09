@@ -16,7 +16,10 @@ reasons for the redesign are kept here. The git history of `infra` and
   offline. The 0.0.4 tooling waited for every Application, so the next `up`
   would have failed after 20 minutes. Now `up` waits for the root and the
   Applications it tracks, and for teamspaces declared in GitOps
-  (`teknoir-default`); other Applications are reported in a `WARN`.
+  (`teknoir-default`); other Applications are reported in a `WARN`. For such a
+  teamspace it also waits until the profile-controller has created its
+  Applications, so a controller that cannot create them fails `up` instead of
+  passing with an empty teamspace.
 - **A failed sync is no longer missed or left behind.** On 2026-10-08
   `monitoring`'s first sync failed while its 1-replica Prometheus had no ready
   pod; ArgoCD spent its 5 retries, then never retried that revision. The
@@ -28,6 +31,9 @@ reasons for the redesign are kept here. The git history of `infra` and
   revision counts as not ready, and post re-syncs such a platform Application
   once per run, setting the operation and clearing the old state in one patch,
   as ArgoCD's own API does. The troubleshooting command in OPERATE does the same.
+  Post re-syncs only a failure of the version the Application stays at: right
+  after r5 pins `monitoring` 0.0.5, its 0.0.4 failure is left to the new
+  version's own sync.
 - **Secrets left over from the migration.** Post removes the Keycloak admin's
   `previous-password` once the current password logs in (it was removed by hand
   on live). `migrate` retires files with mode 0600, and `migrate --finalize`

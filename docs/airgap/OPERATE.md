@@ -83,7 +83,11 @@ Which Applications the post phase waits for:
   `argocd.argoproj.io/tracking-id` starts with `app-of-apps:`). `up` fails if one
   of them is not Synced and Healthy at this release within the timeout.
 - **Teamspaces declared in GitOps** (an Application owned by a Profile that the
-  profile-controller chart declares, such as `teknoir-default`): the same.
+  profile-controller chart declares, such as `teknoir-default`): the same. The
+  Profile itself (`profile/teknoir-default` in the output) must also be ready:
+  the profile-controller has run for it and created one Application per enabled
+  plugin chart. A plugin that the profile-controller could not apply (shown as
+  `plugin(s) not applied: EMQX Fail`) is only reported: the controller retries it.
 - **Every other Application** is reported, never waited for: teamspaces created in
   Backstage (such as `teknoir-demo`) and Applications without a Teknoir owner. A
   `WARN` line lists the ones that are not ready.
@@ -94,7 +98,10 @@ that has failed for the same revision. The post phase re-syncs such an
 Application once per run, the way ArgoCD's own UI does: one patch that sets the
 sync operation and clears the old operation state. The patch never sets the
 operation alone (see section 12). If that sync fails again, `up` fails and
-names the error.
+names the error. Right after `up` pins a new release, an Application can still
+show the failure of its previous version until ArgoCD has applied and compared
+the new one; post does not re-sync that old failure, it waits for the new
+version's own sync.
 
 CoreDNS answers the platform names itself and forwards every other name to
 `UPSTREAM_DNS` from the site config when it is set, else to the node's own
@@ -281,7 +288,9 @@ Applications and the bundle payloads on the node; when this bundle is on the
 node it adds `teknoir-node status` (Harbor, certificate expiry and more). Its
 `apps:` lines count the Applications per class (platform, each teamspace,
 other) with how many are not ready and whether `up` waits for them; in the
-table, a class marked `*` is reported only.
+table, a class marked `*` is reported only. Its `profile:` lines say, per
+teamspace, whether the profile-controller has created its Applications and
+which plugins it could not apply.
 
 ```sh
 ./teknoir-airgap doctor
@@ -637,9 +646,19 @@ Application in the ArgoCD UI (its failing resource and events), fix the cause,
 and run `up` again: each run re-syncs it once more.
 
 **post warns "not ready, not waited for".** These are Applications of a teamspace
-that is not declared in GitOps (created in Backstage), or Applications without a
-Teknoir owner. They never block `up`. Check them in the ArgoCD UI if the
-teamspace should work.
+that is not declared in GitOps (created in Backstage), Applications without a
+Teknoir owner, or teamspace plugins the profile-controller could not apply yet
+(`profile/<name> ... plugin(s) not applied`). They never block `up`. Check them
+in the ArgoCD UI, or the profile-controller log, if the teamspace should work.
+The EMQX plugin fails until the teamspace's EMQX pod answers, and the controller
+retries it with a growing delay (up to about 17 minutes).
+
+**`up` fails in post naming `profile/teknoir-default`.** The profile-controller
+has not created that teamspace's Applications: "not reconciled by
+profile-controller yet" (is the profile-controller pod running?), "run in
+progress", "no Applications yet" or "Applications not created yet: <names>".
+Check the profile-controller log for errors such as `forbidden`, fix the cause,
+and run `up` again.
 
 **post warns about `argocd-initial-admin-secret`.** ArgoCD's first admin password
 is still readable in that Secret. Rotate the local admin with

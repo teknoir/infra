@@ -982,13 +982,39 @@ plan and the facts behind it are in the r5 hardening plan.
   Teknoir owner) are listed in one WARN and never block. The root must exist.
   `teknoir-node status` prints one `apps:` line per class; the table has a
   CLASS column (`*` = reported only). The same rules gate `migrate --finalize`.
+- **A Profile declared in GitOps is itself waited for (TS-C6).** Its
+  Applications only exist once profile-controller has reconciled it, so without
+  this a Profile with none (profile-controller down, or Forbidden by its RBAC)
+  or only some would add nothing to wait for. Post adds a strict entry
+  `profile/<name>` that is not ready while `status.appliedconfig.lastRunStart`
+  is missing ("not reconciled by profile-controller yet"), while `lastRunEnd`
+  is missing or earlier ("run in progress"), while the Profile owns no
+  Application (owner uid checked), or while an enabled chart plugin's
+  Application is missing (profile-controller names it
+  `<profile>-<pluginConfig.name>`). A plugin whose `applyStatus.status` is not
+  `Success` is only reported: EMQX's fails until the EMQX pod answers its API,
+  and profile-controller retries with a backoff of up to ~17 min, which would
+  fail `up` on timing alone (E11 asserts every plugin `Success` on the VM).
+  Profiles not declared in GitOps get the same entry, reported only. Only
+  names, uids, run times and plugin kind/enabled/chart/status are read; never
+  a plugin's configuration. `status` prints one `profile:` line per Profile.
 - **Failed last sync (HYG-C3).** `why()` reports `last sync to <rev> <phase>:
   <message>` when `.status.operationState.phase` is Failed or Error, its
   revision (`syncResult.revision[s]`, else `operation.sync.revision[s]`) equals
   `.status.sync.revision[s]`, and no `.operation` is pending; a pending
   `.operation` is itself not ready ("requested, not started yet"), which closes
   the window between the re-sync patch and the controller picking it up. Post
-  re-syncs each such *platform* Application at most once per run
+  re-syncs each such *platform* Application, but only while that failure is
+  about the spec the Application keeps: its own status is not stale (no
+  operation pending or running, `comparedTo` equals the spec's source[s], an
+  exact chart pin equals `status.sync.revision`, the root reconciled since this
+  run's pin) and, for a child, the root is `Synced` with a status that is not
+  stale either. Right after a pin the old revision's failure is still in the
+  status (the root has not synced the new child spec yet, or ArgoCD has not
+  compared the child's new spec); re-syncing it would re-apply the superseded
+  chart, spend the once-per-run budget and, with the spec's retry, hold an
+  operation that blocks the new revision's auto-sync. The root's own failure
+  at its current pin makes the root the candidate. At most once per run
   (RELEASE_RESYNCED) with one merge patch: `metadata.resourceVersion` (the
   apiserver rejects a stale write with 409; retried at the next poll),
   `.operation` = {initiatedBy teknoir-node, sync {revision[s] it is at,
