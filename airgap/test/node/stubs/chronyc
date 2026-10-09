@@ -2,7 +2,14 @@
 # Stub chronyc. Records every call in $STUB_CALLS (settime with the TZ it ran
 # under). State in $STUB_STATE: chrony.ref (tracking Reference ID, default
 # 7F7F0101 = LOCAL), chrony.refname, chrony.sources (lines after the header
-# of `sources`). settime exits $STUB_SETTIME_RC (0).
+# of `sources`), chrony.manual (the manual samples: one line per sample, the
+# node clock's epoch when it was taken; `[-c] manual list` prints them as
+# chronyc 4.6.1 does, the time as "YYYY-MM-DD HH:MM:SS" (UTC) also with -c; `manual reset` empties it; chrony.manual-list-rc makes
+# `manual list` fail with that code, chrony.reset-rc `manual reset`). settime
+# exits $STUB_SETTIME_RC (0).
+# Under the fakeclock shim (FAKECLOCK_FILE) settime remembers the correction
+# it asks for and makestep applies it to the shifted clock, as chronyd steps
+# the real one; without makestep the clock does not move (chronyd slews).
 if [[ "$*" == *settime* ]]; then
   printf 'chronyc %s (TZ=%s)\n' "$*" "${TZ:-}" >> "${STUB_CALLS:?}"
 else
@@ -10,6 +17,8 @@ else
 fi
 ref="$(cat "${STUB_STATE:?}/chrony.ref" 2>/dev/null || echo 7F7F0101)"
 name="$(cat "${STUB_STATE}/chrony.refname" 2>/dev/null || true)"
+manual="${STUB_STATE}/chrony.manual"
+pending="${STUB_STATE}/chrony.pending"
 case " $* " in
   *" tracking "*)
     printf 'Reference ID    : %s (%s)\nStratum         : 10\nRef time (UTC)  : Fri Oct 09 06:00:00 2026\n' "${ref}" "${name}"
@@ -20,7 +29,36 @@ case " $* " in
     cat "${STUB_STATE}/chrony.sources" 2>/dev/null ;;
   *" settime "*)
     [[ "${STUB_SETTIME_RC:-0}" == 0 ]] || { echo "501 Not authorised"; exit "${STUB_SETTIME_RC}"; }
-    printf '200 OK\nClock was 0.42 seconds fast.  Frequency change = 0.00ppm, new frequency = 0.00ppm\n' ;;
-  *" makestep "*) echo "200 OK" ;;
+    args="$*"
+    when="${args##*settime }"
+    target="$(LC_ALL=C TZ=UTC date -d "${when}" +%s)"
+    now="$(date +%s)"
+    echo "${now}" >> "${manual}"
+    [[ -z "${FAKECLOCK_FILE:-}" ]] || echo "$(( target - now ))" > "${pending}"
+    printf '200 OK\nClock was %s seconds fast.  Frequency change = 0.00ppm, new frequency = 0.00ppm\n' "$(( now - target )).00" ;;
+  *" makestep "*)
+    if [[ -n "${FAKECLOCK_FILE:-}" && -f "${pending}" ]]; then
+      echo "$(( $(cat "${FAKECLOCK_FILE}") + $(cat "${pending}") ))" > "${FAKECLOCK_FILE}"
+      rm -f "${pending}"
+    fi
+    echo "200 OK" ;;
+  *" manual list "*)
+    rc="$(cat "${STUB_STATE}/chrony.manual-list-rc" 2>/dev/null || echo 0)"
+    [[ "${rc}" == 0 ]] || { echo "506 Cannot talk to daemon"; exit "${rc}"; }
+    i=0
+    while read -r t; do
+      [[ -n "${t}" ]] || continue
+      if [[ " $* " == *" -c "* ]]; then
+        printf '%d,%s,-4.64,-4.64,0.00\n' "${i}" "$(date -u -d "@${t}" '+%Y-%m-%d %H:%M:%S')"
+      else
+        printf '%2d %s %10.2f %10.2f %10.2f\n' "${i}" "$(date -u -d "@${t}" '+%Y-%m-%d %H:%M:%S')" -4.64 -4.64 0
+      fi
+      i=$(( i + 1 ))
+    done < <(cat "${manual}" 2>/dev/null)
+    ;;
+  *" manual reset "*)
+    rc="$(cat "${STUB_STATE}/chrony.reset-rc" 2>/dev/null || echo 0)"
+    [[ "${rc}" == 0 ]] || { echo "501 Not authorised"; exit "${rc}"; }
+    : > "${manual}"; echo "200 OK" ;;
 esac
 exit 0

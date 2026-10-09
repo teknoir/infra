@@ -13,7 +13,7 @@ implementation differs, update this file in the same commit.
 | D3 | **Harbor `teknoir` chart project is public** (LAN-only; charts are on public GitHub anyway). No robot account, no repo-creds credential, no robot env file. Tag immutability stays on the `teknoir` project. |
 | D4 | **Sequencing: redesign first.** user-controller + Backstage ship inside the redesign (app-of-apps 0.0.4). The full procedure is tested end to end in the airgapped KVM VM before the live teknoir-local is migrated. Staging (r415) gets the user-controller secret fix afterwards. |
 | D5 | **Toolbox image** for in-cluster Jobs (platform-secrets, Harbor OIDC config, misc): `docker.io/alpine/k8s:1.34.11` (sh, kubectl, curl, jq). Mirrored like every other image. |
-| D6 | Datastore stays sqlite for now (etcd later). New installs set `secrets-encryption: true`; the live node gets it in a later window. Time (r5): chrony and hwclock ship in the bundle (`node/debs`, installed offline by the host phase); chrony serves NTP to the LAN from a local stratum-10 reference fed by a LAN-host sample on every `up`, or from `TIME_SOURCE` when set; a node/LAN skew up to 30 s is corrected automatically, more only with `--sync-clock`; `up` writes the RTC. |
+| D6 | Datastore stays sqlite for now (etcd later). New installs set `secrets-encryption: true`; the live node gets it in a later window. Time (r5): chrony and hwclock ship in the bundle (`node/debs`, installed offline by the host phase); chrony serves NTP to the LAN from a local stratum-10 reference fed by a LAN-host sample on every `up`, or from `TIME_SOURCE` when set; a node/LAN skew up to 30 s is corrected automatically (a node behind is stepped forward, one ahead is slewed by chrony), more only with `--sync-clock`; chrony learns the drift only from samples at least 12 h apart (`maxdrift 100`); `up` writes the RTC. |
 | D7 | The bundle ships `kubectl` for the LAN host (linux-amd64, darwin-arm64) as a convenience; `up` itself needs only ssh, tar and sha256sum/shasum. |
 | D8 | Teknoir image tags stay mutable for now (warn only); `images.lock` records digests. Immutable image tags need CI changes in the image repos (out of scope). |
 | D9 | No tag immutability on the mirror projects (only on `teknoir`). |
@@ -64,10 +64,13 @@ package adds its own subsection.
   (bash 3.2, no locale-dependent ranges). A value holding `SECRET-KEY` (any
   case, anywhere) is refused with "holds an age PRIVATE key
   (AGE-SECRET-KEY-...) ... treat that identity as exposed" and nothing of the
-  value is printed; any other bad entry is shown with at most its first 12
+  value is printed; any other bad entry is shown with at most its first 8
   characters (control and glob characters as `?`), so neither the run logs nor
   the build output ever hold a key. The build's `site_check` also refuses an
-  age identity anywhere else in a site file, a comment included. Decision:
+  age identity (`AGE-SECRET-KEY-1` and key characters; a comment that only
+  names the prefix passes) anywhere else in a site file, a comment included.
+  The message texts are WP-I-HOST's, so both packages' tests check one text.
+  Decision:
   two recipients, the operator's key and an offline recovery key; no identity
   ever goes onto the node or into a repo.
 - **Node backups** (I-12 superseded): with recipients, `backup_take` also writes
@@ -124,23 +127,50 @@ resolve (coredns-custom knew only the platform names).
   `DPkg::Lock::Timeout=300` (unattended-upgrades) and keeps changed conffiles.
 - **chrony (TIME-T3).** The drop-in `/etc/chrony/conf.d/teknoir-airgap.conf`
   holds one `server <s> iburst prefer` line per `TIME_SOURCE` entry, then
-  `allow <NODE_IP network>/<prefix>`, `local stratum 10` and `manual`. chrony
+  `allow <NODE_IP network>/<prefix>`, `local stratum 10`, `manual` and
+  `maxdrift 100` (the largest clock-rate correction chrony may use, 8.6 s a
+  day; chrony's default is 500000 ppm). chrony
   restarts only when the drop-in changes, and is enabled and started when it
   is installed but not active. Debian's own `pool 2.debian.pool.ntp.org` line
   stays: a drop-in cannot remove it, it fails or times out on an airgap, and
   it is a valid source if egress ever opens.
-- **Clock policy (TIME-T3).** Preflight compares the node with `--lan-time`:
-  up to 2 s nothing; up to 30 s corrected by this run (with an active chrony
-  through the host-phase sample, else stepped at once with `date -u -s`); more
-  is refused unless `--sync-clock`, which steps at once (`chronyc settime` +
-  `makestep`, or `date -u -s`) and writes the RTC. The host phase gives chrony
-  one sample per `up` (`TZ=UTC chronyc settime`) while its reference is LOCAL,
-  MANU or none and no source is selected (`^*`); chrony learns the drift from
-  the samples of successive runs (driftfile). Deviation from the
-  investigation: when the sample is more than 2 s off, the host phase also
-  runs `chronyc makestep`, so the correction applies at once instead of
-  slewing for minutes (20 s at chrony's maximum slew rate takes about 4 min)
-  and the VM e2e can assert it within 60 s. The RTC is written
+- **Clock policy (TIME-T3).** Preflight compares the node with `--lan-time`
+  (skew = node - LAN host): up to 2 s nothing; up to 30 s corrected by this
+  run without a flag, but never by a step back: with an active chrony through
+  the host-phase sample, else a node behind is stepped forward at once with
+  `date -u -s` (a refused `date` is a WARN: time must not block a platform
+  update) and a node ahead is left to chrony (WARN); more is refused unless
+  `--sync-clock`, which steps at once in either direction (`chronyc settime` +
+  `makestep`, or `date -u -s`, fatal if refused) and writes the RTC. The host
+  phase gives chrony one sample per `up` (`TZ=UTC chronyc settime`) while its
+  reference is LOCAL, MANU or none and no source is selected (`^*`).
+  Deviations from the investigation: when the node is more than 2 s behind
+  the sample, the host phase also runs `chronyc makestep`, so the correction
+  applies at once instead of slewing for minutes (20 s at chrony's maximum
+  slew rate takes about 4 min) and the VM e2e can assert it within 60 s; a
+  node more than 2 s ahead is slewed by chrony (teknoir-node does not step a
+  running node back without `--sync-clock`; chrony itself may step it under
+  Debian's `makestep 1 3` in its first three updates after a start).
+- **Drift learning (TIME-T3, review r5).** chrony fits a clock rate across its
+  manual samples, and each sample is only good to about a second (whole
+  seconds on both sides, ssh latency): with the bundled chrony 4.6.1, two
+  samples 60 s apart with a 1 s error set the frequency to -16455 ppm (about
+  23 minutes a day). So before each sample `clock_manual_guard` reads
+  `chronyc -c manual list` and, when the newest sample is younger than 12 h
+  (`CLOCK_RATE_MIN_AGE`; a re-run, a second `up` the same day) or the list
+  cannot be read, runs `chronyc manual reset`: the sample then corrects the
+  offset only and the rate learned so far stays. Samples at least 12 h apart
+  still teach chrony the node's drift (live: about -45 ppm); a second of
+  sample error over 12 h is a rate error of 23 ppm, and later samples refine
+  it; chrony's list lives in memory, so a restart starts a new one, and
+  the learned rate persists in the driftfile. `maxdrift 100` bounds any fit.
+  `airgap/test/node/chrony-test.sh` checks the drop-in, the guard and the cap
+  against chronyd 4.6.1 (`chronyd -x`, which sets no clock).
+- **LAN time (review r5).** teknoir-node measures the age of `--lan-time` on
+  CLOCK_BOOTTIME (`/proc/uptime`), which setting the wall clock does not move.
+  bash's `SECONDS` follows the wall clock: with it, preflight's own `date`
+  step went into the host phase's sample, which then stepped the node that
+  far ahead again. The RTC is written
   (`hwclock --systohc --utc`) when it is more than 2 s off the system clock;
   never when `/etc/adjtime` says the RTC keeps local time. A routine sample is
   not a recorded change, so an unchanged second `up` still reports 0 changes.
@@ -177,8 +207,12 @@ resolve (coredns-custom knew only the platform names).
   (`^age1[0-9a-z]{58}$`, consumed by the backup work). The build
   (`site_check`), the node (`load_site`) and the LAN tool check all three;
   `BACKUP_AGE_RECIPIENTS` through the one validator
-  `site_age_recipients_check` (see the backup subsection above), which never
-  prints a private key.
+  `site_age_recipients_check` (see the backup subsection above). None of them
+  prints a recipient whole: an age private key (`AGE-SECRET-KEY-...`, any
+  case) is refused with "remove it now ... and treat that identity as
+  exposed", any other bad entry is named by its first 8 characters; the build
+  also refuses a private key anywhere else in the site file, comments
+  included.
 - **Not in r5:** the `teknoir-node net` tool for a static or keep-lease netplan
   with a dead-man revert (TIME-T6). teknoir-local keeps its DHCP address,
   pinned by a UniFi reservation (HOST-SETUP "Fixed address").

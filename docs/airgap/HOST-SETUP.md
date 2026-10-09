@@ -127,7 +127,8 @@ Log in as `teknoir`.
    service (systemd-timesyncd or chrony) is active.
 
    `up` corrects a difference of up to 30 seconds between the node and the LAN
-   host by itself, and refuses more unless you pass `--sync-clock`. It installs
+   host by itself (a node that is ahead is slewed back by chrony, not stepped),
+   and refuses more unless you pass `--sync-clock`. It installs
    chrony, gives it the LAN host's time on every run and writes the hardware
    clock (RTC), so the node keeps time between updates and after a reboot.
    The node serves that time to the LAN (NTP on `NODE_IP`, port 123/udp):

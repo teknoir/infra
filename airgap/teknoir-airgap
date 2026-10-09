@@ -522,7 +522,7 @@ site_age_recipients_check() {
   # X25519 public keys (^age1[0-9a-z]{58}$) separated by spaces. Valid: prints
   # nothing, returns 0. Otherwise prints one line about the first problem and
   # returns 1. It never prints a private key (SECRET-KEY anywhere in VALUE,
-  # any case: AGE-SECRET-KEY-1...) and shows at most the first 12 characters of
+  # any case: AGE-SECRET-KEY-1...) and shows at most the first 8 characters of
   # any other bad entry. The same text is in airgap/node/lib/common.sh,
   # airgap/teknoir-airgap and airgap/build/lib-build.sh: bash 3.2, no regex
   # (locale-independent); airgap/test/unit/site-age-recipients-test.sh keeps
@@ -530,7 +530,7 @@ site_age_recipients_check() {
   local v=$1 label=${2:-BACKUP_AGE_RECIPIENTS} rest w key shown
   case "${v}" in
     *[Ss][Ee][Cc][Rr][Ee][Tt]-[Kk][Ee][Yy]*)
-      printf '%s\n' "${label} holds an age PRIVATE key (AGE-SECRET-KEY-...); only public keys (age1...) belong there: remove it and treat that identity as exposed"
+      printf '%s\n' "${label} holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed"
       return 1 ;;
   esac
   rest="${v} "
@@ -545,10 +545,9 @@ site_age_recipients_check() {
         *) continue ;;
       esac
     fi
-    shown=${w:0:12}
+    shown=${w:0:8}
     shown=${shown//[![:alnum:]._-]/?}
-    [ "${#w}" -le 12 ] || shown="${shown}..."
-    printf '%s\n' "invalid ${label} entry '${shown}' (an age public key is age1 and 58 lower-case letters or digits; keys are separated by spaces)"
+    printf '%s\n' "${label} entry '${shown}...' is not an age public key (age1 followed by 58 lower-case letters and digits, separated by spaces)"
     return 1
   done
   return 0

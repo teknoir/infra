@@ -5,8 +5,9 @@ CI runs everything except the VM test: [.github/workflows/airgap-ci.yml](../../.
 
 | Suite | Command | Needs | Runs in CI |
 |---|---|---|---|
-| Static + unit | `airgap/test/run-static.sh` | shellcheck, docker (bash 3.2), gitleaks, curl (first bats install) | yes |
+| Static + unit | `airgap/test/run-static.sh` | shellcheck, docker (bash 3.2), gitleaks, curl (first bats install), cc (`node/run.sh` builds its clock shim `node/fakeclock.c`) | yes |
 | coredns-custom in CoreDNS | `airgap/test/node/coredns-test.sh` | docker, dig (one image pull) | no |
+| chrony drop-in and LAN-time samples in chronyd 4.6.1 (`-x`, no clock is set) | `airgap/test/node/chrony-test.sh` | docker, network (apt in debian:trixie) | no |
 | bats only | `airgap/test/bats/run.sh [file.bats]` | bash, curl (first run only) | yes, from run-static.sh |
 | K3s ownership (k3d) | `airgap/test/k3d/run.sh [T1 ... T9]` | docker, k3d, kubectl, jq (T6 also helm, yq) | T1-T5, T4N, T9; T6 on manual dispatch |
 | VM end to end | `airgap/test/vm/e2e.sh [--allow-destroy] [E1 ...]` | vpro: KVM, sudo, the VM base image | no |

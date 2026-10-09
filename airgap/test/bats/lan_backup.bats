@@ -153,15 +153,15 @@ lan() { bash "${BUNDLE}/teknoir-airgap" "$@" --site "${SITE}" </dev/null; }
   printf 'BACKUP_AGE_RECIPIENTS="%s age1short"\n' "${R1}" >> "${SITE}"
   run --separate-stderr lan backup --out "${BATS_TEST_TMPDIR}/out"
   [ "${status}" -eq 1 ]
-  [[ "${stderr}" == *"invalid BACKUP_AGE_RECIPIENTS entry 'age1short' (an age public key is age1"* ]]
+  [[ "${stderr}" == *"BACKUP_AGE_RECIPIENTS entry 'age1shor...' is not an age public key (age1 followed by"* ]]
   [ -z "$(stub_calls ssh)" ]
   printf 'BACKUP_AGE_RECIPIENTS="age1%s"\n' "$(printf 'Z%.0s' {1..58})" >> "${SITE}"
   run --separate-stderr lan backup --out "${BATS_TEST_TMPDIR}/out"
   [ "${status}" -eq 1 ]
-  [[ "${stderr}" == *"entry 'age1ZZZZZZZZ...' ("* && "${stderr}" != *ZZZZZZZZZ* ]]   # at most 12 characters
+  [[ "${stderr}" == *"entry 'age1ZZZZ...' is not"* && "${stderr}" != *ZZZZZ* ]]   # at most 8 characters
   local priv msg
   priv="AGE-SECRET-KEY-""1$(printf 'Q%.0s' {1..58})"   # assembled: no key-shaped literal in the repo
-  msg="BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...); only public keys (age1...) belong there: remove it and treat that identity as exposed"
+  msg="BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed"
   for v in "${priv}" "${R1} $(printf '%s' "${priv}" | tr '[:upper:]' '[:lower:]')"; do
     printf 'BACKUP_AGE_RECIPIENTS="%s"\n' "${v}" >> "${SITE}"
     run --separate-stderr lan backup --out "${BATS_TEST_TMPDIR}/out"

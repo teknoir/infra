@@ -12,7 +12,7 @@
 #   3. each copy, on this bash: valid lists pass silently; a private key
 #      (SECRET-KEY in any case, anywhere in the value, also after a valid or
 #      an invalid entry) gives exactly the PRIVATE key message and nothing of
-#      the key; any other bad entry is shown with at most its first 12
+#      the key; any other bad entry is shown with at most its first 8
 #      characters (control and glob characters as '?');
 #   4. the LAN copy gives the same answers under bash 3.2 (docker bash:3.2,
 #      pinned as in run-static.sh; skipped without docker or the image unless
@@ -109,28 +109,28 @@ t "${PRIV}" --recipient
 t age1short --recipient
 t ' '
 DRIVER
-P="BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...); only public keys (age1...) belong there: remove it and treat that identity as exposed"
-E="(an age public key is age1 and 58 lower-case letters or digits; keys are separated by spaces)"
+P="BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed"
+E="is not an age public key (age1 followed by 58 lower-case letters and digits, separated by spaces)"
 cat > "${WORK}/expected" <<EOF
 0 0 []
 1 0 []
 2 0 []
 3 0 []
-4 1 [invalid BACKUP_AGE_RECIPIENTS entry 'age1short' ${E}]
-5 1 [invalid BACKUP_AGE_RECIPIENTS entry 'AGE1QPZRY9X8...' ${E}]
-6 1 [invalid BACKUP_AGE_RECIPIENTS entry 'x' ${E}]
-7 1 [invalid BACKUP_AGE_RECIPIENTS entry 'age1qpzry9x8...' ${E}]
+4 1 [BACKUP_AGE_RECIPIENTS entry 'age1shor...' ${E}]
+5 1 [BACKUP_AGE_RECIPIENTS entry 'AGE1QPZR...' ${E}]
+6 1 [BACKUP_AGE_RECIPIENTS entry 'x...' ${E}]
+7 1 [BACKUP_AGE_RECIPIENTS entry 'age1qpzr...' ${E}]
 8 1 [${P}]
 9 1 [${P}]
 10 1 [${P}]
 11 1 [${P}]
 12 1 [${P}]
-13 1 [invalid BACKUP_AGE_RECIPIENTS entry 'age1qpzry9x8...' ${E}]
-14 1 [invalid BACKUP_AGE_RECIPIENTS entry 'a?b' ${E}]
-15 1 [invalid BACKUP_AGE_RECIPIENTS entry 'a?b' ${E}]
-16 1 [invalid BACKUP_AGE_RECIPIENTS entry 'ssh-ed25519' ${E}]
+13 1 [BACKUP_AGE_RECIPIENTS entry 'age1qpzr...' ${E}]
+14 1 [BACKUP_AGE_RECIPIENTS entry 'a?b...' ${E}]
+15 1 [BACKUP_AGE_RECIPIENTS entry 'a?b...' ${E}]
+16 1 [BACKUP_AGE_RECIPIENTS entry 'ssh-ed25...' ${E}]
 17 1 [${P/#BACKUP_AGE_RECIPIENTS/--recipient}]
-18 1 [invalid --recipient entry 'age1short' ${E}]
+18 1 [--recipient entry 'age1shor...' ${E}]
 19 0 []
 EOF
 names=("empty" "one key" "two keys" "extra spaces" "too short" "upper case" "a valid key, then junk"
@@ -153,8 +153,8 @@ while IFS= read -r want; do
   n=$((n + 1))
 done < "${WORK}/expected"
 check "every fixture ran" [ "$(wc -l < "${WORK}/common.sh.out")" == "${n}" ]
-check "no answer holds 13 or more characters of the private key" \
-  bash -c "! grep -qiE 'QPZRY9X8GF2TV|SECRET-KEY-1' '${WORK}/common.sh.out'"
+check "no answer holds 9 or more characters of a key body" \
+  bash -c "! grep -qiE 'QPZRY9X8G|SECRET-KEY-1' '${WORK}/common.sh.out'"
 
 echo "# 4. the LAN copy under bash 3.2"
 if [[ -n "${NO_DOCKER:-}" ]]; then

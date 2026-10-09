@@ -369,6 +369,13 @@ host_packages() {
 # |skew| at or below this many seconds needs no correction
 CLOCK_OK_SKEW="${CLOCK_OK_SKEW:-2}"
 RTC_EPOCH_FILE="${HOST_ROOT}/sys/class/rtc/rtc0/since_epoch"
+# chrony fits a clock rate only across LAN-time samples at least this many
+# seconds apart (clock_manual_guard): a second of sample error over 12 h is
+# a rate error of 23 ppm (over 1 min, 16700 ppm)
+CLOCK_RATE_MIN_AGE="${CLOCK_RATE_MIN_AGE:-43200}"
+# chrony's maxdrift (ppm) in the drop-in: the largest clock rate correction
+# chrony may use, 8.6 s a day (chrony's default is 500000)
+CHRONY_MAXDRIFT=100
 # 1 once this run gave chrony its LAN-time sample (settime runs once per up)
 CLOCK_SAMPLE_SENT=0
 # 1 once this run wrote (in dry-run: would write) the RTC
@@ -380,11 +387,28 @@ clock_chrony_active() {
   clock_chrony_installed && systemctl is-active --quiet chrony 2>/dev/null
 }
 
+clock_mono_cs() {
+  # clock_mono_cs - centiseconds of a clock that no setting of the wall clock
+  # moves (CLOCK_BOOTTIME, /proc/uptime). bash's SECONDS follows the wall
+  # clock, so after preflight steps the clock it would carry the step into the
+  # LAN-time estimate. SECONDS only when /proc/uptime cannot be read.
+  local up
+  if { read -r up _ < "${HOST_ROOT}/proc/uptime"; } 2>/dev/null && [[ "${up}" =~ ^([0-9]+)\.([0-9]{2}) ]]; then
+    printf '%s' "$(( 10#${BASH_REMATCH[1]}${BASH_REMATCH[2]} ))"
+  else
+    printf '%s' "$(( SECONDS * 100 ))"
+  fi
+}
+
 clock_lan_now() {
-  # clock_lan_now - the LAN host's clock now (--lan-time plus the seconds
-  # since it was parsed); empty without --lan-time
+  # clock_lan_now - the LAN host's clock now: --lan-time plus the time since
+  # it was parsed (LAN_TIME_MONO, clock_mono_cs), rounded to whole seconds.
+  # Setting the node clock does not change it. Empty without --lan-time.
   [[ -n "${LAN_TIME:-}" ]] || return 0
-  printf '%s' "$(( LAN_TIME + SECONDS - ${LAN_TIME_AT:-0} ))"
+  local now_cs at_cs
+  now_cs="$(clock_mono_cs)"
+  at_cs="${LAN_TIME_MONO:-${now_cs}}"
+  printf '%s' "$(( LAN_TIME + (now_cs - at_cs + 50) / 100 ))"
 }
 
 clock_tracking() {
@@ -446,28 +470,76 @@ clock_write_rtc() {
   fi
 }
 
+clock_manual_guard() {
+  # clock_manual_guard - before a LAN-time sample. chrony fits a clock rate
+  # (frequency) across its manual samples, and each sample is only good to
+  # about a second (whole seconds, ssh latency): two samples a minute apart
+  # taught the bundled chrony 4.6.1 a rate error of 16455 ppm. So when its
+  # newest sample is younger than CLOCK_RATE_MIN_AGE (a re-run, a second up
+  # the same day), or the list cannot be read, the samples are dropped
+  # (manual reset): the new sample then corrects the offset only and the rate
+  # learned so far stays. Samples at least that far apart still teach chrony
+  # the node's drift (live: about 45 ppm); maxdrift bounds any fit.
+  local out newest="" age=""
+  if out="$("${CHRONYC}" -c manual list 2>/dev/null)"; then
+    # chrony 4.6: "<index>,<YYYY-MM-DD HH:MM:SS (UTC)>,<slewed>,<original>,
+    # <residual>" per sample, nothing when there is none
+    newest="$(awk -F, '
+      NF == 0 { next }
+      $2 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ { if ($2 > m) m = $2; next }
+      { bad = 1 }
+      END { if (bad) print "unknown"; else print m }' <<<"${out}")"
+    [[ -n "${newest}" ]] || return 0
+    [[ "${newest}" == unknown ]] || newest="$(date -u -d "${newest}" +%s 2>/dev/null)" || newest=unknown
+  else
+    newest=unknown
+  fi
+  if [[ "${newest}" != unknown ]]; then
+    age=$(( $(date +%s) - newest ))
+    if (( age >= CLOCK_RATE_MIN_AGE )); then
+      log "chrony: its newest LAN-time sample is ${age}s old: this one may also refine the clock rate"
+      return 0
+    fi
+  fi
+  local why="their list could not be read"
+  [[ -z "${age}" ]] || why="the newest is ${age}s old, under ${CLOCK_RATE_MIN_AGE}s"
+  if run "${CHRONYC}" manual reset >/dev/null; then
+    log "chrony: dropped its manual samples (${why}): this sample corrects the offset only"
+  else
+    warn "chronyc manual reset failed: chrony may fit a clock rate across close samples (maxdrift ${CHRONY_MAXDRIFT} ppm bounds it)"
+  fi
+}
+
 clock_settime() {
   # clock_settime <epoch> - give chrony the LAN host's time as a manual sample
   # (needs 'manual' in its configuration, which host_chrony writes). chrony
-  # corrects the clock from it and learns the drift from the samples of
-  # successive runs (driftfile). Returns non-zero when chrony refuses it.
+  # corrects the clock from it, and learns the drift from samples at least
+  # CLOCK_RATE_MIN_AGE apart (clock_manual_guard; driftfile). Returns
+  # non-zero when chrony refuses it.
   local when out
   when="$(LC_ALL=C date -u -d "@$1" '+%b %d, %Y %H:%M:%S')" || return 1
+  clock_manual_guard
   out="$(run env TZ=UTC "${CHRONYC}" settime "${when}" 2>&1)" || { warn "chronyc settime failed: $(tr '\n' ' ' <<<"${out}")"; return 1; }
   CLOCK_SAMPLE_SENT=1
   log "chrony: LAN-time sample ${when} UTC: $(grep -v '^200 OK' <<<"${out}" | tr '\n' ' ')"
 }
 
 clock_step() {
-  # clock_step <epoch> <skew> - set the node clock to the LAN host's time now:
-  # through chrony when it runs (sample + makestep), else with date -u -s
-  local lan="$1" skew="$2"
+  # clock_step <epoch> <skew> <sync|auto> - set the node clock to the LAN
+  # host's time now: through chrony when it runs (sample + makestep), else
+  # with date -u -s. A clock that cannot be set stops the run only for
+  # --sync-clock (sync); in the automatic correction (auto) it is a WARN, as
+  # time must not block a platform update.
+  local lan="$1" skew="$2" mode="$3"
   if clock_chrony_active && clock_settime "${lan}"; then
     run "${CHRONYC}" makestep >/dev/null || warn "chronyc makestep failed (chrony slews the rest)"
     changed "node clock set from the LAN host through chrony (skew was ${skew}s)"
-  else
-    run "${DATE_BIN}" -u -s "@${lan}" >/dev/null || die "cannot set the node clock (date -u -s)"
+  elif run "${DATE_BIN}" -u -s "@${lan}" >/dev/null; then
     changed "node clock set from the LAN host with date (skew was ${skew}s)"
+  elif [[ "${mode}" == sync ]]; then
+    die "cannot set the node clock (date -u -s)"
+  else
+    warn "cannot set the node clock (date -u -s): it stays ${skew}s off the LAN host; chrony corrects it once it runs, or re-run with --sync-clock"
   fi
 }
 
@@ -517,11 +589,18 @@ host_time() {
       log "[dry-run] chrony (reference ${label}) would get a LAN-time sample"
     else
       skew=$(( $(date +%s) - lan ))
-      if clock_settime "${lan}" && (( ${skew#-} > CLOCK_OK_SKEW )); then
-        # apply the correction now: slewing 20 s at chrony's maximum rate
-        # takes about 4 minutes
+      if ! clock_settime "${lan}"; then
+        :
+      elif (( skew < -CLOCK_OK_SKEW )); then
+        # a node behind: apply the correction now (slewing 20 s at chrony's
+        # maximum rate takes about 4 minutes); a step forward only
         run "${CHRONYC}" makestep >/dev/null || warn "chronyc makestep failed (chrony slews the rest)"
-        changed "node clock corrected through chrony (was ${skew}s off the LAN host)"
+        changed "node clock set forward through chrony (was ${skew}s off the LAN host)"
+      elif (( skew > CLOCK_OK_SKEW )); then
+        # a node ahead: teknoir-node does not step a running node back without
+        # --sync-clock; chrony slews it (or steps it itself under its own
+        # 'makestep' rule in its first updates after a start)
+        changed "node clock ${skew}s ahead of the LAN host: chrony corrects it from the sample (no step back by teknoir-node)"
       fi
     fi
   elif clock_chrony_installed; then
@@ -571,12 +650,14 @@ host_chrony() {
     printf '# Serves NTP to the LAN (Robots, cameras: server NODE_IP). Without an\n'
     printf '# answering server below, the reference is the local clock (stratum 10),\n'
     printf '# which up corrects with the LAN host time (chronyc settime, needs manual).\n'
+    printf '# maxdrift bounds the clock rate chrony may learn (%s ppm).\n' "${CHRONY_MAXDRIFT}"
     for s in ${sources[@]+"${sources[@]}"}; do
       printf 'server %s iburst prefer\n' "${s}"
     done
     printf 'allow %s\n' "${net}"
     printf 'local stratum 10\n'
     printf 'manual\n'
+    printf 'maxdrift %s\n' "${CHRONY_MAXDRIFT}"
   } > "${conf}"
   ensure_dir "${CHRONY_CONF_DIR}" 0755
   install_file "${conf}" "${CHRONY_CONF}" 0644 "chrony: serve ${net}${TIME_SOURCE:+, source ${TIME_SOURCE}}"
