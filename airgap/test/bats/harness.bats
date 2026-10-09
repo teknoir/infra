@@ -502,6 +502,158 @@ EOF
   done
 }
 
+@test "e2e.sh: the bundle's app-of-apps version decides E1's baseline and E4's rollback leg" {
+  # shellcheck source=../vm/e2e.sh
+  source "${E2E}"
+  local d="${BATS_TEST_TMPDIR}"
+  mkdir -p "${d}/m4" "${d}/m5" "${d}/p10/node/charts" "${d}/none" "${d}/both/node/charts"
+  printf 'bundleId: x\nappOfAppsVersion: 0.0.4\n' > "${d}/m4/MANIFEST.yaml"
+  printf "appOfAppsVersion: '0.0.5' # r5\n" > "${d}/m5/MANIFEST.yaml"
+  printf 'argo 0.0.4\napp-of-apps 0.0.10\n' > "${d}/p10/node/charts/pins.txt"
+  printf 'appOfAppsVersion: "0.0.4"\n' > "${d}/both/MANIFEST.yaml"
+  printf 'app-of-apps 0.0.5\n' > "${d}/both/node/charts/pins.txt"
+  [ "$(bundle_aoa "${d}/m4")" = 0.0.4 ]
+  [ "$(bundle_aoa "${d}/m5")" = 0.0.5 ]
+  [ "$(bundle_aoa "${d}/p10")" = 0.0.10 ]
+  [ "$(bundle_aoa "${d}/both")" = 0.0.4 ]   # MANIFEST.yaml wins, as load_bundle_info on the node
+  [ -z "$(bundle_aoa "${d}/none")" ]
+  run bundle_is_r5 "${d}/m4"
+  [ "${status}" -eq 1 ]
+  bundle_is_r5 "${d}/m5"
+  bundle_is_r5 "${d}/p10"    # sort -V: 0.0.10 is after 0.0.5
+  bundle_is_r5 "${d}/none"   # no version: strict
+  # E1: auto follows the version; 0 and 1 override it
+  e1_baseline "${d}/m4"
+  run e1_baseline "${d}/m5"
+  [ "${status}" -eq 1 ]
+  E2E_E1_BASELINE=0
+  run e1_baseline "${d}/m4"
+  [ "${status}" -eq 1 ]
+  E2E_E1_BASELINE=1
+  e1_baseline "${d}/m5"
+  unset E2E_E1_BASELINE
+  # E4 after the refused A: r5 B -> pre-r5 A is the open rollback gap
+  [ "$(e4_rollback_mode "${d}/m4" "${d}/m5")" = gap ]
+  [ "$(E2E_E4_ROLLBACK=1 e4_rollback_mode "${d}/m4" "${d}/m5")" = cross ]
+  [ "$(E2E_E4_ROLLBACK=0 e4_rollback_mode "${d}/m4" "${d}/m5")" = off ]
+  [ "$(e4_rollback_mode "${d}/m5" "${d}/p10")" = run ]
+  [ "$(E2E_E4_ROLLBACK=1 e4_rollback_mode "${d}/m5" "${d}/p10")" = run ]
+  [ "$(e4_rollback_mode "${d}/m4" "${d}/both")" = run ]   # both pre-r5
+  R5_AOA=0.0.6
+  run bundle_is_r5 "${d}/m5"
+  [ "${status}" -eq 1 ]
+  # a bad switch stops e2e.sh before it checks tools or touches anything
+  # (E2E_WORK, LAN_HOME and VM_DIR point into the test dir all the same)
+  local env=(E2E_WORK="${d}/w" LAN_HOME="${d}/lan" VM_DIR="${d}/vm")
+  run env "${env[@]}" E2E_E4_ROLLBACK=yes "${E2E}" E4
+  [ "${status}" -eq 2 ]
+  [[ "${output}" == *"E2E_E4_ROLLBACK must be auto, 0 or 1"* ]]
+  run env "${env[@]}" E2E_E1_BASELINE=maybe "${E2E}" E1
+  [ "${status}" -eq 2 ]
+  [[ "${output}" == *"E2E_E1_BASELINE must be auto, 0 or 1"* ]]
+  [ ! -e "${d}/w" ] && [ ! -e "${d}/lan" ]
+}
+
+@test "e2e.sh E1: a pre-r5 bundle is a baseline (the r5-only checks warn); an r5 bundle on that platform fails them" {
+  local fx="${BATS_TEST_DIRNAME}/fixtures/e2e-release.bash" c aoa rel base w
+  for c in "0.0.4 r4 auto" "0.0.5 r4 auto" "0.0.4 r4 0" "0.0.5 r4 1" "0.0.5 r5 auto" "0.0.4 r5 auto"; do
+    read -r aoa rel base <<<"${c}"
+    w="${BATS_TEST_TMPDIR}/w-${aoa}-${rel}-${base}"
+    run bash -c "
+      W='${w}' E2E_WORK='${w}/work' LAN_HOME='${w}/lan' E2E_E1_BASELINE='${base}'
+      source '${E2E}'; RELEASE='${rel}'; source '${fx}'
+      make_bundle \"\${W}/A\" '${aoa}'; E2E_BUNDLE=\"\${W}/A\"
+      e1; echo \"FAILED=\${TL_NFAIL} R5_SOFT=[\${R5_SOFT}]\"; cat \"\${W}/calls\""
+    [ "${status}" -eq 0 ]
+    refute_grep -n 'release: unexpected' <<<"${output}"
+    [[ "${output}" == *"R5_SOFT=[]"* ]] || { echo "${c}: R5_SOFT not reset: ${output}"; return 1; }
+    case "${c}" in
+      "0.0.4 r4 auto"|"0.0.5 r4 1")
+        # A's known gaps are reported as warnings, nothing fails
+        [[ "${output}" == *"FAILED=0 "* ]] || { echo "${c}: ${output}"; return 1; }
+        local m
+        for m in "still carries status.set_initial_password" "the login may meet the Update Profile form" \
+                 "Backstage signs" "admin-user restarted no backstage-api pod" \
+                 "every platform Application's last operation Succeeded" "every monitoring admission webhook has a caBundle"; do
+          grep -q "WARN:.*not asserted: .*${m}" <<<"${output}" || { echo "${c}: no warning for '${m}': ${output}"; return 1; }
+        done
+        # the baseline login answers the Update Profile form instead of failing on it
+        grep -q "^lan ${REPO_ROOT}/airgap/test/vm/kc-login.sh " <<<"${output}"
+        refute_grep -n -- '--forbid-profile-form' <<<"${output}" ;;
+      "0.0.5 r4 auto"|"0.0.4 r4 0")
+        # the same platform under an r5 bundle (or forced strict): each gap fails
+        [[ "${output}" == *"FAILED=6 "* ]] || { echo "${c}: ${output}"; return 1; }
+        for m in "User e2e-admin-at-example.com still carries status.set_initial_password" \
+                 "oauth2-proxy login as e2e-admin@example.com" "Backstage identity not checked: no session" \
+                 "admin-user restarted no backstage-api pod" "every platform Application's last operation Succeeded" \
+                 "every monitoring admission webhook has a caBundle"; do
+          grep -q "FAIL ${m}" <<<"${output}" || { echo "${c}: no FAIL for '${m}': ${output}"; return 1; }
+        done
+        refute_grep -n 'not asserted' <<<"${output}"
+        grep -q -- "--forbid-profile-form" <<<"${output}" ;;
+      *)
+        # an r5 platform passes under either bundle
+        [[ "${output}" == *"FAILED=0 "* ]] || { echo "${c}: ${output}"; return 1; }
+        grep -q "ok   Backstage signs owner@example.com in as user:default/owner-at-example.com" <<<"${output}" ;;
+    esac
+  done
+}
+
+@test "e2e.sh E4: E2E_E4_APPS=auto from the pins; r5 -> pre-r5 rollback skipped by default, asserted part by part with E2E_E4_ROLLBACK=1" {
+  local fx="${BATS_TEST_DIRNAME}/fixtures/e2e-release.bash" c rb mode w
+  for c in "auto gap" "0 gap" "1 gap" "1 fixed"; do
+    read -r rb mode <<<"${c}"
+    w="${BATS_TEST_TMPDIR}/w-${rb}-${mode}"
+    run bash -c "
+      W='${w}' E2E_WORK='${w}/work' LAN_HOME='${w}/lan' E2E_E4_ROLLBACK='${rb}' E2E_E4_APPS=auto
+      source '${E2E}'; RELEASE=r5 ROLLBACK='${mode}'; source '${fx}'
+      make_bundle \"\${W}/A\" 0.0.4 argo 0.0.3 auth 0.0.8 istio 0.0.3 profile-controller 0.0.83 user-controller 0.0.84
+      make_bundle \"\${W}/B\" 0.0.5 argo 0.0.4 auth 0.0.9 istio 0.0.3 profile-controller 0.0.84 user-controller 0.0.85 profile-plugin-emqx 0.0.99
+      printf 'app-of-apps 0.0.4 0.0.4\nauth 0.0.8 0.0.8\nistio 0.0.3 0.0.3\nprofile-controller 0.0.83 0.0.83\nuser-controller 0.0.84 0.0.84\n' > \"\${W}/revs.A\"
+      { sed -e 's/^app-of-apps .*/app-of-apps 0.0.5 0.0.5/' -e 's/^auth .*/auth 0.0.9 0.0.9/' \
+            -e 's/^profile-controller .*/profile-controller 0.0.84 0.0.84/' -e 's/^user-controller .*/user-controller 0.0.85 0.0.85/' \"\${W}/revs.A\"
+        for p in \"\${PLUGINS[@]}\"; do echo \"teknoir-default-\${p} 0.0.99 0.0.99\"; done; } > \"\${W}/revs.B\"
+      cp \"\${W}/revs.A\" \"\${W}/revs\"; echo 'A install' > \"\${W}/record\"; touch \"\${W}/legacy\"
+      E2E_BUNDLE=\"\${W}/A\" E2E_BUNDLE_B=\"\${W}/B\"
+      e4; echo \"FAILED=\${TL_NFAIL} DESC=[\${TL_CASE_DESC}]\"; cat \"\${W}/calls\""
+    [ "${status}" -eq 0 ]
+    refute_grep -n 'release: unexpected' <<<"${output}"
+    # B: exactly the bumped Applications (argo has none, istio kept its pin) and B's teamspace
+    grep -q "ok   the Applications bundle B changed are exactly E2E_E4_APPS" <<<"${output}" || { echo "${c}: ${output}"; return 1; }
+    grep -q "B should change app-of-apps auth profile-controller teknoir-default-deadend .*teknoir-default-observatory .*user-controller" <<<"${output}"
+    grep -q "ok   after B: User e2e-admin-at-example.com carries no status.set_initial_password" <<<"${output}"
+    grep -q "ok   up with the older bundle A is refused" <<<"${output}"
+    case "${c}" in
+      "auto gap")
+        [[ "${output}" == *"FAILED=0 DESC=[update to bundle B, refusal of A, rollback to A (rollback leg not run: r5 -> pre-r5 gap)]"* ]] \
+          || { echo "${c}: ${output}"; return 1; }
+        grep -q "WARN:.*rollback to A not run: .*IgnoreExtraneous" <<<"${output}"
+        refute_grep -n -- '--rollback$' <<<"${output}" ;;
+      "0 gap")
+        [[ "${output}" == *"FAILED=0 DESC=[update to bundle B, refusal of A, rollback to A]"* ]] || { echo "${c}: ${output}"; return 1; }
+        refute_grep -n -- '--rollback$' <<<"${output}" ;;
+      "1 gap")
+        # today's design: each open part fails by name, nothing stops at the first
+        [[ "${output}" == *"FAILED=5 "* ]] || { echo "${c}: ${output}"; return 1; }
+        local m
+        for m in "up --rollback with the pre-r5 A failed" "after the rollback, not Synced/Healthy: profile-controller=OutOfSync/Healthy" \
+                 "profile-controller is Synced/Healthy after the rollback" "user-controller is Synced/Healthy after the rollback" \
+                 "the release record is bundle A, mode rollback"; do
+          grep -q "FAIL ${m}" <<<"${output}" || { echo "${c}: no FAIL for '${m}': ${output}"; return 1; }
+        done
+        grep -q "ok   Profile teknoir-default is kept" <<<"${output}"
+        grep -q "ok   Namespace teknoir-user-credentials is kept" <<<"${output}"
+        grep -q "ok   every Application is back at its revision before B" <<<"${output}"
+        grep -q "the teknoir-default Applications after the rollback: teknoir-default-emqx=Unknown/Healthy@https://teknoir.github.io" <<<"${output}" ;;
+      "1 fixed")
+        # once the rollback design is settled, the same run passes
+        [[ "${output}" == *"FAILED=0 "* ]] || { echo "${c}: ${output}"; return 1; }
+        grep -q -- "--rollback$" <<<"${output}"
+        grep -q "ok   a plain up with A keeps A in rollback mode" <<<"${output}" ;;
+    esac
+  done
+}
+
 @test "e2e.sh: the cluster reads of E1, E2, E4 and E15 select what they should (fixture JSON)" {
   # shellcheck source=../vm/e2e.sh
   source "${E2E}"

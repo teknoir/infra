@@ -23,7 +23,10 @@
 #       an oauth2-proxy login as that admin sets the new password Keycloak
 #       demands and never sees the Update Profile form; Backstage resolves the
 #       session to user:default/<name> within 3 min of the User's creation;
-#       backstage-api never restarted                       [--allow-destroy]
+#       backstage-api never restarted. A bundle older than r5 (app-of-apps <
+#       E2E_R5_AOA: bundle A of the upgrade run) is a baseline: those r5-only
+#       checks (operations, caBundle, digests, the handover, the profile form,
+#       the Backstage identity, the restarts) only warn    [--allow-destroy]
 #   E11 default teamspace teknoir-default (GitOps Profile): Profile, namespace,
 #       RoleBindings, the owner claim, policies, Secrets, the AppProject
 #       (Harbor only, no cluster kinds) and its 9 plugin Applications from
@@ -64,8 +67,10 @@
 #   E4  update to bundle B changes only the bumped Applications and records B,
 #       every platform operation Succeeded, admission caBundle set, digests
 #       match, the admin still signs in (Keycloak data kept), Harbor healthy;
-#       bundle A is refused, accepted with --rollback, and then kept
-#       (E2E_E4_ROLLBACK=0: stop after the refusal)
+#       bundle A is refused, accepted with --rollback, and then kept. From an
+#       r5 B to a pre-r5 A the rollback is not run by default (an open design
+#       gap: B's kept Profile and Namespace, A's post); E2E_E4_ROLLBACK=1 runs
+#       it and asserts each part; E2E_E4_ROLLBACK=0 stops after the refusal
 #   E5  interrupt up during payload sync, Harbor push and tarball import; each
 #       re-run completes with no manual repair
 #   E8  rotate oauth2-proxy-cookie: only that Secret changes, oauth2-proxy
@@ -107,8 +112,18 @@
 # Environment:
 #   E2E_BUNDLE       bundle A: dist/teknoir-airgap-<id>.tar (+ .tar.sha256 next to it)
 #   E2E_BUNDLE_B     bundle B for E4 and E15 (E15: the release under test)
-#   E2E_E4_APPS      exactly the Applications B changes, e.g. "app-of-apps device-controller" (E4 needs it)
-#   E2E_E4_ROLLBACK  0: E4 stops after the refused A (default 1: rollback to A)
+#   E2E_E4_APPS      exactly the Applications B changes, e.g. "app-of-apps device-controller",
+#                    or auto: app-of-apps and the Applications whose chart pin differs
+#                    between A's and B's node/charts/pins.txt, plus the teknoir-default
+#                    plugin Applications when B's profile-controller adds that Profile
+#                    (E4 needs it)
+#   E2E_E4_ROLLBACK  E4 after the refused A: auto (default) rolls back to A unless B
+#                    is r5 and A predates it (then a warning names the gap); 1 always
+#                    (r5 -> pre-r5: each part of the expected state asserted); 0 never
+#   E2E_E1_BASELINE  E1: auto (default) treats a bundle older than r5 as a baseline
+#                    (the r5-only checks warn); 1 always; 0 never (all strict)
+#   E2E_R5_AOA       the first app-of-apps version of r5 (default 0.0.5), read from
+#                    MANIFEST.yaml appOfAppsVersion or node/charts/pins.txt
 #   E2E_OLD_SETUP    E10, E15: command (run on vpro, VM_IP exported) that installs the
 #                    old (e9a3b7f) layout with dummy secrets on the fresh VM
 #                    (airgap/test/vm/old-setup.sh)
@@ -177,6 +192,11 @@ CATALOG_TIMEOUT="${E2E_CATALOG_TIMEOUT:-300}"
 # the profile-controller's default plugins (TS-C6): one Application each, <teamspace>-<plugin>
 PLUGINS=(deadend emqx prometheus jwks fleet-metrics grafana mongodb historian observatory)
 ROOT_APP="app-of-apps"
+# the first app-of-apps version of release r5: an older bundle (E1's baseline
+# in the upgrade run, E4's rollback target) predates the r5 assertions
+R5_AOA="${E2E_R5_AOA:-0.0.5}"
+# set while E1 checks a pre-r5 baseline bundle: the r5-only assertions warn
+R5_SOFT=""
 NODE_STATE_DIR=/var/lib/teknoir-airgap
 AGE_ID_DIR="${VM_DIR:-${HOME}/vmtest}/age"
 ZERO_RE="${E2E_ZERO_CHANGES_RE:-(^|[^0-9])0 change|no change|nothing changed}"
@@ -345,6 +365,34 @@ bundle_dir() {
 }
 
 bundle_id() { basename "$1" | sed 's/^teknoir-airgap-//'; }
+
+bundle_aoa() {
+  # bundle_aoa <bundle-dir> — the app-of-apps version the bundle installs:
+  # MANIFEST.yaml appOfAppsVersion, else node/charts/pins.txt (as
+  # load_bundle_info reads it on the node); empty when neither says
+  local dir="$1" v=""
+  if [[ -f "${dir}/MANIFEST.yaml" ]]; then
+    v="$(awk '/^appOfAppsVersion:/ {
+        sub(/^appOfAppsVersion:[[:space:]]*/, ""); sub(/[[:space:]]+#.*$/, ""); gsub(/^["\047]|["\047]$/, ""); print; exit }' \
+      "${dir}/MANIFEST.yaml")"
+  fi
+  if [[ -z "${v}" && -f "${dir}/node/charts/pins.txt" ]]; then
+    v="$(awk '$1 == "app-of-apps" {print $2; exit}' "${dir}/node/charts/pins.txt")"
+  fi
+  printf '%s' "${v}"
+}
+version_lt() {
+  # version_lt <a> <b> — 0 when a sorts strictly before b (sort -V, as release.sh)
+  [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]
+}
+bundle_is_r5() {
+  # bundle_is_r5 <bundle-dir> — 0 when the bundle carries release r5
+  # (app-of-apps >= R5_AOA). A bundle without a version counts as r5, so its
+  # checks stay strict.
+  local v
+  v="$(bundle_aoa "$1")"
+  [[ -z "${v}" ]] || ! version_lt "${v}" "${R5_AOA}"
+}
 
 ca_file() { find "${LAN_HOME}/.teknoir-airgap" -name teknoir-root-ca.crt -print -quit 2>/dev/null; }
 
@@ -848,17 +896,42 @@ lan_secret_patterns() {
 # ---------------------------------------------------------------------------
 url_host() { sed -E 's|^https?://([^/:?#]+).*|\1|' <<<"$1"; }
 
+e1_baseline() {
+  # e1_baseline <bundle-dir> — 0 when E1 installs a pre-r5 baseline (bundle A
+  # of the upgrade run): E2E_E1_BASELINE=1, or auto (the default) and the
+  # bundle's app-of-apps is older than R5_AOA. E2E_E1_BASELINE=0 keeps every
+  # check strict.
+  case "${E2E_E1_BASELINE:-auto}" in
+    1) return 0 ;;
+    0) return 1 ;;
+    auto) ! bundle_is_r5 "$1" ;;
+    *) tl_die "E2E_E1_BASELINE must be auto, 0 or 1 (got ${E2E_E1_BASELINE})" ;;
+  esac
+}
+
+r5_eq() {
+  # r5_eq <msg> <want> <got> — assert_eq for an assertion that only release r5
+  # satisfies; on a pre-r5 baseline (R5_SOFT set) a mismatch is a warning
+  if [[ -z "${R5_SOFT}" || "$2" == "$3" ]]; then assert_eq "$@"; return 0; fi
+  tl_warn "${R5_SOFT}, not asserted: $1: want [$2] got [$3]"
+}
+r5_fail() {
+  # r5_fail <msg> — fail, or on a pre-r5 baseline (R5_SOFT) a warning
+  if [[ -z "${R5_SOFT}" ]]; then fail "$*"; else tl_warn "${R5_SOFT}, not asserted: $*"; fi
+}
+
 platform_checks() {
   # platform_checks <output of up> — release-level assertions shared by E1, E4
-  # and E15 (after wait_apps)
+  # and E15 (after wait_apps). The operation, caBundle and digest checks are
+  # r5's (HYG, K5): on E1's pre-r5 baseline they only warn.
   local out="$1" v
   if image_check_ok "${out}"; then pass "post: live image check reports N pullable, 0 missing"
   else fail "post did not report 'live image check: N pullable ..., 0 missing'"; fi
-  assert_eq "every platform Application's last operation Succeeded" "" "$(platform_ops_not_succeeded)"
+  r5_eq "every platform Application's last operation Succeeded" "" "$(platform_ops_not_succeeded)"
   v="$(admission_ca)"
-  assert_eq "the monitoring admission webhook configurations exist (validating, mutating)" 2 "${v%% *}"
-  assert_eq "every monitoring admission webhook has a caBundle" "" "${v#* }"
-  assert_eq "every digest-pinned container runs that digest (imageID)" "" "$(digest_mismatches)"
+  r5_eq "the monitoring admission webhook configurations exist (validating, mutating)" 2 "${v%% *}"
+  r5_eq "every monitoring admission webhook has a caBundle" "" "${v#* }"
+  r5_eq "every digest-pinned container runs that digest (imageID)" "" "$(digest_mismatches)"
 }
 
 oauth2_start_check() {
@@ -884,7 +957,7 @@ backstage_identity_check() {
     sleep 10
   done
   rm -f "${hdr}"
-  assert_eq "Backstage signs ${ADMIN_USER} in as user:default/${name} within 3 min of the User's creation" "user:default/${name}" "${ref}"
+  r5_eq "Backstage signs ${ADMIN_USER} in as user:default/${name} within 3 min of the User's creation" "user:default/${name}" "${ref}"
 }
 
 e1() {
@@ -893,8 +966,25 @@ e1() {
   fresh_vm || return 0
   rm -rf "${LAN_HOME:?}/.teknoir-airgap"
   reset_admin
-  local dir mark out
+  local dir aoa
   dir="$(bundle_dir "${E2E_BUNDLE}")"
+  aoa="$(bundle_aoa "${dir}")"
+  R5_SOFT=""
+  if e1_baseline "${dir}"; then
+    # the upgrade run's bundle A (E1, then E4 to B): A predates r5, so the
+    # r5-only assertions (the K1 handover, no Update Profile form, the
+    # Backstage identity without a restart, operations, caBundle, digest pins)
+    # only warn here; E4 asserts the release-level ones after the update to B
+    if [[ "${E2E_E1_BASELINE:-auto}" == 1 ]]; then R5_SOFT="baseline (E2E_E1_BASELINE=1, app-of-apps ${aoa:-unknown})"
+    else R5_SOFT="baseline app-of-apps ${aoa} < ${R5_AOA}"; fi
+    tl_log "the bundle predates r5 (${R5_SOFT}; E2E_E1_BASELINE=${E2E_E1_BASELINE:-auto}): the r5-only checks warn"
+  fi
+  e1_body "${dir}"
+  R5_SOFT=""
+}
+
+e1_body() {
+  local dir="$1" mark out
   dotdirs > "${STATE}/dotdirs.before"
   mark="$(transcript_mark)"
   if up_in "${dir}"; then pass "teknoir-airgap up exits 0 on a fresh node"; else fail "teknoir-airgap up failed"; return 0; fi
@@ -921,15 +1011,23 @@ e1() {
     fail "teknoir-airgap admin-user --email ${ADMIN_EMAIL} --out failed"; return 0
   fi
   [[ -s "${pw}" ]] || { fail "admin-user wrote no temporary password to ${pw}"; return 0; }
-  if user_has_legacy_pw "${name}"; then fail "User ${name} still carries status.set_initial_password after admin-user"
+  if user_has_legacy_pw "${name}"; then r5_fail "User ${name} still carries status.set_initial_password after admin-user"
   else pass "User ${name} carries no status.set_initial_password"; fi
-  assert_eq "the temporary-password Secret ${CRED_NS}/user-initial-password-${name} is gone after the handover" "" "$(k1_secret "${name}")"
-  login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} with the --out password (the forced change handled, no Update Profile form)" \
-    --forbid-profile-form
-  if (( LOGIN_OK )); then backstage_identity_check "${name}"; else fail "Backstage identity not checked: no session"; fi
+  r5_eq "the temporary-password Secret ${CRED_NS}/user-initial-password-${name} is gone after the handover" "" "$(k1_secret "${name}")"
+  # r5 drops VERIFY_PROFILE (K6): the login must not meet the Update Profile
+  # form. A pre-r5 realm still shows it to a user without a last name, so the
+  # baseline login answers it (kc-login.sh does unless --forbid-profile-form).
+  local form=(--forbid-profile-form) how="no Update Profile form"
+  if [[ -n "${R5_SOFT}" ]]; then
+    form=() how="the Update Profile form answered (${R5_SOFT})"
+    tl_warn "${R5_SOFT}, not asserted: the login may meet the Update Profile form (VERIFY_PROFILE)"
+  fi
+  login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} with the --out password (the forced change handled, ${how})" \
+    "${form[@]}"
+  if (( LOGIN_OK )); then backstage_identity_check "${name}"; else r5_fail "Backstage identity not checked: no session"; fi
   bs1="$(pod_states teknoir-system backstage-api)"
-  assert_eq "admin-user restarted no backstage-api pod" "${bs0}" "${bs1}"
-  assert_eq "backstage-api never restarted (restartCount 0 since its first start)" "" "$(awk '$2 != 0 || $1 == "absent"' <<<"${bs1}")"
+  r5_eq "admin-user restarted no backstage-api pod" "${bs0}" "${bs1}"
+  r5_eq "backstage-api never restarted (restartCount 0 since its first start)" "" "$(awk '$2 != 0 || $1 == "absent"' <<<"${bs1}")"
 }
 
 # ---------------------------------------------------------------------------
@@ -1027,14 +1125,19 @@ e3() {
 e4() {
   tl_case E4 "update to bundle B, refusal of A, rollback to A"
   [[ -n "${E2E_BUNDLE:-}" && -n "${E2E_BUNDLE_B:-}" ]] || { skip_case "E2E_BUNDLE and E2E_BUNDLE_B required"; return 0; }
-  [[ -n "${E2E_E4_APPS:-}" ]] || { skip_case "E2E_E4_APPS required: the Applications bundle B changes, e.g. \"app-of-apps device-controller\""; return 0; }
+  [[ -n "${E2E_E4_APPS:-}" ]] || { skip_case "E2E_E4_APPS required: the Applications bundle B changes (\"app-of-apps device-controller\", or auto)"; return 0; }
   ensure_vm
-  local a b ida idb before after changed want out rc mark kept
+  local a b ida idb before after changed want out rc mark kept name
   a="$(bundle_dir "${E2E_BUNDLE}")" b="$(bundle_dir "${E2E_BUNDLE_B}")"
   ida="$(bundle_id "${a}")" idb="$(bundle_id "${b}")"
-  want="$(tr ' ' '\n' <<<"${E2E_E4_APPS}" | grep . | sort -u | tr '\n' ' ')"
   wait_until 1800 apps_healthy || true
   before="$(app_revs)"
+  if [[ "${E2E_E4_APPS}" == auto ]]; then
+    want="$(e4_expected_apps "${a}" "${b}" "$(awk '{print $1}' <<<"${before}")")"
+    tl_log "E2E_E4_APPS=auto: B should change ${want:-nothing}"
+  else
+    want="$(tr ' ' '\n' <<<"${E2E_E4_APPS}" | grep . | sort -u | tr '\n' ' ')"
+  fi
   mark="$(transcript_mark)"
   if up_in "${b}"; then pass "up with bundle B exits 0"; else fail "up with bundle B failed"; return 0; fi
   out="$(transcript_since "${mark}")"
@@ -1045,6 +1148,13 @@ e4() {
   assert_eq "the release record is bundle B, mode update" "${idb} update" "$(release_state)"
   platform_checks "${out}"
   assert_eq "https://harbor.${DOMAIN}/api/v2.0/health after the update" 200 "$(lan_https "https://harbor.${DOMAIN}/api/v2.0/health")"
+  # an admin made on a pre-r5 A kept the legacy status.set_initial_password
+  # (E1 only warned); r5's user-controller clears it without a password change
+  name="$(user_name "${ADMIN_EMAIL}")"
+  if bundle_is_r5 "${b}" && user_reconciled "${name}"; then
+    if wait_until 300 not_legacy "${name}"; then pass "after B: User ${name} carries no status.set_initial_password"
+    else fail "after B: User ${name} still carries status.set_initial_password"; fi
+  fi
   if [[ -s "$(admin_pw_current)" ]]; then
     login_check "the admin still signs in after the update (Keycloak database kept)"
   else
@@ -1055,7 +1165,14 @@ e4() {
   else fail "up with the older bundle A was not refused (rc=${rc})"; fi
   assert_eq "the refused run left the release record at B" "${idb} update" "$(release_state)"
   assert_eq "the refused run left every Application at B" "${after}" "$(app_revs)"
-  if [[ "${E2E_E4_ROLLBACK:-1}" == 0 ]]; then tl_log "E2E_E4_ROLLBACK=0: no rollback to A"; return 0; fi
+  case "$(e4_rollback_mode "${a}" "${b}")" in
+    off) tl_log "E2E_E4_ROLLBACK=0: no rollback to A"; return 0 ;;
+    gap)
+      tl_warn "rollback to A not run: ${E4_ROLLBACK_GAP} E2E_E4_ROLLBACK=1 runs it and asserts that state"
+      TL_CASE_DESC+=" (rollback leg not run: r5 -> pre-r5 gap)"
+      return 0 ;;
+    cross) e4_rollback_cross "${a}" "${ida}" "${before}"; return 0 ;;
+  esac
   if up_in "${a}" --rollback; then pass "up --rollback with A exits 0"; else fail "up --rollback with A failed"; return 0; fi
   wait_apps 1800 || true
   assert_eq "the release record is bundle A, mode rollback" "${ida} rollback" "$(release_state)"
@@ -1068,6 +1185,94 @@ e4() {
   wait_apps 900 || true
   assert_eq "a plain up with A keeps A in rollback mode (no roll-forward)" "${ida} rollback" "$(release_state)"
   assert_eq "a plain up with A leaves every Application at A" "${before}" "$(app_revs_known "${before}")"
+}
+
+# A rollback from r5 to a pre-r5 bundle meets state that A neither renders nor
+# prunes. Until the rollback design settles it (WP-G-CTRL, WP-I-RELEASE,
+# WP-I-BUNDLE), E4 does not run that leg by default.
+E4_ROLLBACK_GAP="B (r5) adds the GitOps Profile ${TEAMSPACE} and the Namespace ${CRED_NS}, both Prune=false,Delete=false \
+without IgnoreExtraneous, so after a rollback to a pre-r5 A the profile-controller and user-controller Applications stay \
+OutOfSync (pruning skipped); A's profile-controller points the ${TEAMSPACE}-* Applications back at github.io (Unknown \
+offline), and A's post waits for every Application to be Synced/Healthy. Open rollback-design gap."
+
+e4_rollback_mode() {
+  # e4_rollback_mode <dir A> <dir B> — what E4 does after the refused A:
+  #   off    E2E_E4_ROLLBACK=0
+  #   gap    auto (the default) and B is r5 while A predates it: not run, a warning
+  #   cross  E2E_E4_ROLLBACK=1 and that same r5 -> pre-r5 rollback: run, and
+  #          assert the state the rollback design must reach
+  #   run    otherwise: the plain rollback (A and B on the same side of r5)
+  local crosses=0
+  if bundle_is_r5 "$2" && ! bundle_is_r5 "$1"; then crosses=1; fi
+  case "${E2E_E4_ROLLBACK:-auto}" in
+    0) echo off ;;
+    1) if (( crosses )); then echo cross; else echo run; fi ;;
+    auto) if (( crosses )); then echo gap; else echo run; fi ;;
+    *) tl_die "E2E_E4_ROLLBACK must be auto, 0 or 1 (got ${E2E_E4_ROLLBACK})" ;;
+  esac
+}
+
+app_sync() {
+  # app_sync <application> — "<sync>/<health>" ("absent" when it does not exist)
+  local s
+  s="$(vm_kc -n teknoir-system get applications.argoproj.io "$1" -o jsonpath='{.status.sync.status}/{.status.health.status}' 2>/dev/null || true)"
+  printf '%s' "${s:-absent}"
+}
+ts_apps_report() {
+  # ts_apps_report <teamspace> — "<app>=<sync>/<health>@<repoURL>" of its Applications
+  vm_kc -n teknoir-system get applications.argoproj.io -o json 2>/dev/null | jq -r --arg p "$1-" '
+    .items[] | select(.metadata.name | startswith($p))
+    | "\(.metadata.name)=\(.status.sync.status // "none")/\(.status.health.status // "none")@\(.spec.source.repoURL // "")"' \
+    | sort | tr '\n' ' ' || true
+}
+
+e4_rollback_cross() {
+  # e4_rollback_cross <dir A> <bundle id A> <app_revs before B> — the r5 ->
+  # pre-r5 rollback (E2E_E4_ROLLBACK=1): every step is asserted and nothing
+  # stops at the first failure, so the run names which part of the gap is open
+  local a="$1" ida="$2" before="$3" rc app
+  tl_log "rollback across r5 (E2E_E4_ROLLBACK=1); known gap: ${E4_ROLLBACK_GAP}"
+  set +e; up_in "${a}" --rollback; rc=$?; set -e
+  if (( rc == 0 )); then pass "up --rollback with the pre-r5 A exits 0"
+  else fail "up --rollback with the pre-r5 A failed (rc=${rc}); the Application states follow"; fi
+  if wait_until 1800 apps_healthy_except "${TEAMSPACE}-"; then pass "every Application but ${TEAMSPACE}-* is Synced/Healthy after the rollback"
+  else fail "after the rollback, not Synced/Healthy: $(apps_unhealthy_except "${TEAMSPACE}-")"; fi
+  for app in profile-controller user-controller; do
+    assert_eq "${app} is Synced/Healthy after the rollback (its kept r5 object is ignored, not pending a prune)" \
+      Synced/Healthy "$(app_sync "${app}")"
+  done
+  if vm_kc get profiles.teknoir.org "${TEAMSPACE}" -o name >/dev/null 2>&1; then pass "Profile ${TEAMSPACE} is kept (a rollback deletes no teamspace)"
+  else fail "Profile ${TEAMSPACE} is gone after the rollback"; fi
+  if vm_kc get namespace "${CRED_NS}" -o name >/dev/null 2>&1; then pass "Namespace ${CRED_NS} is kept (Prune=false,Delete=false)"
+  else fail "Namespace ${CRED_NS} is gone after the rollback"; fi
+  tl_log "the ${TEAMSPACE} Applications after the rollback: $(ts_apps_report "${TEAMSPACE}")"
+  assert_eq "the release record is bundle A, mode rollback" "${ida} rollback" "$(release_state)"
+  assert_eq "every Application is back at its revision before B" "${before}" "$(app_revs_known "${before}")"
+  (( rc == 0 )) || return 0
+  if up_in "${a}"; then pass "a plain up with A after the rollback exits 0"; else fail "plain up with A after the rollback failed"; fi
+  assert_eq "a plain up with A keeps A in rollback mode (no roll-forward)" "${ida} rollback" "$(release_state)"
+}
+
+bundle_pins() {
+  # bundle_pins <bundle-dir> — "<chart> <version>" lines of node/charts/pins.txt
+  [[ -f "$1/node/charts/pins.txt" ]] && awk 'NF >= 2 && $1 !~ /^#/ {print $1, $2}' "$1/node/charts/pins.txt"
+  return 0
+}
+e4_expected_apps() {
+  # e4_expected_apps <dir A> <dir B> <Application names before B> — what B
+  # should change (E2E_E4_APPS=auto): ROOT_APP and every existing Application
+  # whose chart pin differs between A and B (an Application is named after its
+  # chart), plus the plugin Applications of the GitOps Profile when B adds it
+  local names="$3" p
+  {
+    awk -v root="${ROOT_APP}" -v names="$(tr '\n' ' ' <<<"${names}")" '
+      BEGIN { n = split(names, x, " "); for (i = 1; i <= n; i++) known[x[i]] = 1 }
+      FNR == NR { va[$1] = $2; next }
+      ($1 == root || $1 in known) && va[$1] != $2 { print $1 }' <(bundle_pins "$1") <(bundle_pins "$2")
+    if [[ -n "$(bundle_profile_owner "$2")" ]] && ! grep -q "^${TEAMSPACE}-" <<<"${names}"; then
+      for p in "${PLUGINS[@]}"; do echo "${TEAMSPACE}-${p}"; done
+    fi
+  } | sort -u | tr '\n' ' '
 }
 
 app_revs_known() {
@@ -2320,6 +2525,8 @@ main() {
     shift
   done
   (( ${#run[@]} )) || run=("${ALL[@]}")
+  [[ "${E2E_E1_BASELINE:-auto}" =~ ^(auto|0|1)$ ]] || tl_die "E2E_E1_BASELINE must be auto, 0 or 1"
+  [[ "${E2E_E4_ROLLBACK:-auto}" =~ ^(auto|0|1)$ ]] || tl_die "E2E_E4_ROLLBACK must be auto, 0 or 1"
   need sudo ip curl jq tar sha256sum ssh ssh-agent ssh-add setsid iptables stat python3 openssl awk
   trap cleanup EXIT
   prepare
