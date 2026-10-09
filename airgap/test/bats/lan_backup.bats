@@ -149,17 +149,29 @@ lan() { bash "${BUNDLE}/teknoir-airgap" "$@" --site "${SITE}" </dev/null; }
 }
 
 @test "an invalid or private BACKUP_AGE_RECIPIENTS entry is refused before ssh" {
+  # site_load's site_age_recipients_check (the one validator, R9) stops it
   printf 'BACKUP_AGE_RECIPIENTS="%s age1short"\n' "${R1}" >> "${SITE}"
   run --separate-stderr lan backup --out "${BATS_TEST_TMPDIR}/out"
   [ "${status}" -eq 1 ]
-  [[ "${stderr}" == *"is not an age public key"* ]]
+  [[ "${stderr}" == *"invalid BACKUP_AGE_RECIPIENTS entry 'age1short' (an age public key is age1"* ]]
   [ -z "$(stub_calls ssh)" ]
-  local priv
-  priv="AGE-SECRET-KEY-""1$(printf 'Q%.0s' {1..58})"   # assembled: no key-shaped literal in the repo
-  printf 'BACKUP_AGE_RECIPIENTS="%s"\n' "${priv}" >> "${SITE}"
+  printf 'BACKUP_AGE_RECIPIENTS="age1%s"\n' "$(printf 'Z%.0s' {1..58})" >> "${SITE}"
   run --separate-stderr lan backup --out "${BATS_TEST_TMPDIR}/out"
   [ "${status}" -eq 1 ]
-  [[ "${stderr}" == *"PRIVATE key"* && "${stderr}" != *"${priv}"* ]]
+  [[ "${stderr}" == *"entry 'age1ZZZZZZZZ...' ("* && "${stderr}" != *ZZZZZZZZZ* ]]   # at most 12 characters
+  local priv msg
+  priv="AGE-SECRET-KEY-""1$(printf 'Q%.0s' {1..58})"   # assembled: no key-shaped literal in the repo
+  msg="BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...); only public keys (age1...) belong there: remove it and treat that identity as exposed"
+  for v in "${priv}" "${R1} $(printf '%s' "${priv}" | tr '[:upper:]' '[:lower:]')"; do
+    printf 'BACKUP_AGE_RECIPIENTS="%s"\n' "${v}" >> "${SITE}"
+    run --separate-stderr lan backup --out "${BATS_TEST_TMPDIR}/out"
+    [ "${status}" -eq 1 ]
+    [[ "${stderr}" == *"${SITE}: ${msg}"* ]]
+    # never echoed: not the key, not 9 characters of its body, in no output or LAN log
+    refute_grep -qiE 'SECRET-KEY-1|Q{9}' <<<"${output}${stderr}"
+    refute_grep -rqiE 'SECRET-KEY-1|Q{9}' "${HOME}/.teknoir-airgap"
+    [ -z "$(stub_calls ssh)" ]
+  done
 }
 
 @test "backup --name must be a backup timestamp" {

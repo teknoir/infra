@@ -45,7 +45,6 @@ BACKUP_RECIPIENTS=()
 BACKUP_DBS=()
 _K3S_STOPPED_FOR_BACKUP=0
 BACKUP_NAME_RE='^[0-9]{8}T[0-9]{6}Z$'
-BACKUP_RECIPIENT_RE='^age1[0-9a-z]{58}$'
 
 # Secrets exported into every backup ("namespace name"); absent ones are
 # skipped. The wildcard TLS is added at run time (its name follows the domain).
@@ -75,28 +74,16 @@ _backup_restart_k3s_if_stopped() {
   fi
 }
 
-backup_recipient_check() {
-  # backup_recipient_check <value> <where> - die unless <value> is an age
-  # X25519 public key. Never echoes more than the first 12 characters: a
-  # private key pasted by mistake must not reach the log.
-  local r="$1" where="$2"
-  if [[ "${r}" == AGE-SECRET-KEY-* ]]; then
-    die "${where}: that is an age PRIVATE key (AGE-SECRET-KEY-...); remove it there now, only public keys (age1...) belong in it, and treat that identity as exposed"
-  fi
-  [[ "${r}" =~ ${BACKUP_RECIPIENT_RE} ]] \
-    || die "${where}: '${r:0:12}...' is not an age X25519 public key (age1 followed by 58 lower-case letters and digits)"
-}
-
 backup_recipients_load() {
   # backup_recipients_load - BACKUP_RECIPIENTS from the site's
-  # BACKUP_AGE_RECIPIENTS (space-separated). Dies on an invalid entry; returns
-  # 1 when none is set.
-  local r
+  # BACKUP_AGE_RECIPIENTS (space-separated). Dies on an invalid entry (the
+  # one validator, site_age_recipients_check in lib/common.sh, that load_site
+  # already ran: it never echoes a private key); returns 1 when none is set.
+  local problem
+  problem="$(site_age_recipients_check "${BACKUP_AGE_RECIPIENTS:-}")" \
+    || die "${SITE_FILE:-the site config}: ${problem}"
   BACKUP_RECIPIENTS=()
-  for r in ${BACKUP_AGE_RECIPIENTS:-}; do
-    backup_recipient_check "${r}" "BACKUP_AGE_RECIPIENTS in ${SITE_FILE:-the site config}"
-    BACKUP_RECIPIENTS+=("${r}")
-  done
+  read -r -a BACKUP_RECIPIENTS <<<"${BACKUP_AGE_RECIPIENTS:-}"
   (( ${#BACKUP_RECIPIENTS[@]} > 0 ))
 }
 
@@ -387,8 +374,8 @@ cmd_backup() {
   # backup --recipient AGE1... [--recipient AGE1...] [--take | --name TS]
   #                             stream a backup encrypted to these age public
   #                             keys to stdout; no terminal needed
-  local mode="take" file="" keep=0 take=0 name="" out real d f
-  local -a recipients=() rargs=()
+  local mode="take" file="" keep=0 take=0 name="" out real d f r
+  local -a recipients=() rargs=() ws=()
   while (( $# > 0 )); do
     case "$1" in
       --list) mode="list" ;;
@@ -454,9 +441,11 @@ cmd_backup() {
       ;;
     recipient)
       for f in "${recipients[@]}"; do
-        backup_recipient_check "${f}" "backup --recipient"
-        rargs+=(-r "${f}")
+        d="$(site_age_recipients_check "${f}" "--recipient")" || die "backup: ${d}"
+        read -r -a ws <<<"${f}"
+        for r in ${ws[@]+"${ws[@]}"}; do rargs+=(-r "${r}"); done
       done
+      (( ${#rargs[@]} > 0 )) || die "backup: --recipient needs an age public key"
       [[ ! -t 1 ]] || die "backup --recipient: refusing to write binary data to a terminal; redirect stdout"
       ;;
   esac

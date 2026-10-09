@@ -481,19 +481,45 @@ tn backup --site "${T}/age.env"
 check "the next backup encrypts the set left unencrypted, then prunes it" \
   bash -c "[ ${RC} = 0 ] && [ -f '${EX}/${FAILED_TS}.tar.age' ] && [ ! -d '${BK}/${FAILED_TS}' ] && [ $(nplain) = 1 ]"
 
-echo "# backup: invalid recipients are refused before k3s is stopped"
+echo "# backup: invalid recipients are refused before k3s is stopped (site_age_recipients_check)"
 site_with "${T}/bad.env" "${R1} age1tooshort"
 before="$(ncalls)"; plain_before="$(nplain)"
 tn backup --site "${T}/bad.env"
-check "an entry that is not an age public key is refused" bash -c "[ ${RC} != 0 ] && grep -q \"'age1tooshort...' is not an age X25519 public key\" '${T}/out'"
+check "an entry that is not an age public key is refused" \
+  bash -c "[ ${RC} != 0 ] && grep -q \"ERROR: .*bad.env: invalid BACKUP_AGE_RECIPIENTS entry 'age1tooshort' (an age public key is age1\" '${T}/out'"
 check "nothing was stopped and no backup was taken" \
   bash -c "! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q '^systemctl stop k3s' && [ $(nplain) = ${plain_before} ]"
+site_with "${T}/bad.env" "age1$(printf 'Z%.0s' {1..58})"
+tn backup --site "${T}/bad.env"
+check "a bad entry is shown with at most its first 12 characters" \
+  bash -c "[ ${RC} != 0 ] && grep -qF \"entry 'age1ZZZZZZZZ...' (\" '${T}/out' && ! grep -q 'Z\\{9\\}' '${T}/out'"
 # assembled at run time: no private-key-shaped literal in the repository
 FAKE_PRIV="AGE-SECRET-KEY-""1$(printf 'Q%.0s' {1..58})"
+no_priv() {
+  # no_priv: neither the fake key nor any 9 characters of its body in the
+  # output or in any run log
+  ! grep -qiE "SECRET-KEY-1|Q{9}" "${T}/out" && ! grep -rqiE "SECRET-KEY-1|Q{9}" "${ROOT}/var/log/teknoir-airgap"
+}
+priv_msg="holds an age PRIVATE key (AGE-SECRET-KEY-...); only public keys (age1...) belong there: remove it and treat that identity as exposed"
 site_with "${T}/priv.env" "${FAKE_PRIV}"
+before="$(ncalls)"
 tn backup --site "${T}/priv.env"
-check "a private key in BACKUP_AGE_RECIPIENTS is refused and called out" bash -c "[ ${RC} != 0 ] && grep -q 'age PRIVATE key' '${T}/out'"
-check "the private key is never echoed" bash -c "! grep -qF '${FAKE_PRIV}' '${T}/out' && ! grep -rqF '${FAKE_PRIV}' '${ROOT}/var/log/teknoir-airgap'"
+check "a private key in BACKUP_AGE_RECIPIENTS is refused and called out" \
+  bash -c "[ ${RC} != 0 ] && grep -qF 'priv.env: BACKUP_AGE_RECIPIENTS ${priv_msg}' '${T}/out'"
+check "the private key is never echoed" no_priv
+check "nothing was stopped for it" bash -c "! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q '^systemctl stop k3s'"
+site_with "${T}/priv.env" "${R1} ${FAKE_PRIV,,}"
+tn backup --site "${T}/priv.env" --list
+check "a lower-case private key after a valid one stops even --list (load_site), not echoed" \
+  bash -c "[ ${RC} != 0 ] && grep -qF 'BACKUP_AGE_RECIPIENTS ${priv_msg}' '${T}/out'"
+check "  ...and not echoed" no_priv
+before="$(ncalls)"
+node_env "${PAYLOAD}/bin/teknoir-node" backup --site test --recipient "${FAKE_PRIV}" > "${T}/stream" 2> "${T}/out" && RC=0 || RC=$?
+check "a private key as --recipient is refused and called out, nothing is streamed" \
+  bash -c "[ ${RC} != 0 ] && grep -qF 'backup: --recipient ${priv_msg}' '${T}/out' && [ ! -s '${T}/stream' ] && ! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q '^age '"
+check "  ...and not echoed" no_priv
+node_env "${PAYLOAD}/bin/teknoir-node" backup --site test --recipient ' ' > "${T}/stream" 2> "${T}/out" && RC=0 || RC=$?
+check "a blank --recipient is refused" bash -c "[ ${RC} != 0 ] && grep -q 'recipient needs an age public key' '${T}/out' && [ ! -s '${T}/stream' ]"
 
 echo "# backup --recipient-site / --name / --recipient / --list"
 TS="$(basename "$(newest)")"
@@ -914,6 +940,24 @@ for bad in 'TIME_SOURCE="a;b"' 'TIME_SOURCE="10.0.0.300"' 'TIME_SOURCE="-x.examp
   check "load_site rejects ${bad}" bash -c "[ ${RC} = 1 ] && grep -q 'ERROR: .*invalid ${bad%%=*}' '${T}/out'"
   check "site_check rejects ${bad}" bash -c "[ \"\$(bash -c \"source '${HERE}/../../build/lib-build.sh'; site_check '${T}/bad.env'\" 2>&1 >/dev/null | grep -c 'invalid ${bad%%=*}')\" -ge 1 ]"
 done
+# the one validator (site_age_recipients_check, the same text in the node, LAN
+# and build code): a private key is called out and never echoed
+site_variant "${T}/bad.env" "BACKUP_AGE_RECIPIENTS=\"${AGE_OK} ${FAKE_PRIV}\""
+tn converge --site "${T}/bad.env" --only verify
+check "load_site refuses a private key after a valid recipient and calls it out" \
+  bash -c "[ ${RC} = 1 ] && grep -qF 'ERROR: ${T}/bad.env: BACKUP_AGE_RECIPIENTS ${priv_msg}' '${T}/out'"
+check "  ...without echoing it (output and run logs)" no_priv
+bash -c "source '${HERE}/../../build/lib-build.sh'; site_check '${T}/bad.env'" > "${T}/out" 2>&1 && RC=0 || RC=$?
+check "site_check (build) refuses it and calls it out" \
+  bash -c "[ ${RC} != 0 ] && grep -qF '${T}/bad.env: BACKUP_AGE_RECIPIENTS ${priv_msg}' '${T}/out'"
+check "  ...without echoing it" no_priv
+site_variant "${T}/bad.env" "# BACKUP_AGE_RECIPIENTS=\"${FAKE_PRIV,,}\""
+bash -c "source '${HERE}/../../build/lib-build.sh'; site_check '${T}/bad.env'" > "${T}/out" 2>&1 && RC=0 || RC=$?
+check "site_check refuses an age private key in a comment, without echoing it" \
+  bash -c "[ ${RC} != 0 ] && grep -q 'holds an age PRIVATE key' '${T}/out'"
+check "  ...not echoed" no_priv
+site_variant "${T}/good2.env" "# BACKUP_AGE_RECIPIENTS: public keys only, never an AGE-SECRET-KEY-... line"
+check "a comment that only names AGE-SECRET-KEY-... passes site_check" [ "$(site_check_rc "${T}/good2.env")" == 0 ]
 check "the committed site files pass site_check" \
   bash -c "[ \"\$(bash -c \"source '${HERE}/../../build/lib-build.sh'; site_check '${HERE}/../../site/teknoir-local.env' && site_check '${HERE}/../../site/vmtest.env' && echo ok\" 2>/dev/null)\" = ok ]"
 

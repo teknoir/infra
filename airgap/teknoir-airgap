@@ -492,10 +492,7 @@ site_load() {
     site_time_source_ok "${h}" || die "${SITE_FILE}: invalid TIME_SOURCE entry '${h}' (space-separated IPv4 addresses or host names)"
   done
   case "${NODE_IP_DHCP_RESERVED}" in ''|yes|no) ;; *) die "${SITE_FILE}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)" ;; esac
-  case "${BACKUP_AGE_RECIPIENTS}" in *[!a-z0-9\ ]*) die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS (space-separated age public keys)" ;; esac
-  for h in ${BACKUP_AGE_RECIPIENTS}; do
-    age_recipient_ok "${h}" || die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS entry '${h}' (an age public key: age1 and 58 characters)"
-  done
+  h=$(site_age_recipients_check "${BACKUP_AGE_RECIPIENTS}") || die "${SITE_FILE}: ${h}"
   mdomain=$(manifest_get domain)
   if [ -n "${mdomain}" ] && [ "${mdomain}" != "${TEKNOIR_DOMAIN}" ]; then
     die "site ${SITE_NAME} is for domain ${TEKNOIR_DOMAIN}, but this bundle was built for ${mdomain}"
@@ -519,12 +516,41 @@ site_time_source_ok() {
   [ "$(printf '%s' "${t}" | awk -F. 'NF == 4 && $1 != "" && $2 != "" && $3 != "" && $4 != "" && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 { print "ok" }')" = ok ]
 }
 
-# age_recipient_ok KEY: an age X25519 public key (age1 and 58 lowercase characters).
-age_recipient_ok() {
-  local rest
-  case "$1" in age1*) rest=${1#age1} ;; *) return 1 ;; esac
-  [ "${#rest}" -eq 58 ] || return 1
-  case "${rest}" in *[!0-9a-z]*) return 1 ;; esac
+site_age_recipients_check() {
+  # site_age_recipients_check VALUE [LABEL] - the one check of an age recipient
+  # list (R9; LABEL names it, default BACKUP_AGE_RECIPIENTS): empty, or age
+  # X25519 public keys (^age1[0-9a-z]{58}$) separated by spaces. Valid: prints
+  # nothing, returns 0. Otherwise prints one line about the first problem and
+  # returns 1. It never prints a private key (SECRET-KEY anywhere in VALUE,
+  # any case: AGE-SECRET-KEY-1...) and shows at most the first 12 characters of
+  # any other bad entry. The same text is in airgap/node/lib/common.sh,
+  # airgap/teknoir-airgap and airgap/build/lib-build.sh: bash 3.2, no regex
+  # (locale-independent); airgap/test/unit/site-age-recipients-test.sh keeps
+  # the three identical.
+  local v=$1 label=${2:-BACKUP_AGE_RECIPIENTS} rest w key shown
+  case "${v}" in
+    *[Ss][Ee][Cc][Rr][Ee][Tt]-[Kk][Ee][Yy]*)
+      printf '%s\n' "${label} holds an age PRIVATE key (AGE-SECRET-KEY-...); only public keys (age1...) belong there: remove it and treat that identity as exposed"
+      return 1 ;;
+  esac
+  rest="${v} "
+  while [ -n "${rest}" ]; do
+    w=${rest%% *}
+    rest=${rest#* }
+    [ -n "${w}" ] || continue
+    key=${w#age1}
+    if [ "${key}" != "${w}" ] && [ "${#key}" -eq 58 ]; then
+      case "${key}" in
+        *[!0123456789abcdefghijklmnopqrstuvwxyz]*) ;;
+        *) continue ;;
+      esac
+    fi
+    shown=${w:0:12}
+    shown=${shown//[![:alnum:]._-]/?}
+    [ "${#w}" -le 12 ] || shown="${shown}..."
+    printf '%s\n' "invalid ${label} entry '${shown}' (an age public key is age1 and 58 lower-case letters or digits; keys are separated by spaces)"
+    return 1
+  done
   return 0
 }
 
@@ -1546,21 +1572,17 @@ cmd_admin_user() {
 }
 
 # backup_recipients_count: BACKUP_RECIPIENTS_N = the number of age public keys
-# in the site's BACKUP_AGE_RECIPIENTS (0 when unset); dies on an entry that is
-# not one, showing at most its first 12 characters.
+# in the site's BACKUP_AGE_RECIPIENTS (0 when unset). site_load has checked
+# them with site_age_recipients_check; checked again here, so this never
+# counts what that check refuses (and never echoes a private key).
 BACKUP_RECIPIENTS_N=0
 backup_recipients_count() {
-  local r n=0 head
-  for r in ${BACKUP_AGE_RECIPIENTS:-}; do
-    head=$(printf '%s' "${r}" | cut -c1-12)
-    case "${r}" in
-      AGE-SECRET-KEY-*) die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (${head}...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed" ;;
-    esac
-    printf '%s\n' "${r}" | grep -Eq '^age1[0-9a-z]{58}$' \
-      || die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS entry '${head}...' is not an age public key (age1 followed by 58 lower-case letters and digits)"
-    n=$((n + 1))
-  done
-  BACKUP_RECIPIENTS_N=${n}
+  local problem
+  problem=$(site_age_recipients_check "${BACKUP_AGE_RECIPIENTS:-}") || die "${SITE_FILE}: ${problem}"
+  # (valid: only a-z, 0-9 and spaces, so no glob can expand here)
+  # shellcheck disable=SC2086
+  set -- ${BACKUP_AGE_RECIPIENTS:-}
+  BACKUP_RECIPIENTS_N=$#
 }
 
 # backup_fetch EXPORT OUT: copy the node file EXPORT (an encrypted export in

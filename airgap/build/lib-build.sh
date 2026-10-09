@@ -676,6 +676,44 @@ site_time_source_ok() {
   (( ${#t} <= 253 )) && [[ "${t}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
 }
 
+site_age_recipients_check() {
+  # site_age_recipients_check VALUE [LABEL] - the one check of an age recipient
+  # list (R9; LABEL names it, default BACKUP_AGE_RECIPIENTS): empty, or age
+  # X25519 public keys (^age1[0-9a-z]{58}$) separated by spaces. Valid: prints
+  # nothing, returns 0. Otherwise prints one line about the first problem and
+  # returns 1. It never prints a private key (SECRET-KEY anywhere in VALUE,
+  # any case: AGE-SECRET-KEY-1...) and shows at most the first 12 characters of
+  # any other bad entry. The same text is in airgap/node/lib/common.sh,
+  # airgap/teknoir-airgap and airgap/build/lib-build.sh: bash 3.2, no regex
+  # (locale-independent); airgap/test/unit/site-age-recipients-test.sh keeps
+  # the three identical.
+  local v=$1 label=${2:-BACKUP_AGE_RECIPIENTS} rest w key shown
+  case "${v}" in
+    *[Ss][Ee][Cc][Rr][Ee][Tt]-[Kk][Ee][Yy]*)
+      printf '%s\n' "${label} holds an age PRIVATE key (AGE-SECRET-KEY-...); only public keys (age1...) belong there: remove it and treat that identity as exposed"
+      return 1 ;;
+  esac
+  rest="${v} "
+  while [ -n "${rest}" ]; do
+    w=${rest%% *}
+    rest=${rest#* }
+    [ -n "${w}" ] || continue
+    key=${w#age1}
+    if [ "${key}" != "${w}" ] && [ "${#key}" -eq 58 ]; then
+      case "${key}" in
+        *[!0123456789abcdefghijklmnopqrstuvwxyz]*) ;;
+        *) continue ;;
+      esac
+    fi
+    shown=${w:0:12}
+    shown=${shown//[![:alnum:]._-]/?}
+    [ "${#w}" -le 12 ] || shown="${shown}..."
+    printf '%s\n' "invalid ${label} entry '${shown}' (an age public key is age1 and 58 lower-case letters or digits; keys are separated by spaces)"
+    return 1
+  done
+  return 0
+}
+
 site_values_check() {
   # site_values_check <file> — the formats of the optional keys; prints one
   # line per problem, returns 1 when there is one
@@ -691,10 +729,8 @@ site_values_check() {
   done
   v="$(site_get "${f}" NODE_IP_DHCP_RESERVED)"
   [[ "${v}" =~ ^(yes|no)?$ ]] || { echo "${f}: invalid NODE_IP_DHCP_RESERVED '${v}' (yes, no or empty)"; bad=1; }
-  read -r -a words <<<"$(site_get "${f}" BACKUP_AGE_RECIPIENTS)"
-  for w in ${words[@]+"${words[@]}"}; do
-    [[ "${w}" =~ ^age1[0-9a-z]{58}$ ]] || { echo "${f}: invalid BACKUP_AGE_RECIPIENTS entry '${w}' (age public keys: age1 and 58 characters)"; bad=1; }
-  done
+  v="$(site_get "${f}" BACKUP_AGE_RECIPIENTS)"
+  w="$(site_age_recipients_check "${v}")" || { echo "${f}: ${w}"; bad=1; }
   return "${bad}"
 }
 
@@ -729,6 +765,13 @@ site_check() {
   # (an age public key is random lowercase text: its line is not scanned)
   if grep -v '^[[:space:]]*#' "${f}" | grep -v '^BACKUP_AGE_RECIPIENTS=' | grep -qiE '(password|passwd|secret|token|private)'; then
     warn "${f}: mentions a credential; site files are public and must hold none"
+    bad=1
+  fi
+  # an age identity elsewhere (in a comment too) is key material in a public
+  # file; the BACKUP_AGE_RECIPIENTS line is site_age_recipients_check's. Never
+  # echoed.
+  if grep -v '^BACKUP_AGE_RECIPIENTS=' "${f}" | LC_ALL=C grep -qiE 'AGE-SECRET-KEY-1[0-9a-z]{20}'; then
+    warn "${f}: holds an age PRIVATE key (AGE-SECRET-KEY-...); site files are public: remove it and treat that identity as exposed"
     bad=1
   fi
   (( bad == 0 )) || die "invalid site file ${f}"
