@@ -673,7 +673,7 @@ Each run uses a freshly created VM. The VM's Harbor keeps the first push of
 every version.
 
 - Fresh: `E1 E11 E12 E13 E14 E2 E3 E7 E8` with bundle B.
-- Upgrade: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto e2e.sh --allow-destroy E1 E4`,
+- Upgrade: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto E2E_E4_ROLLBACK=1 e2e.sh --allow-destroy E1 E4`,
   with A = aoa0.0.4.
   - E1 installs A as a baseline. A bundle whose app-of-apps is below 0.0.5 is a baseline,
     and the r5-only E1 checks below only warn there.
@@ -683,8 +683,8 @@ every version.
     teknoir-default plugin Applications.
 - Live rehearsal: E15.
 
-Rollback from r5 to a pre-r5 bundle is an open design gap, so E4 does not run that leg by
-default. B's GitOps Profile teknoir-default and Namespace teknoir-user-credentials carry
+Rollback from r5 to a pre-r5 bundle is an open design gap. B's GitOps Profile
+teknoir-default and Namespace teknoir-user-credentials carry
 Prune=false,Delete=false but no `argocd.argoproj.io/compare-options: IgnoreExtraneous`.
 Once A no longer renders them, three things happen:
 - profile-controller and user-controller stay OutOfSync, because a skipped prune keeps an
@@ -694,11 +694,20 @@ Once A no longer renders them, three things happen:
 - A's post waits for every Application.
 
 The plan's rollback, an r5-built 0.0.4 bundle, has the same problem: under R2 the kept,
-tracked Profile keeps its teamspace Applications strict. `E2E_E4_ROLLBACK=1` runs the leg.
-It asserts each part separately (up exits 0; every Application except teknoir-default-*
-Synced/Healthy; profile-controller and user-controller Synced; Profile and Namespace kept;
-release record A rollback; revisions back), and it reports the teknoir-default
-Applications. The decision belongs to WP-G-CTRL, WP-I-RELEASE and WP-I-BUNDLE.
+tracked Profile keeps its teamspace Applications strict.
+
+An untested rollback is not green:
+- `E2E_E4_ROLLBACK=1` (the release run) runs the leg. It asserts each part separately (up
+  exits 0; every Application except teknoir-default-* Synced/Healthy; profile-controller
+  and user-controller Synced; Profile and Namespace kept; release record A rollback;
+  revisions back), and it reports the teknoir-default Applications. Today it fails, by
+  name, on the parts above.
+- `E2E_E4_ROLLBACK=0` waives the leg on purpose, and the summary row says so.
+- Left at auto, E4 fails when the rollback would cross r5.
+
+The decision belongs to WP-G-CTRL, WP-I-RELEASE and WP-I-BUNDLE, before the live rollout.
+One option is `argocd.argoproj.io/compare-options: IgnoreExtraneous` on the GitOps Profile
+and the credentials Namespace; another is a documented rollback procedure.
 
 The first admin is the owner of the GitOps Profile teknoir-default, so E11 can
 check its grants.
@@ -745,9 +754,11 @@ check its grants.
   - SNTP from the netns gets stratum 11 or lower and an offset within 2 s;
   - doctor reports no FAIL for the node.
 - E13 checks access and credentials:
-  - a non-admin realm user (a User CR with role viewer) gets 403 on the
-    teknoir-system monitoring UIs, no ArgoCD Applications, and 403 from Harbor
-    project creation (not a CSRF failure);
+  - a non-admin realm user (a User CR with role viewer) signs in with a forced
+    password change; after a reconcile its temporary-password Secret is gone (K1
+    case b);
+  - that user gets 403 on the teknoir-system monitoring UIs, no ArgoCD
+    Applications, and 403 from Harbor project creation (not a CSRF failure);
   - the admin gets 200 and Grafana Admin by e-mail;
   - platform-admin is disabled and its login is refused;
   - the can-i matrix of rbac-k3d holds, and no "forbidden" appears in the
@@ -770,6 +781,13 @@ check its grants.
     --argo and M6.
   - Then the live state is injected: Profile teknoir-demo on github.io, a stale
     Failed monitoring operation with retryCount 5, and empty admission caBundles.
+  - The master-realm legacy clients are created through the master admin API,
+    because neither the old layout nor A creates them (the live node got them by
+    hand, old AIRGAP-BOOTSTRAP 8): teknoir, with the oauth2-proxy client's secret
+    and a service account holding master-realm manage-users; argocd; and harbor.
+    The teknoir service account lists master's users, which shows the severity.
+    Before B, all three exist and teknoir's secret gets a token on master, so the
+    check after B cannot pass on an empty realm.
   - Then up B runs, and these must hold:
     - post passes;
     - teknoir-demo moves to Harbor (a warning only if it stays unhealthy);
@@ -786,7 +804,9 @@ check its grants.
 
 The e2e harness itself is tested without a VM (airgap/test/README.md):
 `kc_login.bats` uses a local HTTPS stand-in for oauth2-proxy and Keycloak, and
-`harness.bats` dry-runs E11, E12 and E13's backup check against stubs.
+`harness.bats` dry-runs E1, E4, E11, E12, all of E13, E15's injection and the whole
+E15 sequence against stub worlds. Each broken part of a world fails exactly its
+assertion.
 
 ## Work items
 

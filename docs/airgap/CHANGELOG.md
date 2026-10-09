@@ -21,7 +21,13 @@ live node.
   `rotate argocd-admin` and `keycloak-db`. E14 checks sign-in robustness: a garbage
   cookie, XHR 401, http to https, upstream 401/403 passthrough and the logout
   chain. E15 rehearses the live rollout: the old layout, bundle A, the injected
-  live state, then bundle B.
+  live state, then bundle B. The injected state includes the master-realm legacy
+  clients that the live node got by hand; before B they must exist and answer,
+  so their deletion is really rehearsed.
+- E13 also checks that the non-admin's temporary-password Secret is deleted after
+  its first sign-in. A reconcile is started with an annotation, so the deletion
+  does not fall into E2's no-change window. E2 tolerates only such K1 deletions
+  in teknoir-user-credentials.
 - **Extended scenarios.**
   - E1: every platform operation Succeeded, the admission caBundle, the digest
     pins, post's image check, `/oauth2/start`, the one-time password handover, no
@@ -33,8 +39,10 @@ live node.
     baseline: the r5-only checks warn instead of failing (`E2E_E1_BASELINE`).
   - E4: the same release checks after the update, and A's legacy password field
     cleared. `E2E_E4_APPS=auto` derives the expected Applications from the pins.
-    The rollback from r5 to a pre-r5 A is not run by default (an open design
-    gap, DESIGN.md); `E2E_E4_ROLLBACK=1` runs it and asserts each part.
+    The rollback from r5 to a pre-r5 A meets an open design gap (DESIGN.md).
+    `E2E_E4_ROLLBACK=1` runs it and asserts each part; `=0` waives it on purpose.
+    Left at auto, E4 fails, because a rollback that was not rehearsed is not
+    green.
   - E7: the passwords the LAN side holds and the test age identities appear in no
     log.
   - E8: the pre-rotation cookie gets a login redirect.

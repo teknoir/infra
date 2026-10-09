@@ -31,11 +31,22 @@ Test files:
   every object present, every server-side diff reports a change, Harbor healthy but
   empty, so the run reaches every apply, restart and push gate).
 - `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2.
-- `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts, including dry runs of
-  E11, E12 and E13's backup check against stubs (`fixtures/e2e-world.bash`: a healthy
-  teknoir-default world; `WORLD_BREAK` breaks one part, and exactly its check must fail),
-  fixture JSON for the cluster reads, `vm.sh age-key` with a stand-in age-keygen, and
-  `sntp-query.py` against a local NTP responder.
+- `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts. It includes:
+  - dry runs of E11 and E12 against stubs (`fixtures/e2e-world.bash`, a healthy
+    teknoir-default world);
+  - dry runs of E1 and E4 on release stand-ins (`fixtures/e2e-release.bash`);
+  - dry runs of all of E13, of E15's `e15_inject`, and of the whole E15 sequence
+    (`fixtures/e2e-live-world.bash`). This world keeps the node's state in files, so `up`
+    with B changes what the reads answer. It answers `vm_kc`, the root scripts (each
+    checked with `bash -n`, dispatched on its `# vm-script:` line), kc-login, curl and the
+    operator's commands, and fails on any call it does not expect. The E15 test also
+    checks the order: A's history, the injected state, the checks before B, B, the
+    checks after B, then E11, E13 and E14.
+  - fixture JSON for the cluster reads, `vm.sh age-key` with a stand-in age-keygen, and
+    `sntp-query.py` against a local NTP responder.
+
+  In the stub worlds, `WORLD_BREAK` breaks one part, and exactly the assertions the test
+  names must fail.
 - `kc_login.bats`: `kc-login.sh` and e2e.sh's E14 checks against `stubs/fake-sso.py`, a
   local HTTPS stand-in for oauth2-proxy, Keycloak (realm teknoir: login form, required
   actions, SSO cookie, logout confirmation) and an ArgoCD-like OIDC client. Throwaway CA
@@ -112,7 +123,7 @@ ArgoCD runs in the fixture); T6 and E10 do.
   A release (r5) runs, each on a re-created VM:
   - fresh: `E2E_BUNDLE=<B> e2e.sh --allow-destroy E1 E11 E12 E13 E14 E2 E3 E7 E8`;
   - upgrade, with A = the deployed `dist/teknoir-airgap-teknoir-local-aoa0.0.4-….tar`:
-    `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto e2e.sh --allow-destroy E1 E4`.
+    `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto E2E_E4_ROLLBACK=1 e2e.sh --allow-destroy E1 E4`.
     - E1 installs A. A predates r5 (its app-of-apps, from `MANIFEST.yaml` or
       `node/charts/pins.txt`, is below `E2E_R5_AOA`, default 0.0.5), so E1 treats it as a
       baseline. The r5-only checks warn instead of failing: platform operations, caBundle,
@@ -124,16 +135,18 @@ ArgoCD runs in the fixture); T6 and E10 do.
     - `E2E_E4_APPS=auto` expects app-of-apps, each Application whose chart pin differs
       between A and B, and the nine teknoir-default plugin Applications that B's GitOps
       Profile adds.
-    - By default E4 does not run the rollback from r5 B to the pre-r5 A, and its summary
-      row says so. This is an open design gap:
+    - The rollback from r5 B to the pre-r5 A meets an open design gap:
       - after the rollback, B's Profile teknoir-default and Namespace
         teknoir-user-credentials remain (Prune=false,Delete=false, without
         IgnoreExtraneous), so profile-controller and user-controller stay OutOfSync;
       - A's profile-controller points the teknoir-default Applications back at github.io;
       - A's post waits for every Application.
 
-      `E2E_E4_ROLLBACK=1` runs the rollback and asserts each part of the expected state.
-      `E2E_E4_ROLLBACK=0` stops after the refused A.
+      `E2E_E4_ROLLBACK=1` (the release run) runs the rollback and asserts each part of the
+      expected state, so E4 stays red until the rollback design settles the gap.
+      `E2E_E4_ROLLBACK=0` waives the leg on purpose; the summary row then says
+      "rollback leg waived". Left at auto, E4 fails and names the gap, because a rollback
+      that was not rehearsed is not green.
   - live rehearsal: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_OLD_SETUP="$PWD/airgap/test/vm/old-setup.sh"
     e2e.sh --allow-destroy E15`.
 - `vm/vm.sh age-key [--check SITE]`: the two test age identities behind `vmtest.env`'s
