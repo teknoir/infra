@@ -665,6 +665,9 @@ migrate_keycloak_admin() {
   # first up: platform-secrets adds a random password and the keycloak-config
   # Job rotates the admin to it. Absent Keycloak or an existing Secret: nothing to do.
   local sts user pass="" ref code
+  # the private 0700 scratch dir (tmpfs, shredded at exit) for the password
+  # and CA temp files; in the main shell, so the exit handler knows it
+  ensure_work_dir
   if in_cluster secrets "${MIGRATE_KC_SECRET}" "${MIGRATE_KC_NS}"; then
     log "keycloak-admin: Secret ${MIGRATE_KC_NS}/${MIGRATE_KC_SECRET} exists (left as it is)"
     return 0

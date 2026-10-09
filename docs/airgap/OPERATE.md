@@ -657,14 +657,22 @@ password in a 0600 file for M3. Delete the old bundle copy in
 other secrets at mode 0644), and move any `.secrets/` and `bundle/*/bootstrap/secrets`
 copies on laptops and USB media into an encrypted backup.
 
-**M2. Backup and baseline.** `backup` is the first `teknoir-airgap` command on
-the live node. Run it in a terminal: it asks you to confirm the node's ssh host
-key, asks once for `teknoir`'s sudo password (and installs
-`/etc/sudoers.d/teknoir-airgap`), copies the bundle payload (about 3 GB) and the
-site config to the node, then takes the backup. Do not run `up` before M4.
+**M2. Status, backup and baseline.** `status` is the first `teknoir-airgap`
+command on the live node: it pins the node's ssh host key (confirm it in a
+terminal, or pass `--host-key SHA256:<fingerprint>` read on the node console)
+and reports the clock skew; if the clock is off by more than 30 s, every `up`
+below needs `--sync-clock`. `backup` then copies the bundle payload (about 3 GB)
+and the site config to the node and takes the backup; it asks for an
+encryption passphrase, so run it in a terminal. Without a terminal, take the
+node-local backup instead (unencrypted, root-only on the node; copy it out of
+the keep-3 rotation). Do not run `up` before M4.
 
 ```sh
+./teknoir-airgap status
 ./teknoir-airgap backup --out /media/usb/teknoir-local-premigration
+# or, without a terminal (after `./teknoir-airgap migrate --dry-run` has copied the payload):
+#   ssh teknoir@192.168.5.181 sudo /var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/teknoir-node backup \
+#     --site /var/lib/teknoir-airgap/site/teknoir-local.env
 kubectl --context teknoir-local get crd -o name | sort > before-crds.txt
 kubectl --context teknoir-local get ns,secrets -A --no-headers | wc -l > before-counts.txt
 kubectl --context teknoir-local get virtualservices,gateways,destinationrules,authorizationpolicies,peerauthentications,certificates,clusterissuers,applications -A --no-headers | wc -l >> before-counts.txt
@@ -697,14 +705,14 @@ Verify:
 ```sh
 kubectl --context teknoir-local -n teknoir-auth get secret keycloak-admin   # exists (keys username, previous-password)
 kubectl --context teknoir-local get addons -n kube-system   # only k3s's own addons, plus teknoir-argo
-kubectl --context teknoir-local get crd,ns,secrets -A -l objectset.rio.cattle.io/hash --no-headers   # none of Teknoir's
+kubectl --context teknoir-local get crd,ns,secrets -A -l objectset.rio.cattle.io/hash --no-headers   # only teknoir-argo's: the argoproj CRDs, argocd-secret, argocd-notifications-secret
 ssh teknoir@192.168.5.181 sudo ls /opt/k3s/server/manifests   # .skip guards; no Teknoir *.yaml but teknoir-argo.yaml
 ```
 
 **M4. Converge.**
 
 ```sh
-./teknoir-airgap up --force-images
+./teknoir-airgap up --force-images            # plus --sync-clock when status reported a skew
 ```
 
 `--force-images` is needed once: Harbor's mirror tag `dockerhub/library/postgres:17-alpine`
