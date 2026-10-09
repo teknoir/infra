@@ -6,6 +6,35 @@ describe only the current procedure; past procedures, incidents and the
 reasons for the redesign are kept here. The git history of `infra` and
 `platform-applications-gitops` (branch `teknoir-local`) is the full archive.
 
+## r5 (app-of-apps 0.0.5)
+
+### admin-user
+
+- **The temporary password is handed out once.** `admin-user` reads it from
+  user-controller's short-lived Secret
+  `teknoir-user-credentials/user-initial-password-<name>` (or, with an older
+  user-controller, from the User's `status.set_initial_password`), writes it to
+  the `--out` file (0600, checked by sha256), then deletes the Secret or the
+  status field. Before, the password stayed in the User object, where anyone
+  who can read Users could see it, and every re-run wrote it out again.
+- **`--out` is never overwritten.** A file that exists and is not empty is
+  refused; with nothing on record no file is written, and the warning names
+  `--reset-password`. The LAN tool keeps the password when the node fails
+  after the handover (for example on a catalog timeout).
+- **`--reset-password`** (explicit only, needs `--out`) sets a new temporary
+  password through the Keycloak admin API (`temporary: true`). The file is
+  written first and removed again if Keycloak refuses.
+- **Teamspace owner.** `admin-user` adds ClaimSet `owner` on every teamspace
+  whose Profile names the address as owner (`teknoir-default`; `--teamspace
+  NAME` limits it) and waits for user-controller's RoleBinding. An existing User
+  now gets missing owner claims; before, it was never touched.
+- **No Backstage restart.** The restart never made the catalog read the user
+  earlier: Backstage's scheduler keeps min(stored, now + cadence) as the next
+  run. `admin-user` now waits until the catalog lists `user:default/<name>`
+  (read-only query on backstage-postgres-0, `ADMIN_CATALOG_TIMEOUT`, default
+  240 s); backstage chart 0.0.84 runs the user and profile providers every
+  minute.
+
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
 One build command, one LAN-host command, and the same command for the first
