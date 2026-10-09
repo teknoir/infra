@@ -8,6 +8,7 @@ CI runs everything except the VM test: [.github/workflows/airgap-ci.yml](../../.
 | Static + unit | `airgap/test/run-static.sh` | shellcheck, docker (bash 3.2), gitleaks, curl (first bats install) | yes |
 | bats only | `airgap/test/bats/run.sh [file.bats]` | bash, curl (first run only) | yes, from run-static.sh |
 | K3s ownership (k3d) | `airgap/test/k3d/run.sh [T1 ... T10]` | docker, k3d, kubectl, jq (T6 also helm, yq; T10 python3) | T1-T5, T4N, T9, T10; T6 on manual dispatch |
+| Node runner cluster phases (k3d) | `airgap/test/node/k3d.sh [-v] [--keep]` | docker, k3d, kubectl, jq, openssl (pulls postgres:16-alpine) | yes |
 | VM end to end | `airgap/test/vm/e2e.sh [--allow-destroy] [E1 ...]` | vpro: KVM, sudo, the VM base image | no |
 
 ## bats (pinned, offline-friendly)
