@@ -466,10 +466,14 @@ harbor_remote_config_digest() {
 
 harbor_chart_tree() {
   # harbor_chart_tree <tgz> — "sha256  path" of every file in the chart archive
+  # but Chart.lock: dependency-resolution metadata that rendering never reads,
+  # with a build timestamp (generated:) and present or not depending on how the
+  # chart was packed (the pre-redesign bundles shipped monitoring 0.0.4 with
+  # different Chart.lock files and nothing else different)
   local d
   d="$(mktemp -d "${HARBOR_TMP}/tree.XXXXXX")" || return 1
   tar -xzf "$1" -C "${d}" || { rm -rf "${d}"; return 1; }
-  (cd "${d}" && find . -type f -print0 | sort -z | xargs -0 -r sha256sum)
+  (cd "${d}" && find . -type f ! -name Chart.lock -print0 | sort -z | xargs -0 -r sha256sum)
   rm -rf "${d}"
 }
 
