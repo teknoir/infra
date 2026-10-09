@@ -24,10 +24,17 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
   those two and the removal of systemd-timesyncd (else a WARN; the converge
   goes on).
 - chrony serves NTP to the LAN from a local stratum-10 reference; every `up`
-  gives it the LAN host's time (`chronyc settime`), so it learns the drift.
-  `TIME_SOURCE` takes a list of servers.
-- Clock policy: up to 2 s nothing, up to 30 s corrected by `up` itself, more
-  only with `--sync-clock`; `up` writes the RTC when it is more than 2 s off.
+  gives it the LAN host's time (`chronyc settime`). It learns the drift only
+  from samples at least 12 h apart (a re-run drops the earlier sample first:
+  two samples a minute apart taught chrony 4.6.1 a rate error of 16455 ppm),
+  and `maxdrift 100` caps the rate it may learn. `TIME_SOURCE` takes a list of
+  servers.
+- Clock policy: up to 2 s nothing, up to 30 s corrected by `up` itself (a node
+  behind is stepped forward, a node ahead is slewed back by chrony, never
+  stepped back without the flag; a refused `date -u -s` is a WARN), more only
+  with `--sync-clock`; `up` writes the RTC when it is more than 2 s off. The
+  age of `--lan-time` is measured on a clock that setting the time does not
+  move, so preflight's own correction no longer skews the host phase's sample.
 - `status` and `doctor` report chrony, the RTC offset, `TIME_SOURCE` in use and
   whether `NODE_IP` is a DHCP lease (new site key `NODE_IP_DHCP_RESERVED`; the
   live node keeps its address through a UniFi reservation).
@@ -37,7 +44,9 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
 - New optional site keys, checked by the build, the node and the LAN tool:
   `NODE_IP_DHCP_RESERVED` and `BACKUP_AGE_RECIPIENTS` (age public keys for the
   encrypted backups); `TIME_SOURCE` entries must be IPv4 addresses or host
-  names.
+  names. An age private key pasted into the site file is refused without
+  being printed ("treat that identity as exposed"); other bad recipients are
+  named by their first 8 characters.
 - HOST-SETUP no longer installs chrony from the DVD, no longer suggests
   `timedatectl set-time` (refused while NTP is active), describes the
   cloud-image network layout of the live node, and has new sections on the

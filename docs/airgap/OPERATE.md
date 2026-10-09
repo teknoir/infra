@@ -579,7 +579,7 @@ install sudo from the installation medium (`apt-get install sudo`), run
 | Skew | What `up` does |
 |---|---|
 | up to 2 s | nothing |
-| up to 30 s | corrects it in the same run: chrony gets the LAN host's time as a sample (`chronyc settime`, then `makestep`); without an active chrony the clock is set with `date` |
+| up to 30 s | corrects it in the same run, but never steps the clock back: chrony gets the LAN host's time as a sample (`chronyc settime`); a node behind is stepped forward (`makestep`, or `date` without an active chrony), a node ahead is slewed back by chrony over a few minutes |
 | more | refuses, because the LAN host's own clock may be the wrong one |
 
 Check the LAN host's clock first. If the node is the one that is wrong, let `up`
@@ -589,13 +589,26 @@ set it from the LAN host:
 ./teknoir-airgap up --sync-clock
 ```
 
+`--sync-clock` also sets a node that is ahead back at once. Without an active
+chrony, a node more than 2 s ahead gets a WARN and stays ahead until chrony runs
+(the same `up` installs and starts it) or you pass `--sync-clock`. A clock that
+cannot be set (`date -u -s` refused) is a WARN in the automatic correction and
+stops the run only with `--sync-clock`.
+
 `up` also writes the hardware clock (RTC) whenever it is more than 2 s off, so
 the node starts with the right time after a reboot. Every `up` gives chrony one
-sample, and chrony learns the node's drift from them (`/var/lib/chrony/chrony.drift`).
-The live teknoir-local node lost about 3.9 s a day before r5 (118 s in 31 days);
-with the drift learned, the clock should stay within 30 s between updates. If
-it does not, give the node an NTP source: `TIME_SOURCE` in the site config (a
-LAN NTP server, or an allowed public one), then `up`.
+sample. chrony learns the node's drift (`/var/lib/chrony/chrony.drift`) only
+from samples at least 12 hours apart: each sample is good to about a second,
+and two samples minutes apart would teach it a rate error of thousands of ppm.
+So a re-run or a second `up` on the same day only corrects the offset (the log
+says "dropped its manual samples"), and `maxdrift 100` in the drop-in caps any
+rate chrony learns at 8.6 s a day. The live teknoir-local node lost about 3.9 s
+a day before r5 (118 s in 31 days); once chrony has two samples 12 hours or more
+apart, the clock should stay within 30 s between updates. On the node,
+`chronyc -n tracking` shows the learned rate (`Frequency`, about 45 ppm for
+that drift; a value near 100 ppm means the cap is reached). If the clock still
+drifts out of the window, give the node an NTP source: `TIME_SOURCE` in the
+site config (a LAN NTP server, or an allowed public one), then `up`.
 
 **`doctor`: RTC far off.** A reboot would start the node that far off, and the
 next `up` would then need `--sync-clock`. Run `./teknoir-airgap up`; it writes
