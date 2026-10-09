@@ -248,6 +248,10 @@ cd teknoir-airgap-<older bundleId>
 - A rollback re-pins charts and images. It does not undo a database migration
   that a newer chart already ran (Keycloak, Harbor): if one did, restore the
   databases from the backup taken before the update (section 10).
+- Roll back with the bundle that was live, so keep its tar and `.tar.sha256`
+  until the update is accepted. A rebuild of an older version is a different
+  bundle ([BUILD.md](BUILD.md#rollback-bundles)); for r5 see
+  [Rolling back from r5](#rolling-back-from-r5).
 
 ## 6. Status and checks
 
@@ -804,6 +808,31 @@ code.
   reports `live image check: N pullable from Harbor, 0 only in containerd,
   0 missing` when every running image, pinned ones included, can be pulled
   again.
+
+### Rolling back from r5
+
+- Before the update, keep the bundle that is live: on teknoir-local that is
+  `teknoir-airgap-teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af.tar` (with
+  its `.tar.sha256`). Keep it on the USB medium next to the r5 bundle (about
+  10 GB together: exFAT or ext4), and extracted on the LAN host, until r5 is
+  accepted.
+- The rollback is section 5 with that bundle:
+
+  ```sh
+  cd teknoir-airgap-teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af
+  ./teknoir-airgap up --rollback
+  ```
+
+- Do not rebuild 0.0.4 for a rollback while that tar exists. The r5 build
+  can only make it as a `-mutable` bundle without teamspace plugins
+  (`ALLOW_MUTABLE_TEKNOIR_TAGS=1`, `PROFILE_PLUGIN_CHARTS=""`); that is
+  allowed only when the tar is lost, and only with `--rollback`
+  ([BUILD.md](BUILD.md#rollback-bundles)).
+- A rollback to 0.0.4 does not remove what r5 added: the node packages stay
+  installed, and the plugin charts and images stay in Harbor (unused).
+  0.0.4's profile-controller has no `PLUGIN_CHART_REPO`, so teamspaces cannot
+  install their plugins offline again, as before r5. Database changes need the
+  backup taken before the update (section 10).
 
 ## 15. Command reference
 

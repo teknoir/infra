@@ -144,7 +144,7 @@ log "  site ${SITE_FILE#"${INFRA_ROOT}"/} (${TEKNOIR_ENV}, ${TEKNOIR_DOMAIN})"
 log "  infra  ${INFRA_BRANCH} ${INFRA_COMMIT:0:12}  gitops ${GITOPS_BRANCH} ${GITOPS_COMMIT:0:12}"
 log "  app-of-apps ${APP_OF_APPS_VERSION}, tiers: ${ONESHOT_TIERS}, k3s ${K3S_VERSION}, ${IMAGE_PLATFORMS}"
 log "  teamspace plugins: ${PROFILE_PLUGIN_CHARTS:-none}; node packages: ${NODE_DEBS:-none}"
-(( MUTABLE )) && warn "ALLOW_MUTABLE_TEKNOIR_TAGS=1: unpinned Teknoir images only warn; this -mutable bundle is not for the live environment"
+(( MUTABLE )) && warn "ALLOW_MUTABLE_TEKNOIR_TAGS=1: unpinned Teknoir images only warn; this -mutable bundle is not for the live environment (the one exception: a rebuilt rollback bundle, docs/airgap/BUILD.md \"Rollback bundles\")"
 
 # Required sources written by the node and LAN implementations
 NODE_SRC="${AIRGAP_DIR}/node"

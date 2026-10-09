@@ -89,11 +89,17 @@ hold files over 4 GB: build with `--split`, which also writes the tar as 3900 Mi
 cat teknoir-airgap-<bundleId>.tar.part-* > teknoir-airgap-<bundleId>.tar
 ```
 
+Keep the bundle that is live now on the same medium: its tar and `.tar.sha256`
+are the rollback ([Rollback bundles](#rollback-bundles)). With an r5 bundle and
+the app-of-apps 0.0.4 bundle that is about 10 GB.
+
 ## 4. Check a build
 
 - [ ] `sha256sum -c dist/teknoir-airgap-<bundleId>.tar.sha256` prints `OK`.
 - [ ] The tar is under 6.5 GiB (about 5.8 GB with the teamspace plugins).
-- [ ] The bundle id has no `-dirty`, `-mutable` or `-incomplete` suffix.
+- [ ] The bundle id has no `-dirty`, `-mutable` or `-incomplete` suffix (the
+      one exception is a rebuilt rollback bundle,
+      [Rollback bundles](#rollback-bundles)).
 - [ ] `MANIFEST.yaml` lists the 9 `profile-plugin-*` charts under
       `teamspacePlugins`, the two packages under `debs`, and
       `mutableTeknoirTags: false`; `teamspace_mutable_images` lists the plugin
@@ -187,7 +193,8 @@ references; `pin-images.sh --verify <pinned ref> ...` checks existing pins. The
 one-shot tiers (istio, harbor, argo, platform-secrets) stay tag-only: the node
 imports them as docker archives, which crane re-manifests.
 `ALLOW_MUTABLE_TEKNOIR_TAGS=1 make-bundle.sh ...` builds anyway, marked
-`-mutable`; such a bundle is for tests only.
+`-mutable`; such a bundle is for tests only, with one exception: a rebuilt
+rollback bundle ([Rollback bundles](#rollback-bundles)).
 
 The teamspace plugin charts are published bytes and still use `:latest` for
 11 Teknoir images and `alpine:latest`; they only warn and are listed in
@@ -207,10 +214,10 @@ plugin chart version: set it in the gitops chart, add the
 downloaded archives) and build. Airgap Profiles must not enable plugins
 outside `PROFILE_PLUGIN_CHARTS` (postgres, claims) or set another version.
 
-A rollback bundle for an app-of-apps whose profile-controller has no
-`PLUGIN_CHART_REPO` (0.0.4 and older) sets `PROFILE_PLUGIN_CHARTS=""` in
-`airgap/versions.env` (committed): it carries no plugins, so teamspaces do not
-work offline with it.
+An app-of-apps whose profile-controller has no `PLUGIN_CHART_REPO` (0.0.4 and
+older) only builds with `PROFILE_PLUGIN_CHARTS=""`: a bundle without plugins,
+with which teamspaces do not work offline. Roll back to such a version with the
+bundle that was live, not with a rebuild ([Rollback bundles](#rollback-bundles)).
 
 ### Node packages
 
@@ -225,3 +232,40 @@ sha256 against the node's own signed apt metadata (`apt-cache show
 Never reuse a version that Harbor already has, even one that was never deployed:
 app-of-apps 0.0.1 and 0.0.2 were overwritten in Harbor once, and both are now
 refused forever (see [CHANGELOG.md](CHANGELOG.md)).
+
+### Rollback bundles
+
+Roll back with the bundle that was live before the update, not with a rebuild.
+Keep its tar and `.tar.sha256` on the USB medium next to the new bundle, and on
+the LAN host, until the new release is accepted. For r5 that is the app-of-apps
+0.0.4 bundle `teknoir-airgap-teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af.tar`
+(built by infra 8610f8d from gitops a8fe7af; 4.0 GiB). The rollback is
+`./teknoir-airgap up --rollback` from that bundle
+([OPERATE.md](OPERATE.md#5-rollback)). It runs that bundle's own node code,
+which is what the VM end-to-end test E4 runs (`up` with the new bundle, then
+`up --rollback` with the old one).
+
+A rebuild is a different bundle. The old charts' floating tags resolve to
+whatever the registries serve on the build day, and the current build applies
+its current gates. The r5 build cannot make a clean app-of-apps 0.0.4 bundle:
+
+- 0.0.4's profile-controller sets no `PLUGIN_CHART_REPO`, so the build fails
+  unless `PROFILE_PLUGIN_CHARTS=""` (no teamspace plugins);
+- 0.0.4 has 8 Teknoir images without a G-09 pin (branch tags, `latest`, or an
+  immutable tag with no digest), so G-09 fails unless
+  `ALLOW_MUTABLE_TEKNOIR_TAGS=1`, which marks the bundle `-mutable`.
+
+Only when the retained tar is lost, rebuild it as an exception:
+
+1. In `infra`, on a release branch such as `r5-rollback`, set
+   `APP_OF_APPS_VERSION="0.0.4"` and `PROFILE_PLUGIN_CHARTS=""` in
+   `airgap/versions.env` and commit (so the bundle is not `-dirty`).
+2. In `platform-applications-gitops`, check out the revision that was live
+   (a8fe7af for 0.0.4) on a branch of the same name.
+3. Build with `ALLOW_MUTABLE_TEKNOIR_TAGS=1 airgap/build/make-bundle.sh --gitops <that checkout>`.
+
+That bundle is the only `-mutable` bundle that may reach the live environment,
+and only with `up --rollback` to an app-of-apps version that was already live.
+It runs the current node code with the old charts (a combination E4 does not
+test), carries no teamspace plugins, and its Teknoir images may be newer builds
+than the ones that were live.
