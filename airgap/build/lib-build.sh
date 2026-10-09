@@ -52,7 +52,7 @@ require_cmd() {
 # ---------------------------------------------------------------------------
 # Variables a test may override from the environment. Any override is listed
 # in PIN_OVERRIDES; make-bundle.sh treats it like a dirty tree.
-PIN_OVERRIDABLE=(APP_OF_APPS_VERSION ONESHOT_TIERS EXTRA_CHART_PINS IMAGE_PLATFORMS)
+PIN_OVERRIDABLE=(APP_OF_APPS_VERSION ONESHOT_TIERS EXTRA_CHART_PINS IMAGE_PLATFORMS PROFILE_PLUGIN_CHARTS)
 PIN_OVERRIDES=()
 declare -A _pin_env=()
 for _v in "${PIN_OVERRIDABLE[@]}"; do
@@ -170,8 +170,11 @@ git_is_dirty() {
 }
 
 branch_allowed() {
-  # branch_allowed <branch> <env> — the env branch or an airgap-redesign* branch
-  [[ "$1" == "$2" || "$1" == airgap-redesign* ]]
+  # branch_allowed <branch> <env> — the env branch, an airgap-redesign* branch,
+  # or a release integration branch r<N>[-<name>] (r5, r5-bundle): the r5
+  # bundle is built from the r5 branches of both repos before they are merged
+  # into the env branch
+  [[ "$1" == "$2" || "$1" == airgap-redesign* || "$1" =~ ^r[0-9]+(-[a-z0-9][a-z0-9-]*)?$ ]]
 }
 
 copy_git_files() {
@@ -310,6 +313,169 @@ split_crds() {
 }
 
 # ---------------------------------------------------------------------------
+# Teamspace plugin charts (profile-plugins-helm; contracts K2 and K8)
+# ---------------------------------------------------------------------------
+configmap_value() {
+  # configmap_value <render.yaml> <configmap-name> <key> — the ConfigMap's
+  # data value on stdout. Exit 1 when the render has no ConfigMap of that
+  # name, 2 when it lacks the key (an empty value is a value).
+  local render="$1" name="$2" key="$3" n
+  n="$(CM_NAME="${name}" yq -r 'select(.kind == "ConfigMap" and .metadata.name == env(CM_NAME)) | .metadata.name' "${render}")" \
+    || die "configmap_value: cannot parse ${render}"
+  [[ -n "${n}" ]] || return 1
+  [[ "$(CM_NAME="${name}" CM_KEY="${key}" yq -r 'select(.kind == "ConfigMap" and .metadata.name == env(CM_NAME)) | (.data // {}) | has(env(CM_KEY))' "${render}" | head -1)" == true ]] \
+    || return 2
+  CM_NAME="${name}" CM_KEY="${key}" yq -r 'select(.kind == "ConfigMap" and .metadata.name == env(CM_NAME)) | .data[env(CM_KEY)] // ""' "${render}" | head -1
+}
+
+profile_names() {
+  # profile_names <render.yaml> — metadata.name of every teknoir.org Profile, in render order
+  yq -r 'select(.kind == "Profile" and ((.apiVersion // "") | test("^teknoir\\.org/"))) | .metadata.name' "$1"
+}
+
+plugin_chart_config() {
+  # plugin_chart_config <profile-controller-render> <domain> — read the plugin
+  # chart repo and version the controller will use (ConfigMap
+  # PROFILE_CONTROLLER_CONFIGMAP, keys PLUGIN_CHART_REPO / PLUGIN_CHART_VERSION,
+  # contract K2) into PLUGIN_REPO and PLUGIN_VERSION. Returns 1 with
+  # PLUGIN_CONFIG_ERROR set when they do not fit the airgap: the repo must be
+  # harbor.<domain>/<HARBOR_CHART_PROJECT> (Helm OCI without "oci://", like
+  # every Application repoURL), the version an exact chart version.
+  local render="$1" domain="$2" want rc=0
+  PLUGIN_REPO="" PLUGIN_VERSION="" PLUGIN_CONFIG_ERROR=""
+  want="harbor.${domain}/${HARBOR_CHART_PROJECT}"
+  if [[ ! -s "${render}" ]]; then
+    PLUGIN_CONFIG_ERROR="no ${PROFILE_CONTROLLER_APP} render (${render}): app-of-apps ${APP_OF_APPS_VERSION} must deploy profile-controller when PROFILE_PLUGIN_CHARTS is set"
+    return 1
+  fi
+  PLUGIN_REPO="$(configmap_value "${render}" "${PROFILE_CONTROLLER_CONFIGMAP}" PLUGIN_CHART_REPO)" || rc=$?
+  case "${rc}" in
+    0) ;;
+    1) PLUGIN_CONFIG_ERROR="the ${PROFILE_CONTROLLER_APP} render has no ConfigMap ${PROFILE_CONTROLLER_CONFIGMAP}"; return 1 ;;
+    *) PLUGIN_CONFIG_ERROR="ConfigMap ${PROFILE_CONTROLLER_CONFIGMAP} sets no PLUGIN_CHART_REPO, so the controller pulls the plugin charts from its compiled default (${PROFILE_PLUGIN_SOURCE}), unreachable offline: use a gitops revision whose profile-controller chart sets it (contract K2), or set PROFILE_PLUGIN_CHARTS=\"\" in airgap/versions.env for a bundle without teamspaces"; return 1 ;;
+  esac
+  if [[ "${PLUGIN_REPO}" != "${want}" ]]; then
+    PLUGIN_CONFIG_ERROR="ConfigMap ${PROFILE_CONTROLLER_CONFIGMAP}: PLUGIN_CHART_REPO is '${PLUGIN_REPO}', not ${want} (Helm OCI in Harbor, no oci:// prefix; site domain ${domain})"
+    return 1
+  fi
+  rc=0
+  PLUGIN_VERSION="$(configmap_value "${render}" "${PROFILE_CONTROLLER_CONFIGMAP}" PLUGIN_CHART_VERSION)" || rc=$?
+  if (( rc != 0 )) || ! [[ "${PLUGIN_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+    PLUGIN_CONFIG_ERROR="ConfigMap ${PROFILE_CONTROLLER_CONFIGMAP}: PLUGIN_CHART_VERSION '${PLUGIN_VERSION}' is not an exact chart version (the airgap pins it; an empty value means the controller's compiled default)"
+    return 1
+  fi
+}
+
+plugin_index_lookup() {
+  # plugin_index_lookup <index.yaml> <chart> <version> — "<digest> <url>" of
+  # that entry (url resolved against PROFILE_PLUGIN_SOURCE); nothing when absent
+  local digest url
+  digest="$(C="$2" V="$3" yq -r '.entries[env(C)] // [] | .[] | select(.version == env(V)) | .digest // ""' "$1" | head -1)" || return 1
+  url="$(C="$2" V="$3" yq -r '.entries[env(C)] // [] | .[] | select(.version == env(V)) | .urls[0] // ""' "$1" | head -1)" || return 1
+  [[ -n "${digest}" && -n "${url}" ]] || return 0
+  [[ "${url}" == *://* ]] || url="${PROFILE_PLUGIN_SOURCE%/}/${url#./}"
+  echo "${digest} ${url}"
+}
+
+fetch_plugin_chart() {
+  # fetch_plugin_chart <chart> <version> <dest-dir> — the published archive
+  # <chart>-<version>.tgz of PROFILE_PLUGIN_SOURCE into <dest-dir>, byte for
+  # byte (never re-packed: the pin is the published file). A download must
+  # equal BOTH its pin PINNED_SHA256[<chart>-<version>] and the digest in the
+  # repo's index.yaml. Cached by sha256 in ${CACHE_DIR}/charts/<sha256>/; a
+  # cached file whose sha256 differs from the pin fails the build.
+  local chart="$1" version="$2" dest="$3" key pin dir file got entry idx_digest url tmp
+  key="${chart}-${version}"
+  pin="${PINNED_SHA256[${key}]:-}"
+  [[ "${pin}" =~ ^[0-9a-f]{64}$ ]] \
+    || die "no sha256 pin for ${key} in airgap/versions.env: add PINNED_SHA256[${key}] = the digest in ${PROFILE_PLUGIN_SOURCE}/index.yaml, after checking it against the downloaded archive"
+  dir="${CACHE_DIR}/charts/${pin}"
+  file="${dir}/${key}.tgz"
+  if [[ -f "${file}" ]]; then
+    got="$(sha256_file "${file}")"
+    [[ "${got}" == "${pin}" ]] \
+      || die "cached ${file} has sha256 ${got}, but versions.env pins ${pin}: the cache entry was modified; delete ${dir} to re-download"
+  else
+    mkdir -p "${dir}"
+    find "${dir}" -maxdepth 1 -name '.download.*' -mmin +60 -delete
+    tmp="$(mktemp "${dir}/.download.XXXXXX")"
+    curl -fsSL --retry 3 -o "${tmp}" "${PROFILE_PLUGIN_SOURCE%/}/index.yaml" \
+      || { rm -f "${tmp}"; die "cannot download ${PROFILE_PLUGIN_SOURCE%/}/index.yaml"; }
+    entry="$(plugin_index_lookup "${tmp}" "${chart}" "${version}")" \
+      || { rm -f "${tmp}"; die "cannot parse ${PROFILE_PLUGIN_SOURCE%/}/index.yaml"; }
+    rm -f "${tmp}"
+    [[ -n "${entry}" ]] || die "${chart} ${version} is not in ${PROFILE_PLUGIN_SOURCE%/}/index.yaml"
+    idx_digest="${entry%% *}"
+    url="${entry#* }"
+    [[ "${idx_digest}" == "${pin}" ]] \
+      || die "${key}: ${PROFILE_PLUGIN_SOURCE%/}/index.yaml lists digest ${idx_digest}, but versions.env pins ${pin}"
+    tmp="$(mktemp "${dir}/.download.XXXXXX")"
+    log "downloading ${url}"
+    curl -fsSL --retry 3 -o "${tmp}" "${url}" || { rm -f "${tmp}"; die "download failed: ${url}"; }
+    got="$(sha256_file "${tmp}")"
+    [[ "${got}" == "${pin}" ]] || { rm -f "${tmp}"; die "${key}: downloaded sha256 ${got} differs from the pin ${pin}"; }
+    mv -f "${tmp}" "${file}"
+  fi
+  tar -tzf "${file}" "${chart}/Chart.yaml" >/dev/null 2>&1 \
+    || die "${key}.tgz has no ${chart}/Chart.yaml (not the chart it claims to be)"
+  mkdir -p "${dest}"
+  cp "${file}" "${dest}/${key}.tgz.tmp"
+  chmod 0644 "${dest}/${key}.tgz.tmp"
+  mv -f "${dest}/${key}.tgz.tmp" "${dest}/${key}.tgz"
+}
+
+plugin_supply_gate() {
+  # plugin_supply_gate <fail-fn> <renders-dir> <charts-dir> <images.lock> <domain>
+  # — the teamspace plugin supply is complete and from the pins:
+  #   - PLUGIN_CHART_REPO = harbor.<domain>/<project>, exact PLUGIN_CHART_VERSION
+  #     (plugin_chart_config on <renders-dir>/<PROFILE_CONTROLLER_APP>.yaml);
+  #   - every PROFILE_PLUGIN_CHARTS chart at that version is in pins.txt and
+  #     <charts-dir>, and equals its PINNED_SHA256 pin;
+  #   - no other profile-plugin-* chart is carried (postgres and claims are
+  #     not supported on the airgap);
+  #   - every image of every teamspace-<name> render is in images.lock.
+  # Calls <fail-fn> once per finding; prints nothing else.
+  local fail="$1" renders="$2" charts="$3" lock="$4" domain="$5" name chart tgz key want got img locked
+  [[ -n "${PROFILE_PLUGIN_CHARTS// /}" ]] || return 0
+  if ! plugin_chart_config "${renders}/${PROFILE_CONTROLLER_APP}.yaml" "${domain}"; then
+    "${fail}" "teamspace plugins: ${PLUGIN_CONFIG_ERROR}"
+    return 0
+  fi
+  [[ -f "${charts}/pins.txt" ]] || { "${fail}" "teamspace plugins: no node/charts/pins.txt"; return 0; }
+  [[ -f "${lock}" ]] || { "${fail}" "teamspace plugins: no images.lock"; return 0; }
+  locked="$(awk '{sub(/@sha256:[0-9a-f]+$/, "", $1); print $1}' "${lock}" | LC_ALL=C sort -u)"
+  for name in ${PROFILE_PLUGIN_CHARTS}; do
+    chart="profile-plugin-${name}"
+    key="${chart}-${PLUGIN_VERSION}"
+    tgz="${charts}/${key}.tgz"
+    grep -qxF "${chart} ${PLUGIN_VERSION}" "${charts}/pins.txt" 2>/dev/null \
+      || "${fail}" "teamspace plugins: ${chart} ${PLUGIN_VERSION} is not in node/charts/pins.txt"
+    want="${PINNED_SHA256[${key}]:-}"
+    if [[ ! -f "${tgz}" ]]; then
+      "${fail}" "teamspace plugins: node/charts/${key}.tgz is missing"
+    elif [[ -z "${want}" ]]; then
+      "${fail}" "teamspace plugins: no PINNED_SHA256[${key}] in airgap/versions.env"
+    else
+      got="$(sha256_file "${tgz}")"
+      [[ "${got}" == "${want}" ]] || "${fail}" "teamspace plugins: node/charts/${key}.tgz has sha256 ${got}, not its pin ${want}"
+    fi
+    if [[ ! -s "${renders}/teamspace-${name}.yaml" ]]; then
+      "${fail}" "teamspace plugins: no render teamspace-${name}.yaml"
+      continue
+    fi
+    while IFS= read -r img; do
+      [[ -n "${img}" ]] || continue
+      grep -qxF -- "${img}" <<<"${locked}" || "${fail}" "teamspace plugins: image ${img} (teamspace-${name}) is not in images.lock"
+    done < <(extract_images < "${renders}/teamspace-${name}.yaml" | LC_ALL=C sort -u)
+  done
+  while read -r chart _; do
+    [[ "${chart}" == profile-plugin-* ]] || continue
+    [[ " ${PROFILE_PLUGIN_CHARTS} " == *" ${chart#profile-plugin-} "* ]] \
+      || "${fail}" "teamspace plugins: ${chart} is in pins.txt but not in PROFILE_PLUGIN_CHARTS (airgap Profiles must not enable it)"
+  done < "${charts}/pins.txt"
+}
+
+# ---------------------------------------------------------------------------
 # Image references
 # ---------------------------------------------------------------------------
 normalize_image() {
@@ -389,11 +555,196 @@ is_teknoir_image() {
 is_immutable_tag() {
   # is_immutable_tag <ref> — pinned by digest, or a version-like tag
   # (v1.2.3, 1.2, 0.0.83-rc1, sha-<hex>); latest, branch names and
-  # date-stamped branch builds are mutable
+  # date-stamped branch builds are mutable. (The G-09 rule for Teknoir images
+  # is stricter: teknoir_pin_ok.)
   local tag
   [[ "$1" == *@sha256:* ]] && return 0
   tag="$(image_tag "$1")"
   [[ "${tag}" =~ ^v?[0-9]+(\.[0-9]+)+([-+][0-9A-Za-z.-]+)?$ || "${tag}" =~ ^sha-[0-9a-f]{7,}$ ]]
+}
+
+# ---------------------------------------------------------------------------
+# Image pin policy (G-09; r5 contract K5). The same rule as the gitops
+# tests/render.sh images check.
+# ---------------------------------------------------------------------------
+# An immutable Teknoir tag: the CI's sha-<first 8 hex of the commit>, its
+# <branch>-<UTC YYYYMMDD-HHMMSS> build tag, or a semantic version. CI also
+# pushes <branch> and latest, which move.
+IMMUTABLE_TAG_RE='^(sha-[0-9a-f]{7,}|[A-Za-z0-9][A-Za-z0-9._-]*-[0-9]{8}-[0-9]{6}|v?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?)$'
+
+teknoir_pin_ok() {
+  # teknoir_pin_ok <ref> — 0 when <ref> is "<repo>:<immutable tag>@sha256:<64 hex>".
+  # The digest must be the linux/amd64 manifest, not the multi-arch index
+  # (collect-images.sh resolve() refuses an index): the bundle ships and
+  # Harbor receives the amd64 manifest only, and the index digest changes
+  # with every build's provenance attestation. The tag must be immutable too,
+  # because Harbor is pushed by tag.
+  local ref="$1" tag
+  [[ "${ref}" =~ ^[^@]+@sha256:[0-9a-f]{64}$ ]] || return 1
+  tag="$(image_tag "${ref}")"
+  [[ -n "${tag}" && "${tag}" =~ ${IMMUTABLE_TAG_RE} ]]
+}
+
+is_floating_tag() {
+  # is_floating_tag <ref> — 0 for a ref without a digest whose tag moves
+  # upstream: latest (or none) and major-only tags (16, 17-alpine, v2)
+  local tag
+  [[ "$1" == *@sha256:* ]] && return 1
+  tag="$(image_tag "$1")"
+  [[ -z "${tag}" || "${tag}" == latest || "${tag}" =~ ^v?[0-9]+(-[A-Za-z0-9._-]+)?$ ]]
+}
+
+manifest_platform_digest() {
+  # manifest_platform_digest <manifest.json> <its digest> <os> <arch> [variant]
+  # — the digest of the <os>/<arch>[/variant] image: the matching child of an
+  # index (attestation children are platform unknown/unknown), or <its digest>
+  # for a single image manifest. Exit 1 when an index has no such child.
+  local m="$1" top="$2" os="$3" arch="$4" variant="${5:-}" d
+  if jq -e '.manifests' "${m}" >/dev/null 2>&1; then
+    d="$(jq -r --arg os "${os}" --arg arch "${arch}" --arg v "${variant}" '
+      [.manifests[] | select(.platform.os == $os and .platform.architecture == $arch
+                             and ($v == "" or .platform.variant == $v))][0].digest // ""' "${m}")"
+    [[ -n "${d}" ]] || return 1
+    echo "${d}"
+  else
+    echo "${top}"
+  fi
+}
+
+pinned_index_error() {
+  # pinned_index_error <ref> <platform-digest> <platform> — 1 with
+  # PINNED_INDEX_ERROR set when <ref> pins a digest that is not the platform
+  # manifest (i.e. a multi-platform index); 0 for tag-only refs and correct pins
+  local ref="$1" pd="$2" platform="$3"
+  PINNED_INDEX_ERROR=""
+  [[ "${ref}" == *@sha256:* ]] || return 0
+  [[ "${ref##*@}" != "${pd}" ]] || return 0
+  PINNED_INDEX_ERROR="${ref}: the pinned digest is a multi-platform index; pin the ${platform} manifest ${pd}, not the index (airgap/build/pin-images.sh prints it)"
+  return 1
+}
+
+image_policy() {
+  # image_policy <fail-fn> <warn-fn> <platform-list> <teamspace-list> <oneshot-list> [<mutable-out>]
+  # — the pin policy over three lists of normalized refs (one per line):
+  #   platform   (Application renders, images-extra.txt): a Teknoir ref that is
+  #              not teknoir_pin_ok fails; with ALLOW_MUTABLE_TEKNOIR_TAGS=1 it
+  #              only warns (the bundle is then marked -mutable)
+  #   teamspace  (the teamspace-* plugin renders, chart bytes we do not own):
+  #              an unpinned Teknoir ref or a floating tag only warns and is
+  #              listed in <mutable-out> (MANIFEST.yaml teamspace_mutable_images)
+  #   oneshot    (the bootstrap tier: one-shot renders and BOOTSTRAP_EXTRA_IMAGES):
+  #              a digest fails; crane re-manifests the docker archives and
+  #              containerd imports them by tag, so a pinned digest never matches
+  #   all        a non-Teknoir floating tag (latest, major-only) warns
+  local fail="$1" warnf="$2" platform="$3" teamspace="$4" oneshot="$5" out="${6:-}" ref
+  local -A seen=()
+  [[ -z "${out}" ]] || : > "${out}"
+  while IFS= read -r ref; do
+    [[ -n "${ref}" ]] || continue
+    if is_teknoir_image "${ref}" && ! teknoir_pin_ok "${ref}"; then
+      if [[ "${ALLOW_MUTABLE_TEKNOIR_TAGS:-0}" == 1 ]]; then
+        "${warnf}" "unpinned Teknoir image ${ref} (ALLOW_MUTABLE_TEKNOIR_TAGS=1: the bundle is -mutable; G-09 needs <repo>:<sha-…|branch-YYYYMMDD-HHMMSS|semver>@sha256:<linux/amd64 manifest>)"
+      else
+        "${fail}" "unpinned Teknoir image ${ref}: G-09 needs <repo>:<sha-…|branch-YYYYMMDD-HHMMSS|semver>@sha256:<linux/amd64 manifest> (airgap/build/pin-images.sh prints it)"
+      fi
+    fi
+  done < "${platform}"
+  while IFS= read -r ref; do
+    [[ -n "${ref}" ]] || continue
+    if { is_teknoir_image "${ref}" && ! teknoir_pin_ok "${ref}"; } || is_floating_tag "${ref}"; then
+      "${warnf}" "teamspace plugin image on a mutable tag (accepted for r5, pinned by digest in images.lock only): ${ref}"
+      [[ -z "${out}" ]] || printf '%s\n' "${ref}" >> "${out}"
+      seen[${ref}]=1
+    fi
+  done < "${teamspace}"
+  while IFS= read -r ref; do
+    [[ -n "${ref}" ]] || continue
+    [[ "${ref}" != *@sha256:* ]] \
+      || "${fail}" "one-shot tier image ${ref} carries a digest: the bootstrap tier ships docker archives imported by tag (crane re-manifests them), so pin it by tag only"
+  done < "${oneshot}"
+  while IFS= read -r ref; do
+    [[ -n "${ref}" && -z "${seen[${ref}]:-}" ]] || continue
+    seen[${ref}]=1
+    if ! is_teknoir_image "${ref}" && is_floating_tag "${ref}"; then
+      "${warnf}" "floating image tag (latest or major-only; the build locks today's digest): ${ref}"
+    fi
+  done < <(LC_ALL=C sort -u "${platform}" "${oneshot}")
+  if [[ -n "${out}" ]]; then LC_ALL=C sort -u -o "${out}" "${out}"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Node packages (.deb; contract K8: node/debs/debs.lock)
+# ---------------------------------------------------------------------------
+deb_file_version() {
+  # deb_file_version <version> — the version as it appears in a pool file
+  # name (Debian drops the epoch: 1:2.3-4 -> 2.3-4)
+  echo "${1#*:}"
+}
+
+deb_key() {
+  # deb_key <package> <version> <arch> — the PINNED_SHA256 / PINNED_DEB_SHA1 key
+  echo "deb-$1-$2-$3"
+}
+
+debs_gate() {
+  # debs_gate <fail-fn> <debs-dir> — node/debs holds exactly NODE_DEBS:
+  #   - debs.lock has one line "<pkg> <version> <arch> <sha256> <file>" per
+  #     NODE_DEBS entry (arch NODE_ARCH), and no other line;
+  #   - each lock sha256 equals its PINNED_SHA256 pin and the file's sha256;
+  #   - no file in <debs-dir> besides debs.lock and the listed files;
+  #   - with dpkg-deb on the build host, the package's own Package, Version
+  #     and Architecture equal the lock line.
+  # Calls <fail-fn> once per finding.
+  local fail="$1" dir="$2" lock entry pkg version arch sha file key pin got f n field want have
+  local -A listed=()
+  lock="${dir}/debs.lock"
+  if [[ -z "${NODE_DEBS// /}" ]]; then
+    [[ ! -e "${dir}" || -z "$(find "${dir}" -mindepth 1 -print -quit)" ]] \
+      || "${fail}" "node/debs: NODE_DEBS is empty, but node/debs is not"
+    return 0
+  fi
+  [[ -f "${lock}" ]] || { "${fail}" "node/debs/debs.lock is missing"; return 0; }
+  n=0
+  while read -r pkg version arch sha file; do
+    [[ -n "${pkg}" && "${pkg}" != \#* ]] || continue
+    n=$((n + 1))
+    if [[ -z "${file}" || ! "${sha}" =~ ^[0-9a-f]{64}$ || "${file}" == */* ]]; then
+      "${fail}" "node/debs/debs.lock: malformed line '${pkg} ${version} ${arch} ${sha} ${file}'"
+      continue
+    fi
+    [[ " ${NODE_DEBS} " == *" ${pkg}=${version} "* && "${arch}" == "${NODE_ARCH}" ]] \
+      || "${fail}" "node/debs/debs.lock lists ${pkg} ${version} ${arch}, which is not in NODE_DEBS (${NODE_DEBS}) for ${NODE_ARCH}"
+    key="$(deb_key "${pkg}" "${version}" "${arch}")"
+    pin="${PINNED_SHA256[${key}]:-}"
+    [[ "${sha}" == "${pin}" ]] || "${fail}" "node/debs/debs.lock: ${file} has sha256 ${sha} in the lock, but versions.env pins ${pin:-nothing} (${key})"
+    [[ "${file}" == "${pkg}_$(deb_file_version "${version}")_${arch}.deb" ]] \
+      || "${fail}" "node/debs/debs.lock: ${file} is not named ${pkg}_$(deb_file_version "${version}")_${arch}.deb"
+    listed[${file}]=1
+    if [[ ! -f "${dir}/${file}" ]]; then
+      "${fail}" "node/debs/${file} is in debs.lock but missing"
+      continue
+    fi
+    got="$(sha256_file "${dir}/${file}")"
+    [[ "${got}" == "${sha}" ]] || "${fail}" "node/debs/${file} has sha256 ${got}, not the locked ${sha} (tampered or replaced)"
+    if command -v dpkg-deb >/dev/null 2>&1; then
+      for field in Package Version Architecture; do
+        case "${field}" in Package) want="${pkg}" ;; Version) want="${version}" ;; Architecture) want="${arch}" ;; esac
+        have="$(dpkg-deb -f "${dir}/${file}" "${field}" 2>/dev/null)" || have="<unreadable>"
+        [[ "${have}" == "${want}" ]] || "${fail}" "node/debs/${file}: dpkg-deb says ${field} ${have}, the lock says ${want}"
+      done
+    fi
+  done < "${lock}"
+  for entry in ${NODE_DEBS}; do
+    pkg="${entry%%=*}"
+    version="${entry#*=}"
+    awk -v p="${pkg}" -v v="${version}" -v a="${NODE_ARCH}" '$1 == p && $2 == v && $3 == a { f = 1 } END { exit !f }' "${lock}" \
+      || "${fail}" "node/debs/debs.lock has no line for ${pkg} ${version} ${NODE_ARCH} (NODE_DEBS)"
+  done
+  (( n == $(wc -w <<<"${NODE_DEBS}") )) || "${fail}" "node/debs/debs.lock has ${n} lines for $(wc -w <<<"${NODE_DEBS}") NODE_DEBS entries"
+  while IFS= read -r -d '' f; do
+    f="${f#"${dir}/"}"
+    [[ "${f}" == debs.lock || -n "${listed[${f}]:-}" ]] || "${fail}" "node/debs/${f} is not listed in debs.lock"
+  done < <(find "${dir}" -mindepth 1 \( -type f -o -type l \) -print0)
 }
 
 # ---------------------------------------------------------------------------
