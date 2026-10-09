@@ -76,10 +76,10 @@ package adds its own subsection.
   exists. `--name` of a set pruned to its export hands that export out as it
   is. Without recipients the passphrase flow (`--export`, tty) is unchanged.
 - **`rotate argocd-admin`** (D10): `random_alnum 32`; `argocd account bcrypt`
-  runs in `deploy/argo-argocd-server` (container `server`) with the value on
-  `kubectl exec -i` stdin, so it is never in the node's argv or log (inside the
-  container it is the argv of that short-lived process, in the pod's own PID
-  namespace). Order: store in `argocd-admin-break-glass` (create or merge
+  (no `--password`: ArgoCD v3.5.1 reads it from a non-terminal stdin and
+  prints `Password: <hash>`) runs in `deploy/argo-argocd-server` (container
+  `server`) with the value on `kubectl exec -i` stdin, so it is in no argv (node
+  or container) and no log. Order: store in `argocd-admin-break-glass` (create or merge
   patch, never apply: no last-applied annotation), merge-patch `argocd-secret`
   `admin.password` and `admin.passwordMtime` (ends older admin sessions) from a
   0600 file, then up to `ARGOCD_LOGIN_ATTEMPTS` (4) spaced logins on

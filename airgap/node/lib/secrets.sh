@@ -535,10 +535,12 @@ _secrets_argocd_break_glass_write() {
 
 _secrets_rotate_argocd_admin() {
   # New password for ArgoCD's local `admin` (DESIGN D10 break-glass):
-  #   1. bcrypt it inside the argocd-server container: the value goes on
-  #      kubectl exec's stdin, never into the node's argv or log (inside the
-  #      container it is the argv of the short-lived `argocd account bcrypt`,
-  #      in that pod's own PID namespace);
+  #   1. bcrypt it inside the argocd-server container with `argocd account
+  #      bcrypt`, which reads the password from stdin when no --password is
+  #      given (checked in ArgoCD v3.5.1, the deployed version; it prints
+  #      "Password: " before the hash; an ArgoCD without it fails here): the
+  #      value travels only on kubectl exec's stdin, never in any argv (node
+  #      or container) or log;
   #   2. store it in Secret argocd-admin-break-glass, BEFORE it becomes active,
   #      so an active password is never one that is stored nowhere;
   #   3. patch argocd-secret admin.password + admin.passwordMtime (now, which
@@ -548,7 +550,7 @@ _secrets_rotate_argocd_admin() {
   # A failed step stops the run before the next one; until step 3 the old
   # password stays valid. argocd-server watches argocd-secret, so nothing
   # restarts. A login check that keeps failing never deletes anything.
-  local newval="" hash="" mtime f code="" i re='^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$'
+  local newval="" out="" hash="" mtime f code="" i re='(\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53})'
   in_cluster deployment "${ARGOCD_SERVER_DEPLOY}" "${ARGOCD_NS}" \
     || die "rotate argocd-admin: Deployment ${ARGOCD_NS}/${ARGOCD_SERVER_DEPLOY} does not exist"
   in_cluster secret argocd-secret "${ARGOCD_NS}" || die "rotate argocd-admin: Secret ${ARGOCD_NS}/argocd-secret does not exist"
@@ -560,13 +562,13 @@ _secrets_rotate_argocd_admin() {
   newval="$(random_alnum 32)"
   [[ ${#newval} -eq 32 ]] || die "rotate argocd-admin: could not generate a password"
   mark_sensitive "${newval}"
-  # 1. bcrypt (stdin -> the container; the hash comes back on stdout)
-  hash="$(printf '%s\n' "${newval}" \
-    | kc -n "${ARGOCD_NS}" exec -i "deploy/${ARGOCD_SERVER_DEPLOY}" -c server -- \
-        sh -c 'IFS= read -r p && exec argocd account bcrypt --password "$p"')" \
+  # 1. bcrypt (stdin -> the container; "Password: <hash>" comes back on stdout)
+  out="$(printf '%s\n' "${newval}" \
+    | kc -n "${ARGOCD_NS}" exec -i "deploy/${ARGOCD_SERVER_DEPLOY}" -c server -- argocd account bcrypt)" \
     || die "rotate argocd-admin: argocd account bcrypt in ${ARGOCD_NS}/${ARGOCD_SERVER_DEPLOY} failed; nothing was changed"
-  hash="${hash//[[:space:]]/}"
-  [[ "${hash}" =~ ${re} ]] || die "rotate argocd-admin: argocd account bcrypt returned no bcrypt hash; nothing was changed"
+  [[ "${out}" =~ ${re} ]] || die "rotate argocd-admin: argocd account bcrypt returned no bcrypt hash; nothing was changed"
+  hash="${BASH_REMATCH[1]}"
+  out=""
   mark_sensitive "${hash}"
   # 2. store the new value
   _secrets_argocd_break_glass_write newval

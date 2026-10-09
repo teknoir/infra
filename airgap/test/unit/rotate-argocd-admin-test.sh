@@ -3,8 +3,8 @@
 # `rotate argocd-admin` (DESIGN D10, SEC-C9) and `credentials argocd-admin`,
 # with kc(), in_cluster() and the login check replaced by recorders:
 #
-#   1. the happy path: bcrypt in the argocd-server container with the password
-#      on stdin only, then Secret argocd-admin-break-glass, then one merge
+#   1. the happy path: `argocd account bcrypt` in the argocd-server container
+#      with the password on stdin only (no --password: in no argv), then Secret argocd-admin-break-glass, then one merge
 #      patch of argocd-secret with exactly admin.password (the hash) and
 #      admin.passwordMtime from a 0600 file, then the login check, and only
 #      after its 200 the delete of argocd-initial-admin-secret; the password
@@ -40,7 +40,8 @@ check() { local d="$1"; shift; if "$@"; then ok "${d}"; else bad "${d}"; fi; }
 
 # scenario VAR=VALUE... — run cmd_rotate argocd-admin in a fresh bash with the
 # recorders. Knobs: BG (break-glass exists 0|1), INIT (initial secret exists
-# 0|1), DEPLOY (0|1), BCRYPT (ok|fail|garbage), PATCH_FAIL (0|1), LOGIN_CODES
+# 0|1), DEPLOY (0|1), BCRYPT (ok: "Password: <hash>" as ArgoCD 3.5 prints it |
+# bare: the hash alone | fail | garbage), PATCH_FAIL (0|1), LOGIN_CODES
 # (space-separated answers of the login check), DRY (0|1).
 # Records in ${WORK}/rec: calls (one per kc call, argv only), stdin.bcrypt (the
 # value given to bcrypt), create.json, patch-*.json (+ .mode), logins.
@@ -71,10 +72,12 @@ scenario() {
         local a f="" prev=""
         for a in "$@"; do [[ "${prev}" == --patch-file ]] && f="${a}"; prev="${a}"; done
         case " $* " in
-          *" exec -i deploy/argo-argocd-server -c server -- sh -c "*)
+          *" exec -i deploy/argo-argocd-server -c server -- argocd account bcrypt ")
             cat > "${REC}/stdin.bcrypt"
             case "${BCRYPT}" in
-              ok) printf "%s" "${FAKE_HASH}" ;;
+              ok) printf "Password: %s" "${FAKE_HASH}" ;;
+              bare) printf "%s\n" "${FAKE_HASH}" ;;
+              real) HOME="${REC}" argocd account bcrypt < "${REC}/stdin.bcrypt" ;;   # the CLI needs a HOME
               garbage) echo "Error: something" ;;
               *) return 1 ;;
             esac ;;
@@ -110,8 +113,8 @@ echo "# 1. happy path: bcrypt, break-glass, argocd-secret, login 200, then delet
 scenario
 check "rc 0" has '^rc=0$' "${WORK}/out"
 check "the value for bcrypt is 32 alphanumerics on stdin" bash -c "[[ \"\$(tr -d '\n' < '${WORK}/rec/stdin.bcrypt')\" =~ ^[A-Za-z0-9]{32}\$ ]]"
-check "bcrypt runs as 'argocd account bcrypt' from the stdin line, in container server" \
-  bash -c "grep -q 'exec -i deploy/argo-argocd-server -c server -- sh -c IFS= read -r p && exec argocd account bcrypt --password \"\$p\"' '${WORK}/rec/calls'"
+check "bcrypt runs as 'argocd account bcrypt' (stdin, no --password) in container server" \
+  bash -c "grep -qx -- '-n teknoir-system exec -i deploy/argo-argocd-server -c server -- argocd account bcrypt' '${WORK}/rec/calls'"
 check "order: bcrypt < break-glass create < argocd-secret patch < initial delete" \
   bash -c "[ $(nth 'exec -i') -lt $(nth 'create -f -') ] && [ $(nth 'create -f -') -lt $(nth 'patch secret argocd-secret') ] && [ $(nth 'patch secret argocd-secret') -lt $(nth 'delete secret argocd-initial-admin-secret') ]"
 check "the break-glass Secret: name, namespace, label, annotation, password = the bcrypt input" \
@@ -125,6 +128,20 @@ check "neither the password nor the hash is printed" \
   bash -c "! grep -qF \"\$(tr -d '\n' < '${WORK}/rec/stdin.bcrypt')\" '${WORK}/out' && ! grep -qF '${FAKE_HASH}' '${WORK}/out'"
 check "the summary names the three changes" \
   bash -c "grep -q 'stored the new ArgoCD admin password' '${WORK}/out' && grep -q 'set the new ArgoCD admin password' '${WORK}/out' && grep -q 'deleted teknoir-system/argocd-initial-admin-secret' '${WORK}/out'"
+
+scenario BCRYPT=bare
+check "a bare hash on stdout (no prompt) is accepted too" \
+  bash -c "grep -q '^rc=0\$' '${WORK}/out' && jq -e --arg h '${FAKE_HASH}' '(.data[\"admin.password\"] | @base64d) == \$h' '${WORK}/rec/patch-argocd.json' >/dev/null"
+
+if command -v argocd >/dev/null 2>&1 && argocd account bcrypt --help 2>/dev/null | grep -q 'Read password from stdin'; then
+  scenario BCRYPT=real
+  real_hash="$(jq -r '.data["admin.password"] | @base64d' "${WORK}/rec/patch-argocd.json" 2>/dev/null || true)"
+  check "the real argocd CLI ($(argocd version --client --short 2>/dev/null | head -1)) reads stdin; rc 0" grep -q '^rc=0$' "${WORK}/out"
+  check "its output (\"Password: <hash>\") parses to the bcrypt hash that is patched in" \
+    grep -qE '^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$' <<<"${real_hash}"
+else
+  echo "  skip the real argocd CLI (not installed, or without bcrypt from stdin)"
+fi
 
 echo "# 2. bcrypt fails or returns no hash: nothing is written"
 for mode in fail garbage; do
