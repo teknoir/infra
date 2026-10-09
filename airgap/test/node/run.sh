@@ -502,6 +502,33 @@ for f in teknoir-app-of-apps manifest-harbor-secret teknoir-keycloak-db-secret; 
 tn converge --site test --only preflight
 check "once every Teknoir file has its .skip, preflight passes" [ "${RC}" == 0 ]
 
+echo "# site keys (R9): TIME_SOURCE, NODE_IP_DHCP_RESERVED, BACKUP_AGE_RECIPIENTS"
+# a dummy in the age public-key format (age1 + 58 bech32 characters), no real key
+AGE_OK="age1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce"
+check "the dummy age recipient has the format's length (62)" [ "${#AGE_OK}" == 62 ]
+site_variant() {
+  # site_variant <file> <extra line>... - the test site plus extra KEY=value lines
+  local f="$1"
+  shift
+  { cat "${PAYLOAD}/site/test.env"; printf '%s\n' "$@"; } > "${f}"
+}
+site_check_rc() {
+  bash -c "source '${HERE}/../../build/lib-build.sh'; site_check '$1'" > "${T}/sc.out" 2>&1 && echo 0 || echo 1
+}
+site_variant "${T}/good.env" 'TIME_SOURCE="a.example 10.0.0.5"' 'NODE_IP_DHCP_RESERVED=yes' "BACKUP_AGE_RECIPIENTS=\"${AGE_OK} ${AGE_OK}\""
+tn converge --site "${T}/good.env" --only verify
+check "valid TIME_SOURCE, NODE_IP_DHCP_RESERVED and two age recipients: load_site accepts them" [ "${RC}" == 0 ]
+check "site_check (build) accepts them" [ "$(site_check_rc "${T}/good.env")" == 0 ]
+for bad in 'TIME_SOURCE="a;b"' 'TIME_SOURCE="10.0.0.300"' 'TIME_SOURCE="-x.example"' 'NODE_IP_DHCP_RESERVED=maybe' \
+           'BACKUP_AGE_RECIPIENTS="age1short"' "BACKUP_AGE_RECIPIENTS=\"${AGE_OK^^}\"" "BACKUP_AGE_RECIPIENTS=\"${AGE_OK} x\""; do
+  site_variant "${T}/bad.env" "${bad}"
+  tn converge --site "${T}/bad.env" --only verify
+  check "load_site rejects ${bad}" bash -c "[ ${RC} = 1 ] && grep -q 'ERROR: .*invalid ${bad%%=*}' '${T}/out'"
+  check "site_check rejects ${bad}" bash -c "[ \"\$(bash -c \"source '${HERE}/../../build/lib-build.sh'; site_check '${T}/bad.env'\" 2>&1 >/dev/null | grep -c 'invalid ${bad%%=*}')\" -ge 1 ]"
+done
+check "the committed site files pass site_check" \
+  bash -c "[ \"\$(bash -c \"source '${HERE}/../../build/lib-build.sh'; site_check '${HERE}/../../site/teknoir-local.env' && site_check '${HERE}/../../site/vmtest.env' && echo ok\" 2>/dev/null)\" = ok ]"
+
 # ---------------------------------------------------------------------------
 echo "# leak check"
 lc() {

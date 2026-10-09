@@ -454,8 +454,9 @@ site_load() {
   case "${SITE_NAME}" in
     ''|*[!A-Za-z0-9._-]*|.*) die "invalid site name '${SITE_NAME}' (from ${SITE_FILE})" ;;
   esac
-  # shellcheck disable=SC2034  # TEKNOIR_ENV, TIME_SOURCE, UPSTREAM_DNS and K3S_DATA_DIR are the node's
+  # shellcheck disable=SC2034  # TEKNOIR_ENV, UPSTREAM_DNS and K3S_DATA_DIR are the node's
   TEKNOIR_ENV='' TEKNOIR_DOMAIN='' NODE_IP='' NODE='' TEKNOIR_HOSTNAMES='' TIME_SOURCE='' UPSTREAM_DNS='' K3S_DATA_DIR=''
+  NODE_IP_DHCP_RESERVED='' BACKUP_AGE_RECIPIENTS=''
   # shellcheck source=/dev/null
   . "${SITE_FILE}" || die "cannot read ${SITE_FILE}"
   [ -z "${OPT_NODE}" ] || NODE=${OPT_NODE}
@@ -470,11 +471,47 @@ site_load() {
   for h in ${TEKNOIR_HOSTNAMES}; do
     case "${h}" in *[!A-Za-z0-9-]*|-*) die "${SITE_FILE}: invalid name '${h}' in TEKNOIR_HOSTNAMES" ;; esac
   done
+  # the node checks these again (lib/common.sh load_site); checked here so
+  # the operator learns before ssh. No glob characters can pass the first case.
+  case "${TIME_SOURCE}" in *[!A-Za-z0-9.\ -]*) die "${SITE_FILE}: invalid TIME_SOURCE '${TIME_SOURCE}' (space-separated IPv4 addresses or host names)" ;; esac
+  for h in ${TIME_SOURCE}; do
+    site_time_source_ok "${h}" || die "${SITE_FILE}: invalid TIME_SOURCE entry '${h}' (space-separated IPv4 addresses or host names)"
+  done
+  case "${NODE_IP_DHCP_RESERVED}" in ''|yes|no) ;; *) die "${SITE_FILE}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)" ;; esac
+  case "${BACKUP_AGE_RECIPIENTS}" in *[!a-z0-9\ ]*) die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS (space-separated age public keys)" ;; esac
+  for h in ${BACKUP_AGE_RECIPIENTS}; do
+    age_recipient_ok "${h}" || die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS entry '${h}' (an age public key: age1 and 58 characters)"
+  done
   mdomain=$(manifest_get domain)
   if [ -n "${mdomain}" ] && [ "${mdomain}" != "${TEKNOIR_DOMAIN}" ]; then
     die "site ${SITE_NAME} is for domain ${TEKNOIR_DOMAIN}, but this bundle was built for ${mdomain}"
   fi
   REMOTE_SITE=${NODE_STATE_DIR}/site/${SITE_NAME}.env
+}
+
+# site_time_source_ok TOKEN: an IPv4 address or a host name (one TIME_SOURCE entry).
+site_time_source_ok() {
+  local t=$1
+  case "${t}" in ''|-*|.*|*.|*..*|*[!A-Za-z0-9.-]*) return 1 ;; esac
+  [ "${#t}" -le 253 ] || return 1
+  case "${t}" in
+    *[!0-9.]*)
+      # a host name: labels of 1-63 characters that do not start or end with '-'
+      case ".${t}." in *.-*|*-.*) return 1 ;; esac
+      printf '%s\n' "${t}" | awk -F. '{ for (i = 1; i <= NF; i++) if (length($i) > 63) exit 1 }'
+      return ;;
+  esac
+  # only digits and dots: an IPv4 address
+  [ "$(printf '%s' "${t}" | awk -F. 'NF == 4 && $1 != "" && $2 != "" && $3 != "" && $4 != "" && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 { print "ok" }')" = ok ]
+}
+
+# age_recipient_ok KEY: an age X25519 public key (age1 and 58 lowercase characters).
+age_recipient_ok() {
+  local rest
+  case "$1" in age1*) rest=${1#age1} ;; *) return 1 ;; esac
+  [ "${#rest}" -eq 58 ] || return 1
+  case "${rest}" in *[!0-9a-z]*) return 1 ;; esac
+  return 0
 }
 
 state_init() {

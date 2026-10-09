@@ -11,7 +11,8 @@
 #   DRY_RUN            1 = read-only; mutations only print what they would do
 #   KUBECTL            "k3s kubectl" (tests: "kubectl --context k3d-x")
 #   site variables     TEKNOIR_ENV TEKNOIR_DOMAIN NODE_IP NODE
-#                      TEKNOIR_HOSTNAMES TIME_SOURCE K3S_DATA_DIR, plus the
+#                      TEKNOIR_HOSTNAMES TIME_SOURCE K3S_DATA_DIR UPSTREAM_DNS
+#                      NODE_IP_DHCP_RESERVED BACKUP_AGE_RECIPIENTS, plus the
 #                      derived HARBOR_HOST (harbor.<domain>)
 #   bundle variables   BUNDLE_ID APP_OF_APPS_VERSION MANIFEST_SHA256
 #                      INFRA_COMMIT GITOPS_COMMIT (load_bundle_info)
@@ -499,11 +500,36 @@ load_site() {
   K3S_DATA_DIR="${K3S_DATA_DIR:-/opt/k3s}"
   [[ "${K3S_DATA_DIR}" == /* ]] || die "${f}: K3S_DATA_DIR must be absolute"
   TIME_SOURCE="${TIME_SOURCE:-}"
+  local -a words=()
+  read -r -a words <<<"${TIME_SOURCE}"
+  for h in ${words[@]+"${words[@]}"}; do
+    site_time_source_ok "${h}" || die "${f}: invalid TIME_SOURCE entry '${h}' (space-separated IPv4 addresses or host names)"
+  done
   UPSTREAM_DNS="${UPSTREAM_DNS:-}"
   for h in ${UPSTREAM_DNS}; do
     [[ "${h}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "${f}: invalid UPSTREAM_DNS entry '${h}' (IPv4 addresses)"
   done
+  NODE_IP_DHCP_RESERVED="${NODE_IP_DHCP_RESERVED:-}"
+  [[ "${NODE_IP_DHCP_RESERVED}" =~ ^(yes|no)?$ ]] \
+    || die "${f}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)"
+  BACKUP_AGE_RECIPIENTS="${BACKUP_AGE_RECIPIENTS:-}"
+  read -r -a words <<<"${BACKUP_AGE_RECIPIENTS}"
+  for h in ${words[@]+"${words[@]}"}; do
+    [[ "${h}" =~ ^age1[0-9a-z]{58}$ ]] || die "${f}: invalid BACKUP_AGE_RECIPIENTS entry '${h}' (age public keys: age1 and 58 characters)"
+  done
   HARBOR_HOST="harbor.${TEKNOIR_DOMAIN}"
+}
+
+site_time_source_ok() {
+  # site_time_source_ok <token> - 0 for an IPv4 address or a host name (one
+  # TIME_SOURCE entry, written into chrony's drop-in as a server line)
+  local t="$1" o
+  if [[ "${t}" =~ ^[0-9.]+$ ]]; then
+    [[ "${t}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do (( 10#${o} <= 255 )) || return 1; done
+    return 0
+  fi
+  (( ${#t} <= 253 )) && [[ "${t}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
 }
 
 manifest_get() {
