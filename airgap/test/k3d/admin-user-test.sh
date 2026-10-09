@@ -361,10 +361,11 @@ check "the stand-in recorded a legacy status value" has_legacy "${B}"
 busy0="$(fstate "${WORK}/files/busy.txt")"
 check "a non-empty --out is refused while a password is on record" bash -c "! env KUBECTL='kubectl --context ${CTX}' NODE_ROOT='${WORK}/node' TEKNOIR_DOMAIN=teknoir.airgapped ADMIN_KEYCLOAK_URL=http://127.0.0.1:${KC_PORT} STUB_WAIT_INTERVAL=2 '${REPO}/airgap/test/stubs/teknoir-node-stub' cmd_admin_user --email second.admin@teknoir.ai --out '${WORK}/files/busy.txt' > '${WORK}/out/busy.log' 2>&1 && grep -q 'never overwrites' '${WORK}/out/busy.log'"
 check "  ... the file is untouched and the value still on record" unchanged_and_on_record "${WORK}/files/busy.txt" "${busy0}" "${B}"
-if admin_user --email second.admin@teknoir.ai --out "${WORK}/files/pwB.txt" > "${WORK}/out/runB1.log" 2>&1; then
-  ok "admin-user (legacy) exits 0"
+# an older user-controller has no credentials namespace: admin-user must read that as "no Secret"
+if ADMIN_CREDENTIALS_NS=teknoir-user-credentials admin_user --email second.admin@teknoir.ai --out "${WORK}/files/pwB.txt" > "${WORK}/out/runB1.log" 2>&1; then
+  ok "admin-user (legacy, no credentials namespace) exits 0"
 else
-  bad "admin-user (legacy) exits 0"; cat "${WORK}/out/runB1.log"
+  bad "admin-user (legacy, no credentials namespace) exits 0"; cat "${WORK}/out/runB1.log"
 fi
 check "the file holds the legacy value, mode 0600" bash -c "cmp -s '${WORK}/files/pwB.txt' '${WORK}/rec/${B}' && [[ \$(stat -c %a '${WORK}/files/pwB.txt') == 600 ]]"
 check "status.set_initial_password is removed" no_legacy "${B}"

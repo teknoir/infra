@@ -69,7 +69,8 @@ setup() {
 # /var/lib/teknoir-airgap mapped to a sandbox directory (arguments in, stdout
 # out). The fake runner records its arguments and plays teknoir-node
 # admin-user: it writes a password to --out (none@: nothing on record; late@:
-# fails after the handover, like a catalog timeout).
+# fails after the handover, like a catalog timeout; refused@: a refused
+# reset, which removes --out).
 lan_sandbox() {
   B="${BATS_TEST_TMPDIR}/bundle"
   SB="${BATS_TEST_TMPDIR}/node-state"
@@ -91,7 +92,10 @@ while [ $# -gt 0 ]; do
   case $1 in --out) out=$2; shift ;; --email) email=$2; shift ;; --reset-password) reset=1 ;; esac
   shift
 done
-case $email in none@*) echo "WARN: no temporary password of $email is on record" >&2; exit 0 ;; esac
+case $email in
+  none@*) echo "WARN: no temporary password of $email is on record" >&2; exit 0 ;;
+  refused@*) rm -f "$out"; echo "ERROR: Keycloak refused the new password of $email (HTTP 500); nothing changed" >&2; exit 1 ;;
+esac
 v=s3cr3t-temporary-password
 [ "$reset" = 1 ] && v=s3cr3t-reset-password
 printf '%s\n' "$v" > "$out"
@@ -185,4 +189,14 @@ EOF
   [ "$(cat "${OUT}/late.txt")" = s3cr3t-temporary-password ]
   [ "$(stat -c %a "${OUT}/late.txt")" = 600 ]
   [ -z "$(find "${SB}/tmp" -type f)" ]
+}
+
+@test "admin-user reports a refused reset as the node's failure and writes no file" {
+  lan_sandbox
+  run bash "${B}/teknoir-airgap" admin-user --local --email refused@example.com --reset-password --out "${OUT}/refused.txt"
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"teknoir-node admin-user failed on the node (exit 1); fix the cause"* ]]
+  [[ "${output}" != *"could not copy"* ]]
+  [ ! -e "${OUT}/refused.txt" ]
+  [ -z "$(find "${OUT}" -type f)" ]
 }

@@ -1492,8 +1492,8 @@ cmd_admin_user() {
   run_runner tty admin-user "$@" >&2 || rc=$?
   # Fetched even after a failure: the runner hands the password over (and
   # deletes it from the cluster) before its last steps, so this file may be
-  # the only copy.
-  if ! node_sh pipe 'cat "$1" && rm -f "$1"' "${REMOTE_TMP}" </dev/null >"${LOCAL_TMP}" 2>"${TMPD}/fetch.err"; then
+  # the only copy. A missing file is no password (a refused reset removes it).
+  if ! node_sh pipe '[ ! -e "$1" ] || { cat "$1" && rm -f "$1"; }' "${REMOTE_TMP}" </dev/null >"${LOCAL_TMP}" 2>"${TMPD}/fetch.err"; then
     sed 's/^/  node: /' "${TMPD}/fetch.err" >&2
     die "could not copy the file teknoir-node admin-user wrote on the node (it may hold the temporary password, which is then no longer on record there); run the command again with --reset-password and a new --out file"
   fi
