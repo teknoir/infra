@@ -44,7 +44,8 @@
 #        succeeds; a platform Application pinned ahead of its stale Failed
 #        status is waited for but never patched; a Profile declared in
 #        GitOps blocks post until profile-controller (played by the test)
-#        has run and its Application exists, which is then strict;
+#        has run and its Application exists, which is then strict; an
+#        update that creates that teamspace waits the first-install time;
 #        previous-password of teknoir-auth/keycloak-admin is removed
 #        after a 200 master login (stubs/fake-keycloak.py) and kept with a
 #        WARN on 401; no password in any log [needs python3]
@@ -1264,8 +1265,10 @@ t10_stop_helpers() {
 
 t10_node() {
   # the real node runner, as in t9_node, with the post phase's test knobs:
-  # a short poll, and Keycloak at the fake on 127.0.0.1
+  # a short poll, short default waits when the caller sets them, and Keycloak
+  # at the fake on 127.0.0.1
   env KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG}" POST_POLL=2 \
+    ${POST_WAIT_DEFAULT:+POST_WAIT_DEFAULT="${POST_WAIT_DEFAULT}"} ${POST_WAIT_FIRST_INSTALL:+POST_WAIT_FIRST_INSTALL="${POST_WAIT_FIRST_INSTALL}"} \
     RELEASE_KEYCLOAK_URL="http://127.0.0.1:${T10_KC_PORT}" \
     TEKNOIR_HOST_ROOT="${WORK}/t10/root" TEKNOIR_LOCK_FILE="${WORK}/t10/teknoir-airgap.lock" \
     TEKNOIR_LOG_DIR="${WORK}/t10/log" STATE_DIR="${WORK}/t10/state" \
@@ -1273,9 +1276,15 @@ t10_node() {
 }
 
 t10_post() {
-  # t10_post <wait-timeout> — converge --only post; output T10_OUT, exit code T10_RC
+  # t10_post <wait-timeout|-> — converge --only post; output T10_OUT, exit code
+  # T10_RC. "-": no --wait-timeout, so post's own waits apply, shortened to 8s
+  # (update) and 20s (first install, or an update that creates a teamspace)
   set +e
-  T10_OUT="$(t10_node converge --only post --site "${WORK}/t10/site.env" --wait-timeout "$1" 2>&1)"
+  if [[ "$1" == - ]]; then
+    T10_OUT="$(POST_WAIT_DEFAULT=8 POST_WAIT_FIRST_INSTALL=20 t10_node converge --only post --site "${WORK}/t10/site.env" 2>&1)"
+  else
+    T10_OUT="$(t10_node converge --only post --site "${WORK}/t10/site.env" --wait-timeout "$1" 2>&1)"
+  fi
   T10_RC=$?
   set -e
   printf '%s\n' "${T10_OUT}" >> "${WORK}/t10/outputs.log"
@@ -1333,6 +1342,9 @@ EOF
   kc wait --for=condition=Established crd/applications.argoproj.io crd/profiles.teknoir.org --timeout=60s >/dev/null
   kc create namespace teknoir-system >/dev/null
   kc create namespace teknoir-auth >/dev/null
+  # a recorded release: this post is an update's (8s below, not a first install's)
+  kc -n teknoir-system create configmap teknoir-airgap-release --from-literal=appOfAppsVersion=0.0.5 \
+    --from-literal=bundleId=t10 --from-literal=mode=update >/dev/null
   t10_app app-of-apps app-of-apps 0.0.5 -
   t10_app auth auth 0.0.9 "app-of-apps:argoproj.io/Application:teknoir-system/auth"
   t10_app monitoring monitoring 0.0.4 "app-of-apps:argoproj.io/Application:teknoir-system/monitoring"
@@ -1369,9 +1381,12 @@ EOF
   t10_fake_controller &
   T10_PIDS+=($!)
 
-  # run 1: the re-sync fails again -> post fails, naming the reason, after one patch
-  t10_post 20
+  # run 1: the re-sync fails again -> post fails, naming the reason, after one
+  # patch; the update creates teknoir-default, so it waits the first-install time
+  t10_post -
   assert_eq "run 1 (re-sync fails again): post exits non-zero" 1 "${T10_RC}"
+  assert_eq "run 1: an update creating teknoir-default waits the first-install time, from the start" 1 \
+    "$(grep -c 'this run creates teamspace(s) declared in GitOps (teknoir-default): post waits up to 20s in all, as on a first install' <<<"${T10_OUT}")"
   if grep -qE 'ERROR: post: after 20s these Applications are not Synced/Healthy at this release: .*monitoring \(last sync to 0\.0\.4 Failed: failed again\) ' <<<"${T10_OUT}"; then
     pass "run 1: the error names monitoring and its failed last sync"
   else fail "run 1: no error naming monitoring's failed sync"; tail -15 <<<"${T10_OUT}" >&2; fi
