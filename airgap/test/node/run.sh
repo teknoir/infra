@@ -495,6 +495,25 @@ check "--list shows the unencrypted set and the encrypted exports" \
   bash -c "[ ${RC} = 0 ] && grep -q '^${NEW} ' '${T}/out' && grep -q '^${NEW}.tar.age .*encrypted export' '${T}/out'"
 check "every export is 0600" [ "$(find "${EX}" -type f ! -perm 600 | wc -l)" == 0 ]
 
+echo "# backup: the real age (when installed) encrypts to every recipient"
+REAL_AGE="$(command -v age || true)"
+if [[ -n "${REAL_AGE}" && "${REAL_AGE}" != "${HERE}/stubs/age" && -x "$(dirname "${REAL_AGE}")/age-keygen" ]]; then
+  for k in a b; do "$(dirname "${REAL_AGE}")/age-keygen" -o "${T}/id-${k}.key" 2>/dev/null; done
+  site_with "${T}/real.env" "$("$(dirname "${REAL_AGE}")/age-keygen" -y "${T}/id-a.key") $("$(dirname "${REAL_AGE}")/age-keygen" -y "${T}/id-b.key")"
+  sleep 1
+  tne AGE="${REAL_AGE}" backup --site "${T}/real.env"
+  TS="$(basename "$(newest)")"
+  check "real age: the backup succeeds" [ "${RC}" == 0 ]
+  check "real age: the export carries no plaintext" bash -c "! grep -qa 'createdAt=' '${EX}/${TS}.tar.age'"
+  for k in a b; do
+    rm -rf "${T}/dec"; mkdir -p "${T}/dec"
+    check "real age: identity ${k} decrypts it and SHA256SUMS verifies" \
+      bash -c "'${REAL_AGE}' -d -i '${T}/id-${k}.key' '${EX}/${TS}.tar.age' | tar -C '${T}/dec' -xf - && cd '${T}/dec/${TS}' && sha256sum --quiet -c SHA256SUMS"
+  done
+else
+  echo "skip real age (no age and age-keygen on PATH)"
+fi
+
 # ---------------------------------------------------------------------------
 echo "# credentials"
 if command -v script >/dev/null 2>&1; then
