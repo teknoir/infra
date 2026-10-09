@@ -835,7 +835,9 @@ e10() {
   assert_eq "after migrate no Teknoir K3s file is left but teknoir-argo" "teknoir-argo " "$(teknoir_k3s_files)"
 
   # --- M4: up, the Keycloak admin rotation, realm teknoir, the first admin ------
-  if up_in "${dir}"; then pass "up after migrate exits 0"; else fail "up after migrate failed"; return 0; fi
+  # --force-images as in OPERATE M4: the old tooling mirrored mutable tags
+  # (postgres:17-alpine) that have moved upstream since
+  if up_in "${dir}" --force-images; then pass "up --force-images after migrate exits 0"; else fail "up after migrate failed"; return 0; fi
   wait_apps 2700 || true
   assert_eq "up added password to Secret keycloak-admin" "password previous-password username" "$(secret_keys teknoir-auth keycloak-admin)"
   wait_until 900 kc_admin_rotated || true
