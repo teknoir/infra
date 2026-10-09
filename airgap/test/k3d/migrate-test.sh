@@ -16,7 +16,15 @@
 # later name re-created, or a Secret deleted, while migrate runs stops it.
 # M7a: migrate --argo refuses without a Synced/Healthy argo Application or
 # with unprotected argoproj CRDs, then detaches teknoir-argo without
-# restarting the ArgoCD pod.
+# restarting the ArgoCD pod; CRDs count as adopted when they are Synced in the
+# argo Application's status.resources (ArgoCD 3.5 writes no tracking-id on
+# them), argocd-tls-certs-cm is reported as converge-owned and only argocd-cm
+# as ownerless (r5, HYG-C6). Retired files are mode 0600.
+# Finalize (r5, SEC-C10): migrate --finalize refuses before --argo, without a
+# .skip guard, while the root Application is not ready, and without an
+# age-encrypted export newer than the migration (an older one, or a plaintext
+# file named .tar.age, does not count); --dry-run and --i-know --dry-run change
+# nothing; then it shreds manifests-retired and keeps every .skip guard.
 #
 # Usage: airgap/test/k3d/migrate-test.sh [--keep]
 #   --keep   leave the cluster and temp dir for inspection
@@ -55,7 +63,7 @@ K() { kubectl --context "${CTX}" "$@"; }
 node_fn() {
   env KUBECTL="kubectl --context ${CTX}" K3S_DATA_DIR="${DATA}" TEKNOIR_DOMAIN=teknoir.airgapped \
     NODE=teknoir@10.77.0.10 MIGRATE_LEGACY_HOME="${WORK}/home" NODE_ROOT="${WORK}/node" \
-    STUB_WAIT_INTERVAL=3 "${REPO}/airgap/test/stubs/teknoir-node-stub" "$@"
+    STATE_DIR="${WORK}/state" STUB_WAIT_INTERVAL=3 "${REPO}/airgap/test/stubs/teknoir-node-stub" "$@"
 }
 
 cleanup() {
@@ -301,6 +309,7 @@ assert_detached() {
 assert_detached "after migrate"
 check "a .skip guard exists for every detached name (25)" bash -c "[[ \$(ls '${MAN}' | grep -c '\.yaml\.skip$') == 25 ]]"
 check "22 files retired unmodified (orphans have none)" bash -c "[[ \$(find '${RETIRED_ROOT}' -type f | wc -l) == 22 ]] && cmp -s '${WORK}/out/teknoir-harbor-secret.yaml' \$(find '${RETIRED_ROOT}' -name teknoir-harbor-secret.yaml)"
+check "every retired file is mode 0600 (they hold secrets)" test "$(find "${RETIRED_ROOT}" -type f ! -perm 600 | wc -l)" == 0
 check "the old bundle copy was removed" test ! -e "${WORK}/home/teknoir-airgap-bundle-0.1.0"
 check "robot repo-creds kept (no credential-less repository yet)" bash -c "kubectl --context ${CTX} -n teknoir-system get secret argocd-harbor-repo -o name >/dev/null && grep -q 'robot: not yet' '${WORK}/out/migrate.log'"
 check "no secret value in the migrate output" bash -c "! grep -q 'dummy-' '${WORK}/out/migrate.log' '${WORK}/out/dry-run.log'"
@@ -401,12 +410,20 @@ check "the baseline is logged as names and counts, never UIDs" bash -c "
   ! grep -qE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' '${WORK}/out/net1.log' '${WORK}/out/net3.log'"
 check "the safety-net runs printed no secret value" bash -c "! grep -q 'dummy-' '${WORK}/out/net1.log' '${WORK}/out/net2.log' '${WORK}/out/net3.log'"
 
+say "finalize before --argo: refused, nothing removed"
+retired_count() { find "${RETIRED_ROOT}" -type f 2>/dev/null | wc -l; }
+retired_before="$(retired_count)"
+if node_fn cmd_migrate --finalize > "${WORK}/out/fin0.log" 2>&1; then bad "finalize before --argo is refused"; else
+  check "finalize before --argo is refused: K3s still owns teknoir-argo" grep -q 'the migration is not complete, K3s still owns: teknoir-argo' "${WORK}/out/fin0.log"
+fi
+check "the refusal removed no retired file" test "$(retired_count)" == "${retired_before}"
+
 say "M7a: migrate --argo detaches teknoir-argo once the argo Application runs ArgoCD"
 wait_until "the ArgoCD stand-in pod Running" 180 bash -c "[[ \$(kubectl --context ${CTX} -n teknoir-system get pods -l app.kubernetes.io/part-of=argocd -o jsonpath='{.items[*].status.phase}') == Running ]]"
 argo_pods() { K -n teknoir-system get pods -l app.kubernetes.io/part-of=argocd -o jsonpath='{range .items[*]}{.metadata.name} {.metadata.uid}{"\n"}{end}' | sort; }
 argo_pods > "${WORK}/out/argo-pods.txt"
 if node_fn cmd_migrate --argo > "${WORK}/out/argo1.log" 2>&1; then bad "--argo without the argo Application is refused"; else
-  check "--argo without the argo Application is refused (app-of-apps 0.0.5)" grep -q 'there is no Application teknoir-system/argo.*0.0.5' "${WORK}/out/argo1.log"
+  check "--argo without the argo Application is refused (app-of-apps 0.0.4)" grep -q 'there is no Application teknoir-system/argo.*0.0.4' "${WORK}/out/argo1.log"
 fi
 printf 'apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata: {name: argo, namespace: teknoir-system}\nspec: {destination: {namespace: teknoir-system}}\n' | K apply -f - >/dev/null
 K -n teknoir-system patch applications.argoproj.io argo --type=merge -p '{"status":{"sync":{"status":"Synced"},"health":{"status":"Progressing"}}}' >/dev/null
@@ -420,11 +437,18 @@ if node_fn cmd_migrate --argo > "${WORK}/out/argo3.log" 2>&1; then bad "--argo w
 fi
 check "the refusals changed nothing" bash -c "[[ -e '${MAN}/teknoir-argo.yaml' && ! -e '${MAN}/teknoir-argo.yaml.skip' ]] && kubectl --context ${CTX} -n kube-system get addons.k3s.cattle.io teknoir-argo -o name >/dev/null"
 K annotate crd appprojects.argoproj.io argocd.argoproj.io/sync-options=ServerSideApply=true,Prune=false,Delete=false --overwrite >/dev/null
-# ArgoCD's adoption, as far as this test can show it: tracking annotations on all but argocd-cm
-for o in crd/applications.argoproj.io crd/appprojects.argoproj.io; do
-  K annotate "${o}" "argocd.argoproj.io/tracking-id=argo:apiextensions.k8s.io/CustomResourceDefinition:/${o#crd/}" --overwrite >/dev/null
-done
+# ArgoCD's adoption as ArgoCD 3.5.1 shows it (live teknoir-local, VM): the CRDs
+# get no tracking-id annotation but are Synced entries of the argo
+# Application's status.resources; the workloads carry the annotation;
+# argocd-cm is in neither (it drifted: OutOfSync); argocd-tls-certs-cm is the
+# converge's
 K -n teknoir-system annotate deploy argocd-server argocd.argoproj.io/tracking-id=argo:apps/Deployment:teknoir-system/argocd-server --overwrite >/dev/null
+K -n teknoir-system patch applications.argoproj.io argo --type=merge -p '{"status":{"resources":[
+  {"group":"apiextensions.k8s.io","version":"v1","kind":"CustomResourceDefinition","name":"applications.argoproj.io","status":"Synced"},
+  {"group":"apiextensions.k8s.io","version":"v1","kind":"CustomResourceDefinition","name":"appprojects.argoproj.io","status":"Synced"},
+  {"group":"apps","version":"v1","kind":"Deployment","namespace":"teknoir-system","name":"argocd-server","status":"Synced"},
+  {"version":"v1","kind":"ConfigMap","namespace":"teknoir-system","name":"argocd-cm","status":"OutOfSync"}]}}' >/dev/null
+check "the CRDs carry no tracking-id (as ArgoCD 3.5 leaves them)" test -z "$(K get crd applications.argoproj.io appprojects.argoproj.io -o jsonpath='{.items[*].metadata.annotations.argocd\.argoproj\.io/tracking-id}')"
 node_fn cmd_migrate --argo --dry-run > "${WORK}/out/argo-dry.log" 2>&1 || { bad "--argo --dry-run exits 0"; cat "${WORK}/out/argo-dry.log"; }
 check "--argo --dry-run plans teknoir-argo only and changes nothing" bash -c "
   [[ \$(grep -c '\[dry-run\] [^ ]*: would' '${WORK}/out/argo-dry.log') == 1 ]] && grep -q '\[dry-run\] teknoir-argo: would create teknoir-argo.yaml.skip' '${WORK}/out/argo-dry.log' &&
@@ -437,6 +461,10 @@ check "--argo: no object carries a K3s label of teknoir-argo" bash -c "[[ -z \$(
 check "--argo: the ArgoCD pod kept its UID" diff -q "${WORK}/out/argo-pods.txt" <(argo_pods)
 check "--argo: every baseline object exists with the same UID" baseline_kept
 check "--argo: the object outside the argo Application is reported, not deleted" bash -c "grep -q 'not in the Application argo and now have no owner.*ConfigMap.v1. teknoir-system/argocd-cm' '${WORK}/out/argo4.log' && kubectl --context ${CTX} -n teknoir-system get cm argocd-cm -o name >/dev/null"
+check "--argo: the ownerless list is exactly argocd-cm (Synced CRDs count as adopted)" \
+  grep -qE 'and now have no owner \(left in place; delete them by hand once you know they are unused\): ConfigMap\.v1\. teknoir-system/argocd-cm; $' "${WORK}/out/argo4.log"
+check "--argo: argocd-tls-certs-cm is reported as converge-owned, not ownerless" \
+  grep -qE 'owned by the converge \(secrets phase\), not by the Application argo: ConfigMap\.v1\. teknoir-system/argocd-tls-certs-cm; $' "${WORK}/out/argo4.log"
 restart_k3s
 check "after restart: no Teknoir Addon re-appears" test -z "$(teknoir_addons)"
 check "after restart: every baseline object exists with the same UID" baseline_kept
@@ -444,6 +472,56 @@ node_fn cmd_migrate --argo > "${WORK}/out/argo5.log" 2>&1 || { bad "--argo re-ru
 check "--argo re-run: detached already, 0 changes" bash -c "grep -q 'teknoir-argo is detached already' '${WORK}/out/argo5.log' && grep -q 'summary: 0 change' '${WORK}/out/argo5.log'"
 node_fn cmd_migrate > "${WORK}/out/migrate5.log" 2>&1 || { bad "migrate after --argo exits 0"; cat "${WORK}/out/migrate5.log"; }
 check "migrate after --argo: nothing left, no Teknoir Addon" bash -c "grep -q 'no Teknoir K3s files or Addons left' '${WORK}/out/migrate5.log' && grep -q 'Teknoir Addons left: none' '${WORK}/out/migrate5.log'"
+
+say "finalize (SEC-C10): shred manifests-retired once the migration is accepted"
+skips() { find "${MAN}" -maxdepth 1 -name '*.skip' -printf '%f\n' | sort; }
+skips > "${WORK}/out/skips-before.txt"
+retired_before="$(retired_count)"
+check "there are retired files and .skip guards to keep" bash -c "(( ${retired_before} > 20 )) && [[ \$(grep -c . '${WORK}/out/skips-before.txt') == 26 ]]"
+# a missing .skip guard of a retired name
+mv "${MAN}/teknoir-harbor-secret.yaml.skip" "${WORK}/out/harbor.skip.moved"
+if node_fn cmd_migrate --finalize > "${WORK}/out/fin1.log" 2>&1; then bad "finalize without a .skip guard is refused"; else
+  check "finalize without a .skip guard is refused, naming the file" grep -q 'no .skip guard in .* for the retired: teknoir-harbor-secret.yaml' "${WORK}/out/fin1.log"
+fi
+mv "${WORK}/out/harbor.skip.moved" "${MAN}/teknoir-harbor-secret.yaml.skip"
+# the root Application has no status yet (no ArgoCD in this cluster)
+if node_fn cmd_migrate --finalize > "${WORK}/out/fin2.log" 2>&1; then bad "finalize while app-of-apps is not ready is refused"; else
+  check "finalize while app-of-apps is not ready is refused, naming it" grep -q 'these Applications are not Synced/Healthy: app-of-apps (Unknown/Unknown' "${WORK}/out/fin2.log"
+fi
+K -n teknoir-system patch applications.argoproj.io app-of-apps --type=merge -p "$(K -n teknoir-system get applications.argoproj.io app-of-apps -o json \
+  | jq -c '{status: {sync: {status: "Synced", revision: .spec.source.targetRevision, comparedTo: {source: .spec.source}}, health: {status: "Healthy"}, operationState: {phase: "Succeeded"}}}')" >/dev/null
+# no export, an export older than the migration, a plaintext file named .tar.age
+mkdir -p "${WORK}/state/exports"
+if node_fn cmd_migrate --finalize > "${WORK}/out/fin3.log" 2>&1; then bad "finalize without an encrypted export is refused"; else
+  check "finalize without an encrypted export is refused" grep -q 'no age-encrypted backup export newer than the migration' "${WORK}/out/fin3.log"
+fi
+printf 'age-encryption.org/v1\n-> X25519 test-only-stanza\n' > "${WORK}/state/exports/teknoir-backup-20200101T000000Z.tar.age"
+sleep 1
+printf 'plain tar, not encrypted\n' > "${WORK}/state/exports/$(date -u +%Y%m%dT%H%M%SZ).tar.age"
+if node_fn cmd_migrate --finalize > "${WORK}/out/fin4.log" 2>&1; then bad "an old export or a plaintext .tar.age does not count"; else
+  check "an export older than the migration and a plaintext .tar.age do not count" bash -c "
+    grep -q 'no age-encrypted backup export newer than the migration' '${WORK}/out/fin4.log' && grep -q 'is not an age-encrypted file; ignored' '${WORK}/out/fin4.log'"
+fi
+node_fn cmd_migrate --finalize --i-know --dry-run > "${WORK}/out/fin5.log" 2>&1 || { bad "finalize --i-know --dry-run exits 0"; cat "${WORK}/out/fin5.log"; }
+check "--i-know accepts an off-node encrypted backup (warned); --dry-run lists names and removes nothing" bash -c "
+  grep -q -- '--i-know: you hold an encrypted backup' '${WORK}/out/fin5.log' && grep -q 'would shred ${retired_before} retired file(s)' '${WORK}/out/fin5.log' &&
+  [[ \$(find '${RETIRED_ROOT}' -type f | wc -l) == ${retired_before} ]]"
+check "finalize refusals and dry-runs removed nothing" test "$(retired_count)" == "${retired_before}"
+rm -f "${WORK}/state/exports/"2*Z.tar.age
+sleep 1
+printf 'age-encryption.org/v1\n-> X25519 test-only-stanza\n' > "${WORK}/state/exports/$(date -u +%Y%m%dT%H%M%SZ).tar.age"
+if node_fn cmd_migrate --finalize > "${WORK}/out/fin6.log" 2>&1; then ok "finalize with a newer encrypted export exits 0"; else bad "finalize with a newer encrypted export exits 0"; cat "${WORK}/out/fin6.log"; fi
+check "finalize: manifests-retired is gone" test ! -e "${RETIRED_ROOT}"
+check "finalize: every .skip guard stays" diff -q "${WORK}/out/skips-before.txt" <(skips)
+check "finalize: logs one 'shredded' line per retired file, names only" bash -c "
+  [[ \$(grep -c '  shredded ' '${WORK}/out/fin6.log') == ${retired_before} ]] && grep -q 'shredded 2[0-9]*T[0-9]*Z/teknoir-harbor-secret.yaml' '${WORK}/out/fin6.log' &&
+  grep -q 'changed: finalized the migration: shredded ${retired_before} retired file(s)' '${WORK}/out/fin6.log'"
+node_fn cmd_migrate --finalize > "${WORK}/out/fin7.log" 2>&1 || { bad "finalize re-run exits 0"; cat "${WORK}/out/fin7.log"; }
+check "finalize re-run: nothing to finalize, 0 changes" bash -c "grep -q 'does not exist: nothing to finalize' '${WORK}/out/fin7.log' && grep -q 'summary: 0 change' '${WORK}/out/fin7.log'"
+if node_fn cmd_migrate --undo teknoir-coredns-custom > "${WORK}/out/fin8.log" 2>&1; then bad "--undo after finalize fails"; else
+  check "--undo after finalize fails: no retired copy" grep -q 'no retired copy under' "${WORK}/out/fin8.log"
+fi
+check "every object still exists with the same UID after finalize" baseline_kept
 check "no secret value in any output" bash -c "! grep -q 'dummy-' '${WORK}/out/'*.log"
 
 say "result: ${PASS} passed, ${FAIL} failed"

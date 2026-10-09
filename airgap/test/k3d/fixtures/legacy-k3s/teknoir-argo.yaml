@@ -54,6 +54,18 @@ metadata:
 data:
   url: https://argocd.teknoir.airgapped
 ---
+# on the live node the K3s file also carried this one; the converge's secrets
+# phase reconciles it since the redesign (not the argo chart)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-tls-certs-cm
+  namespace: teknoir-system
+  labels:
+    app.kubernetes.io/name: argocd-tls-certs-cm
+    app.kubernetes.io/part-of: argocd
+data: {}
+---
 # stands in for the ArgoCD workloads: migrate --argo (DESIGN M7a) must not restart their pods
 apiVersion: apps/v1
 kind: Deployment

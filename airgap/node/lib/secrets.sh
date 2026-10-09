@@ -270,11 +270,15 @@ secrets_reconcile_ca_bundles() {
 }
 
 secrets_reconcile_argocd_tls_certs() {
+  # The converge owns this ConfigMap (not the argo chart): MANAGED_BY_LABEL
+  # records that on the object, so migrate --argo reports it as converge-owned
+  # rather than ownerless (r5, HYG-C6). part-of=argocd is what ArgoCD watches.
   local f="${WORK_DIR}/argocd-tls-certs-cm.json"
-  "${JQ}" -n --rawfile pem "${CA_PEM}" --arg ns "${ARGOCD_NS}" --arg name "${ARGOCD_TLS_CM}" --arg host "${HARBOR_HOST}" '{
+  "${JQ}" -n --rawfile pem "${CA_PEM}" --arg ns "${ARGOCD_NS}" --arg name "${ARGOCD_TLS_CM}" --arg host "${HARBOR_HOST}" \
+      --arg mk "${MANAGED_BY_LABEL%%=*}" --arg mv "${MANAGED_BY_LABEL#*=}" '{
     apiVersion: "v1", kind: "ConfigMap",
     metadata: {name: $name, namespace: $ns,
-      labels: {"app.kubernetes.io/name": $name, "app.kubernetes.io/part-of": "argocd"}},
+      labels: {"app.kubernetes.io/name": $name, "app.kubernetes.io/part-of": "argocd", ($mk): $mv}},
     data: {($host): $pem}
   }' > "${f}"
   apply_ssa "${f}" teknoir-bootstrap "ConfigMap ${ARGOCD_NS}/${ARGOCD_TLS_CM} entry ${HARBOR_HOST}"
