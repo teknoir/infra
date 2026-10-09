@@ -241,9 +241,16 @@ the LAN host, until the new release is accepted. For r5 that is the app-of-apps
 0.0.4 bundle `teknoir-airgap-teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af.tar`
 (built by infra 8610f8d from gitops a8fe7af; 4.0 GiB). The rollback is
 `./teknoir-airgap up --rollback` from that bundle
-([OPERATE.md](OPERATE.md#5-rollback)). It runs that bundle's own node code,
-which is what the VM end-to-end test E4 runs (`up` with the new bundle, then
-`up --rollback` with the old one).
+([OPERATE.md](OPERATE.md#5-rollback)), which runs that bundle's own node code.
+
+The rollback from r5 to 0.0.4 is not clean, and it has not been rehearsed. The
+VM end-to-end test E4 does not run the rollback from r5 to a pre-r5 bundle by
+default. 0.0.4 does not prune r5's kept objects (the `Prune=false` Namespace
+`teknoir-user-credentials`, the Profile `teknoir-default`, the admission
+policies). Its post phase therefore fails on `user-controller` (`OutOfSync`),
+and `up --rollback` exits non-zero although the platform is back on 0.0.4.
+[OPERATE.md](OPERATE.md#rolling-back-from-r5) explains how to confirm the
+rollback.
 
 A rebuild is a different bundle. The old charts' floating tags resolve to
 whatever the registries serve on the build day, and the current build applies
@@ -268,4 +275,4 @@ That bundle is the only `-mutable` bundle that may reach the live environment,
 and only with `up --rollback` to an app-of-apps version that was already live.
 It runs the current node code with the old charts (a combination E4 does not
 test), carries no teamspace plugins, and its Teknoir images may be newer builds
-than the ones that were live.
+than the ones that were live. Its post phase runs into the same kept objects.

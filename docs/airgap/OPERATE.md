@@ -250,7 +250,8 @@ cd teknoir-airgap-<older bundleId>
   databases from the backup taken before the update (section 10).
 - Roll back with the bundle that was live, so keep its tar and `.tar.sha256`
   until the update is accepted. A rebuild of an older version is a different
-  bundle ([BUILD.md](BUILD.md#rollback-bundles)); for r5 see
+  bundle ([BUILD.md](BUILD.md#rollback-bundles)). A rollback from r5 to 0.0.4
+  is not clean: its post phase fails. See
   [Rolling back from r5](#rolling-back-from-r5).
 
 ## 6. Status and checks
@@ -823,16 +824,85 @@ code.
   ./teknoir-airgap up --rollback
   ```
 
+- Expect this `up --rollback` to exit non-zero once its post phase has waited
+  1200 s. Nobody has rehearsed this rollback: the VM test E4 does not run the
+  rollback from r5 to a pre-r5 bundle by default (an open design gap, see
+  DESIGN.md, r5). The release phase rolls the platform back to 0.0.4 and
+  records it. Then 0.0.4's post phase waits for every Application in
+  teknoir-system to be `Synced`/`Healthy`, and it finds r5 objects that 0.0.4
+  neither renders nor prunes:
+  - Namespace `teknoir-user-credentials` (user-controller 0.0.85,
+    `Prune=false,Delete=false`) is kept. 0.0.4's AppProject permits
+    Namespaces, so ArgoCD keeps the `user-controller` Application `OutOfSync`
+    (pruning skipped). This alone makes the post phase fail.
+  - Profile `teknoir-default` and its namespace are kept (profile-controller
+    0.0.84, `Prune=false,Delete=false`). 0.0.4's AppProject does not permit
+    `teknoir.org/Profile`, so ArgoCD should leave the Profile out of the
+    comparison and not report `profile-controller` as `OutOfSync`. If it does
+    report it, treat it like the Namespace above.
+  - The teamspace Applications (`teknoir-default-*`, and `teknoir-demo-*` if
+    that teamspace exists): 0.0.4's profile-controller has no
+    `PLUGIN_CHART_REPO`, so it tries to point them back at
+    `https://teknoir.github.io/profile-plugins-helm`. There they would be
+    `Unknown`, because the node is offline. r5's admission policy
+    `profile-controller-argocd` (next point) should refuse that change. The
+    Applications then stay on Harbor, and the profile-controller log shows the
+    refused updates.
+  - The admission policies and their bindings
+    (`profile-controller-teamspaces`, `profile-controller-argocd`,
+    `user-controller-teamspace-access`) are also kept, as are the Role and
+    RoleBinding `user-controller-credentials` in `teknoir-user-credentials`.
+    0.0.4's AppProject covers neither those kinds nor that namespace, so
+    ArgoCD neither compares nor prunes them. The policies still apply to the
+    0.0.4 controllers, which run under the same ServiceAccounts.
+- To check that the platform rollback itself worked:
+  1. `./teknoir-airgap status` (run from the 0.0.4 bundle) prints
+     `release:   app-of-apps 0.0.4, bundle teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af (rollback)`,
+     and the first `history:` line is that rollback. The release phase writes
+     this record before the post phase runs.
+  2. The same command prints the Application table. Every Application except
+     the ones above is `Synced`/`Healthy` at the version that the 0.0.4
+     bundle pins (its `node/charts/pins.txt`).
+  3. An `OutOfSync` controller Application must be waiting only for its kept
+     object. This command lists what is out of sync:
+
+     ```sh
+     kubectl --context teknoir-local -n teknoir-system get application user-controller \
+       -o jsonpath='{range .status.resources[?(@.status=="OutOfSync")]}{.kind}/{.name} requiresPruning={.requiresPruning}{"\n"}{end}'
+     ```
+
+     It should print only `Namespace/teknoir-user-credentials
+     requiresPruning=true` (for profile-controller, only
+     `Profile/teknoir-default`), and the Application's health should be
+     `Healthy`.
+  4. The post phase stopped before its image check, so check the pods
+     yourself. This prints nothing:
+
+     ```sh
+     kubectl --context teknoir-local get pods -A | grep -E 'ErrImagePull|ImagePullBackOff'
+     ```
+
+  5. The browser checks from section 3 pass.
+
+  If any other Application is not `Synced`/`Healthy`, the rollback has a real
+  problem. Troubleshoot it like a failed update (section 12).
+- Do not delete the kept Profile, its namespace or `teknoir-user-credentials`
+  to make the post phase pass. Deleting a Profile or its namespace deletes the
+  teamspace's volumes, and no backup covers them. A later plain `up` with the
+  0.0.4 bundle fails in the same way and stays on the rollback. A plain `up`
+  with the r5 bundle (or a later one) rolls forward and renders all of these
+  objects again.
 - Do not rebuild 0.0.4 for a rollback while that tar exists. The r5 build
   can only make it as a `-mutable` bundle without teamspace plugins
-  (`ALLOW_MUTABLE_TEKNOIR_TAGS=1`, `PROFILE_PLUGIN_CHARTS=""`); that is
+  (`ALLOW_MUTABLE_TEKNOIR_TAGS=1`, `PROFILE_PLUGIN_CHARTS=""`). That is
   allowed only when the tar is lost, and only with `--rollback`
-  ([BUILD.md](BUILD.md#rollback-bundles)).
-- A rollback to 0.0.4 does not remove what r5 added: the node packages stay
-  installed, and the plugin charts and images stay in Harbor (unused).
-  0.0.4's profile-controller has no `PLUGIN_CHART_REPO`, so, as before r5,
-  teamspaces cannot install their plugins offline. Database changes need the
-  backup taken before the update (section 10).
+  ([BUILD.md](BUILD.md#rollback-bundles)). Its post phase runs into the same
+  kept objects.
+- A rollback to 0.0.4 does not remove what r5 added. The node packages stay
+  installed, and the plugin charts and images stay in Harbor (the teamspace
+  pods keep running from them). As before r5, 0.0.4's profile-controller
+  cannot install teamspace plugins offline. Database changes need the backup
+  taken before the update (section 10).
 
 ## 15. Command reference
 

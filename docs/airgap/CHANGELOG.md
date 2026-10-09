@@ -29,6 +29,11 @@ reasons for the redesign are kept here. The git history of `infra` and
   containerd. `airgap/build/pin-images.sh` prints and verifies pins.
 - **Size.** A bundle is about 5.8 GB; the limit is 6.5 GiB. Use exFAT or ext4
   media, or `make-bundle.sh --split` for FAT32.
+- **Rollback.** To roll back from r5, run `up --rollback` with the retained
+  0.0.4 bundle, not a rebuild. The rollback is not clean: 0.0.4 does not
+  prune r5's kept objects, so its post phase fails on `user-controller`, and
+  nobody has rehearsed it. OPERATE.md ("Rolling back from r5") explains how to
+  confirm it.
 
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
