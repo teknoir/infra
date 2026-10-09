@@ -1,6 +1,8 @@
 # shellcheck shell=bash
 # _stub.bash — shared implementation of the recording command stubs in this
-# directory (kubectl, k3s, ssh, crane, helm, curl, systemctl, ip). Put the directory
+# directory (kubectl, k3s, ssh, crane, helm, curl, systemctl, ip, apt-get,
+# dpkg-query; test_helper.bash clock_tools adds chronyc, hwclock and date
+# outside PATH). Put the directory
 # first on PATH in a test; every call is then
 #   1. recorded as one line in $STUB_LOG: "<name> <args, each %q-quoted>";
 #   2. refused with rc 97 when the args match $STUB_FAIL_ON (an ERE), which

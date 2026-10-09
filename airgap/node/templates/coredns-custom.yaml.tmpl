@@ -7,6 +7,19 @@ data:
   teknoir.server: |
     __DOMAIN__:53 {
         errors
+        # CoreDNS runs template before hosts: the apex and every <name>.<domain>
+        # (the platform and every teamspace hostname) answer NODE_IP for A and
+        # NODATA for AAAA; deeper names and other types get the hosts answers.
+        template IN A __DOMAIN__ {
+            match ^([a-z0-9-]+[.])?__DOMAIN_RE__[.]$
+            answer "{{ .Name }} 60 IN A __NODE_IP__"
+            fallthrough
+        }
+        template IN AAAA __DOMAIN__ {
+            match ^([a-z0-9-]+[.])?__DOMAIN_RE__[.]$
+            rcode NOERROR
+            fallthrough
+        }
         hosts {
             __HOSTS_ENTRIES__
         }

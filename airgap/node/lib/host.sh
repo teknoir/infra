@@ -11,6 +11,12 @@
 # (stale ones pruned) and any image missing from containerd is imported with
 # `k3s ctr` - no restart needed for that.
 #
+# Time (DESIGN D6, r5): the bundle's node packages (node/debs: chrony and
+# util-linux-extra for hwclock) are installed offline when missing; chrony
+# serves NTP to the LAN from a local stratum-10 reference that every up
+# corrects with a LAN-host sample (or from TIME_SOURCE); the RTC is written
+# when it is more than CLOCK_OK_SKEW seconds off, so a reboot starts right.
+#
 # k3s subcommands that take --data-dir get it explicitly (secrets-encrypt,
 # etcd-snapshot, ...); ctr/kubectl/crictl find it through config.yaml.
 # Role: only "server" is implemented (D11); "agent" is refused in preflight.
@@ -245,32 +251,348 @@ host_ipv4_network() {
   printf '%d.%d.%d.%d' $(( (n >> 24) & 255 )) $(( (n >> 16) & 255 )) $(( (n >> 8) & 255 )) $(( n & 255 ))
 }
 
+# ---------------------------------------------------------------------------
+# Host packages from the bundle (node/debs): chrony and util-linux-extra
+# (hwclock), installed offline
+# ---------------------------------------------------------------------------
+# What an install from node/debs may remove: chrony and systemd-timesyncd
+# both provide time-daemon and conflict, so apt replaces timesyncd.
+HOST_PKG_REMOVALS_OK="systemd-timesyncd"
+# 1 when this run (or, in dry-run, the plan) installs the bundle's packages
+HOST_PACKAGES_PLANNED=0
+
+host_join() {
+  # host_join <separator> <word>... - the words joined by the separator
+  local sep="$1" out="" w
+  shift
+  for w in "$@"; do out+="${out:+${sep}}${w}"; done
+  printf '%s' "${out}"
+}
+
+host_pkg_installed_version() {
+  # host_pkg_installed_version <pkg> - the installed version, empty when the
+  # package is not installed (removed-but-configured counts as not installed)
+  local out
+  # shellcheck disable=SC2016  # a dpkg-query format, not a shell expansion
+  out="$(dpkg-query -W -f '${db:Status-Status} ${Version}' "$1" 2>/dev/null)" || return 0
+  [[ "${out}" == "installed "* ]] && printf '%s' "${out#installed }"
+  return 0
+}
+
+host_packages() {
+  # Install the bundle's node packages (node/debs/debs.lock lines: <pkg>
+  # <version> <arch> <sha256> <file>) when the node lacks those exact
+  # versions. apt simulates first, offline (--no-download): any plan other
+  # than installing these packages and removing systemd-timesyncd, or a plan
+  # that fails, is a WARN and the step is skipped. A node on another Debian
+  # point release must not be blocked from a platform update; preflight keeps
+  # checking the clock, and doctor shows the gap.
+  local lock="${NODE_ROOT}/debs/debs.lock" pkg ver sha file deb have sim rc=0 op what bad="" removed="" list
+  local -a debs=() names=()
+  if [[ ! -f "${lock}" ]]; then
+    log "host packages: this payload has no node/debs (nothing to install)"
+    return 0
+  fi
+  if ! have_tool dpkg-query || ! have_tool apt-get; then
+    warn "host packages: dpkg-query or apt-get not found: the bundle's node packages (chrony, hwclock) are not installed"
+    return 0
+  fi
+  while read -r pkg ver _ sha file; do
+    [[ -z "${pkg}" || "${pkg}" == \#* ]] && continue
+    if [[ ! "${pkg}" =~ ^[a-z0-9][a-z0-9.+-]+$ || ! "${ver}" =~ ^[A-Za-z0-9.+:~-]+$ || ! "${sha}" =~ ^[0-9a-f]{64}$ \
+          || ! "${file}" =~ ^[A-Za-z0-9][A-Za-z0-9._+~-]*\.deb$ ]]; then
+      warn "host packages: malformed line in node/debs/debs.lock (${pkg:-?} ${ver:-?}): skipped"
+      continue
+    fi
+    deb="${NODE_ROOT}/debs/${file}"
+    if [[ ! -f "${deb}" ]] || [[ "$(host_bundle_sha "debs/${file}")" != "${sha}" ]]; then
+      warn "host packages: debs/${file} is missing or does not match its pin in debs.lock: ${pkg} is not installed"
+      continue
+    fi
+    have="$(host_pkg_installed_version "${pkg}")"
+    if [[ "${have}" == "${ver}" ]]; then
+      continue
+    fi
+    if [[ -n "${have}" ]] && have_tool dpkg && dpkg --compare-versions "${have}" gt "${ver}"; then
+      log "host packages: ${pkg} ${have} is newer than the bundle's ${ver}: kept"
+      continue
+    fi
+    debs+=("${deb}")
+    names+=("${pkg} ${ver}${have:+ (was ${have})}")
+  done < "${lock}"
+  list="$(host_join ", " "${names[@]}")"
+  if (( ${#debs[@]} == 0 )); then
+    log "host packages: the bundle's node packages are installed ($(awk 'NF && $1 !~ /^#/ {printf "%s%s %s", s, $1, $2; s = ", "}' "${lock}"))"
+    return 0
+  fi
+  sim="$(LC_ALL=C apt-get install -s --no-download --no-install-recommends "${debs[@]}" 2>&1)" || rc=$?
+  if (( rc != 0 )); then
+    warn "host packages: apt cannot install ${list} offline (simulate exit ${rc}: $(grep -E '^(E:|W:)' <<<"${sim}" | tail -n 3 | tr '\n' ' ')): skipped; the node keeps its clock tools as they are"
+    return 0
+  fi
+  while read -r op what _; do
+    case "${op}" in
+      Inst|Remv|Purg) ;;
+      *) continue ;;
+    esac
+    if [[ "${op}" == Inst ]] && printf '%s\n' "${names[@]}" | awk '{print $1}' | grep -qxF -- "${what}"; then
+      continue
+    fi
+    if [[ "${op}" == Remv && " ${HOST_PKG_REMOVALS_OK} " == *" ${what} "* ]]; then
+      removed+="${removed:+, }${what}"
+      continue
+    fi
+    bad+="${bad:+; }${op} ${what}"
+  done <<<"${sim}"
+  if [[ -n "${bad}" ]]; then
+    warn "host packages: apt's offline plan for ${list} also changes other packages (${bad}): skipped; the node keeps its clock tools as they are"
+    return 0
+  fi
+  HOST_PACKAGES_PLANNED=1
+  if dry_run; then
+    changed "install ${list} from the bundle${removed:+ (removes ${removed})}"
+    return 0
+  fi
+  # DPkg::Lock::Timeout: unattended-upgrades and apt-daily may hold the lock
+  if ! run env DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 apt-get install -y --no-download \
+       --no-install-recommends -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold "${debs[@]}" >&2; then
+    HOST_PACKAGES_PLANNED=0
+    warn "host packages: apt-get install of ${list} failed (see /var/log/apt/term.log; dpkg --audit): the converge goes on without them"
+    return 0
+  fi
+  changed "installed ${list} from the bundle${removed:+ (removed ${removed})}"
+}
+
+# ---------------------------------------------------------------------------
+# Time: chrony serves the LAN; every up corrects the clock and the RTC
+# ---------------------------------------------------------------------------
+# |skew| at or below this many seconds needs no correction
+CLOCK_OK_SKEW="${CLOCK_OK_SKEW:-2}"
+RTC_EPOCH_FILE="${HOST_ROOT}/sys/class/rtc/rtc0/since_epoch"
+# 1 once this run gave chrony its LAN-time sample (settime runs once per up)
+CLOCK_SAMPLE_SENT=0
+# 1 once this run wrote (in dry-run: would write) the RTC
+CLOCK_RTC_WRITTEN=0
+
+clock_chrony_installed() { have_tool "${CHRONYC}"; }
+
+clock_chrony_active() {
+  clock_chrony_installed && systemctl is-active --quiet chrony 2>/dev/null
+}
+
+clock_lan_now() {
+  # clock_lan_now - the LAN host's clock now (--lan-time plus the seconds
+  # since it was parsed); empty without --lan-time
+  [[ -n "${LAN_TIME:-}" ]] || return 0
+  printf '%s' "$(( LAN_TIME + SECONDS - ${LAN_TIME_AT:-0} ))"
+}
+
+clock_tracking() {
+  # clock_tracking - "<reference id> <stratum> <frequency...>" from
+  # `chronyc -n tracking` (a monitoring command, read-only); empty when chrony
+  # does not answer
+  "${CHRONYC}" -n tracking 2>/dev/null | awk -F': *' '
+    /^Reference ID/ { split($2, a, " "); ref = a[1]; name = a[2]; gsub(/[()]/, "", name) }
+    /^Stratum/ { st = $2 }
+    /^Frequency/ { fr = $2 }
+    END { if (ref != "") printf "%s %s %s %s", ref, (name == "" ? "-" : name), (st == "" ? "?" : st), fr }' || true
+}
+
+clock_source_label() {
+  # clock_source_label <reference id> <name> - LOCAL (local stratum), MANU
+  # (manual samples), none (no reference yet), else the source's name
+  case "$1" in
+    7F7F0101) printf 'LOCAL' ;;
+    4D414E55) printf 'MANU' ;;
+    00000000|"") printf 'none' ;;
+    *) if [[ "$2" != "-" && -n "$2" ]]; then printf '%s' "$2"; else printf '%s' "$1"; fi ;;
+  esac
+}
+
+clock_source_selected() {
+  # clock_source_selected - 0 when chrony has selected an NTP source ('^*')
+  "${CHRONYC}" -n sources 2>/dev/null | grep -q '^\^\*'
+}
+
+clock_rtc_offset() {
+  # clock_rtc_offset - RTC minus system clock in seconds; empty when the node
+  # has no readable RTC
+  local rtc
+  rtc="$(cat "${RTC_EPOCH_FILE}" 2>/dev/null)" || return 0
+  [[ "${rtc}" =~ ^[0-9]+$ ]] || return 0
+  printf '%s' "$(( rtc - $(date +%s) ))"
+}
+
+clock_rtc_local() {
+  # clock_rtc_local - 0 when /etc/adjtime says the RTC keeps local time
+  [[ "$(sed -n 3p "${HOST_ROOT}/etc/adjtime" 2>/dev/null)" == LOCAL ]]
+}
+
+clock_write_rtc() {
+  # clock_write_rtc <why> - set the RTC from the system clock (UTC)
+  if ! have_tool "${HWCLOCK}"; then
+    warn "hwclock is not installed (util-linux-extra): the RTC is not written; the next boot starts from it ($1)"
+    return 0
+  fi
+  if clock_rtc_local; then
+    warn "the RTC keeps local time (/etc/adjtime): teknoir-node does not write it ($1)"
+    return 0
+  fi
+  if run "${HWCLOCK}" --systohc --utc; then
+    CLOCK_RTC_WRITTEN=1
+    changed "RTC set from the system clock ($1)"
+  else
+    warn "hwclock --systohc --utc failed: the RTC keeps its time ($1)"
+  fi
+}
+
+clock_settime() {
+  # clock_settime <epoch> - give chrony the LAN host's time as a manual sample
+  # (needs 'manual' in its configuration, which host_chrony writes). chrony
+  # corrects the clock from it and learns the drift from the samples of
+  # successive runs (driftfile). Returns non-zero when chrony refuses it.
+  local when out
+  when="$(LC_ALL=C date -u -d "@$1" '+%b %d, %Y %H:%M:%S')" || return 1
+  out="$(run env TZ=UTC "${CHRONYC}" settime "${when}" 2>&1)" || { warn "chronyc settime failed: $(tr '\n' ' ' <<<"${out}")"; return 1; }
+  CLOCK_SAMPLE_SENT=1
+  log "chrony: LAN-time sample ${when} UTC: $(grep -v '^200 OK' <<<"${out}" | tr '\n' ' ')"
+}
+
+clock_step() {
+  # clock_step <epoch> <skew> - set the node clock to the LAN host's time now:
+  # through chrony when it runs (sample + makestep), else with date -u -s
+  local lan="$1" skew="$2"
+  if clock_chrony_active && clock_settime "${lan}"; then
+    run "${CHRONYC}" makestep >/dev/null || warn "chronyc makestep failed (chrony slews the rest)"
+    changed "node clock set from the LAN host through chrony (skew was ${skew}s)"
+  else
+    run "${DATE_BIN}" -u -s "@${lan}" >/dev/null || die "cannot set the node clock (date -u -s)"
+    changed "node clock set from the LAN host with date (skew was ${skew}s)"
+  fi
+}
+
+clock_status_line() {
+  # clock_status_line - for status: "<utc> source=<LOCAL|MANU|none|name>
+  # stratum N freq X ppm ... NTPSynchronized=..; RTC <+-N> s; chrony <state>"
+  local line tr ref name st fr off sync="?" chrony=absent
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if clock_chrony_installed; then
+    chrony=inactive
+    systemctl is-active --quiet chrony 2>/dev/null && chrony=active
+    tr="$(clock_tracking)"
+    if [[ -n "${tr}" ]]; then
+      read -r ref name st fr <<<"${tr}"
+      line+=" source=$(clock_source_label "${ref}" "${name}") stratum ${st} freq ${fr:-?}"
+    fi
+  fi
+  if have_tool timedatectl; then
+    sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo '?')"
+  fi
+  line+=" NTPSynchronized=${sync:-?}"
+  off="$(clock_rtc_offset)"
+  if [[ -n "${off}" ]]; then line+="; RTC $(printf '%+d' "${off}") s"; else line+="; RTC unreadable"; fi
+  printf '%s; chrony %s' "${line}" "${chrony}"
+}
+
+host_time() {
+  # After host_chrony: when chrony keeps only its local or manual reference
+  # (no NTP source answers, the air-gap normal case), give it this run's
+  # LAN-time sample (once per up); then write the RTC when it is more than
+  # CLOCK_OK_SKEW seconds off the system clock, so a reboot starts from the
+  # right time. Dry-run only reports.
+  local tr ref name label lan skew off
+  if clock_chrony_active; then
+    tr="$(clock_tracking)"
+    # no answer (chrony just restarted): as with no reference yet
+    read -r ref name _ _ <<<"${tr:-00000000 -}"
+    label="$(clock_source_label "${ref}" "${name}")"
+    lan="$(clock_lan_now)"
+    if [[ "${label}" != LOCAL && "${label}" != MANU && "${label}" != none ]] || clock_source_selected; then
+      log "chrony follows the NTP source ${label}: no LAN-time sample"
+    elif [[ -z "${lan}" ]]; then
+      log "chrony reference ${label}; no --lan-time given: no LAN-time sample"
+    elif (( CLOCK_SAMPLE_SENT )); then
+      log "chrony already has this run's LAN-time sample"
+    elif dry_run; then
+      log "[dry-run] chrony (reference ${label}) would get a LAN-time sample"
+    else
+      skew=$(( $(date +%s) - lan ))
+      if clock_settime "${lan}" && (( ${skew#-} > CLOCK_OK_SKEW )); then
+        # apply the correction now: slewing 20 s at chrony's maximum rate
+        # takes about 4 minutes
+        run "${CHRONYC}" makestep >/dev/null || warn "chronyc makestep failed (chrony slews the rest)"
+        changed "node clock corrected through chrony (was ${skew}s off the LAN host)"
+      fi
+    fi
+  elif clock_chrony_installed; then
+    log "chrony is installed but not active: the clock is checked against the LAN host only"
+  fi
+  off="$(clock_rtc_offset)"
+  if (( CLOCK_RTC_WRITTEN )); then
+    log "RTC: written in this run's preflight"
+  elif [[ -z "${off}" ]]; then
+    log "no RTC to check (${RTC_EPOCH_FILE#"${HOST_ROOT}"} not readable)"
+  elif (( ${off#-} <= CLOCK_OK_SKEW )); then
+    log "RTC: ${off}s from the system clock"
+  elif dry_run; then
+    if have_tool "${HWCLOCK}" || (( HOST_PACKAGES_PLANNED )); then
+      changed "set the RTC from the system clock (it is ${off}s off)"
+    else
+      warn "the RTC is ${off}s off the system clock and hwclock is not installed"
+    fi
+  else
+    clock_write_rtc "was ${off}s off"
+  fi
+}
+
 host_chrony() {
-  # chrony (if installed) serves time to the LAN from the node; TIME_SOURCE
-  # (site env) adds an upstream server. Without chrony, preflight still checks
-  # the skew against the LAN host.
-  if ! command -v chronyd >/dev/null 2>&1 && [[ ! -x "${HOST_ROOT}/usr/sbin/chronyd" ]]; then
-    log "chrony is not installed: the node does not serve time (skew is checked against the LAN host)"
+  # chrony serves time to the LAN from the node: a local stratum-10 reference
+  # that every up corrects with a LAN-time sample (manual, host_time), or the
+  # TIME_SOURCE servers (site env, space-separated) when they answer. Without
+  # chrony, preflight still checks the skew against the LAN host.
+  if ! clock_chrony_installed; then
+    if (( HOST_PACKAGES_PLANNED )) && dry_run; then
+      log "[dry-run] chrony is not installed yet: its drop-in ${CHRONY_CONF} would be written after the install"
+    else
+      log "chrony is not installed: the node does not serve time (skew is checked against the LAN host)"
+    fi
     return 0
   fi
   ensure_work_dir
-  local cidr prefix net conf="${WORK_DIR}/chrony.conf"
+  local cidr prefix net s conf="${WORK_DIR}/chrony.conf"
+  local -a sources=()
+  read -r -a sources <<<"${TIME_SOURCE:-}"
   cidr="$(ip -o -4 addr show 2>/dev/null | awk -v ip="${NODE_IP}" '{split($4, a, "/"); if (a[1] == ip) {print $4; exit}}')"
   [[ -n "${cidr}" ]] || die "cannot find the prefix length of ${NODE_IP} for chrony's allow rule"
   prefix="${cidr#*/}"
   net="$(host_ipv4_network "${NODE_IP}" "${prefix}")/${prefix}"
   {
-    printf '# Managed by teknoir-node (host phase): serve time to the airgapped LAN.\n'
-    if [[ -n "${TIME_SOURCE}" ]]; then
-      printf 'server %s iburst prefer\n' "${TIME_SOURCE}"
-    fi
+    printf '# Managed by teknoir-node (host phase); every up rewrites it.\n'
+    printf '# Serves NTP to the LAN (Robots, cameras: server NODE_IP). Without an\n'
+    printf '# answering server below, the reference is the local clock (stratum 10),\n'
+    printf '# which up corrects with the LAN host time (chronyc settime, needs manual).\n'
+    for s in ${sources[@]+"${sources[@]}"}; do
+      printf 'server %s iburst prefer\n' "${s}"
+    done
     printf 'allow %s\n' "${net}"
     printf 'local stratum 10\n'
+    printf 'manual\n'
   } > "${conf}"
   ensure_dir "${CHRONY_CONF_DIR}" 0755
   install_file "${conf}" "${CHRONY_CONF}" 0644 "chrony: serve ${net}${TIME_SOURCE:+, source ${TIME_SOURCE}}"
-  if (( FILE_CHANGED )) && systemctl is-active --quiet chrony 2>/dev/null; then
-    run systemctl restart chrony
+  # time must not block the platform update: a chrony that fails is a WARN
+  if systemctl is-active --quiet chrony 2>/dev/null; then
+    if (( FILE_CHANGED )); then
+      if run systemctl restart chrony; then
+        changed "restarted chrony for its new drop-in"
+      else
+        warn "chrony did not restart with ${CHRONY_CONF} (journalctl -u chrony): the node does not serve time"
+      fi
+    fi
+  elif run systemctl enable --now chrony; then
+    changed "enabled and started chrony (it was installed but not active)"
+  else
+    warn "chrony is installed but does not start (journalctl -u chrony): the node does not serve time"
   fi
   if ! grep -qsE '^[[:space:]]*confdir[[:space:]]+/etc/chrony/conf\.d' "${HOST_ROOT}/etc/chrony/chrony.conf"; then
     warn "/etc/chrony/chrony.conf has no 'confdir /etc/chrony/conf.d': ${CHRONY_CONF} is not read"
@@ -697,7 +1019,9 @@ phase_host() {
   host_check_k3s_payload
   host_node_files
   host_hosts_block
+  host_packages
   host_chrony
+  host_time
   host_sync_tarballs
   host_k3s_reconcile
   host_import_images

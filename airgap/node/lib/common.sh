@@ -11,7 +11,8 @@
 #   DRY_RUN            1 = read-only; mutations only print what they would do
 #   KUBECTL            "k3s kubectl" (tests: "kubectl --context k3d-x")
 #   site variables     TEKNOIR_ENV TEKNOIR_DOMAIN NODE_IP NODE
-#                      TEKNOIR_HOSTNAMES TIME_SOURCE K3S_DATA_DIR, plus the
+#                      TEKNOIR_HOSTNAMES TIME_SOURCE K3S_DATA_DIR UPSTREAM_DNS
+#                      NODE_IP_DHCP_RESERVED BACKUP_AGE_RECIPIENTS, plus the
 #                      derived HARBOR_HOST (harbor.<domain>)
 #   bundle variables   BUNDLE_ID APP_OF_APPS_VERSION MANIFEST_SHA256
 #                      INFRA_COMMIT GITOPS_COMMIT (load_bundle_info)
@@ -20,7 +21,9 @@
 #                      flags as ONESHOT_REAPPLY and HARBOR_FORCE_IMAGES, which
 #                      cmd_converge sets from REAPPLY_TIERS and FORCE_IMAGES
 #   tools              JQ HELM CRANE AGE (bundled linux-amd64 binaries),
-#                      K3S_BIN (/usr/local/bin/k3s)
+#                      K3S_BIN (/usr/local/bin/k3s); the node's clock tools
+#                      CHRONYC HWCLOCK and DATE_BIN (the date that SETS the
+#                      clock), overridable so the sandbox tests can stub them
 #
 # Never-print discipline: no `set -x` anywhere; secret values live only in
 # shell variables, private tmpfs files and pipes. Read them with read_secret
@@ -76,6 +79,16 @@ JQ="${JQ:-$(_bundled_or_path jq)}"
 HELM="${HELM:-$(_bundled_or_path helm)}"
 CRANE="${CRANE:-$(_bundled_or_path crane)}"
 AGE="${AGE:-$(_bundled_or_path age)}"
+# The node OS's clock tools (chrony and util-linux-extra come from the bundle,
+# node/debs). DATE_BIN is used only to set the clock; reading it is plain date.
+CHRONYC="${CHRONYC:-chronyc}"
+HWCLOCK="${HWCLOCK:-hwclock}"
+DATE_BIN="${DATE_BIN:-date}"
+
+have_tool() {
+  # have_tool <command> - 0 when <command> (a name or a path) can be run
+  command -v "$1" >/dev/null 2>&1
+}
 
 CHANGES=()
 _SENSITIVE=()
@@ -434,19 +447,21 @@ teknoir_fqdns() {
 
 render_template() {
   # render_template <template> [KEY=VALUE ...] - print the template with every
-  # __KEY__ replaced. Built-in keys: DOMAIN NODE_IP HARBOR_HOST K3S_DATA_DIR
-  # K3S_CA_FILE APP_OF_APPS_VERSION HOSTS_ENTRIES. A line holding only a
+  # __KEY__ replaced. Built-in keys: DOMAIN DOMAIN_RE (the domain as a regex:
+  # each dot is [.]) NODE_IP HARBOR_HOST K3S_DATA_DIR K3S_CA_FILE
+  # APP_OF_APPS_VERSION HOSTS_ENTRIES. A line holding only a
   # placeholder expands a multi-line value with the line's indentation, or
   # disappears when the value is empty. Dies on any unknown placeholder.
   local tmpl="$1" kv line key indent val out="" l h
   shift
   [[ -f "${tmpl}" ]] || die "missing template ${tmpl}"
-  local hosts=""
+  local hosts="" domain="${TEKNOIR_DOMAIN:-}"
   for h in $(teknoir_fqdns); do
     hosts+="${NODE_IP} ${h}"$'\n'
   done
   local -A vars=(
-    [DOMAIN]="${TEKNOIR_DOMAIN:-}"
+    [DOMAIN]="${domain}"
+    [DOMAIN_RE]="${domain//./[.]}"
     [NODE_IP]="${NODE_IP:-}"
     [HARBOR_HOST]="${HARBOR_HOST:-}"
     [K3S_DATA_DIR]="${K3S_DATA_DIR:-}"
@@ -499,11 +514,36 @@ load_site() {
   K3S_DATA_DIR="${K3S_DATA_DIR:-/opt/k3s}"
   [[ "${K3S_DATA_DIR}" == /* ]] || die "${f}: K3S_DATA_DIR must be absolute"
   TIME_SOURCE="${TIME_SOURCE:-}"
+  local -a words=()
+  read -r -a words <<<"${TIME_SOURCE}"
+  for h in ${words[@]+"${words[@]}"}; do
+    site_time_source_ok "${h}" || die "${f}: invalid TIME_SOURCE entry '${h}' (space-separated IPv4 addresses or host names)"
+  done
   UPSTREAM_DNS="${UPSTREAM_DNS:-}"
   for h in ${UPSTREAM_DNS}; do
     [[ "${h}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || die "${f}: invalid UPSTREAM_DNS entry '${h}' (IPv4 addresses)"
   done
+  NODE_IP_DHCP_RESERVED="${NODE_IP_DHCP_RESERVED:-}"
+  [[ "${NODE_IP_DHCP_RESERVED}" =~ ^(yes|no)?$ ]] \
+    || die "${f}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)"
+  BACKUP_AGE_RECIPIENTS="${BACKUP_AGE_RECIPIENTS:-}"
+  read -r -a words <<<"${BACKUP_AGE_RECIPIENTS}"
+  for h in ${words[@]+"${words[@]}"}; do
+    [[ "${h}" =~ ^age1[0-9a-z]{58}$ ]] || die "${f}: invalid BACKUP_AGE_RECIPIENTS entry '${h}' (age public keys: age1 and 58 characters)"
+  done
   HARBOR_HOST="harbor.${TEKNOIR_DOMAIN}"
+}
+
+site_time_source_ok() {
+  # site_time_source_ok <token> - 0 for an IPv4 address or a host name (one
+  # TIME_SOURCE entry, written into chrony's drop-in as a server line)
+  local t="$1" o
+  if [[ "${t}" =~ ^[0-9.]+$ ]]; then
+    [[ "${t}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do (( 10#${o} <= 255 )) || return 1; done
+    return 0
+  fi
+  (( ${#t} <= 253 )) && [[ "${t}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
 }
 
 manifest_get() {

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
-# Stub systemctl: k3s active state lives in $STUB_STATE/k3s.active.
+# Stub systemctl: k3s active state lives in $STUB_STATE/k3s.active, chrony's
+# in chrony.active (chrony.broken: it does not start).
 printf 'systemctl %s\n' "$*" >> "${STUB_CALLS:?}"
 st="${STUB_STATE:?}/k3s.active"
 case "$*" in
   "is-active --quiet k3s") [[ -f "${st}" ]]; exit $? ;;
-  "is-active --quiet chrony") exit 1 ;;
+  "is-active --quiet chrony") [[ -f "${STUB_STATE}/chrony.active" ]]; exit $? ;;
+  "enable --now chrony"|"restart chrony")
+    # chrony.broken: chronyd does not start (a bad configuration)
+    [[ -f "${STUB_STATE}/chrony.broken" ]] && { rm -f "${STUB_STATE}/chrony.active"; exit 1; }
+    touch "${STUB_STATE}/chrony.active" ;;
   "start k3s"|"restart k3s") date -u '+%a %Y-%m-%d %H:%M:%S UTC' > "${st}" ;;
   "stop k3s") rm -f "${st}" ;;
   "show k3s -p ActiveEnterTimestamp --value") if [[ -f "${st}" ]]; then cat "${st}"; else echo "n/a"; fi ;;

@@ -14,12 +14,15 @@
 # running one. Phases, in order:
 #   verify        node/SHA256SUMS (and MANIFEST.yaml's entry for it)
 #   preflight     tools, NODE_IP is local, free disk, clock skew vs the LAN
-#                 host (--lan-time), no Teknoir K3s auto-deploy files left
+#                 host (--lan-time: up to 2 s ok, up to 30 s corrected, more
+#                 needs --sync-clock), no Teknoir K3s auto-deploy files left
 #                 (migrate first), release guard (no silent downgrade)
 #   backup        pre-change backup when a cluster exists and the bundle
 #                 differs from the deployed one (lib/backup.sh)
 #   host          k3s install/upgrade, config.yaml, registries.yaml, /etc/hosts,
-#                 chrony, bootstrap image tarballs (lib/host.sh)
+#                 node packages from node/debs (chrony, hwclock; offline apt),
+#                 chrony, clock sample and RTC, bootstrap image tarballs
+#                 (lib/host.sh)
 #   cluster-base  coredns-custom (NODE_IP at run time), namespaces, node label
 #   secrets       Root CA, wildcard placeholder, Harbor token TLS, CA-bundle
 #                 copies, argocd-tls-certs-cm, node CA trust (lib/secrets.sh)
@@ -70,7 +73,8 @@ Usage: teknoir-node <command> [options]
 
 Commands:
   converge                 bring node + cluster to this bundle's state (idempotent)
-  status                   read-only report: k3s, release record, Applications, certificates
+  status                   read-only report: k3s, clock (chrony source, RTC), release record,
+                           Applications, certificates
   verify                   check the payload sha256s only
   credentials NAME [--out FILE]
                            write one credential to a 0600 file, or to a non-terminal
@@ -107,6 +111,7 @@ converge options:
   --lan-time EPOCH         the LAN host's clock (date +%s) for the skew check
   --lan-user NAME          operator recorded in the release record (alias: --operator)
   --sync-clock             set the node clock from --lan-time when the skew exceeds 30s
+                           (a skew up to 30s is corrected without it)
   --rollback               accept an app-of-apps older than the deployed one
   --reapply TIER           re-apply a one-shot tier ArgoCD already owns (break-glass, repeatable)
   --force-images           let the harbor phase move a mirror tag to another digest
@@ -317,28 +322,48 @@ preflight_disk() {
 }
 
 preflight_clock() {
+  # Clock policy (DESIGN D6, r5), against the LAN host's clock (--lan-time):
+  #   |skew| <= CLOCK_OK_SKEW (2 s)   nothing to do;
+  #   <= MAX_CLOCK_SKEW (30 s)        corrected by this run: chrony gets a
+  #                                   LAN-time sample in the host phase, or,
+  #                                   without an active chrony, the clock is
+  #                                   stepped now with date;
+  #   more                            refused unless --sync-clock, which steps
+  #                                   now (chrony settime + makestep, or date)
+  #                                   and writes the RTC.
+  # The limit protects against a LAN host whose own clock is wrong.
   local now lan skew abs sync=""
-  if command -v timedatectl >/dev/null 2>&1; then
+  if have_tool timedatectl; then
     sync="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
   fi
-  if [[ -z "${LAN_TIME}" ]]; then
+  lan="$(clock_lan_now)"
+  if [[ -z "${lan}" ]]; then
     warn "no --lan-time given: clock skew not checked${sync:+ (NTPSynchronized=${sync})}"
     return 0
   fi
   now="$(date +%s)"
-  lan=$(( LAN_TIME + SECONDS - LAN_TIME_AT ))
   skew=$(( now - lan ))
   abs=${skew#-}
-  if (( abs <= MAX_CLOCK_SKEW )); then
+  if (( abs <= CLOCK_OK_SKEW )); then
     log "clock: ${skew}s from the LAN host${sync:+ (NTPSynchronized=${sync})}"
     return 0
   fi
-  if (( SYNC_CLOCK == 1 )); then
-    run date -u -s "@${lan}" >/dev/null
-    if command -v hwclock >/dev/null 2>&1; then
-      run hwclock --systohc || warn "hwclock --systohc failed (the RTC keeps the old time)"
+  if (( abs <= MAX_CLOCK_SKEW )); then
+    if clock_chrony_active; then
+      log "clock: ${skew}s from the LAN host; chrony corrects it from the LAN-time sample of the host phase"
+    else
+      log "clock: ${skew}s from the LAN host and chrony is not active: setting the clock now"
+      clock_step "${lan}" "${skew}"
     fi
-    changed "node clock set from the LAN host (skew was ${skew}s)"
+    return 0
+  fi
+  if (( SYNC_CLOCK == 1 )); then
+    clock_step "${lan}" "${skew}"
+    if have_tool "${HWCLOCK}"; then
+      clock_write_rtc "after --sync-clock"
+    else
+      log "hwclock is not installed yet: the host phase writes the RTC once the bundle's util-linux-extra is installed"
+    fi
     return 0
   fi
   die "the node clock is ${skew}s off the LAN host (limit ${MAX_CLOCK_SKEW}s); fix the node time or re-run with --sync-clock"
@@ -516,9 +541,7 @@ cmd_status() {
   printf 'site:      %s (env %s, domain %s, node %s)\n' "${SITE_FILE}" "${TEKNOIR_ENV}" "${TEKNOIR_DOMAIN}" "${NODE_IP}"
   printf 'k3s:       %s, %s since %s\n' "${k3s_ver}" "${active:-unknown}" "${ts:-?}"
   printf 'restart:   %s\n' "$(host_restart_state)"
-  if command -v timedatectl >/dev/null 2>&1; then
-    printf 'time:      %s (NTPSynchronized=%s)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo ?)"
-  fi
+  printf 'time:      %s\n' "$(clock_status_line)"
   if [[ -f "${STATE_DIR}/last-converge.env" ]]; then
     printf 'last run:  %s\n' "$(tr '\n' ' ' < "${STATE_DIR}/last-converge.env")"
   fi

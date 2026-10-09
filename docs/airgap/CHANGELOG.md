@@ -30,6 +30,41 @@ reasons for the redesign are kept here. The git history of `infra` and
 - vpro: `~/.config/teknoir/install-devtools.sh` installs `age` and `age-keygen`
   v1.3.1 (sha256-pinned) for decryption.
 
+### Node time, RTC, teamspace DNS and site keys
+
+Found on the live node on 2026-10-09: no chrony and no `hwclock` were
+installed; systemd-timesyncd had not reached an NTP server since 2026-09-08
+(the gateway blocks NTP egress); the clock lost 118 s in 30.65 days (about
+-3.85 s a day), and each `up` only refused or, with `--sync-clock`, set the
+system clock: skews below 30 s were never corrected and the RTC was never
+written (93 s behind), so a reboot would have started the node outside `up`'s
+30 s window. Inside the cluster, teamspace names such as
+`mqtt-teknoir-default.teknoir.airgapped` did not resolve.
+
+- chrony and util-linux-extra ship in the bundle (`node/debs`) and the host
+  phase installs them offline, behind an apt simulate that allows nothing but
+  those two and the removal of systemd-timesyncd (else a WARN; the converge
+  goes on).
+- chrony serves NTP to the LAN from a local stratum-10 reference; every `up`
+  gives it the LAN host's time (`chronyc settime`), so it learns the drift.
+  `TIME_SOURCE` takes a list of servers.
+- Clock policy: up to 2 s nothing, up to 30 s corrected by `up` itself, more
+  only with `--sync-clock`; `up` writes the RTC when it is more than 2 s off.
+- `status` and `doctor` report chrony, the RTC offset, `TIME_SOURCE` in use and
+  whether `NODE_IP` is a DHCP lease (new site key `NODE_IP_DHCP_RESERVED`; the
+  live node keeps its address through a UniFi reservation).
+- coredns-custom answers every `<name>.<domain>` (one label) with `NODE_IP`, so
+  every teamspace's MQTT, deadend and EMQX dashboard names resolve in the
+  cluster.
+- New optional site keys, checked by the build, the node and the LAN tool:
+  `NODE_IP_DHCP_RESERVED` and `BACKUP_AGE_RECIPIENTS` (age public keys for the
+  encrypted backups); `TIME_SOURCE` entries must be IPv4 addresses or host
+  names.
+- HOST-SETUP no longer installs chrony from the DVD, no longer suggests
+  `timedatectl set-time` (refused while NTP is active), describes the
+  cloud-image network layout of the live node, and has new sections on the
+  fixed address and on name resolution for devices.
+
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
 One build command, one LAN-host command, and the same command for the first

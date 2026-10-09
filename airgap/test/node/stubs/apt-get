@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Stub apt-get for the host-package tests. Records every call in $STUB_CALLS.
+# `install -s ...`: prints $STUB_STATE/apt-sim.txt when it exists, else the
+# plan apt prints for the given .debs on a node that lacks them (each one
+# Inst, plus Remv systemd-timesyncd for chrony); exits $STUB_APT_SIM_RC (0).
+# `install` without -s: "installs" each .deb (name_version_arch.deb) into the
+# stub dpkg database $STUB_STATE/dpkg/<pkg>; exits $STUB_APT_RC (0).
+printf 'apt-get %s\n' "$*" >> "${STUB_CALLS:?}"
+sim=0 debs=()
+for a in "$@"; do
+  case "${a}" in
+    -s|--simulate|--dry-run) sim=1 ;;
+    *.deb) debs+=("${a}") ;;
+  esac
+done
+if (( sim )); then
+  if [[ -f "${STUB_STATE}/apt-sim.txt" ]]; then
+    cat "${STUB_STATE}/apt-sim.txt"
+  else
+    echo "NOTE: This is only a simulation!"
+    for d in "${debs[@]}"; do
+      b="$(basename "${d}" .deb)"; p="${b%%_*}"; v="${b#*_}"; v="${v%_*}"
+      [[ "${p}" == chrony ]] && echo "Remv systemd-timesyncd [257.13-1~deb13u1]"
+      echo "Inst ${p} (${v} local-deb [amd64])"
+    done
+    for d in "${debs[@]}"; do
+      b="$(basename "${d}" .deb)"; echo "Conf ${b%%_*} (local-deb [amd64])"
+    done
+  fi
+  exit "${STUB_APT_SIM_RC:-0}"
+fi
+if [[ "${1:-}" == install || " $* " == *" install "* ]]; then
+  [[ "${STUB_APT_RC:-0}" == 0 ]] || exit "${STUB_APT_RC}"
+  mkdir -p "${STUB_STATE}/dpkg"
+  for d in "${debs[@]}"; do
+    b="$(basename "${d}" .deb)"; p="${b%%_*}"; v="${b#*_}"; v="${v%_*}"
+    printf '%s\n' "${v}" > "${STUB_STATE}/dpkg/${p}"
+  done
+fi
+exit 0

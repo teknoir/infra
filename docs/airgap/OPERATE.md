@@ -67,17 +67,20 @@ The converge on the node runs these phases, each idempotent:
 | Phase | What it does |
 |---|---|
 | verify | checks the payload against `node/SHA256SUMS` before changing anything |
-| preflight | `NODE_IP` is the node's address, enough free disk, clock within 30 s of the LAN host, bundle not older than the deployed release |
+| preflight | `NODE_IP` is the node's address, enough free disk, the clock against the LAN host (up to 30 s off is corrected, more needs `--sync-clock`; section 12), bundle not older than the deployed release |
 | backup | when the cluster runs another bundle: a backup to `/var/lib/teknoir-airgap/backups/<ts>` (keeps 3) |
-| host | k3s install or upgrade (only when the version or config changes), `registries.yaml`, the CA in the OS and k3s trust, the `/etc/hosts` block, chrony, bootstrap images, the pod network pinned to `NODE_IP`'s interface, the resolver CoreDNS forwards to (see below); restarts k3s only when its config changed |
-| cluster-base | `coredns-custom` with `NODE_IP`, missing namespaces |
+| host | k3s install or upgrade (only when the version or config changes), `registries.yaml`, the CA in the OS and k3s trust, the `/etc/hosts` block, the bundle's node packages (chrony and `hwclock`, installed offline when missing), chrony serving NTP to the LAN, the LAN host's time for chrony and the hardware clock (RTC), bootstrap images, the pod network pinned to `NODE_IP`'s interface, the resolver CoreDNS forwards to (see below); restarts k3s only when its config changed |
+| cluster-base | `coredns-custom` with `NODE_IP` (every `<name>.<domain>`, teamspace names included), missing namespaces |
 | secrets | creates the CA, the wildcard certificate placeholder and the Harbor token certificate if absent; refreshes the public CA copies |
 | one-shot | first install only: applies platform-secrets, istio, harbor and argo once, then ArgoCD owns them |
 | harbor | Harbor projects, charts and images (skips what is already there) |
 | release | pins the root Application `app-of-apps` to the bundle's version and records the release |
 | post | waits for every Application to be Synced and Healthy, checks that every running image is available offline, prunes old payloads |
 
-CoreDNS answers the platform names itself and forwards every other name to
+CoreDNS answers the platform names itself, and every other `<name>.<domain>`
+(the per-teamspace `mqtt-<teamspace>`, `deadend-<teamspace>` and
+`emqx-dashboard-<teamspace>` among them) with `NODE_IP` as well; it forwards
+every other name to
 `UPSTREAM_DNS` from the site config when it is set, else to the node's own
 resolvers. A node with neither (a full air gap) gets its systemd-resolved
 exposed on `NODE_IP`, so lookups get an immediate answer (the `/etc/hosts` names,
@@ -268,8 +271,20 @@ node it adds `teknoir-node status` (Harbor, certificate expiry and more).
 Checks this LAN host (tools, bundle integrity, name resolution of every platform
 name to `NODE_IP`, CA trust, a TLS request to Harbor, macOS quarantine) and the
 node (ssh with the pinned key, passwordless sudo, clock skew, the tools the
-converge uses, chrony, `NODE_IP` on the node). Each line is `ok`, `WARN` or
-`FAIL`; it exits non-zero on any `FAIL`.
+converge uses, chrony and its reference, `TIME_SOURCE` in use when set, the
+hardware clock's offset, `NODE_IP` on the node and whether it is a DHCP lease).
+Each line is `ok`, `WARN` or `FAIL`; it exits non-zero on any `FAIL`:
+
+| Check | ok | WARN | FAIL |
+|---|---|---|---|
+| chrony | active | installed but not active, or not installed (`up` installs and starts it) | |
+| RTC (hardware clock) offset | up to 5 s | up to 30 s (`up` writes the RTC) | more: a reboot would start the node that far off |
+| `TIME_SOURCE` (when set) | chrony uses one of them (`^*` or `^+`) | none is in use: the node runs on its local clock | |
+| `NODE_IP` | static, or a lease with `NODE_IP_DHCP_RESERVED=yes` | a DHCP lease (`dynamic`): reserve it ([HOST-SETUP](HOST-SETUP.md#fixed-address)) | not an address of the node |
+
+`status` shows the same facts in its `== time` section, and `teknoir-node status`
+on the node prints one line:
+`time: <UTC> source=<LOCAL|MANU|none|server> stratum N freq X ppm ... NTPSynchronized=..; RTC <+-N> s; chrony <state>`.
 
 Directly, with the kubeconfig from section 7:
 
@@ -640,13 +655,54 @@ and does not put the first user in the `sudo` group. As root on the node console
 install sudo from the installation medium (`apt-get install sudo`), run
 `usermod -aG sudo teknoir`, and log in again.
 
-**Clock skew.** The converge refuses to run when the node and the LAN host differ
-by more than 30 seconds. Set the clock on the side that is wrong, or let `up` set
-the node's clock from the LAN host:
+**Clock skew.** `up` compares the node's clock with the LAN host's:
+
+| Skew | What `up` does |
+|---|---|
+| up to 2 s | nothing |
+| up to 30 s | corrects it in the same run: chrony gets the LAN host's time as a sample (`chronyc settime`, then `makestep`); without an active chrony the clock is set with `date` |
+| more | refuses, because the LAN host's own clock may be the wrong one |
+
+Check the LAN host's clock first. If the node is the one that is wrong, let `up`
+set it from the LAN host:
 
 ```sh
 ./teknoir-airgap up --sync-clock
 ```
+
+`up` also writes the hardware clock (RTC) whenever it is more than 2 s off, so
+the node starts with the right time after a reboot. Every `up` gives chrony one
+sample, and chrony learns the node's drift from them (`/var/lib/chrony/chrony.drift`).
+The live teknoir-local node lost about 3.9 s a day before r5 (118 s in 31 days);
+with the drift learned, the clock should stay within 30 s between updates. If
+it does not, give the node an NTP source: `TIME_SOURCE` in the site config (a
+LAN NTP server, or an allowed public one), then `up`.
+
+**`doctor`: RTC far off.** A reboot would start the node that far off, and the
+next `up` would then need `--sync-clock`. Run `./teknoir-airgap up`; it writes
+the RTC (`hwclock --systohc --utc`). On the node, `sudo hwclock --show` and
+`date -u` show both clocks.
+
+**Time for Robots and cameras.** The node serves NTP (udp/123) to its own subnet.
+Point the devices at `NODE_IP`. Check from a LAN host with `chronyd -Q 'server
+<NODE_IP> iburst'` or `sntp <NODE_IP>`; on its own clock the node answers with
+stratum 10 or 11, with a `TIME_SOURCE` one more than the source's. On the node,
+`chronyc -n tracking` and `chronyc -n sources` show what chrony uses.
+`/etc/chrony/chrony.conf` still has Debian's `pool 2.debian.pool.ntp.org` line:
+without egress it never answers and does no harm; the converge's settings are
+in `/etc/chrony/conf.d/teknoir-airgap.conf`.
+
+**`doctor`: NODE_IP is a DHCP lease.** Reserve the address on the router
+([HOST-SETUP](HOST-SETUP.md#fixed-address)), check after the next lease
+renewal that the node kept it, then set `NODE_IP_DHCP_RESERVED=yes` in the site
+config.
+
+**`up`: host packages skipped (WARN).** apt's offline plan for the bundle's
+chrony and util-linux-extra would also change other packages (a node on another
+Debian point release), or apt failed. The converge goes on without them and
+corrects the clock with `date`; the WARN line names the packages apt wanted.
+Update the node from the Debian medium of the bundle's release, or install the
+packages by hand, then `up` again.
 
 **Interrupted run.** Run `./teknoir-airgap up` again. The payload copy resumes per
 file and every converge phase skips what is already done. If the node says a
@@ -659,6 +715,12 @@ it against its `.tar.sha256`. Never fix files by hand.
 **macOS: "cannot be opened" or a killed kubectl.** The tar was downloaded with a
 browser or AirDrop and carries the quarantine attribute. `doctor` reports it;
 clear it with `xattr -dr com.apple.quarantine teknoir-airgap-<bundleId>`.
+
+**A device cannot reach a teamspace** (`mqtt-<teamspace>.<domain>`,
+`deadend-<teamspace>.<domain>`). Inside the cluster every `<name>.<domain>`
+resolves to `NODE_IP`; the device's resolver needs the same: a wildcard
+`*.<domain>` record for `NODE_IP` on the LAN's DNS server
+([HOST-SETUP](HOST-SETUP.md#name-resolution-for-devices)).
 
 **A pod cannot resolve a LAN name** (a NAS, a camera, an NTP server). With no
 `UPSTREAM_DNS` and no resolver on the node, CoreDNS knows only the platform
@@ -705,6 +767,7 @@ auto-deploy directory (`/opt/k3s/server/manifests`).
 | Objects | Owner | Changed by |
 |---|---|---|
 | k3s binary, `/etc/rancher/k3s/config.yaml` and `registries.yaml`, the CA in the OS and k3s trust, the `/etc/hosts` block, chrony, bootstrap image tarballs in `/opt/k3s/agent/images` | the node converge (host phase) | `up`; files are written only when their content differs; k3s restarts only when its config changes |
+| The node packages chrony and util-linux-extra (`node/debs`), the chrony drop-in `/etc/chrony/conf.d/teknoir-airgap.conf`, the node clock and the RTC | the node converge (preflight and host phase) | `up`; a package is installed only when the pinned version is missing; chrony restarts only when its drop-in changes |
 | `kube-system/coredns-custom`, the root Application `teknoir-system/app-of-apps`, ConfigMap `teknoir-system/teknoir-airgap-release`, `argocd-tls-certs-cm` entry for Harbor, the public CA copies `teknoir-root-ca-bundle` | the node converge (server-side apply, field manager `teknoir-bootstrap`) | every `up` |
 | The CA `cert-manager/teknoir-root-ca`, the wildcard certificate placeholder in `istio-system`, `teknoir-system/harbor-token-service` | the node converge, created once | `rotate` only |
 | Random secrets (Harbor, Keycloak database and admin, Keycloak client secrets, oauth2-proxy, Backstage) | the `platform-secrets` chart's Job, created once; copies re-synced | `rotate` only; a new secret is a GitOps change |
@@ -896,10 +959,10 @@ hosts:
 sudo ./teknoir-airgap up --local
 ```
 
-## r5 (app-of-apps 0.0.5): one-time steps
+## r5 (app-of-apps 0.0.5)
 
-Steps that run once on the live `teknoir-local` around the r5 update. Each
-package of r5 adds its own subsection here.
+What the r5 update changes on the live `teknoir-local`, and the steps that run
+once around it. Each package of r5 adds its own subsection here.
 
 ### Encrypted backup, plaintext clean-up and ArgoCD break-glass (SEC-C12)
 
@@ -1023,3 +1086,25 @@ release (they need a platform-secrets change). The CA stays (D1).
 Verify after each step with names and counts only: `sudo find <path> | wc -l`
 is 0 for every deleted path, `teknoir-node backup --list` shows one unencrypted
 set, and the browser sign-in plus ArgoCD and Harbor SSO still work.
+
+### Node time, RTC and teamspace DNS
+
+What the first `up` with an r5 bundle does on the node, beyond the platform
+update (`up --dry-run` lists it first):
+
+- installs chrony and util-linux-extra (`hwclock`) from the bundle, offline;
+  apt removes systemd-timesyncd (chrony replaces it). No k3s restart;
+- writes `/etc/chrony/conf.d/teknoir-airgap.conf`, restarts chrony once, gives
+  it the LAN host's time and writes the RTC (the live node's RTC was 93 s
+  behind);
+- adds the wildcard template to `coredns-custom` (CoreDNS reloads it; no
+  restart), so `mqtt-teknoir-default.teknoir.airgapped` and the other teamspace
+  names resolve inside the cluster.
+
+Add `--sync-clock` only when `status` or the preflight reports more than 30 s.
+
+One-time, outside `up`: reserve the node's address on the router
+([HOST-SETUP](HOST-SETUP.md#fixed-address)); after the next renewal shows the
+same address, set `NODE_IP_DHCP_RESERVED=yes` in `site/teknoir-local.env`.
+Then `./teknoir-airgap doctor` should report no `FAIL` and no time or lease
+`WARN`.

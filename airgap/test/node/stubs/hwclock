@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stub hwclock: records the call; --systohc sets the sandbox RTC
+# (<host root>/sys/class/rtc/rtc0/since_epoch) to the system clock.
+printf 'hwclock %s\n' "$*" >> "${STUB_CALLS:?}"
+if [[ " $* " == *" --systohc "* && -f "${TEKNOIR_HOST_ROOT}/sys/class/rtc/rtc0/since_epoch" ]]; then
+  date +%s > "${TEKNOIR_HOST_ROOT}/sys/class/rtc/rtc0/since_epoch"
+fi
+exit 0
