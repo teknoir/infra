@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Stub age for the teknoir-node unit tests: records its arguments (never its
+# input) in $STUB_CALLS, then "encrypts" stdin by prefixing the header line
+# "age-encryption.org/v1 (stub)": to the -o FILE (created mode 0644, so only
+# the caller's chmod makes it private), else to stdout.
+# STUB_AGE_FAIL=1: write the header and fail (exit 1), like an interrupted age.
+printf 'age %s\n' "$*" >> "${STUB_CALLS:?}"
+out=""
+while (( $# > 0 )); do
+  case "$1" in
+    -o) out="$2"; shift ;;
+  esac
+  shift
+done
+if [[ -n "${out}" ]]; then
+  exec 1>"${out}"
+  chmod 0644 "${out}"
+fi
+echo "age-encryption.org/v1 (stub)"
+if [[ "${STUB_AGE_FAIL:-0}" == 1 ]]; then
+  cat >/dev/null
+  exit 1
+fi
+cat

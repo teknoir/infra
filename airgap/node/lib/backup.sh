@@ -1,8 +1,7 @@
 # shellcheck shell=bash
 # backup.sh: backups on the node (DESIGN I-12).
 #
-# A backup is a directory /var/lib/teknoir-airgap/backups/<UTC> (0700; the
-# last 3 are kept) holding:
+# A backup is a directory /var/lib/teknoir-airgap/backups/<UTC> (0700) holding:
 #   db/harbor.sql.gz, db/keycloak.sql.gz   pg_dumpall through kubectl exec
 #   k3s/db/ (sqlite: copied during a brief `systemctl stop k3s`; pods keep
 #           running) or k3s/etcd-snapshot (k3s etcd-snapshot save)
@@ -12,13 +11,23 @@
 #   BACKUP.info, SHA256SUMS
 # It is written as <UTC>.partial and renamed only when complete.
 #
+# Encryption (SEC-C8): when the site config sets BACKUP_AGE_RECIPIENTS
+# (space-separated age X25519 public keys; public values, no secret), every
+# backup is also written as /var/lib/teknoir-airgap/exports/<UTC>.tar.age
+# (0600, encrypted to every recipient; .partial, then renamed). Then only the
+# newest BACKUP_KEEP_PLAIN (default 1) plaintext sets stay, and BACKUP_KEEP
+# (default 3) encrypted exports. An older plaintext set without an export is
+# encrypted before it is pruned, and kept if that fails. Without recipients
+# the node keeps BACKUP_KEEP plaintext sets, as before, and warns. The node
+# never holds an age identity: decryption happens off the node.
+#
 # converge takes one automatically (phase backup) before changing a cluster
 # that runs a different bundle than this one; a re-run of the deployed bundle
 # takes none (it would rotate the useful pre-update backups out), and neither
 # does a first install that has not reached the release phase yet. A database
 # without a running pod is skipped with a warning (BACKUP.info databases=).
-# `teknoir-node backup` takes one on demand; --export / --stream /
-# --recipient hand the latest one to the LAN host age-encrypted (see
+# `teknoir-node backup` takes one on demand; --recipient-site / --export /
+# --stream / --recipient hand one to the LAN host age-encrypted (see
 # cmd_backup). Nothing here prints secret values.
 # shellcheck source-path=SCRIPTDIR
 # shellcheck disable=SC2016 # jq programs use $variables in single quotes
@@ -27,11 +36,16 @@ source "${NODE_ROOT}/lib/common.sh"
 
 BACKUP_DIR="${STATE_DIR}/backups"
 EXPORT_DIR="${STATE_DIR}/exports"
-BACKUP_KEEP="${BACKUP_KEEP:-3}"
+BACKUP_KEEP="${BACKUP_KEEP:-3}"              # encrypted exports (plaintext sets without recipients)
+BACKUP_KEEP_PLAIN="${BACKUP_KEEP_PLAIN:-1}"  # plaintext sets when BACKUP_AGE_RECIPIENTS is set
 BACKUP_MODE="${BACKUP_MODE:-auto}"   # auto | always | never (converge --backup / --no-backup)
 BACKUP_LAST=""
+BACKUP_LAST_EXPORT=""
+BACKUP_RECIPIENTS=()
 BACKUP_DBS=()
 _K3S_STOPPED_FOR_BACKUP=0
+BACKUP_NAME_RE='^[0-9]{8}T[0-9]{6}Z$'
+BACKUP_RECIPIENT_RE='^age1[0-9a-z]{58}$'
 
 # Secrets exported into every backup ("namespace name"); absent ones are
 # skipped. The wildcard TLS is added at run time (its name follows the domain).
@@ -49,6 +63,7 @@ BACKUP_SECRETS=(
   "teknoir-system backstage-keycloak-secrets"
   "teknoir-system backstage-postgres-secrets"
   "teknoir-system backstage-backend-auth"
+  "teknoir-system argocd-admin-break-glass"
 )
 
 _backup_restart_k3s_if_stopped() {
@@ -58,6 +73,74 @@ _backup_restart_k3s_if_stopped() {
     systemctl start k3s || true
     _K3S_STOPPED_FOR_BACKUP=0
   fi
+}
+
+backup_recipient_check() {
+  # backup_recipient_check <value> <where> - die unless <value> is an age
+  # X25519 public key. Never echoes more than the first 12 characters: a
+  # private key pasted by mistake must not reach the log.
+  local r="$1" where="$2"
+  if [[ "${r}" == AGE-SECRET-KEY-* ]]; then
+    die "${where}: that is an age PRIVATE key (AGE-SECRET-KEY-...); remove it there now, only public keys (age1...) belong in it, and treat that identity as exposed"
+  fi
+  [[ "${r}" =~ ${BACKUP_RECIPIENT_RE} ]] \
+    || die "${where}: '${r:0:12}...' is not an age X25519 public key (age1 followed by 58 lower-case letters and digits)"
+}
+
+backup_recipients_load() {
+  # backup_recipients_load - BACKUP_RECIPIENTS from the site's
+  # BACKUP_AGE_RECIPIENTS (space-separated). Dies on an invalid entry; returns
+  # 1 when none is set.
+  local r
+  BACKUP_RECIPIENTS=()
+  for r in ${BACKUP_AGE_RECIPIENTS:-}; do
+    backup_recipient_check "${r}" "BACKUP_AGE_RECIPIENTS in ${SITE_FILE:-the site config}"
+    BACKUP_RECIPIENTS+=("${r}")
+  done
+  (( ${#BACKUP_RECIPIENTS[@]} > 0 ))
+}
+
+backup_keep_check() {
+  local v
+  for v in BACKUP_KEEP BACKUP_KEEP_PLAIN; do
+    [[ "${!v}" =~ ^[1-9][0-9]*$ ]] || die "backup: ${v} must be a whole number of at least 1 (got '${!v}')"
+  done
+}
+
+backup_need_age() {
+  command -v "${AGE}" >/dev/null 2>&1 || die "backup: age not found (expected the bundled ${NODE_ROOT}/bin/age)"
+}
+
+backup_encrypt() {
+  # backup_encrypt <ts> - EXPORT_DIR/<ts>.tar.age (0600): the set backups/<ts>
+  # as a tar stream, encrypted with age to every BACKUP_RECIPIENTS key. It is
+  # written as <ts>.tar.age.partial and renamed only after age succeeded, so a
+  # failed or interrupted run never leaves a file that looks complete. An
+  # existing export of the set is replaced (re-encrypted to the current
+  # recipients). Returns 1 on failure, with no partial file left.
+  local ts="$1" out part r
+  local -a rargs=()
+  for r in ${BACKUP_RECIPIENTS[@]+"${BACKUP_RECIPIENTS[@]}"}; do rargs+=(-r "${r}"); done
+  (( ${#rargs[@]} > 0 )) || die "internal: backup_encrypt without recipients"
+  [[ -d "${BACKUP_DIR}/${ts}" ]] || die "backup: no backup ${ts} in ${BACKUP_DIR}"
+  backup_need_age
+  ( umask 077 && mkdir -p "${EXPORT_DIR}" )
+  chmod 0700 "${EXPORT_DIR}"
+  out="${EXPORT_DIR}/${ts}.tar.age"
+  part="${out}.partial"
+  rm -f "${part}"
+  at_exit "rm -f $(printf '%q' "${part}")"
+  if ! ( umask 077 && tar -C "${BACKUP_DIR}" -cf - "${ts}" | "${AGE}" "${rargs[@]}" -o "${part}" ); then
+    rm -f "${part}"
+    return 1
+  fi
+  if [[ ! -s "${part}" ]]; then
+    rm -f "${part}"
+    return 1
+  fi
+  chmod 0600 "${part}"
+  mv -f "${part}" "${out}"
+  log "backup: ${ts} encrypted to ${#BACKUP_RECIPIENTS[@]} age recipient(s): ${out} ($(du -h "${out}" | cut -f1))"
 }
 
 backup_pg() {
@@ -140,18 +223,54 @@ backup_k3s() {
 }
 
 backup_prune() {
-  local old
+  # Plaintext sets: keep BACKUP_KEEP, or BACKUP_KEEP_PLAIN with recipients; a
+  # set to prune that has no encrypted export yet is encrypted first (and
+  # kept when that fails). Encrypted exports <ts>.tar.age: keep BACKUP_KEEP.
+  # Passphrase exports (teknoir-backup-*.tar.age) wait for the LAN host's
+  # --stream and are not touched here.
+  local old ts keep="${BACKUP_KEEP}" encrypt=0
+  local -a olds=()
   rm -rf "${BACKUP_DIR}"/*.partial
+  rm -f "${EXPORT_DIR}"/*.partial 2>/dev/null || true
+  if (( ${#BACKUP_RECIPIENTS[@]} > 0 )); then
+    keep="${BACKUP_KEEP_PLAIN}"
+    encrypt=1
+  fi
   while IFS= read -r old; do
-    [[ -n "${old}" ]] || continue
+    [[ -n "${old}" ]] && olds+=("${old}")
+  done < <(find "${BACKUP_DIR}" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort -r | tail -n +$(( keep + 1 )))
+  for old in ${olds[@]+"${olds[@]}"}; do
+    ts="$(basename "${old}")"
+    if (( encrypt == 1 )) && [[ ! -f "${EXPORT_DIR}/${ts}.tar.age" ]]; then
+      if ! backup_encrypt "${ts}"; then
+        warn "backup: encrypting the older backup ${ts} failed; it stays unencrypted in ${BACKUP_DIR}"
+        continue
+      fi
+    fi
     rm -rf "${old}"
     log "backup: pruned ${old}"
-  done < <(find "${BACKUP_DIR}" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort -r | tail -n +$(( BACKUP_KEEP + 1 )))
+  done
+  [[ -d "${EXPORT_DIR}" ]] || return 0
+  olds=()
+  while IFS= read -r old; do
+    [[ -n "${old}" ]] && olds+=("${old}")
+  done < <(find "${EXPORT_DIR}" -mindepth 1 -maxdepth 1 -type f -name '2*Z.tar.age' | sort -r | tail -n +$(( BACKUP_KEEP + 1 )))
+  for old in ${olds[@]+"${olds[@]}"}; do
+    rm -f "${old}"
+    log "backup: pruned ${old}"
+  done
 }
 
 backup_take() {
-  # backup_take <label> - take a full backup; sets BACKUP_LAST.
+  # backup_take <label> - take a full backup; sets BACKUP_LAST and, with
+  # BACKUP_AGE_RECIPIENTS, BACKUP_LAST_EXPORT (its encrypted export).
   local label="$1" ts dir tmp
+  # settings first: nothing (k3s least of all) is stopped for a backup that
+  # could not be encrypted as configured
+  backup_keep_check
+  if backup_recipients_load; then
+    backup_need_age
+  fi
   ensure_work_dir
   mkdir -p "${BACKUP_DIR}"
   chmod 0700 "${BACKUP_DIR}"
@@ -184,9 +303,17 @@ backup_take() {
   mv -f "${WORK_DIR}/backup.sums" "${tmp}/SHA256SUMS"
   mv "${tmp}" "${dir}"
   chmod -R go-rwx "${dir}"
-  backup_prune
   BACKUP_LAST="${dir}"
-  log "backup complete: ${dir} ($(du -sh "${dir}" | cut -f1))"
+  BACKUP_LAST_EXPORT=""
+  if (( ${#BACKUP_RECIPIENTS[@]} > 0 )); then
+    backup_encrypt "${ts}" \
+      || die "backup: encrypting ${ts} with age failed; the unencrypted backup ${dir} is complete and nothing was pruned"
+    BACKUP_LAST_EXPORT="${EXPORT_DIR}/${ts}.tar.age"
+  else
+    warn "backup: BACKUP_AGE_RECIPIENTS is not set in the site config, so this backup exists only unencrypted on the node (OPERATE.md section 10)"
+  fi
+  backup_prune
+  log "backup complete: ${dir} ($(du -sh "${dir}" | cut -f1))${BACKUP_LAST_EXPORT:+, encrypted export ${BACKUP_LAST_EXPORT}}"
 }
 
 phase_backup() {
@@ -224,7 +351,12 @@ phase_backup() {
       ;;
   esac
   if dry_run; then
-    log "[dry-run] would take a pre-change backup into ${BACKUP_DIR}/<UTC> (pg_dumpall harbor + keycloak, k3s datastore with a brief k3s stop, token/tls/cred, bootstrap Secrets; keep ${BACKUP_KEEP})"
+    backup_keep_check
+    if backup_recipients_load; then
+      log "[dry-run] would take a pre-change backup into ${BACKUP_DIR}/<UTC> (pg_dumpall harbor + keycloak, k3s datastore with a brief k3s stop, token/tls/cred, bootstrap Secrets), encrypt it to ${#BACKUP_RECIPIENTS[@]} age recipient(s) into ${EXPORT_DIR}/<UTC>.tar.age, and keep ${BACKUP_KEEP_PLAIN} unencrypted set(s) and ${BACKUP_KEEP} encrypted export(s)"
+    else
+      log "[dry-run] would take a pre-change backup into ${BACKUP_DIR}/<UTC> (pg_dumpall harbor + keycloak, k3s datastore with a brief k3s stop, token/tls/cred, bootstrap Secrets; keep ${BACKUP_KEEP}); no BACKUP_AGE_RECIPIENTS, so not encrypted"
+    fi
     return 0
   fi
   backup_take "pre-change to ${BUNDLE_ID}"
@@ -235,35 +367,63 @@ backup_latest() {
 }
 
 cmd_backup() {
-  # backup                      take a full backup now; prints its path on stdout
-  # backup --list               list the backups
-  # backup --export [--take]    age -p (passphrase from the terminal: run over
-  #                             ssh -t) of the latest backup into
-  #                             /var/lib/teknoir-airgap/exports/<name>.tar.age;
+  # backup                      take a full backup now (with BACKUP_AGE_RECIPIENTS
+  #                             also its encrypted export); prints the backup
+  #                             directory on stdout
+  # backup --list               list the backups and the encrypted exports
+  # backup --recipient-site [--take | --name TS]
+  #                             encrypt a new (--take), the named or the latest
+  #                             backup to the site's BACKUP_AGE_RECIPIENTS into
+  #                             /var/lib/teknoir-airgap/exports/<ts>.tar.age (an
+  #                             existing export is re-encrypted to the current
+  #                             list) and print that path on stdout; no terminal
+  #                             needed (teknoir-airgap backup --out DIR uses it)
+  # backup --export [--take | --name TS]
+  #                             age -p (passphrase from the terminal: run over
+  #                             ssh -t) into exports/teknoir-backup-<ts>.tar.age;
   #                             prints that path on stdout
   # backup --stream FILE [--keep]   write an export to stdout (never to a
   #                             terminal), then delete it unless --keep
-  # backup --recipient AGE1... [--take]   stream the latest backup encrypted
-  #                             to an age public key to stdout; no terminal needed
-  local mode="take" file="" keep=0 take=0 recipient="" latest name out real
+  # backup --recipient AGE1... [--recipient AGE1...] [--take | --name TS]
+  #                             stream a backup encrypted to these age public
+  #                             keys to stdout; no terminal needed
+  local mode="take" file="" keep=0 take=0 name="" out real d f
+  local -a recipients=() rargs=()
   while (( $# > 0 )); do
     case "$1" in
       --list) mode="list" ;;
       --export) mode="export" ;;
+      --recipient-site) mode="recipient-site" ;;
       --stream) [[ -n "${2:-}" ]] || die "backup: --stream needs a file"; mode="stream"; file="$2"; shift ;;
-      --recipient) [[ -n "${2:-}" ]] || die "backup: --recipient needs an age public key"; mode="recipient"; recipient="$2"; shift ;;
+      --recipient) [[ -n "${2:-}" ]] || die "backup: --recipient needs an age public key"; mode="recipient"; recipients+=("$2"); shift ;;
+      --name) [[ -n "${2:-}" ]] || die "backup: --name needs a backup name (teknoir-node backup --list)"; name="$2"; shift ;;
       --keep) keep=1 ;;
       --take) take=1 ;;
       *) die "backup: unknown argument $1" ;;
     esac
     shift
   done
+  if (( ${#recipients[@]} > 0 )) && [[ "${mode}" != "recipient" ]]; then
+    die "backup: --recipient goes with no other mode (--list, --export, --recipient-site, --stream)"
+  fi
+  if [[ -n "${name}" ]]; then
+    [[ "${mode}" =~ ^(export|recipient|recipient-site)$ ]] || die "backup: --name goes with --recipient-site, --recipient or --export"
+    (( take == 0 )) || die "backup: --take and --name exclude each other"
+    [[ "${name}" =~ ${BACKUP_NAME_RE} ]] || die "backup: --name ${name}: a backup name is a UTC timestamp such as 20261009T051050Z (teknoir-node backup --list)"
+  fi
   case "${mode}" in
     list)
-      [[ -d "${BACKUP_DIR}" ]] || { log "no backups yet"; return 0; }
-      find "${BACKUP_DIR}" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort | while IFS= read -r d; do
-        printf '%s %s %s\n' "$(basename "${d}")" "$(du -sh "${d}" | cut -f1)" "$(grep '^label=' "${d}/BACKUP.info" 2>/dev/null | cut -d= -f2-)"
-      done
+      [[ -d "${BACKUP_DIR}" || -d "${EXPORT_DIR}" ]] || { log "no backups yet"; return 0; }
+      if [[ -d "${BACKUP_DIR}" ]]; then
+        find "${BACKUP_DIR}" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort | while IFS= read -r d; do
+          printf '%s %s %s\n' "$(basename "${d}")" "$(du -sh "${d}" | cut -f1)" "$(grep '^label=' "${d}/BACKUP.info" 2>/dev/null | cut -d= -f2-)"
+        done
+      fi
+      if [[ -d "${EXPORT_DIR}" ]]; then
+        find "${EXPORT_DIR}" -mindepth 1 -maxdepth 1 -type f -name '*.tar.age' | sort | while IFS= read -r f; do
+          printf '%s %s %s\n' "$(basename "${f}")" "$(du -h "${f}" | cut -f1)" "encrypted export (age)"
+        done
+      fi
       return 0
       ;;
     take)
@@ -286,31 +446,72 @@ cmd_backup() {
       return 0
       ;;
   esac
-  # export / recipient
-  command -v "${AGE}" >/dev/null 2>&1 || die "backup: age not found (expected the bundled ${NODE_ROOT}/bin/age)"
+  # recipient-site / recipient / export: check the keys before any backup is taken
+  case "${mode}" in
+    recipient-site)
+      backup_recipients_load \
+        || die "backup --recipient-site: BACKUP_AGE_RECIPIENTS is not set in ${SITE_FILE:-the site config} (space-separated age public keys)"
+      ;;
+    recipient)
+      for f in "${recipients[@]}"; do
+        backup_recipient_check "${f}" "backup --recipient"
+        rargs+=(-r "${f}")
+      done
+      [[ ! -t 1 ]] || die "backup --recipient: refusing to write binary data to a terminal; redirect stdout"
+      ;;
+  esac
+  backup_need_age
+  if dry_run; then
+    d="${name:-the latest backup}"
+    (( take == 0 )) || d="a new backup"
+    log "[dry-run] backup --${mode}: would encrypt ${d}; nothing changed"
+    return 0
+  fi
   if (( take == 1 )); then
     require_cluster backup || return 0
     backup_take "for export"
+    name="$(basename "${BACKUP_LAST}")"
+  elif [[ -n "${name}" ]]; then
+    if [[ ! -d "${BACKUP_DIR}/${name}" ]]; then
+      # pruned to its encrypted export: hand that out as it is
+      if [[ "${mode}" == "recipient-site" && -f "${EXPORT_DIR}/${name}.tar.age" ]]; then
+        log "backup: ${name} exists only encrypted (to the recipients of its day): ${EXPORT_DIR}/${name}.tar.age"
+        printf '%s\n' "${EXPORT_DIR}/${name}.tar.age"
+        return 0
+      fi
+      die "backup: no backup ${name} in ${BACKUP_DIR} (teknoir-node backup --list)"
+    fi
+  else
+    d="$(backup_latest)"
+    [[ -n "${d}" ]] || die "backup: no backup yet (run teknoir-node backup, or add --take)"
+    name="$(basename "${d}")"
   fi
-  latest="$(backup_latest)"
-  [[ -n "${latest}" ]] || die "backup: no backup yet (run teknoir-node backup, or add --take)"
-  name="$(basename "${latest}")"
-  if [[ "${mode}" == "recipient" ]]; then
-    [[ "${recipient}" =~ ^age1[0-9a-z]{58}$ ]] || die "backup --recipient: not an age X25519 public key (age1...)"
-    [[ ! -t 1 ]] || die "backup --recipient: refusing to write binary data to a terminal; redirect stdout"
-    log "backup: streaming ${name} encrypted to ${recipient:0:12}..."
-    tar -C "${BACKUP_DIR}" -cf - "${name}" | "${AGE}" -r "${recipient}" || die "backup: encrypting ${name} failed"
-    return 0
-  fi
+  case "${mode}" in
+    recipient-site)
+      out="${EXPORT_DIR}/${name}.tar.age"
+      if [[ "${BACKUP_LAST_EXPORT}" != "${out}" ]]; then
+        backup_encrypt "${name}" || die "backup: encrypting ${name} with age failed"
+      fi
+      printf '%s\n' "${out}"
+      return 0
+      ;;
+    recipient)
+      log "backup: streaming ${name} encrypted to ${#recipients[@]} age recipient(s)"
+      tar -C "${BACKUP_DIR}" -cf - "${name}" | "${AGE}" "${rargs[@]}" || die "backup: encrypting ${name} failed"
+      return 0
+      ;;
+  esac
   # export: age -p reads the passphrase from /dev/tty.
-  [[ -r /dev/tty ]] || die "backup --export needs a terminal for the passphrase (ssh -t); or use --recipient"
-  mkdir -p "${EXPORT_DIR}"
+  [[ -r /dev/tty ]] || die "backup --export needs a terminal for the passphrase (ssh -t); or use --recipient-site"
+  ( umask 077 && mkdir -p "${EXPORT_DIR}" )
   chmod 0700 "${EXPORT_DIR}"
   out="${EXPORT_DIR}/teknoir-backup-${name}.tar.age"
+  at_exit "rm -f $(printf '%q' "${out}.partial")"
   log "backup: encrypting ${name} with a passphrase (age -p); you are asked for it now"
-  tar -C "${BACKUP_DIR}" -cf - "${name}" | "${AGE}" -p -o "${out}.partial" || { rm -f "${out}.partial"; die "backup: encryption failed"; }
+  ( umask 077 && tar -C "${BACKUP_DIR}" -cf - "${name}" | "${AGE}" -p -o "${out}.partial" ) \
+    || { rm -f "${out}.partial"; die "backup: encryption failed"; }
+  chmod 0600 "${out}.partial"
   mv -f "${out}.partial" "${out}"
-  chmod 0600 "${out}"
   log "backup: export ${out} ($(du -h "${out}" | cut -f1)); fetch it with: teknoir-node backup --stream ${out}"
   printf '%s\n' "${out}"
 }

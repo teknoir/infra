@@ -383,6 +383,119 @@ check "k3s is running again after the failed backup" [ -f "${STUB_STATE}/k3s.act
 check "no partial backup is left behind" [ -z "$(find "${ROOT}/var/lib/teknoir-airgap/backups" -name '*.partial')" ]
 
 # ---------------------------------------------------------------------------
+echo "# backup: age-encrypted exports to the site's BACKUP_AGE_RECIPIENTS (SEC-C8)"
+# Stub age (stubs/age) records its arguments and prefixes one header line. The
+# recipients only need the age1 + 58 [0-9a-z] shape; they are no real keys.
+R1="age1$(printf 'q%.0s' {1..58})"
+R2="age1$(printf 'p%.0s' {1..58})"
+BK="${ROOT}/var/lib/teknoir-airgap/backups"
+EX="${ROOT}/var/lib/teknoir-airgap/exports"
+site_with() {
+  # site_with <file> <BACKUP_AGE_RECIPIENTS value>: the test site plus that key
+  { cat "${PAYLOAD}/site/test.env"; printf 'BACKUP_AGE_RECIPIENTS="%s"\n' "$2"; } > "$1"
+}
+site_with "${T}/age.env" "${R1} ${R2}"
+nplain() { find "${BK}" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | wc -l; }
+nexp() { find "${EX}" -mindepth 1 -maxdepth 1 -type f -name '2*Z.tar.age' 2>/dev/null | wc -l; }
+newest() { find "${BK}" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort | tail -1; }
+tne() {
+  # tne VAR=VALUE... <teknoir-node args>: tn with extra environment
+  local -a vars=()
+  while [[ "${1:-}" == *=* ]]; do vars+=("$1"); shift; done
+  RC=0
+  node_env "${vars[@]}" "${PAYLOAD}/bin/teknoir-node" "$@" > "${T}/out" 2>&1 || RC=$?
+  (( VERBOSE )) && sed 's/^/    | /' "${T}/out"
+  return 0
+}
+plain_before="$(nplain)"
+sleep 1
+before="$(ncalls)"
+tn backup --site "${T}/age.env"
+B="$(newest)"; TS="$(basename "${B}")"
+check "a backup with recipients succeeds and still prints its directory on stdout" bash -c "[ ${RC} = 0 ] && grep -qx '${B}' '${T}/out'"
+check "it writes exports/<ts>.tar.age with mode 0600 (age itself created it 0644)" [ "$(stat -c %a "${EX}/${TS}.tar.age" 2>/dev/null)" == 600 ]
+check "the exports directory is 0700" [ "$(stat -c %a "${EX}")" == 700 ]
+check "age gets every recipient and writes a .partial file first" \
+  bash -c "tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -qx 'age -r ${R1} -r ${R2} -o ${EX}/${TS}.tar.age.partial'"
+check "the export holds the backup directory with BACKUP.info and SHA256SUMS" \
+  bash -c "tail -n +2 '${EX}/${TS}.tar.age' | tar -tf - > '${T}/list' && grep -qx '${TS}/SHA256SUMS' '${T}/list' && grep -qx '${TS}/BACKUP.info' '${T}/list'"
+check "only the newest unencrypted set stays (BACKUP_KEEP_PLAIN=1)" [ "$(nplain)" == 1 ]
+check "the older unencrypted sets were encrypted before they were pruned" [ "$(nexp)" == "$(( plain_before + 1 ))" ]
+check "no .partial file is left" [ -z "$(find "${BK}" "${EX}" -name '*.partial')" ]
+check "no warning about missing recipients" bash -c "! grep -q 'BACKUP_AGE_RECIPIENTS is not set' '${T}/out'"
+for _ in 1 2; do sleep 1; tn backup --site "${T}/age.env"; done
+check "encrypted exports rotate at BACKUP_KEEP (3), unencrypted at 1" bash -c "[ ${RC} = 0 ] && [ $(nexp) = 3 ] && [ $(nplain) = 1 ]"
+sleep 1
+tne BACKUP_KEEP=2 BACKUP_KEEP_PLAIN=2 backup --site "${T}/age.env"
+check "BACKUP_KEEP and BACKUP_KEEP_PLAIN override the counts" bash -c "[ ${RC} = 0 ] && [ $(nexp) = 2 ] && [ $(nplain) = 2 ]"
+tne BACKUP_KEEP_PLAIN=0 backup --site "${T}/age.env"
+check "BACKUP_KEEP_PLAIN=0 is refused (the newest set always stays)" bash -c "[ ${RC} != 0 ] && grep -q 'BACKUP_KEEP_PLAIN must be a whole number' '${T}/out'"
+
+echo "# backup: an age failure leaves no partial file and prunes nothing"
+exp_before="$(find "${EX}" -type f | sort)"
+plain_before="$(nplain)"
+sleep 1
+tne STUB_AGE_FAIL=1 backup --site "${T}/age.env"
+check "the backup fails when age fails" bash -c "[ ${RC} != 0 ] && grep -q 'encrypting .* with age failed' '${T}/out'"
+check "no .partial export is left" [ -z "$(find "${EX}" -name '*.partial')" ]
+check "the exports are unchanged" [ "$(find "${EX}" -type f | sort)" == "${exp_before}" ]
+check "the complete unencrypted set stays and nothing was pruned" [ "$(nplain)" == "$(( plain_before + 1 ))" ]
+check "k3s is running after the failed encryption" [ -f "${STUB_STATE}/k3s.active" ]
+FAILED_TS="$(basename "$(newest)")"
+sleep 1
+tn backup --site "${T}/age.env"
+check "the next backup encrypts the set left unencrypted, then prunes it" \
+  bash -c "[ ${RC} = 0 ] && [ -f '${EX}/${FAILED_TS}.tar.age' ] && [ ! -d '${BK}/${FAILED_TS}' ] && [ $(nplain) = 1 ]"
+
+echo "# backup: invalid recipients are refused before k3s is stopped"
+site_with "${T}/bad.env" "${R1} age1tooshort"
+before="$(ncalls)"; plain_before="$(nplain)"
+tn backup --site "${T}/bad.env"
+check "an entry that is not an age public key is refused" bash -c "[ ${RC} != 0 ] && grep -q \"'age1tooshort...' is not an age X25519 public key\" '${T}/out'"
+check "nothing was stopped and no backup was taken" \
+  bash -c "! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q '^systemctl stop k3s' && [ $(nplain) = ${plain_before} ]"
+# assembled at run time: no private-key-shaped literal in the repository
+FAKE_PRIV="AGE-SECRET-KEY-""1$(printf 'Q%.0s' {1..58})"
+site_with "${T}/priv.env" "${FAKE_PRIV}"
+tn backup --site "${T}/priv.env"
+check "a private key in BACKUP_AGE_RECIPIENTS is refused and called out" bash -c "[ ${RC} != 0 ] && grep -q 'age PRIVATE key' '${T}/out'"
+check "the private key is never echoed" bash -c "! grep -qF '${FAKE_PRIV}' '${T}/out' && ! grep -rqF '${FAKE_PRIV}' '${ROOT}/var/log/teknoir-airgap'"
+
+echo "# backup --recipient-site / --name / --recipient / --list"
+TS="$(basename "$(newest)")"
+before="$(ncalls)"
+tn backup --site "${T}/age.env" --recipient-site --name "${TS}"
+check "--recipient-site --name re-encrypts that set to the site's recipients and prints the export path" \
+  bash -c "[ ${RC} = 0 ] && [ \"\$(grep -v ' \[teknoir-node\] ' '${T}/out')\" = '${EX}/${TS}.tar.age' ] && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -qx 'age -r ${R1} -r ${R2} -o ${EX}/${TS}.tar.age.partial'"
+before="$(ncalls)"
+sleep 1
+tn backup --site "${T}/age.env" --recipient-site --take
+NEW="$(basename "$(newest)")"
+check "--recipient-site --take takes a backup and prints its export, encrypted once" \
+  bash -c "[ ${RC} = 0 ] && [ '${NEW}' != '${TS}' ] && [ \"\$(grep -v ' \[teknoir-node\] ' '${T}/out')\" = '${EX}/${NEW}.tar.age' ] && [ \$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -c '^age .*${NEW}.tar.age.partial') = 1 ]"
+OLD="$(find "${EX}" -name '2*Z.tar.age' | sort | head -1)"; OLD="$(basename "${OLD}" .tar.age)"
+before="$(ncalls)"
+tn backup --site "${T}/age.env" --recipient-site --name "${OLD}"
+check "--recipient-site --name of a set kept only encrypted hands out that export as it is" \
+  bash -c "[ ! -d '${BK}/${OLD}' ] && [ ${RC} = 0 ] && [ \"\$(grep -v ' \[teknoir-node\] ' '${T}/out')\" = '${EX}/${OLD}.tar.age' ] && ! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q '^age '"
+tn backup --site test --recipient-site
+check "--recipient-site without BACKUP_AGE_RECIPIENTS fails" bash -c "[ ${RC} != 0 ] && grep -q 'BACKUP_AGE_RECIPIENTS is not set' '${T}/out'"
+before="$(ncalls)"
+node_env "${PAYLOAD}/bin/teknoir-node" backup --site test --recipient "${R1}" --recipient "${R2}" --name "${NEW}" > "${T}/stream" 2> "${T}/out" || true
+check "--recipient (repeatable) streams the named set encrypted to stdout" \
+  bash -c "head -1 '${T}/stream' | grep -q '^age-encryption.org/v1' && tail -n +2 '${T}/stream' | tar -tf - | grep -qx '${NEW}/SHA256SUMS' && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -qx 'age -r ${R1} -r ${R2}'"
+tn backup --site "${T}/age.env" --recipient-site --name 2026-10-09
+check "--name must be a backup timestamp" bash -c "[ ${RC} != 0 ] && grep -q 'a backup name is a UTC timestamp' '${T}/out'"
+tn backup --site "${T}/age.env" --recipient-site --name 20000101T000000Z
+check "--name of a missing backup fails" bash -c "[ ${RC} != 0 ] && grep -q 'no backup 20000101T000000Z' '${T}/out'"
+tn backup --site "${T}/age.env" --recipient-site --take --name "${NEW}"
+check "--take and --name exclude each other" [ "${RC}" != 0 ]
+tn backup --site "${T}/age.env" --list
+check "--list shows the unencrypted set and the encrypted exports" \
+  bash -c "[ ${RC} = 0 ] && grep -q '^${NEW} ' '${T}/out' && grep -q '^${NEW}.tar.age .*encrypted export' '${T}/out'"
+check "every export is 0600" [ "$(find "${EX}" -type f ! -perm 600 | wc -l)" == 0 ]
+
+# ---------------------------------------------------------------------------
 echo "# credentials"
 if command -v script >/dev/null 2>&1; then
   node_env script -qec "'${PAYLOAD}/bin/teknoir-node' credentials harbor-admin --site test" /dev/null > "${T}/out" 2>&1 || true
