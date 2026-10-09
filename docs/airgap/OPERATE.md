@@ -704,8 +704,15 @@ ssh teknoir@192.168.5.181 sudo ls /opt/k3s/server/manifests   # .skip guards; no
 **M4. Converge.**
 
 ```sh
-./teknoir-airgap up
+./teknoir-airgap up --force-images
 ```
+
+`--force-images` is needed once: Harbor's mirror tag `dockerhub/library/postgres:17-alpine`
+(only Backstage's database uses it, and it does not run on teknoir-local yet)
+points at an older build of that upstream tag than the bundle. Without the flag
+`up` stops in the harbor phase and names the tag. A read-only check on
+2026-10-09 found every other image and every chart in Harbor equal to the
+bundle's (charts may be packed differently).
 
 The node creates only what is missing (the Harbor token certificate,
 `keycloak-platform-admin`, the Backstage secrets, a random `password` in
