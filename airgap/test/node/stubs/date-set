@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stub for DATE_BIN (the date that sets the node clock): records the call as
+# "date <args>" and changes nothing.
+printf 'date %s\n' "$*" >> "${STUB_CALLS:?}"
+exit 0

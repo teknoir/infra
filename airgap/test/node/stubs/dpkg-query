@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Stub dpkg-query: `-W -f FORMAT PKG` answers "installed <version>" from the
+# stub dpkg database $STUB_STATE/dpkg/<pkg> (what the apt-get stub installs),
+# else fails like dpkg-query for an unknown package.
+printf 'dpkg-query %s\n' "$*" >> "${STUB_CALLS:?}"
+pkg="${*: -1}"
+if [[ -f "${STUB_STATE:?}/dpkg/${pkg}" ]]; then
+  printf 'installed %s' "$(cat "${STUB_STATE}/dpkg/${pkg}")"
+  exit 0
+fi
+echo "dpkg-query: no packages found matching ${pkg}" >&2
+exit 1

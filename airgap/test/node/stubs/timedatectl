@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stub timedatectl: `show -p NTPSynchronized --value` answers $STUB_NTP_SYNC (no).
+printf 'timedatectl %s\n' "$*" >> "${STUB_CALLS:?}"
+[[ "$*" == "show -p NTPSynchronized --value" ]] && echo "${STUB_NTP_SYNC:-no}"
+exit 0

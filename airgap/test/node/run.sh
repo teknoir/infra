@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # run.sh: unit tests for the node runner (airgap/node), with stub kubectl,
-# k3s, systemctl, ip and install.sh, in a sandbox (TEKNOIR_HOST_ROOT): no
-# root, no cluster, nothing outside a temp dir is touched.
+# k3s, systemctl, ip, install.sh, apt-get, dpkg-query, chronyc, hwclock,
+# timedatectl and date-set (DATE_BIN), in a sandbox (TEKNOIR_HOST_ROOT): no
+# root, no cluster, nothing outside a temp dir is touched, and the test
+# host's clock and packages are never changed (the stubs shadow the real
+# tools; CHRONYC, HWCLOCK and DATE_BIN point at stubs or at absent paths).
 #
 # Covers: template rendering (coredns-custom golden: the live hosts block
 # plus the wildcard template for teamspace names), payload
@@ -14,8 +17,14 @@
 # runner interface (teknoir-airgap up's exact converge argv, --operator, the
 # break-glass flags reaching the oneshot and harbor phases as ONESHOT_REAPPLY
 # and HARBOR_FORCE_IMAGES, --reapply checked against oneshot/TIERS), the
-# preflight refusal of an unmigrated cluster (live Teknoir K3s files), and the
-# leak check. With lib/oneshot.sh and lib/harbor.sh present the real phases
+# preflight refusal of an unmigrated cluster (live Teknoir K3s files), r5 time
+# (offline install of node/debs behind apt's simulate guard; chrony drop-in
+# goldens and restart only on change; one LAN-time sample per up while chrony
+# has only its local/manual reference, none with a selected source; RTC writes
+# above 2 s; the preflight matrix 0/20/400 s x --sync-clock x chrony; status's
+# time line), the site keys TIME_SOURCE, NODE_IP_DHCP_RESERVED and
+# BACKUP_AGE_RECIPIENTS (load_site and the build's site_check), and the leak
+# check. With lib/oneshot.sh and lib/harbor.sh present the real phases
 # parse the flags (only their cluster/Harbor work is replaced); without them
 # a stand-in with their interface is used.
 #
@@ -92,7 +101,11 @@ EOF
 }
 
 node_env() {
+  # The clock tools: chrony and hwclock are absent unless a test points
+  # T_CHRONYC / T_HWCLOCK at the stubs; setting the clock always hits the stub.
   env PATH="${HERE}/stubs:${PATH}" \
+    CHRONYC="${T_CHRONYC:-${T}/absent/chronyc}" HWCLOCK="${T_HWCLOCK:-${T}/absent/hwclock}" \
+    DATE_BIN="${HERE}/stubs/date-set" \
     TEKNOIR_HOST_ROOT="${ROOT}" STUB_STATE="${STUB_STATE}" STUB_CALLS="${STUB_CALLS}" \
     KUBECTL="kubectl" TEKNOIR_MIN_FREE_GB=0 WAIT_INTERVAL=1 K3S_IMPORT_WAIT=0 K3S_READY_TIMEOUT=5 \
     K3S_SETTLE_DELAY=0 K3S_SETTLE_INTERVAL=0 K3S_SETTLE_TIMEOUT=5 \
@@ -522,6 +535,228 @@ check "dry-run reports the files and goes on" \
 for f in teknoir-app-of-apps manifest-harbor-secret teknoir-keycloak-db-secret; do touch "${M}/${f}.yaml.skip"; done
 tn converge --site test --only preflight
 check "once every Teknoir file has its .skip, preflight passes" [ "${RC}" == 0 ]
+
+# ---------------------------------------------------------------------------
+# r5 time and host packages (TIME-T2, TIME-T3) and the site keys (R9)
+# ---------------------------------------------------------------------------
+DEB_CHRONY=chrony_4.6.1-3+deb13u2_amd64.deb
+DEB_ULE=util-linux-extra_2.41.5-0+deb13u1_amd64.deb
+add_debs() {
+  # node/debs as the bundle build stages it: two .debs (stand-ins) and
+  # debs.lock lines "<pkg> <version> <arch> <sha256> <file>"
+  local f b
+  mkdir -p "${PAYLOAD}/debs"
+  : > "${PAYLOAD}/debs/debs.lock"
+  for f in "${DEB_CHRONY}" "${DEB_ULE}"; do
+    head -c 2048 /dev/urandom > "${PAYLOAD}/debs/${f}"
+    b="${f%.deb}"
+    printf '%s %s amd64 %s %s\n' "${b%%_*}" "$(cut -d_ -f2 <<<"${b}")" \
+      "$(sha256sum "${PAYLOAD}/debs/${f}" | cut -d' ' -f1)" "${f}" >> "${PAYLOAD}/debs/debs.lock"
+  done
+  reseal
+}
+since() { calls_since "$1" | grep -E "${2}" || true; }
+clock_calls() { since "$1" '^(date -|chronyc (settime|makestep)|hwclock )'; }
+
+echo "# host packages (TIME-T2): offline install of node/debs"
+new_sandbox 4
+add_debs
+before="$(ncalls)"
+tn converge --site test --only host
+installs="$(since "${before}" '^apt-get install' | grep -v ' -s ' || true)"
+check "(a) fresh node: converge succeeds" [ "${RC}" == 0 ]
+check "(a) exactly one apt-get install, after the simulate" \
+  bash -c "[ \$(grep -c . <<<'${installs}') = 1 ] && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get install' | head -1 | grep -q ' -s '"
+check "(a) the install is offline, with both absolute .deb paths" \
+  bash -c "grep -q -- '--no-download' <<<'${installs}' && grep -qF '${PAYLOAD}/debs/${DEB_CHRONY}' <<<'${installs}' && grep -qF '${PAYLOAD}/debs/${DEB_ULE}' <<<'${installs}' && grep -q 'DPkg::Lock::Timeout=300' <<<'${installs}'"
+check "(a) the change is recorded, with the timesyncd removal" \
+  grep -qF 'changed: installed chrony 4.6.1-3+deb13u2, util-linux-extra 2.41.5-0+deb13u1 from the bundle (removed systemd-timesyncd)' "${T}/out"
+before="$(ncalls)"
+tn converge --site test --only host
+check "(b) re-run with both versions installed: no apt-get call" \
+  bash -c "[ ${RC} = 0 ] && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get' || true)\" ]"
+check "(b) and it says so" grep -q 'host packages: the bundle.s node packages are installed (chrony 4.6.1-3+deb13u2, util-linux-extra 2.41.5-0+deb13u1)' "${T}/out"
+echo 4.6.1-3+deb13u3 > "${STUB_STATE}/dpkg/chrony"
+rm -f "${STUB_STATE}/dpkg/util-linux-extra"
+before="$(ncalls)"
+tn converge --site test --only host
+installs="$(since "${before}" '^apt-get install' | grep -v ' -s ' || true)"
+check "a newer installed chrony is kept (no downgrade); only util-linux-extra is installed" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'chrony 4.6.1-3+deb13u3 is newer than the bundle.s 4.6.1-3+deb13u2: kept' '${T}/out' && grep -qF '${DEB_ULE}' <<<'${installs}' && ! grep -qF '${DEB_CHRONY}' <<<'${installs}' && [ \"\$(cat '${STUB_STATE}/dpkg/chrony')\" = 4.6.1-3+deb13u3 ]"
+rm -rf "${STUB_STATE}/dpkg"
+printf 'Remv systemd-timesyncd [257.13-1~deb13u1]\nInst libsmartcols1 [2.41.4-1] (2.41.5-0+deb13u1 Debian:13.1/stable [amd64])\nInst chrony (4.6.1-3+deb13u2 local-deb [amd64])\nInst util-linux-extra (2.41.5-0+deb13u1 local-deb [amd64])\n' > "${STUB_STATE}/apt-sim.txt"
+before="$(ncalls)"
+tn converge --site test --only host
+check "(c) a plan that also upgrades libsmartcols1: WARN, no install, converge rc 0" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: host packages: .*also changes other packages (Inst libsmartcols1)' '${T}/out' && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get install' | grep -v ' -s ' || true)\" ]"
+rm -f "${STUB_STATE}/apt-sim.txt"
+export STUB_APT_SIM_RC=100
+before="$(ncalls)"
+tn converge --site test --only host
+unset STUB_APT_SIM_RC
+check "(d) a failing simulate (exit 100): WARN, no install, converge rc 0" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: host packages: apt cannot install .* offline (simulate exit 100' '${T}/out' && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get install' | grep -v ' -s ' || true)\" ]"
+before="$(ncalls)"
+tn converge --site test --only host --dry-run
+check "(e) dry-run: the simulate is the only apt-get call" \
+  bash -c "[ ${RC} = 0 ] && [ \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -c '^apt-get')\" = 1 ] && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get' | grep -q '^apt-get install -s --no-download'"
+check "(e) dry-run reports the install it would do" grep -q 'would change: install chrony 4.6.1-3+deb13u2, util-linux-extra 2.41.5-0+deb13u1 from the bundle (removes systemd-timesyncd)' "${T}/out"
+check "(e) dry-run installs nothing" [ ! -d "${STUB_STATE}/dpkg" ]
+printf 'chrony %s amd64 %064d %s\n' 4.6.1-3+deb13u2 0 "${DEB_CHRONY}" > "${PAYLOAD}/debs/debs.lock"
+reseal
+before="$(ncalls)"
+tn converge --site test --only host
+check "a .deb that does not match its debs.lock pin is not installed (WARN, rc 0)" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'does not match its pin in debs.lock' '${T}/out' && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get' || true)\" ]"
+
+echo "# chrony drop-in and the clock sample (TIME-T3)"
+new_sandbox 5
+T_CHRONYC="${HERE}/stubs/chronyc" T_HWCLOCK="${HERE}/stubs/hwclock"
+mkdir -p "${ROOT}/etc/chrony" "${ROOT}/sys/class/rtc/rtc0"
+printf 'pool 2.debian.pool.ntp.org iburst\nconfdir /etc/chrony/conf.d\nrtcsync\nmakestep 1 3\n' > "${ROOT}/etc/chrony/chrony.conf"
+date +%s > "${ROOT}/sys/class/rtc/rtc0/since_epoch"
+touch "${STUB_STATE}/chrony.active"
+DROPIN="${ROOT}/etc/chrony/conf.d/teknoir-airgap.conf"
+golden_head='# Managed by teknoir-node (host phase); every up rewrites it.
+# Serves NTP to the LAN (Robots, cameras: server NODE_IP). Without an
+# answering server below, the reference is the local clock (stratum 10),
+# which up corrects with the LAN host time (chronyc settime, needs manual).'
+golden_tail='allow 10.77.0.0/24
+local stratum 10
+manual'
+before="$(ncalls)"
+lt="$(date +%s)"
+tn converge --site test --only host --lan-time "${lt}"
+check "converge with chrony active succeeds" [ "${RC}" == 0 ]
+check "drop-in golden, TIME_SOURCE empty" [ "$(cat "${DROPIN}")" == "${golden_head}"$'\n'"${golden_tail}" ]
+check "a new drop-in restarts chrony once" [ "$(since "${before}" '^systemctl restart chrony' | grep -c .)" == 1 ]
+st="$(since "${before}" '^chronyc settime')"
+want_any=""
+for d in 0 1 2; do want_any+="chronyc settime $(LC_ALL=C date -u -d "@$(( lt + d ))" '+%b %d, %Y %H:%M:%S') (TZ=UTC)"$'\n'; done
+check "reference LOCAL: exactly one settime, with the LAN time in UTC" \
+  bash -c "[ \"\$(grep -c . <<<'${st}')\" = 1 ] && grep -qxF '${st}' <<<'${want_any}'"
+check "a skew within 2 s needs no makestep" [ -z "$(since "${before}" '^chronyc makestep')" ]
+check "no RTC write when the RTC is right" [ -z "$(since "${before}" '^hwclock')" ]
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "an unchanged drop-in does not restart chrony" [ -z "$(since "${before}" '^systemctl restart chrony')" ]
+check "every up gives chrony one sample" [ "$(since "${before}" '^chronyc settime' | grep -c .)" == 1 ]
+check "a routine sample is not a change (0 changes)" grep -q 'summary: 0 changes' "${T}/out"
+printf 'TEKNOIR_ENV=teknoir-local\nTEKNOIR_DOMAIN=teknoir.airgapped\nNODE_IP=10.77.0.10\nNODE=teknoir@10.77.0.10\nTEKNOIR_HOSTNAMES="harbor"\nTIME_SOURCE="a.example 10.0.0.5"\nK3S_DATA_DIR=/opt/k3s\n' > "${T}/ts.env"
+before="$(ncalls)"
+tn converge --site "${T}/ts.env" --only host --lan-time "$(date +%s)"
+check "drop-in golden, TIME_SOURCE 'a.example 10.0.0.5': one server line each" \
+  [ "$(cat "${DROPIN}")" == "${golden_head}"$'\n''server a.example iburst prefer'$'\n''server 10.0.0.5 iburst prefer'$'\n'"${golden_tail}" ]
+check "the changed drop-in restarts chrony once" [ "$(since "${before}" '^systemctl restart chrony' | grep -c .)" == 1 ]
+echo C0A80201 > "${STUB_STATE}/chrony.ref"
+echo 10.0.0.5 > "${STUB_STATE}/chrony.refname"
+echo '^* 10.0.0.5                    2   6   377    35   +123us[ +456us] +/-   20ms' > "${STUB_STATE}/chrony.sources"
+before="$(ncalls)"
+tn converge --site "${T}/ts.env" --only host --lan-time "$(( $(date +%s) - 20 ))"
+check "a selected NTP source: no settime (not even with a 20 s skew)" \
+  bash -c "[ ${RC} = 0 ] && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^chronyc settime' || true)\" ] && grep -q 'chrony follows the NTP source 10.0.0.5' '${T}/out'"
+rm -f "${STUB_STATE}/chrony.ref" "${STUB_STATE}/chrony.refname" "${STUB_STATE}/chrony.sources"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(( $(date +%s) - 20 ))"
+check "reference LOCAL and a 20 s skew: settime, then makestep applies it at once" \
+  bash -c "[ ${RC} = 0 ] && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -E '^chronyc (settime|makestep)' | cut -d' ' -f2 | tr '\n' ' ' | grep -qx 'settime makestep ' && grep -q 'changed: node clock corrected through chrony (was 2[01]s off the LAN host)' '${T}/out'"
+echo 4D414E55 > "${STUB_STATE}/chrony.ref"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "reference MANU (an earlier sample): another sample" [ "$(since "${before}" '^chronyc settime' | grep -c .)" == 1 ]
+echo 00000000 > "${STUB_STATE}/chrony.ref"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "no reference yet (00000000): a sample" [ "$(since "${before}" '^chronyc settime' | grep -c .)" == 1 ]
+rm -f "${STUB_STATE}/chrony.ref"
+before="$(ncalls)"
+tn converge --site test --only host
+check "without --lan-time: no sample" [ -z "$(since "${before}" '^chronyc settime')" ]
+
+echo "# RTC (TIME-T3)"
+echo "$(( $(date +%s) - 93 ))" > "${ROOT}/sys/class/rtc/rtc0/since_epoch"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "RTC 93 s behind: hwclock --systohc --utc" [ "$(since "${before}" '^hwclock' | tr -d '\n')" == "hwclock --systohc --utc" ]
+check "the RTC write is recorded" grep -q 'changed: RTC set from the system clock (was -9[234]s off)' "${T}/out"
+check "the RTC is right afterwards" [ $(( $(date +%s) - $(cat "${ROOT}/sys/class/rtc/rtc0/since_epoch") )) -le 2 ]
+echo "$(( $(date +%s) - 1 ))" > "${ROOT}/sys/class/rtc/rtc0/since_epoch"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "RTC 1 s off: not written" [ -z "$(since "${before}" '^hwclock')" ]
+echo "$(( $(date +%s) - 93 ))" > "${ROOT}/sys/class/rtc/rtc0/since_epoch"
+before="$(ncalls)"
+T_HWCLOCK="" tn converge --site test --only host --lan-time "$(date +%s)"
+check "RTC 93 s behind without hwclock: a WARN, no write, rc 0" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: hwclock is not installed' '${T}/out' && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^hwclock' || true)\" ]"
+printf '0.0 0 0.0\n0\nLOCAL\n' > "${ROOT}/etc/adjtime"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "an RTC in local time (/etc/adjtime LOCAL) is not written" \
+  bash -c "grep -q 'the RTC keeps local time' '${T}/out' && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^hwclock' || true)\" ]"
+rm -f "${ROOT}/etc/adjtime"
+date +%s > "${ROOT}/sys/class/rtc/rtc0/since_epoch"
+rm -f "${STUB_STATE}/chrony.active"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "chrony installed but not active: enabled and started" \
+  bash -c "tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -qx 'systemctl enable --now chrony' && grep -q 'changed: enabled and started chrony' '${T}/out'"
+rm -f "${STUB_STATE}/chrony.active"
+touch "${STUB_STATE}/chrony.broken"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "a chrony that does not start is a WARN; the converge goes on" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: chrony is installed but does not start' '${T}/out'"
+rm -f "${STUB_STATE}/chrony.broken"
+touch "${STUB_STATE}/chrony.active"
+before="$(ncalls)"
+tn status --site test
+check "status prints the time line" \
+  bash -c "grep -Eq '^time: +[0-9T:-]+Z source=LOCAL stratum 10 freq 45.123 ppm slow NTPSynchronized=no; RTC [+-][0-9]+ s; chrony active$' '${T}/out'"
+
+echo "# preflight clock policy (TIME-T3): skew 0/20/400 s x --sync-clock x chrony"
+# rc and clock calls per case; the LAN host is behind for 20 s (node ahead),
+# ahead for 400 s (node behind, like the live drift)
+pf() {
+  # pf <skew> <flag:0|1> <chrony:active|absent> - run preflight; prints "rc calls"
+  local skew="$1" flag="$2" ch="$3" b lan
+  local -a extra=()
+  (( flag )) && extra=(--sync-clock)
+  rm -f "${STUB_STATE}/chrony.active"
+  [[ "${ch}" == active ]] && touch "${STUB_STATE}/chrony.active"
+  lan=$(( $(date +%s) - skew ))
+  b="$(ncalls)"
+  if [[ "${ch}" == active ]]; then
+    T_CHRONYC="${HERE}/stubs/chronyc" tn converge --site test --only preflight --lan-time "${lan}" ${extra[@]+"${extra[@]}"}
+  else
+    T_CHRONYC="" tn converge --site test --only preflight --lan-time "${lan}" ${extra[@]+"${extra[@]}"}
+  fi
+  printf '%s %s' "${RC}" "$(clock_calls "${b}" | sed -E 's/(settime|-s) .*/\1/' | tr '\n' ',')"
+}
+for flag in 0 1; do
+  for ch in absent active; do
+    check "skew 0, sync-clock=${flag}, chrony ${ch}: nothing" [ "$(pf 0 "${flag}" "${ch}")" == "0 " ]
+  done
+  check "skew 20, sync-clock=${flag}, no chrony: stepped now with date" [ "$(pf 20 "${flag}" absent)" == "0 date -u -s," ]
+  check "skew 20, sync-clock=${flag}, chrony active: left to the host-phase sample" [ "$(pf 20 "${flag}" active)" == "0 " ]
+done
+for ch in absent active; do
+  r="$(pf -400 0 "${ch}")"
+  check "skew -400 without --sync-clock, chrony ${ch}: refused (rc 1) with the hint, no clock call" \
+    bash -c "[ '${r}' = '1 ' ] && grep -q 'off the LAN host (limit 30s).*--sync-clock' '${T}/out'"
+done
+check "skew -400 --sync-clock, no chrony: date -u -s, then hwclock --systohc --utc" [ "$(pf -400 1 absent)" == "0 date -u -s,hwclock --systohc --utc," ]
+check "skew -400 --sync-clock, chrony active: settime + makestep, then hwclock" \
+  [ "$(pf -400 1 active)" == "0 chronyc settime,chronyc makestep,hwclock --systohc --utc," ]
+check "the --sync-clock settime runs in UTC" bash -c "tail -n 20 '${STUB_CALLS}' | grep '^chronyc settime' | tail -1 | grep -q '(TZ=UTC)$'"
+T_HWCLOCK=""
+r="$(pf -400 1 absent)"
+check "skew -400 --sync-clock without hwclock: stepped, the RTC is left to the host phase" \
+  bash -c "[ '${r}' = '0 date -u -s,' ] && grep -q 'host phase writes the RTC once' '${T}/out'"
+unset T_CHRONYC T_HWCLOCK
+before="$(ncalls)"
+tn converge --site test --only preflight --lan-time "$(( $(date +%s) - 20 ))" --dry-run
+check "dry-run: a 20 s skew is reported, the clock is not set" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'would change: node clock set from the LAN host with date' '${T}/out' && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -E '^(date|chronyc|hwclock)' || true)\" ]"
 
 echo "# site keys (R9): TIME_SOURCE, NODE_IP_DHCP_RESERVED, BACKUP_AGE_RECIPIENTS"
 # a dummy in the age public-key format (age1 + 58 bech32 characters), no real key

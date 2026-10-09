@@ -21,7 +21,9 @@
 #                      flags as ONESHOT_REAPPLY and HARBOR_FORCE_IMAGES, which
 #                      cmd_converge sets from REAPPLY_TIERS and FORCE_IMAGES
 #   tools              JQ HELM CRANE AGE (bundled linux-amd64 binaries),
-#                      K3S_BIN (/usr/local/bin/k3s)
+#                      K3S_BIN (/usr/local/bin/k3s); the node's clock tools
+#                      CHRONYC HWCLOCK and DATE_BIN (the date that SETS the
+#                      clock), overridable so the sandbox tests can stub them
 #
 # Never-print discipline: no `set -x` anywhere; secret values live only in
 # shell variables, private tmpfs files and pipes. Read them with read_secret
@@ -77,6 +79,16 @@ JQ="${JQ:-$(_bundled_or_path jq)}"
 HELM="${HELM:-$(_bundled_or_path helm)}"
 CRANE="${CRANE:-$(_bundled_or_path crane)}"
 AGE="${AGE:-$(_bundled_or_path age)}"
+# The node OS's clock tools (chrony and util-linux-extra come from the bundle,
+# node/debs). DATE_BIN is used only to set the clock; reading it is plain date.
+CHRONYC="${CHRONYC:-chronyc}"
+HWCLOCK="${HWCLOCK:-hwclock}"
+DATE_BIN="${DATE_BIN:-date}"
+
+have_tool() {
+  # have_tool <command> - 0 when <command> (a name or a path) can be run
+  command -v "$1" >/dev/null 2>&1
+}
 
 CHANGES=()
 _SENSITIVE=()

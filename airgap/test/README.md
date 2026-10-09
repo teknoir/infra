@@ -42,7 +42,11 @@ Overrides: `COMMON_SH`, `TEKNOIR_NODE_DIR`, `TEKNOIR_LAN_BIN`.
 ### Stubs
 
 `stubs/bin/` holds recording stubs for `kubectl`, `k3s`, `ssh`, `crane`, `helm`, `curl`,
-`systemctl` and `ip` (`test_helper.bash: setup_stubs` puts them first on PATH):
+`systemctl`, `ip`, `apt-get` and `dpkg-query` (`test_helper.bash: setup_stubs` puts them
+first on PATH). `clock_tools` adds recorders for `chronyc`, `hwclock` and `date` outside
+PATH and points `CHRONYC`, `HWCLOCK` and `DATE_BIN` at them (`common_env` always uses
+the `date` recorder and treats chrony and hwclock as absent), so no test reaches the
+test host's clock:
 - every call is logged to `$STUB_LOG`;
 - a call whose arguments match `$STUB_FAIL_ON` (an ERE) exits 97;
 - `stub_<name>` functions in `$STUB_HANDLER` answer calls;
@@ -51,7 +55,9 @@ Overrides: `COMMON_SH`, `TEKNOIR_NODE_DIR`, `TEKNOIR_LAN_BIN`.
 `-f -` input is saved as `$STUB_STDIN`. `mutating_calls` lists every recorded call that
 would change something (`MUTATING_RE`: kubectl writes, `exec` and `cp`, rollout restarts,
 k3s ctr imports, systemctl state changes, crane and helm pushes, curl with POST, PUT, PATCH,
-DELETE or a body); a `kubectl ... --dry-run` call does not count.
+DELETE or a body, apt-get installs and removals, dpkg -i/-r, chronyc settime/makestep,
+hwclock writes, date -s); a `kubectl ... --dry-run` call and an `apt-get -s` simulation do
+not count.
 
 `stage_payload` copies `airgap/node` and adds stand-ins for what only the bundle build
 produces (contract #1): `k3s/` (a `k3s` that answers `--version` and hands everything else

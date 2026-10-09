@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Stub chronyc. Records every call in $STUB_CALLS (settime with the TZ it ran
+# under). State in $STUB_STATE: chrony.ref (tracking Reference ID, default
+# 7F7F0101 = LOCAL), chrony.refname, chrony.sources (lines after the header
+# of `sources`). settime exits $STUB_SETTIME_RC (0).
+if [[ "$*" == *settime* ]]; then
+  printf 'chronyc %s (TZ=%s)\n' "$*" "${TZ:-}" >> "${STUB_CALLS:?}"
+else
+  printf 'chronyc %s\n' "$*" >> "${STUB_CALLS:?}"
+fi
+ref="$(cat "${STUB_STATE:?}/chrony.ref" 2>/dev/null || echo 7F7F0101)"
+name="$(cat "${STUB_STATE}/chrony.refname" 2>/dev/null || true)"
+case " $* " in
+  *" tracking "*)
+    printf 'Reference ID    : %s (%s)\nStratum         : 10\nRef time (UTC)  : Fri Oct 09 06:00:00 2026\n' "${ref}" "${name}"
+    printf 'System time     : 0.000000001 seconds fast of NTP time\nFrequency       : 45.123 ppm slow\nLeap status     : Normal\n' ;;
+  *" sources "*)
+    printf 'MS Name/IP address         Stratum Poll Reach LastRx Last sample\n'
+    printf '===============================================================================\n'
+    cat "${STUB_STATE}/chrony.sources" 2>/dev/null ;;
+  *" settime "*)
+    [[ "${STUB_SETTIME_RC:-0}" == 0 ]] || { echo "501 Not authorised"; exit "${STUB_SETTIME_RC}"; }
+    printf '200 OK\nClock was 0.42 seconds fast.  Frequency change = 0.00ppm, new frequency = 0.00ppm\n' ;;
+  *" makestep "*) echo "200 OK" ;;
+esac
+exit 0
