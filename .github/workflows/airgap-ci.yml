@@ -75,6 +75,16 @@ jobs:
           echo "${GITLEAKS_SHA256}  gl.tar.gz" | sha256sum -c -
           tar -xzf gl.tar.gz gitleaks && install -m 0755 gitleaks "$HOME/.local/bin/gitleaks"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install age (the pin in airgap/versions.env; the node tests' real-age and r5 runbook checks)
+        run: |
+          set -euo pipefail
+          source airgap/versions.env
+          f="age-${AGE_VERSION}-linux-amd64.tar.gz"
+          mkdir -p /tmp/dl-age && cd /tmp/dl-age
+          curl -fsSLo "$f" "https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/$f"
+          echo "${PINNED_SHA256[age-${AGE_VERSION}-linux-amd64]}  $f" | sha256sum -c -
+          tar -xzf "$f" age/age age/age-keygen
+          install -m 0755 age/age age/age-keygen "$HOME/.local/bin/"
       - name: Cache the pinned bats-core
         uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
         with:
