@@ -31,6 +31,11 @@ Test files:
   every object present, every server-side diff reports a change, Harbor healthy but
   empty, so the run reaches every apply, restart and push gate).
 - `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2.
+- `lan_backup.bats`: `teknoir-airgap backup` with the site's `BACKUP_AGE_RECIPIENTS`
+  (no terminal, `--recipient-site`, sha256-checked 0600 copy, `--name`, refused
+  recipients) and `rotate argocd-admin --out`, against an emulated node (the ssh
+  stub's handler runs the remote command locally with `/var/lib/teknoir-airgap`
+  rewritten to a sandbox, a sudo shim and a fake runner).
 - `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts.
 - `static.bats`: shebangs, no xtrace in node/LAN code, public site files, no key material,
   no writes to the test host's `/etc/hosts`.
