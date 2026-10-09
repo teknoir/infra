@@ -526,10 +526,14 @@ load_site() {
   NODE_IP_DHCP_RESERVED="${NODE_IP_DHCP_RESERVED:-}"
   [[ "${NODE_IP_DHCP_RESERVED}" =~ ^(yes|no)?$ ]] \
     || die "${f}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)"
+  # an entry is never printed whole: it may be a pasted private key
   BACKUP_AGE_RECIPIENTS="${BACKUP_AGE_RECIPIENTS:-}"
+  [[ "${BACKUP_AGE_RECIPIENTS^^}" != *AGE-SECRET-KEY-* ]] \
+    || die "${f}: BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed"
   read -r -a words <<<"${BACKUP_AGE_RECIPIENTS}"
   for h in ${words[@]+"${words[@]}"}; do
-    [[ "${h}" =~ ^age1[0-9a-z]{58}$ ]] || die "${f}: invalid BACKUP_AGE_RECIPIENTS entry '${h}' (age public keys: age1 and 58 characters)"
+    [[ "${h}" =~ ^age1[0-9a-z]{58}$ ]] \
+      || die "${f}: BACKUP_AGE_RECIPIENTS entry '${h:0:8}...' is not an age public key (age1 followed by 58 lower-case letters and digits)"
   done
   HARBOR_HOST="harbor.${TEKNOIR_DOMAIN}"
 }

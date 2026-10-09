@@ -480,9 +480,16 @@ site_load() {
     site_time_source_ok "${h}" || die "${SITE_FILE}: invalid TIME_SOURCE entry '${h}' (space-separated IPv4 addresses or host names)"
   done
   case "${NODE_IP_DHCP_RESERVED}" in ''|yes|no) ;; *) die "${SITE_FILE}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)" ;; esac
-  case "${BACKUP_AGE_RECIPIENTS}" in *[!a-z0-9\ ]*) die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS (space-separated age public keys)" ;; esac
+  # BACKUP_AGE_RECIPIENTS is never printed whole: it may hold a pasted private
+  # key. The same messages as the node's load_site.
+  case "${BACKUP_AGE_RECIPIENTS}" in
+    *[Aa][Gg][Ee]-[Ss][Ee][Cc][Rr][Ee][Tt]-[Kk][Ee][Yy]-*)
+      die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed" ;;
+    *[!a-z0-9\ ]*) die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS: only space-separated age public keys (age1 followed by 58 lower-case letters and digits)" ;;
+  esac
   for h in ${BACKUP_AGE_RECIPIENTS}; do
-    age_recipient_ok "${h}" || die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS entry '${h}' (an age public key: age1 and 58 characters)"
+    age_recipient_ok "${h}" \
+      || die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS entry '$(printf '%s' "${h}" | cut -c1-8)...' is not an age public key (age1 followed by 58 lower-case letters and digits)"
   done
   mdomain=$(manifest_get domain)
   if [ -n "${mdomain}" ] && [ "${mdomain}" != "${TEKNOIR_DOMAIN}" ]; then

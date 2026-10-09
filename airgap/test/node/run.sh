@@ -775,13 +775,47 @@ site_variant "${T}/good.env" 'TIME_SOURCE="a.example 10.0.0.5"' 'NODE_IP_DHCP_RE
 tn converge --site "${T}/good.env" --only verify
 check "valid TIME_SOURCE, NODE_IP_DHCP_RESERVED and two age recipients: load_site accepts them" [ "${RC}" == 0 ]
 check "site_check (build) accepts them" [ "$(site_check_rc "${T}/good.env")" == 0 ]
-for bad in 'TIME_SOURCE="a;b"' 'TIME_SOURCE="10.0.0.300"' 'TIME_SOURCE="-x.example"' 'NODE_IP_DHCP_RESERVED=maybe' \
-           'BACKUP_AGE_RECIPIENTS="age1short"' "BACKUP_AGE_RECIPIENTS=\"${AGE_OK^^}\"" "BACKUP_AGE_RECIPIENTS=\"${AGE_OK} x\""; do
+for bad in 'TIME_SOURCE="a;b"' 'TIME_SOURCE="10.0.0.300"' 'TIME_SOURCE="-x.example"' 'NODE_IP_DHCP_RESERVED=maybe'; do
   site_variant "${T}/bad.env" "${bad}"
   tn converge --site "${T}/bad.env" --only verify
   check "load_site rejects ${bad}" bash -c "[ ${RC} = 1 ] && grep -q 'ERROR: .*invalid ${bad%%=*}' '${T}/out'"
   check "site_check rejects ${bad}" bash -c "[ \"\$(bash -c \"source '${HERE}/../../build/lib-build.sh'; site_check '${T}/bad.env'\" 2>&1 >/dev/null | grep -c 'invalid ${bad%%=*}')\" -ge 1 ]"
 done
+# BACKUP_AGE_RECIPIENTS: a bad entry is named by at most its first 8
+# characters, an age private key not at all (it may be pasted by mistake).
+# The dummy private key (AGE-SECRET-KEY-1 + 58 upper-case bech32 characters)
+# is built here, so no key-shaped literal sits in the repository.
+AGE_SK="AGE-SECRET-""KEY-1$(tr '[:lower:]' '[:upper:]' <<<"${AGE_OK#age1}")"
+check "the dummy private key has the format's length (74)" [ "${#AGE_SK}" == 74 ]
+# sc_err <file> - site_check's messages (stderr) for the file
+sc_err() { { bash -c "source '${HERE}/../../build/lib-build.sh'; site_check '$1'" > /dev/null; } 2>&1 || true; }
+age_bad() {
+  # age_bad <description> <site line> <expected message ERE> <text that must not be printed>
+  local d="$1" line="$2" want="$3" hide="$4" err
+  site_variant "${T}/bad.env" "${line}"
+  tn converge --site "${T}/bad.env" --only verify
+  check "load_site rejects ${d}" bash -c "[ ${RC} = 1 ] && grep -Eq \"ERROR: .*\$1\" '${T}/out'" _ "${want}"
+  check "load_site does not print ${d}" bash -c "! grep -qF -- \"\$1\" '${T}/out'" _ "${hide}"
+  err="$(sc_err "${T}/bad.env")"
+  check "site_check rejects ${d}" bash -c "grep -Eq -- \"\$1\" <<<\"\$2\" && grep -q 'invalid site file' <<<\"\$2\"" _ "${want}" "${err}"
+  check "site_check does not print ${d}" bash -c "! grep -qF -- \"\$1\" <<<\"\$2\"" _ "${hide}" "${err}"
+}
+age_bad "a short entry" 'BACKUP_AGE_RECIPIENTS="age1shortXYZ0123456789"' \
+  "BACKUP_AGE_RECIPIENTS entry 'age1shor\\.\\.\\.' is not an age public key" "age1shortX"
+age_bad "an upper-case public key" "BACKUP_AGE_RECIPIENTS=\"${AGE_OK^^}\"" \
+  "BACKUP_AGE_RECIPIENTS entry 'AGE1QPZR\\.\\.\\.' is not an age public key" "${AGE_OK:0:9}"
+age_bad "a stray word after a valid key" "BACKUP_AGE_RECIPIENTS=\"${AGE_OK} x\"" \
+  "BACKUP_AGE_RECIPIENTS entry 'x\\.\\.\\.' is not an age public key" "${AGE_OK}"
+age_bad "an age private key" "BACKUP_AGE_RECIPIENTS=\"${AGE_SK}\"" \
+  "BACKUP_AGE_RECIPIENTS holds an age PRIVATE key \\(AGE-SECRET-KEY-\\.\\.\\.\\): remove it now .* treat that identity as exposed" "${AGE_SK:15:8}"
+age_bad "a private key after a valid public key" "BACKUP_AGE_RECIPIENTS=\"${AGE_OK} ${AGE_SK}\"" \
+  "BACKUP_AGE_RECIPIENTS holds an age PRIVATE key" "${AGE_SK:15:8}"
+age_bad "a lower-case private key" "BACKUP_AGE_RECIPIENTS=\"$(tr '[:upper:]' '[:lower:]' <<<"${AGE_SK}")\"" \
+  "BACKUP_AGE_RECIPIENTS holds an age PRIVATE key" "$(tr '[:upper:]' '[:lower:]' <<<"${AGE_SK:15:8}")"
+site_variant "${T}/bad.env" "# old backup identity: ${AGE_SK}"
+err="$(sc_err "${T}/bad.env")"
+check "site_check rejects a private key in a comment, without printing it" \
+  bash -c "grep -q 'holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now and treat that identity as exposed' <<<\"\$1\" && ! grep -qF -- \"\$2\" <<<\"\$1\"" _ "${err}" "${AGE_SK:15:8}"
 check "the committed site files pass site_check" \
   bash -c "[ \"\$(bash -c \"source '${HERE}/../../build/lib-build.sh'; site_check '${HERE}/../../site/teknoir-local.env' && site_check '${HERE}/../../site/vmtest.env' && echo ok\" 2>/dev/null)\" = ok ]"
 

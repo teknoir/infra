@@ -691,9 +691,16 @@ site_values_check() {
   done
   v="$(site_get "${f}" NODE_IP_DHCP_RESERVED)"
   [[ "${v}" =~ ^(yes|no)?$ ]] || { echo "${f}: invalid NODE_IP_DHCP_RESERVED '${v}' (yes, no or empty)"; bad=1; }
+  # an entry is never printed whole: it may be a pasted private key
   read -r -a words <<<"$(site_get "${f}" BACKUP_AGE_RECIPIENTS)"
   for w in ${words[@]+"${words[@]}"}; do
-    [[ "${w}" =~ ^age1[0-9a-z]{58}$ ]] || { echo "${f}: invalid BACKUP_AGE_RECIPIENTS entry '${w}' (age public keys: age1 and 58 characters)"; bad=1; }
+    if [[ "${w^^}" == AGE-SECRET-KEY-* ]]; then
+      echo "${f}: BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed"
+      bad=1
+    elif [[ ! "${w}" =~ ^age1[0-9a-z]{58}$ ]]; then
+      echo "${f}: BACKUP_AGE_RECIPIENTS entry '${w:0:8}...' is not an age public key (age1 followed by 58 lower-case letters and digits)"
+      bad=1
+    fi
   done
   return "${bad}"
 }
@@ -726,9 +733,15 @@ site_check() {
     while IFS= read -r line; do warn "${line}"; done <<<"${problems}"
     bad=1
   fi
-  # (an age public key is random lowercase text: its line is not scanned)
+  # (an age public key is random lowercase text: its line is not scanned for
+  # words; site_values_check checks every entry, private keys included)
   if grep -v '^[[:space:]]*#' "${f}" | grep -v '^BACKUP_AGE_RECIPIENTS=' | grep -qiE '(password|passwd|secret|token|private)'; then
     warn "${f}: mentions a credential; site files are public and must hold none"
+    bad=1
+  fi
+  # an age private key anywhere else, comments included (never printed)
+  if grep -v '^BACKUP_AGE_RECIPIENTS=' "${f}" | grep -qi 'AGE-SECRET-KEY-'; then
+    warn "${f}: holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now and treat that identity as exposed"
     bad=1
   fi
   (( bad == 0 )) || die "invalid site file ${f}"
