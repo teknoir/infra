@@ -31,7 +31,8 @@
 #      {name: owner, namespace: <profile>} entries to spec.claim_set (JSON
 #      patch guarded by the resourceVersion, retried on conflict), then wait
 #      for user-controller's RoleBinding user-<name>-teknoir-role-binding;
-#   5. wait until the Backstage catalog lists user:default/<name> (read-only
+#   5. wait until the Backstage catalog lists user:default/<name> with
+#      group:<ns>/<ns> in its memberOf for every teamspace of step 4 (read-only
 #      psql query on backstage-postgres-0). Backstage is never restarted: a
 #      restart does not run its user provider any earlier.
 # FILE is never overwritten or truncated: a FILE that exists and is not empty
@@ -119,7 +120,8 @@ email with @ -> -at-), Keycloak group `admin` in realm teknoir, the temporary
 password handed over once into FILE (mode 0600, never printed; afterwards it
 is deleted from the cluster), ClaimSet `owner` on every teamspace the address
 owns (only the --teamspace ones when given), and a wait until Backstage's
-catalog knows the user. An existing User only gets missing owner claims.
+catalog knows the user as a member of those teamspaces. An existing User only
+gets missing owner claims.
 
 FILE is never overwritten: it must not exist or be empty. When no temporary
 password is on record (already handed out, or the user has signed in), FILE
@@ -560,38 +562,68 @@ admin_grant_teamspaces() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5: Backstage's catalog knows the user
+# Step 5: Backstage's catalog knows the user, with its teamspaces
 # ---------------------------------------------------------------------------
-admin_catalog_has_user() {
-  # admin_catalog_has_user <entity-ref> — read-only query on Backstage's
+admin_catalog_state() {
+  # admin_catalog_state <entity-ref> <groups> — read-only query on Backstage's
   # catalog database through the postgres container's local socket (no
-  # credentials). The ref travels as a psql variable, never inside the SQL.
+  # credentials). Prints "member" when final_entities lists the entity and its
+  # spec.memberOf holds every group in <groups> (comma-separated; empty: no
+  # group needed), "listed" when it lists the entity without all of them, and
+  # nothing when it does not list it; returns 1 when the query fails. The SQL
+  # goes on stdin; the ref and the groups travel as psql variables, never
+  # inside the SQL.
   local out
-  out="$(kc -n "${ADMIN_NS}" exec backstage-postgres-0 -c postgres -- sh -c '
-      printf "%s\n" "select 1 from final_entities where entity_ref = :'"'"'ref'"'"' and final_entity is not null limit 1;" \
-        | psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d backstage_plugin_catalog -v ref="$1" -tA' _ "$1" 2>/dev/null)" || return 1
-  [[ "$(printf '%s' "${out}" | tr -d '[:space:]')" == "1" ]]
+  out="$(kc -n "${ADMIN_NS}" exec -i backstage-postgres-0 -c postgres -- sh -c \
+      'exec psql -X -q -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d backstage_plugin_catalog -v ref="$1" -v grps="$2" -tA' \
+      _ "$1" "$2" 2>/dev/null <<'SQL'
+select case when :'grps' = ''
+              or coalesce((final_entity::jsonb -> 'spec' -> 'memberOf') ?& string_to_array(:'grps', ','), false)
+            then 'member' else 'listed' end
+  from final_entities
+ where entity_ref = :'ref' and final_entity is not null
+ limit 1;
+SQL
+  )" || return 1
+  printf '%s' "${out//[[:space:]]/}"
 }
 
 admin_wait_catalog() {
-  local name="$1" email="$2" ref="user:default/$1" deadline
+  # admin_wait_catalog <name> <email> — until the catalog lists
+  # user:default/<name>, and (sign-in takes the user's teamspaces from that
+  # entity) its memberOf has group:<ns>/<ns> for every teamspace of step 4.
+  # The user provider derives memberOf from spec.claim_set on its next run, so
+  # for an existing User the entity is there long before the new claims are.
+  local name="$1" email="$2" ref="user:default/$1" grps="" what p state deadline hint
+  for p in ${ADMIN_TEAMSPACES[@]+"${ADMIN_TEAMSPACES[@]}"}; do
+    grps="${grps:+${grps},}group:${p}/${p}"
+  done
+  what="${ref}"
+  [[ -z "${grps}" ]] || what="${ref} as a member of ${grps//,/, }"
   if [[ "${DRY_RUN}" == "1" ]]; then
-    log "[dry-run] would wait up to ${ADMIN_CATALOG_TIMEOUT}s until the Backstage catalog lists ${ref}"
+    log "[dry-run] would wait up to ${ADMIN_CATALOG_TIMEOUT}s until the Backstage catalog lists ${what}"
     return 0
   fi
   if ! in_cluster statefulset backstage-postgres "${ADMIN_NS}"; then
     warn "Backstage is not deployed (no StatefulSet ${ADMIN_NS}/backstage-postgres): its catalog reads User ${name} when it starts"
     return 0
   fi
-  if ! admin_catalog_has_user "${ref}"; then
-    log "waiting up to ${ADMIN_CATALOG_TIMEOUT}s until the Backstage catalog lists ${ref} (its user provider runs every minute) ..."
+  state="$(admin_catalog_state "${ref}" "${grps}")" || state=error
+  if [[ "${state}" != member ]]; then
+    log "waiting up to ${ADMIN_CATALOG_TIMEOUT}s until the Backstage catalog lists ${what} (its user provider runs every minute) ..."
     deadline=$(( SECONDS + ADMIN_CATALOG_TIMEOUT ))
-    until admin_catalog_has_user "${ref}"; do
+    while [[ "${state}" != member ]]; do
       if (( SECONDS >= deadline )); then
-        die "timed out after ${ADMIN_CATALOG_TIMEOUT}s waiting until the Backstage catalog lists ${ref}. Check the user provider's schedule (catalog.providers.k8s.users in the backstage chart: every minute since 0.0.84) and its log (kubectl -n ${ADMIN_NS} logs deploy/backstage-api | grep user-provider). A Backstage restart does not help (the scheduler keeps the next run). Run admin-user again to resume"
+        case "${state}" in
+          listed) hint="The catalog lists ${ref}, but its memberOf lacks one of ${grps//,/, }: the user provider has not run since the owner claims were added, or Backstage does not know the ClaimSet owner of that teamspace (the provider log then warns: Claimset 'group:<teamspace>/owner' ... not found)" ;;
+          error) hint="The catalog query on ${ADMIN_NS}/backstage-postgres-0 (database backstage_plugin_catalog) failed" ;;
+          *) hint="The catalog does not list ${ref}" ;;
+        esac
+        die "timed out after ${ADMIN_CATALOG_TIMEOUT}s waiting until the Backstage catalog lists ${what}. ${hint}. Check the user provider's schedule (catalog.providers.k8s.users in the backstage chart: every minute since 0.0.84) and its log (kubectl -n ${ADMIN_NS} logs deploy/backstage-api | grep -i -e user-provider -e claimset). A Backstage restart does not help (the scheduler keeps the next run). Run admin-user again to resume"
       fi
       sleep "${WAIT_INTERVAL:-5}"
+      state="$(admin_catalog_state "${ref}" "${grps}")" || state=error
     done
   fi
-  log "the Backstage catalog lists ${ref}: ${email} can sign in to Backstage"
+  log "the Backstage catalog lists ${what}: ${email} can sign in to Backstage"
 }

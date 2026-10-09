@@ -9,12 +9,16 @@
 #         temporary password, then status.computed_status. The password goes
 #         into Secret <ns>/user-initial-password-<name> (mode "secret": the r5
 #         contract K1, <ns> from the user-controller-config ConfigMap) or into
-#         status.set_initial_password (mode "legacy": the older controller).
-#         12 s later the user's row appears in the Backstage catalog, unless the
-#         user is listed in no-catalog;
+#         status.set_initial_password (mode "legacy": the older controller);
 #       user-controller, for an owner claim on a Profile: RoleBinding
 #         <ns>/user-<name>-teknoir-role-binding;
 #       profile-controller: a namespace per Profile, annotated owner=<owner>;
+#       Backstage's user provider: a final_entities row user:default/<name>
+#         whose spec.memberOf has group:<ns>/owner and group:<ns>/<ns> per
+#         owner claim (only group:default/superadmin for a user listed in
+#         no-groups; no row for one listed in no-catalog). A row changes only
+#         once the User has looked the same for CATALOG_LAG seconds, so the
+#         catalog trails every claim change, like the real provider's schedule;
 #   - stubs/fake-keycloak.py for the Keycloak admin API (group, reset-password);
 #   - a postgres StatefulSet backstage-postgres (container postgres, the
 #     catalog table final_entities) and a pause Deployment backstage-api.
@@ -27,8 +31,9 @@
 # --out is never overwritten); --reset-password (one temporary=true call, the
 # file 0600, a refused reset removes the file); owner claims on the user's own
 # teamspaces only, existing claims kept, idempotent, dry-run read-only,
-# --teamspace checks; the catalog wait (no backstage-api restart; a timeout
-# fails with the hint); no password in any output.
+# --teamspace checks; the catalog wait covers the new owner claims of an
+# existing User (memberOf), no backstage-api restart, a timeout fails with the
+# hint; no password in any output.
 #
 # Usage: airgap/test/k3d/admin-user-test.sh [--keep]
 set -euo pipefail
@@ -42,15 +47,18 @@ K3S_IMAGE="${K3S_IMAGE:-rancher/k3s:v1.33.5-k3s1}"
 PG_IMAGE="${PG_IMAGE:-docker.io/library/postgres:17.11-alpine@sha256:aa90e97ee862e558111d34cfb8b2c4bec768c2b039fb791341686928560263b3}"
 PAUSE_IMAGE="${PAUSE_IMAGE:-registry.k8s.io/pause:3.10}"
 KC_PORT="${KC_PORT:-5057}"
+CATALOG_LAG="${CATALOG_LAG:-10}"
 CRED_NS=tk-user-creds   # deliberately not the default: admin-user must read it from the ConfigMap
 KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tkn2-admin.XXXXXX")"
 chmod 700 "${WORK}"
-mkdir -p "${WORK}/node/bin" "${WORK}/out" "${WORK}/secret" "${WORK}/rec" "${WORK}/files"
+mkdir -p "${WORK}/node/bin" "${WORK}/out" "${WORK}/secret" "${WORK}/rec" "${WORK}/files" "${WORK}/cat"
 ln -s "$(command -v jq)" "${WORK}/node/bin/jq"
 printf 'secret\n' > "${WORK}/uc-mode"
 : > "${WORK}/no-catalog"
+: > "${WORK}/no-groups"
+: > "${WORK}/out/catalog.log"
 
 PASS=0
 FAIL=0
@@ -92,6 +100,33 @@ no_legacy() { ! has_legacy "$1"; }
 unchanged_and_on_record() { [[ "$(fstate "$1")" == "$2" ]] && has_legacy "$3"; }
 fstate() { [[ -e "$1" ]] && printf '%s %s' "$(sha256sum < "$1" | cut -c1-64)" "$(stat -c %Y "$1")"; }
 same_file() { cmp -s "$1" "$2"; }
+wait_until() { local n="$1"; shift; while ! "$@"; do (( n-- > 0 )) || return 1; sleep 1; done; }
+cat_memberof() {
+  # cat_memberof <name> — spec.memberOf of user:default/<name> in the catalog (JSON), empty when not listed
+  K -n teknoir-system exec -i backstage-postgres-0 -c postgres -- psql -X -q -U backstage -d backstage_plugin_catalog -tA \
+    <<<"select final_entity::jsonb -> 'spec' -> 'memberOf' from final_entities where entity_ref = 'user:default/$1'" | tr -d '[:space:]'
+}
+cat_listed() { [[ -n "$(cat_memberof "$1")" ]]; }
+cat_member() { cat_memberof "$1" | jq -e --arg g "$2" 'any(.[]; . == $g)' >/dev/null 2>&1; }
+cat_listed_not_member() { cat_listed "$1" && ! cat_member "$1" "$2"; }
+new_user() {
+  # new_user <name> <email> — an existing User for admin-user to complete (no claims)
+  K apply -f - >/dev/null <<EOF
+apiVersion: teknoir.org/v1
+kind: User
+metadata: {name: $1}
+spec: {email: $2, email_verified: true, enabled: true, claims_v0: {role: superadmin}, plugins: []}
+EOF
+}
+new_profile() {
+  # new_profile <name> <owner>
+  K apply -f - >/dev/null <<EOF
+apiVersion: teknoir.org/v1
+kind: Profile
+metadata: {name: $1}
+spec: {owner: {kind: User, name: $2}}
+EOF
+}
 no_secret_in() {
   # no_secret_in <file...> — none of the recorded or reset passwords (and not
   # the Keycloak admin password) appears in the files; grep reads them from a pipe
@@ -131,11 +166,38 @@ EOF
       -p "{\"status\":{\"computed_status\":\"Enabled\",\"set_initial_password\":\"${pw}\"}}" >/dev/null
   fi
   pw=""
-  if ! grep -qx "${n}" "${WORK}/no-catalog"; then
-    ( sleep 12
-      K -n teknoir-system exec backstage-postgres-0 -c postgres -- psql -q -U backstage -d backstage_plugin_catalog \
-        -c "insert into final_entities (entity_ref, final_entity) values ('user:default/${n}', '{}')" >/dev/null 2>&1 ) &
-  fi
+}
+
+fake_user_provider() {
+  # Backstage's user provider: one final_entities row per reconciled User,
+  # written only once the User has looked the same for CATALOG_LAG seconds
+  local n want now
+  now="$(date +%s)"
+  while read -r n want; do
+    [[ -n "${n}" ]] || continue
+    grep -qx "${n}" "${WORK}/no-catalog" && continue
+    grep -qx "${n}" "${WORK}/no-groups" && want='["group:default/superadmin"]'
+    [[ "$(cat "${WORK}/cat/${n}.have" 2>/dev/null)" != "${want}" ]] || continue
+    if [[ "$(cat "${WORK}/cat/${n}.want" 2>/dev/null)" != "${want}" ]]; then
+      printf '%s' "${want}" > "${WORK}/cat/${n}.want"
+      printf '%s' "${now}" > "${WORK}/cat/${n}.since"
+      continue
+    fi
+    (( now - $(cat "${WORK}/cat/${n}.since") >= CATALOG_LAG )) || continue
+    if K -n teknoir-system exec -i backstage-postgres-0 -c postgres -- \
+        psql -X -q -v ON_ERROR_STOP=1 -U backstage -d backstage_plugin_catalog >/dev/null 2>&1 <<SQL
+begin;
+delete from final_entities where entity_ref = 'user:default/${n}';
+insert into final_entities (entity_ref, final_entity) values ('user:default/${n}', '{"spec":{"memberOf":${want}}}');
+commit;
+SQL
+    then
+      printf '%s' "${want}" > "${WORK}/cat/${n}.have"
+      printf '%s user:default/%s %s\n' "$(date +%s)" "${n}" "${want}" >> "${WORK}/out/catalog.log"
+    fi
+  done < <(K get users.teknoir.org -o json 2>/dev/null | jq -r '.items[] | select(.status.computed_status != null)
+      | (["group:default/superadmin"] + [(.spec.claim_set // [])[] | select(.name == "owner") | "group:\(.namespace)/owner", "group:\(.namespace)/\(.namespace)"]) as $m
+      | "\(.metadata.name) \($m | tojson)"')
 }
 
 fake_controllers() {
@@ -160,6 +222,7 @@ fake_controllers() {
         || K -n "${ns}" create rolebinding "user-${n}-teknoir-role-binding" --clusterrole=view --user="${n}" >/dev/null 2>&1
     done < <(K get users.teknoir.org -o json 2>/dev/null \
       | jq -r '.items[] | .metadata.name as $n | (.spec.claim_set // [])[] | select(.name == "owner") | "\($n) \(.namespace)"')
+    fake_user_provider
   done
 }
 
@@ -358,6 +421,7 @@ spec:
 EOF
 for _ in $(seq 1 30); do has_legacy "${B}" && break; sleep 1; done
 check "the stand-in recorded a legacy status value" has_legacy "${B}"
+check "the catalog lists ${B} before admin-user runs, without group:team-b/team-b" wait_until 60 cat_listed_not_member "${B}" group:team-b/team-b
 busy0="$(fstate "${WORK}/files/busy.txt")"
 check "a non-empty --out is refused while a password is on record" bash -c "! env KUBECTL='kubectl --context ${CTX}' NODE_ROOT='${WORK}/node' TEKNOIR_DOMAIN=teknoir.airgapped ADMIN_KEYCLOAK_URL=http://127.0.0.1:${KC_PORT} STUB_WAIT_INTERVAL=2 '${REPO}/airgap/test/stubs/teknoir-node-stub' cmd_admin_user --email second.admin@teknoir.ai --out '${WORK}/files/busy.txt' > '${WORK}/out/busy.log' 2>&1 && grep -q 'never overwrites' '${WORK}/out/busy.log'"
 check "  ... the file is untouched and the value still on record" unchanged_and_on_record "${WORK}/files/busy.txt" "${busy0}" "${B}"
@@ -368,6 +432,9 @@ else
   bad "admin-user (legacy, no credentials namespace) exits 0"; cat "${WORK}/out/runB1.log"
 fi
 check "the file holds the legacy value, mode 0600" bash -c "cmp -s '${WORK}/files/pwB.txt' '${WORK}/rec/${B}' && [[ \$(stat -c %a '${WORK}/files/pwB.txt') == 600 ]]"
+check "it waited until the catalog lists ${B} as a member of group:team-b/team-b" grep -q "waiting up to .* catalog lists user:default/${B} as a member of group:team-b/team-b" "${WORK}/out/runB1.log"
+check "  ... and when it returned, the catalog's memberOf has group:team-b/team-b" cat_member "${B}" group:team-b/team-b
+check "  ... the stand-in provider wrote ${B}'s row without and then with the group" bash -c "grep ' user:default/${B} ' '${WORK}/out/catalog.log' | grep -v -q 'group:team-b/team-b' && grep ' user:default/${B} ' '${WORK}/out/catalog.log' | tail -n 1 | grep -q 'group:team-b/team-b'"
 check "status.set_initial_password is removed" no_legacy "${B}"
 check "claim_set keeps viewer@foreign and gains exactly owner@team-b" bash -c "kubectl --context ${CTX} get users.teknoir.org ${B} -o json | jq -e '.spec.claim_set == [{name: \"viewer\", namespace: \"foreign\"}, {name: \"owner\", namespace: \"team-b\"}]' >/dev/null"
 check "RoleBinding team-b/user-${B}-teknoir-role-binding exists" K -n team-b get rolebinding "user-${B}-teknoir-role-binding" -o name
@@ -385,6 +452,21 @@ check "dry-run: says it would add owner@team-b, changes nothing" bash -c "grep -
 admin_user --email second.admin@teknoir.ai --out "${WORK}/files/pwB3.txt" > "${WORK}/out/runB3.log" 2>&1 || { bad "re-run after the claim was removed exits 0"; cat "${WORK}/out/runB3.log"; }
 check "the re-run adds owner@team-b back, once" bash -c "kubectl --context ${CTX} get users.teknoir.org ${B} -o json | jq -e '.spec.claim_set == [{name: \"viewer\", namespace: \"foreign\"}, {name: \"owner\", namespace: \"team-b\"}]' >/dev/null && grep -q 'summary: 1 change' '${WORK}/out/runB3.log'"
 
+say "the catalog lists the user but never with its teamspace"
+printf 'secret\n' > "${WORK}/uc-mode"
+L=no.group-at-teknoir.ai
+new_profile team-l no.group@teknoir.ai
+printf '%s\n' "${L}" >> "${WORK}/no-groups"
+new_user "${L}" no.group@teknoir.ai
+check "the catalog lists ${L} (without its teamspace)" wait_until 60 cat_listed "${L}"
+if ADMIN_CATALOG_TIMEOUT=6 admin_user --email no.group@teknoir.ai --out "${WORK}/files/pwL.txt" > "${WORK}/out/runL.log" 2>&1; then
+  bad "a missing teamspace group times out non-zero"
+else
+  ok "a missing teamspace group times out non-zero"
+fi
+check "  ... the timeout names the group, memberOf and the ClaimSet" bash -c "grep -q 'timed out after 6s waiting until the Backstage catalog lists user:default/${L} as a member of group:team-l/team-l' '${WORK}/out/runL.log' && grep -q 'memberOf lacks' '${WORK}/out/runL.log' && grep -q 'ClaimSet owner' '${WORK}/out/runL.log'"
+check "  ... the password was handed over before (equal)" same_file "${WORK}/files/pwL.txt" "${WORK}/rec/${L}"
+
 say "the catalog does not list the user in time"
 printf 'secret\n' > "${WORK}/uc-mode"
 printf '%s\n' "${C}" >> "${WORK}/no-catalog"
@@ -393,7 +475,7 @@ if ADMIN_CATALOG_TIMEOUT=5 admin_user --email late.user@teknoir.ai --out "${WORK
 else
   ok "a catalog timeout exits non-zero"
 fi
-check "the timeout names the provider schedule and its log" bash -c "grep -q 'timed out after 5s' '${WORK}/out/runC.log' && grep -q 'catalog.providers.k8s.users' '${WORK}/out/runC.log' && grep -q 'grep user-provider' '${WORK}/out/runC.log'"
+check "the timeout names the provider schedule and its log" bash -c "grep -q 'timed out after 5s' '${WORK}/out/runC.log' && grep -q 'does not list user:default/${C}' '${WORK}/out/runC.log' && grep -q 'catalog.providers.k8s.users' '${WORK}/out/runC.log' && grep -q 'user-provider' '${WORK}/out/runC.log'"
 check "the password was still handed over before (0600, equal)" bash -c "cmp -s '${WORK}/files/pwC.txt' '${WORK}/rec/${C}' && [[ \$(stat -c %a '${WORK}/files/pwC.txt') == 600 ]]"
 check "a user owning no teamspace gets no claim" bash -c "grep -q 'owns no teamspace' '${WORK}/out/runC.log' && kubectl --context ${CTX} get users.teknoir.org ${C} -o json | jq -e '.spec | has(\"claim_set\") | not' >/dev/null"
 check "backstage-api was never restarted" test "$(K -n teknoir-system get deploy backstage-api -o jsonpath='{.metadata.generation}')" == "${gen0}"

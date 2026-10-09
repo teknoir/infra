@@ -31,9 +31,11 @@ reasons for the redesign are kept here. The git history of `infra` and
 - **No Backstage restart.** The restart never made the catalog read the user
   earlier: Backstage's scheduler keeps min(stored, now + cadence) as the next
   run. `admin-user` now waits until the catalog lists `user:default/<name>`
-  (read-only query on backstage-postgres-0, `ADMIN_CATALOG_TIMEOUT`, default
-  240 s); backstage chart 0.0.84 runs the user and profile providers every
-  minute.
+  as a member of each of its teamspaces (`group:<teamspace>/<teamspace>` in
+  `memberOf`, which the provider adds only on its next run after the owner
+  claim; read-only query on backstage-postgres-0, `ADMIN_CATALOG_TIMEOUT`,
+  default 240 s); backstage chart 0.0.84 runs the user and profile providers
+  every minute. Sign out and in again after `admin-user` has finished.
 
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
