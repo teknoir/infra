@@ -10,8 +10,17 @@
 #   3. package every chart@version it deploys, plus EXTRA_CHART_PINS, from the
 #      gitops tree (else this repo's charts/) at exactly that version, with
 #      vendored dependencies and reproducible bytes -> <stage>/node/charts/
-#   4. <stage>/node/charts/pins.txt: "name version", app-of-apps first
-#   5. render every Application from its packaged chart -> <work>/renders/
+#   4. teamspace plugin charts (TS-C3): read PLUGIN_CHART_REPO and
+#      PLUGIN_CHART_VERSION from the profile-controller render (ConfigMap
+#      PROFILE_CONTROLLER_CONFIGMAP, contract K2; the repo must be
+#      harbor.<domain>/<project>), fetch every PROFILE_PLUGIN_CHARTS archive at
+#      that version from PROFILE_PLUGIN_SOURCE, verified against its pin and
+#      the repo index (fetch_plugin_chart), and add one "teamspace-<name>"
+#      line per plugin to apps.jsonl (deployed: false; profile-controller
+#      creates those Applications at run time)
+#   5. <stage>/node/charts/pins.txt: "name version", app-of-apps first
+#   6. render every Application from its packaged chart -> <work>/renders/
+#      (teamspace-<name>.yaml for the plugins)
 #
 # Sources are what a commit of each tree would contain (tracked + untracked,
 # never ignored files), copied to <work>/src first: the gitops checkout is never
@@ -196,9 +205,56 @@ while read -r name version; do
   log "packaged ${name}-${version} ($(sha256_file "${CHARTS_OUT}/${name}-${version}.tgz" | cut -c1-12))"
 done < "${WORK}/charts.txt"
 
+# --- teamspace plugin charts ------------------------------------------------------------
+# profile-controller creates the plugin Applications at run time (one per
+# plugin and Profile), from PLUGIN_CHART_REPO at PLUGIN_CHART_VERSION; the
+# bundle carries those charts and, through their renders, their images.
+step "teamspace plugin charts"
+if [[ -z "${PROFILE_PLUGIN_CHARTS// /}" ]]; then
+  warn "PROFILE_PLUGIN_CHARTS is empty: the bundle carries no teamspace plugin charts, so teamspaces cannot work offline"
+else
+  pc_json="$(jq -c --arg a "${PROFILE_CONTROLLER_APP}" 'select(.app == $a)' "${WORK}/apps.deployed.jsonl" | head -1)"
+  [[ -n "${pc_json}" ]] \
+    || die "PROFILE_PLUGIN_CHARTS is set, but app-of-apps ${APP_OF_APPS_VERSION} deploys no Application ${PROFILE_CONTROLLER_APP} (set PROFILE_PLUGIN_CHARTS=\"\" in airgap/versions.env for a bundle without teamspaces)"
+  pc_render="${WORK}/renders/${PROFILE_CONTROLLER_APP}.yaml"
+  if (( DRY_RUN )); then
+    # no downloads in a dry run; packaging this one dependency-free chart is local
+    pc_dir="$(chart_dir_for "$(jq -r .chart <<<"${pc_json}")" "$(jq -r .version <<<"${pc_json}")")" \
+      || die "chart $(jq -r '.chart + " " + .version' <<<"${pc_json}") is pinned, but no source tree carries it"
+    helm_package_reproducible "${pc_dir}" "${WORK}/dry-charts"
+    render_app "${pc_json}" "${WORK}/dry-charts" "${pc_render}"
+  else
+    render_app "${pc_json}" "${CHARTS_OUT}" "${pc_render}"
+  fi
+  plugin_chart_config "${pc_render}" "${DOMAIN}" || die "teamspace plugins: ${PLUGIN_CONFIG_ERROR}"
+  ts_ns="$(profile_names "${pc_render}" | head -1)"
+  ts_ns="${ts_ns:-${TEAMSPACE_DEFAULT_NAMESPACE}}"
+  log "profile-controller pulls the plugin charts from ${PLUGIN_REPO} at ${PLUGIN_VERSION}; plugins rendered for namespace ${ts_ns}"
+  for name in ${PROFILE_PLUGIN_CHARTS}; do
+    [[ "${name}" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "PROFILE_PLUGIN_CHARTS: invalid plugin name '${name}'"
+    chart="profile-plugin-${name}"
+    if jq -e --arg c "${chart}" 'select(.chart == $c)' "${WORK}/apps.jsonl" >/dev/null; then
+      die "chart ${chart} is pinned twice (app-of-apps or EXTRA_CHART_PINS, and PROFILE_PLUGIN_CHARTS)"
+    fi
+    pin="${PINNED_SHA256[${chart}-${PLUGIN_VERSION}]:-}"
+    [[ -n "${pin}" ]] || die "no sha256 pin for ${chart}-${PLUGIN_VERSION} in airgap/versions.env (PINNED_SHA256)"
+    if (( DRY_RUN )); then
+      log "[dry-run] teamspace plugin ${chart} ${PLUGIN_VERSION} from ${PROFILE_PLUGIN_SOURCE} (pin ${pin})"
+    else
+      fetch_plugin_chart "${chart}" "${PLUGIN_VERSION}" "${CHARTS_OUT}"
+      log "teamspace plugin ${chart}-${PLUGIN_VERSION} (${pin:0:12})"
+    fi
+    # contract K8
+    jq -cn --arg app "teamspace-${name}" --arg c "${chart}" --arg v "${PLUGIN_VERSION}" --arg r "${PLUGIN_REPO}" \
+       --arg n "${ts_ns}" --arg rel "${name}" --arg values "domain: ${DOMAIN}" \
+      '{app: $app, chart: $c, version: $v, repo: $r, namespace: $n, release: $rel, skipCrds: false,
+        overrides: {values: $values}, deployed: false, teamspace: true, nChartSources: 1}' >> "${WORK}/apps.jsonl"
+  done
+fi
+
 {
   echo "app-of-apps ${APP_OF_APPS_VERSION}"
-  grep -v '^app-of-apps ' "${WORK}/charts.txt" || true
+  jq -r '.chart + " " + .version' "${WORK}/apps.jsonl" | sort -u | grep -v '^app-of-apps ' || true
 } > "${WORK}/pins.txt"
 if (( DRY_RUN )); then
   log "[dry-run] node/charts/pins.txt would be:"

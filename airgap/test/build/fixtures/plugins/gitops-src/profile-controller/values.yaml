@@ -1,0 +1,7 @@
+config:
+  admin: admin@example.test
+  domain: teknoir.airgapped
+  pluginChartRepo: harbor.teknoir.airgapped/teknoir
+  pluginChartVersion: "0.0.99"
+profiles:
+  - name: teknoir-default

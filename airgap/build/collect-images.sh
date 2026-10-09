@@ -15,6 +15,14 @@
 #                   OCI layout, `crane digest --tarball` for a docker archive.
 #                   <slug> is images/<slug>/ or bootstrap-images/<slug>.tar.
 #
+# Pin policy (G-09, lib-build.sh image_policy), checked before any pull: a
+# Teknoir image in a platform render must be "<repo>:<immutable
+# tag>@sha256:<linux/amd64 manifest>" (fatal; ALLOW_MUTABLE_TEKNOIR_TAGS=1
+# warns instead and make-bundle.sh marks the bundle -mutable); the teamspace
+# plugin renders (teamspace-*.yaml) only warn and their mutable refs go to
+# <work>/images.teamspace-mutable; a digest in the bootstrap tier is fatal.
+# A pinned digest that is a multi-platform index is fatal too (resolve).
+#
 # Each image is stored once. Every tag is resolved to its digest on every build
 # (mutable tags are never trusted); the content is cached by digest in
 # ${TEKNOIR_AIRGAP_CACHE:-~/.cache/teknoir-airgap}/images/ and pulled into a
@@ -85,10 +93,22 @@ step "image lists"
   # shellcheck disable=SC2086  # a whitespace-separated list
   printf '%s\n' ${BOOTSTRAP_EXTRA_IMAGES} | while read -r r; do normalize_image "${r}"; done
 } | sed '/^$/d' | LC_ALL=C sort -u > "${WORK}/images.bootstrap"
+# teamspace plugin renders (teamspace-<plugin>.yaml) are kept apart for the
+# pin policy below; every image of every render ships
+shopt -s nullglob
+platform_renders=() teamspace_renders=()
+for f in "${WORK}/renders/"*.yaml; do
+  if [[ "$(basename "${f}")" == teamspace-* ]]; then teamspace_renders+=("${f}"); else platform_renders+=("${f}"); fi
+done
+shopt -u nullglob
 {
-  cat "${WORK}/renders/"*.yaml | extract_images
+  (( ${#platform_renders[@]} == 0 )) || cat "${platform_renders[@]}" | extract_images
   image_list_file "${AIRGAP_DIR}/images-extra.txt"
-} | sed '/^$/d' | LC_ALL=C sort -u > "${WORK}/images.rendered"
+} | sed '/^$/d' | LC_ALL=C sort -u > "${WORK}/images.platform"
+{
+  (( ${#teamspace_renders[@]} == 0 )) || cat "${teamspace_renders[@]}" | extract_images
+} | sed '/^$/d' | LC_ALL=C sort -u > "${WORK}/images.teamspace"
+LC_ALL=C sort -u "${WORK}/images.platform" "${WORK}/images.teamspace" > "${WORK}/images.rendered"
 LC_ALL=C sort -u "${WORK}/images.bootstrap" "${WORK}/images.rendered" > "${WORK}/images.required"
 LC_ALL=C comm -23 "${WORK}/images.required" "${WORK}/images.bootstrap" > "${WORK}/images.regular"
 log "$(wc -l < "${WORK}/images.required") images: $(wc -l < "${WORK}/images.bootstrap") bootstrap tier, $(wc -l < "${WORK}/images.regular") others"
@@ -98,12 +118,16 @@ while read -r ref; do
   [[ -n "$(image_tag "${ref}")" ]] || die "bootstrap image ${ref} has no tag: containerd imports archives by tag name"
 done < "${WORK}/images.bootstrap"
 
-# Teknoir images on mutable tags (D8: warn for now; G-09 turns this into an error)
-while read -r ref; do
-  if is_teknoir_image "${ref}" && ! is_immutable_tag "${ref}"; then
-    warn "mutable Teknoir image tag (D8, pinned by digest in images.lock only): ${ref}"
-  fi
-done < "${WORK}/images.required"
+# Pin policy (G-09, before anything is pulled): every Teknoir image of a
+# platform render is <repo>:<immutable tag>@sha256:<amd64 manifest> (else
+# fatal, unless ALLOW_MUTABLE_TEKNOIR_TAGS=1); the teamspace plugin images on
+# mutable tags only warn and are listed for MANIFEST.yaml; no digest in the
+# bootstrap tier; floating non-Teknoir tags warn.
+POLICY_FAIL=0
+policy_fail() { warn "G-09: $*"; POLICY_FAIL=1; }
+image_policy policy_fail warn "${WORK}/images.platform" "${WORK}/images.teamspace" "${WORK}/images.bootstrap" \
+  "${WORK}/images.teamspace-mutable"
+(( POLICY_FAIL == 0 )) || die "image pin policy failed (see the G-09 lines above): pin the image in the gitops chart values"
 
 INCOMPLETE=0
 if [[ -n "${LIMIT}" ]]; then
@@ -140,7 +164,7 @@ resolve() {
   # images) and R_PLATFORM (the manifest digest for PLATFORM). The tag is
   # resolved with a HEAD request (crane digest), which registries do not
   # count against pull rate limits; manifests are cached by digest.
-  local ref="$1" repo top m mt
+  local ref="$1" repo top m
   repo="$(image_repo "${ref}")"
   if [[ "${ref}" == *@sha256:* ]]; then
     top="${ref##*@}"
@@ -149,19 +173,12 @@ resolve() {
   fi
   [[ "${top}" =~ ^sha256:[0-9a-f]{64}$ ]] || die "${ref}: unexpected digest '${top}'"
   m="$(cached_manifest "${repo}" "${top}")"
-  mt="$(jq -r '.mediaType // (if .manifests then "index" else "manifest" end)' "${m}")"
   R_INDEX="${top}"
-  case "${mt}" in
-    *index*|*manifest.list*)
-      R_PLATFORM="$(jq -r --arg os "${P_OS}" --arg arch "${P_ARCH}" --arg v "${P_VARIANT}" '
-        [.manifests[] | select(.platform.os == $os and .platform.architecture == $arch
-                               and ($v == "" or .platform.variant == $v))][0].digest // ""' "${m}")"
-      [[ -n "${R_PLATFORM}" ]] || die "${ref} has no ${PLATFORM} image (index ${top})"
-      ;;
-    *)
-      R_PLATFORM="${top}"
-      ;;
-  esac
+  R_PLATFORM="$(manifest_platform_digest "${m}" "${top}" "${P_OS}" "${P_ARCH}" "${P_VARIANT}")" \
+    || die "${ref} has no ${PLATFORM} image (index ${top})"
+  # a pinned index would lock (and Harbor would serve) another digest than
+  # the one the pod spec names (G-09)
+  pinned_index_error "${ref}" "${R_PLATFORM}" "${PLATFORM}" || die "${PINNED_INDEX_ERROR}"
 }
 
 check_platform_config() {

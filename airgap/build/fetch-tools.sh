@@ -8,16 +8,28 @@
 #                      DIR/node/k3s/{k3s,k3s-airgap-images-<arch>.tar.zst,
 #                                    install.sh,sha256sum-<arch>.txt}
 #                      DIR/tools/<os>-<arch>/kubectl         (LAN_KUBECTL_PLATFORMS)
+#                      DIR/node/debs/<package>_<version>_<arch>.deb and
+#                      DIR/node/debs/debs.lock (NODE_DEBS; one line per file:
+#                      "<package> <version> <arch> <sha256> <file>")
 #   --host-bin DIR   extract the build's own helm, crane, jq and yq for this
 #                    build host into DIR (used by every build step)
 #   --print-pins     print the PINNED_SHA256 block for versions.env (after a
 #                    version bump); artifacts without an upstream checksum file
-#                    are downloaded once and marked trust-on-first-use
+#                    are downloaded once and marked trust-on-first-use. The
+#                    NODE_DEBS pins come from the current Packages.xz of
+#                    NODE_DEB_SUITES (plus NODE_DEB_POOL and PINNED_DEB_SHA1)
 #   --dry-run        with --stage: print the plan, download nothing
 #
-# Cache: ${TEKNOIR_AIRGAP_CACHE:-~/.cache/teknoir-airgap}/tools/<tool>-<version>-<os>-<arch>/.
+# Cache: ${TEKNOIR_AIRGAP_CACHE:-~/.cache/teknoir-airgap}/tools/<tool>-<version>-<os>-<arch>/
+# (debs: tools/deb-<package>-<version>-<arch>/).
 # A cached file whose sha256 differs from its pin fails the build (it is never
 # silently re-downloaded): delete that cache entry to re-fetch it.
+#
+# A .deb comes from the deb.debian.org pool, else (the pool drops superseded
+# point-release files) from snapshot.debian.org/file/<sha1>; either way only
+# the sha256 pin decides (D12).
+#
+# Sourcing this file (tests) defines the functions without running anything.
 set -euo pipefail
 # shellcheck source-path=SCRIPTDIR source=lib-build.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-build.sh"
@@ -27,19 +39,6 @@ usage() { usage_from_header "${BASH_SOURCE[0]}"; }
 MODE=""
 TARGET=""
 DRY_RUN=0
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --stage) MODE=stage; TARGET="${2:?--stage needs a directory}"; shift ;;
-    --host-bin) MODE=host-bin; TARGET="${2:?--host-bin needs a directory}"; shift ;;
-    --print-pins) MODE=print-pins ;;
-    --dry-run) DRY_RUN=1 ;;
-    -h|--help) usage; exit 0 ;;
-    *) die "unknown argument: $1 (see --help)" ;;
-  esac
-  shift
-done
-[[ -n "${MODE}" ]] || { usage; exit 2; }
-require_cmd curl tar sha256sum awk
 
 # ---------------------------------------------------------------------------
 # Artifact catalogue. art_<tool> <os> <arch> sets:
@@ -54,6 +53,7 @@ require_cmd curl tar sha256sum awk
 #   A_MEMBER  tar member holding the binary ("" = the download is the binary)
 # ---------------------------------------------------------------------------
 art_helm() {
+  A_FALLBACK=""
   A_KEY="helm-${HELM_VERSION}-$1-$2"
   A_FILE="helm-${HELM_VERSION}-$1-$2.tar.gz"
   A_URL="https://get.helm.sh/${A_FILE}"
@@ -62,6 +62,7 @@ art_helm() {
 }
 
 art_crane() {
+  A_FALLBACK=""
   local os arch
   case "$1" in linux) os=Linux ;; darwin) os=Darwin ;; *) die "crane: unsupported os $1" ;; esac
   case "$2" in amd64) arch=x86_64 ;; arm64) arch=arm64 ;; *) die "crane: unsupported arch $2" ;; esac
@@ -73,6 +74,7 @@ art_crane() {
 }
 
 art_jq() {
+  A_FALLBACK=""
   local os="$1"
   [[ "${os}" == darwin ]] && os=macos
   A_KEY="jq-${JQ_VERSION}-$1-$2"
@@ -83,6 +85,7 @@ art_jq() {
 }
 
 art_yq() {
+  A_FALLBACK=""
   A_KEY="yq-${YQ_VERSION}-$1-$2"
   A_FILE="yq_$1_$2"
   A_URL="https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${A_FILE}"
@@ -91,6 +94,7 @@ art_yq() {
 }
 
 art_age() {
+  A_FALLBACK=""
   A_KEY="age-${AGE_VERSION}-$1-$2"
   A_FILE="age-${AGE_VERSION}-$1-$2.tar.gz"
   A_URL="https://github.com/FiloSottile/age/releases/download/${AGE_VERSION}/${A_FILE}"
@@ -100,6 +104,7 @@ art_age() {
 }
 
 art_kubectl() {
+  A_FALLBACK=""
   A_KEY="kubectl-${KUBECTL_VERSION}-$1-$2"
   A_FILE="kubectl"
   A_URL="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/$1/$2/kubectl"
@@ -110,6 +115,7 @@ art_kubectl() {
 # bin | images | sums | install
 art_k3s() {
   local base
+  A_FALLBACK=""
   base="https://github.com/k3s-io/k3s/releases/download/$(k3s_url_version)"
   local sums_name="sha256sum-${NODE_ARCH}.txt" bin_asset="k3s"
   [[ "${NODE_ARCH}" == amd64 ]] || bin_asset="k3s-${NODE_ARCH}"
@@ -133,6 +139,23 @@ art_k3s() {
       A_SUMS="" A_SUMFMT="" A_NAME="" ;;
     *) die "art_k3s: unknown asset $1" ;;
   esac
+}
+
+# Debian packages for the node (NODE_DEBS). art_deb <package> <version>.
+# No upstream checksum file is read here (A_SUMS ""): the sha256 pin, taken
+# from the archive's Packages index by --print-pins, is the only check.
+# A_FALLBACK is snapshot.debian.org's content-addressed copy (by sha1).
+art_deb() {
+  local pkg="$1" version="$2" pool sha1
+  pool="${NODE_DEB_POOL[${pkg}]:-}"
+  [[ -n "${pool}" ]] || die "no NODE_DEB_POOL entry for ${pkg} in airgap/versions.env (run: airgap/build/fetch-tools.sh --print-pins)"
+  A_KEY="$(deb_key "${pkg}" "${version}" "${NODE_ARCH}")"
+  A_FILE="${pkg}_$(deb_file_version "${version}")_${NODE_ARCH}.deb"
+  A_URL="${NODE_DEB_MIRROR%/}/${pool}/${A_FILE}"
+  A_SUMS="" A_SUMFMT="" A_NAME="${A_FILE}" A_MEMBER=""
+  sha1="${PINNED_DEB_SHA1[${A_KEY}]:-}"
+  A_FALLBACK=""
+  [[ -z "${sha1}" ]] || A_FALLBACK="${NODE_DEB_SNAPSHOT%/}/${sha1}"
 }
 
 # ---------------------------------------------------------------------------
@@ -187,8 +210,18 @@ fetch_artifact() {
   tmp="$(mktemp "${dir}/.download.XXXXXX")"
   log "downloading ${A_URL}"
   if ! curl -fsSL --retry 3 -o "${tmp}" "${A_URL}"; then
-    rm -f "${tmp}"
-    die "download failed: ${A_URL}"
+    if [[ -z "${A_FALLBACK:-}" ]]; then
+      rm -f "${tmp}"
+      die "download failed: ${A_URL}"
+    fi
+    warn "download failed: ${A_URL}; trying ${A_FALLBACK}"
+    if ! curl -fsSL --retry 3 -o "${tmp}" "${A_FALLBACK}"; then
+      rm -f "${tmp}"
+      die "download failed: ${A_URL} and ${A_FALLBACK}"
+    fi
+    got="$(sha1sum "${tmp}" | awk '{print $1}')"
+    [[ "${A_FALLBACK}" == */"${got}" ]] \
+      || { rm -f "${tmp}"; die "${A_KEY}: ${A_FALLBACK} returned a file with sha1 ${got}"; }
   fi
   got="$(sha256_file "${tmp}")"
   if [[ "${got}" != "${pin}" ]]; then
@@ -227,7 +260,7 @@ install_file() {
 }
 
 plan() {
-  log "[dry-run] ${A_URL} -> $1 (pin ${PINNED_SHA256[${A_KEY}]:-MISSING}${A_SUMS:+, upstream ${A_SUMS##*/}})"
+  log "[dry-run] ${A_URL} -> $1 (pin ${PINNED_SHA256[${A_KEY}]:-MISSING}${A_SUMS:+, upstream ${A_SUMS##*/}}${A_FALLBACK:+, fallback ${A_FALLBACK}})"
 }
 
 # ---------------------------------------------------------------------------
@@ -263,7 +296,32 @@ stage() {
     art_kubectl "${plat%-*}" "${plat#*-}"
     if (( DRY_RUN )); then plan "tools/${plat}/kubectl"; else install_binary "${out}/tools/${plat}/kubectl"; fi
   done
-  (( DRY_RUN )) || log "tools: node/bin (${NODE_TOOLS[*]}), node/k3s (${K3S_VERSION}), tools/{${LAN_KUBECTL_PLATFORMS// /,}}/kubectl"
+  stage_debs "${out}"
+  (( DRY_RUN )) || log "tools: node/bin (${NODE_TOOLS[*]}), node/k3s (${K3S_VERSION}), tools/{${LAN_KUBECTL_PLATFORMS// /,}}/kubectl, node/debs (${NODE_DEBS:-none})"
+}
+
+stage_debs() {
+  # stage_debs <out> — NODE_DEBS into <out>/node/debs (0644) plus debs.lock
+  local out="$1" entry pkg version lock
+  [[ -n "${NODE_DEBS// /}" ]] || return 0
+  lock="${out}/node/debs/debs.lock"
+  (( DRY_RUN )) || { mkdir -p "${out}/node/debs"; : > "${lock}.tmp"; }
+  for entry in ${NODE_DEBS}; do
+    [[ "${entry}" =~ ^[a-z0-9][a-z0-9.+-]*=[0-9A-Za-z.+:~-]+$ ]] || die "NODE_DEBS entry '${entry}' is not <package>=<version>"
+    pkg="${entry%%=*}"
+    version="${entry#*=}"
+    art_deb "${pkg}" "${version}"
+    if (( DRY_RUN )); then
+      plan "node/debs/${A_FILE}"
+      continue
+    fi
+    install_file "${out}/node/debs/${A_FILE}" 0644
+    printf '%s %s %s %s %s\n' "${pkg}" "${version}" "${NODE_ARCH}" "$(sha256_file "${out}/node/debs/${A_FILE}")" "${A_FILE}" >> "${lock}.tmp"
+  done
+  if (( ! DRY_RUN )); then
+    chmod 0644 "${lock}.tmp"
+    mv -f "${lock}.tmp" "${lock}"
+  fi
 }
 
 host_bin() {
@@ -312,11 +370,97 @@ print_pins() {
     art_k3s "${a}"
     emit_pin
   done
+  print_deb_pins
+  echo ")"
+  print_deb_tables
+}
+
+deb_packages_index() {
+  # deb_packages_index <dir> — download and unpack the Packages index of every
+  # NODE_DEB_SUITES entry ("<archive>:<suite>") to <dir>/<archive>_<suite>
+  local dir="$1" s archive suite
+  require_cmd xz
+  for s in ${NODE_DEB_SUITES}; do
+    archive="${s%%:*}"
+    suite="${s#*:}"
+    curl -fsSL --retry 3 "${NODE_DEB_MIRROR%/}/${archive}/dists/${suite}/main/binary-${NODE_ARCH}/Packages.xz" \
+      | xz -dc > "${dir}/${archive}_${suite}" \
+      || die "cannot read the Packages index of ${archive} ${suite}"
+  done
+}
+
+deb_index_entry() {
+  # deb_index_entry <dir> <package> <version> — "<archive> <Filename> <SHA256>"
+  # of the first index (NODE_DEB_SUITES order) that has that exact version
+  local dir="$1" s f out
+  for s in ${NODE_DEB_SUITES}; do
+    f="${dir}/${s%%:*}_${s#*:}"
+    out="$(awk -v p="$2" -v v="$3" '
+      /^$/ { if (pk == p && ve == v && fn != "" && sh != "") { print fn " " sh; exit } pk = ve = fn = sh = ""; next }
+      /^Package: / { pk = $2 } /^Version: / { ve = $2 } /^Filename: / { fn = $2 } /^SHA256: / { sh = $2 }
+      END { if (pk == p && ve == v && fn != "" && sh != "") print fn " " sh }' "${f}" | head -1)"
+    if [[ -n "${out}" ]]; then echo "${s%%:*} ${out}"; return 0; fi
+  done
+  return 1
+}
+
+DEB_POOL_LINES=() DEB_SHA1_LINES=()
+print_deb_pins() {
+  # the PINNED_SHA256 lines of NODE_DEBS (inside the block print_pins prints);
+  # print_deb_tables prints NODE_DEB_POOL and PINNED_DEB_SHA1 afterwards
+  local tmpd entry pkg version archive filename sha256 got sha1 key
+  [[ -n "${NODE_DEBS// /}" ]] || return 0
+  tmpd="$(mktemp -d)"
+  deb_packages_index "${tmpd}"
+  for entry in ${NODE_DEBS}; do
+    pkg="${entry%%=*}"
+    version="${entry#*=}"
+    read -r archive filename sha256 < <(deb_index_entry "${tmpd}" "${pkg}" "${version}") \
+      || { rm -rf "${tmpd}"; die "${pkg} ${version} is in none of NODE_DEB_SUITES (${NODE_DEB_SUITES}): pick the current version"; }
+    curl -fsSL --retry 3 -o "${tmpd}/deb" "${NODE_DEB_MIRROR%/}/${archive}/${filename}" \
+      || { rm -rf "${tmpd}"; die "download failed: ${NODE_DEB_MIRROR%/}/${archive}/${filename}"; }
+    got="$(sha256_file "${tmpd}/deb")"
+    [[ "${got}" == "${sha256}" ]] || { rm -rf "${tmpd}"; die "${filename}: sha256 ${got} differs from the Packages index (${sha256})"; }
+    sha1="$(sha1sum "${tmpd}/deb" | awk '{print $1}')"
+    key="$(deb_key "${pkg}" "${version}" "${NODE_ARCH}")"
+    printf '  [%s]=%s\n' "${key}" "${sha256}"
+    DEB_POOL_LINES+=("  [${pkg}]=${archive}/$(dirname "${filename}")")
+    DEB_SHA1_LINES+=("  [${key}]=${sha1}")
+  done
+  rm -rf "${tmpd}"
+}
+
+print_deb_tables() {
+  [[ -n "${NODE_DEBS// /}" ]] || return 0
+  echo "declare -gA NODE_DEB_POOL=("
+  printf '%s\n' "${DEB_POOL_LINES[@]}"
+  echo ")"
+  echo "declare -gA PINNED_DEB_SHA1=("
+  printf '%s\n' "${DEB_SHA1_LINES[@]}"
   echo ")"
 }
 
-case "${MODE}" in
-  stage) stage "${TARGET}" ;;
-  host-bin) host_bin "${TARGET}" ;;
-  print-pins) print_pins ;;
-esac
+main() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stage) MODE=stage; TARGET="${2:?--stage needs a directory}"; shift ;;
+      --host-bin) MODE=host-bin; TARGET="${2:?--host-bin needs a directory}"; shift ;;
+      --print-pins) MODE=print-pins ;;
+      --dry-run) DRY_RUN=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown argument: $1 (see --help)" ;;
+    esac
+    shift
+  done
+  [[ -n "${MODE}" ]] || { usage; exit 2; }
+  require_cmd curl tar sha256sum sha1sum awk
+  case "${MODE}" in
+    stage) stage "${TARGET}" ;;
+    host-bin) host_bin "${TARGET}" ;;
+    print-pins) print_pins ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

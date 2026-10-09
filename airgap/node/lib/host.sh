@@ -758,7 +758,10 @@ host_sync_tarballs() {
 
 host_normalize_image_ref() {
   # host_normalize_image_ref <ref> - containerd's name for a docker reference.
-  local ref="$1" first rest
+  # A reference with both a tag and a digest (G-09 pins,
+  # "<repo>:<tag>@sha256:<d>") is named "<repo>@sha256:<d>": containerd's
+  # ParseDockerRef drops the tag when a digest is present.
+  local ref="$1" first rest last
   first="${ref%%/*}"
   if [[ "${ref}" != */* ]]; then
     ref="docker.io/library/${ref}"
@@ -770,6 +773,11 @@ host_normalize_image_ref() {
     [[ "${rest}" == */* ]] || ref="docker.io/library/${rest}"
   fi
   [[ "${ref##*/}" == *[:@]* ]] || ref="${ref}:latest"
+  if [[ "${ref}" == *@sha256:* ]]; then
+    rest="${ref%%@*}"
+    last="${rest##*/}"
+    [[ "${last}" != *:* ]] || ref="${rest%:*}@${ref#*@}"
+  fi
   printf '%s' "${ref}"
 }
 

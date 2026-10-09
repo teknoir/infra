@@ -1,0 +1,22 @@
+# The same render with an empty PLUGIN_CHART_VERSION (must fail).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: profile-controller-config
+  namespace: teknoir-system
+data:
+  ADMIN: "admin@example.test"
+  DOMAIN: "teknoir.airgapped"
+  PLUGIN_CHART_REPO: "harbor.teknoir.airgapped/teknoir"
+  PLUGIN_CHART_VERSION: ""
+  OIDC_ISSUER: "https://auth.teknoir.airgapped/auth/realms/teknoir"
+---
+apiVersion: teknoir.org/v1
+kind: Profile
+metadata:
+  name: teknoir-default
+spec:
+  owner:
+    kind: User
+    name: admin@example.test

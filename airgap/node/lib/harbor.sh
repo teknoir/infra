@@ -15,7 +15,11 @@
 #     config digest (the image ID, which survives re-compression and a
 #     multi-platform index on the Harbor side); skipped when present, pushed
 #     when absent, and a mirror tag that points at a different image is
-#     refused unless --force-images;
+#     refused unless --force-images. A pinned ref "<repo>:<tag>@sha256:<d>"
+#     (G-09) must name exactly the manifest the bundle holds (else fatal: a
+#     pod would pull a manifest the mirror never gets), and <repo>@<d> must be
+#     in Harbor afterwards (pushed by digest when the tag already holds the
+#     same image in another manifest);
 #   - robot$argocd is deleted once no ArgoCD Secret uses it (D3; on the live
 #     env `teknoir-node migrate` first retires the repo-creds Secret).
 #
@@ -570,6 +574,14 @@ harbor_normalize_ref() {
   printf '%s\n' "${ref}"
 }
 
+harbor_ref_repo() {
+  # harbor_ref_repo <ref> — the repository: no digest, no tag (a registry
+  # port is not a tag)
+  local r="${1%%@*}"
+  [[ "${r##*/}" != *:* ]] || r="${r%:*}"
+  printf '%s\n' "${r}"
+}
+
 harbor_mirror_ref() {
   # harbor_mirror_ref <ref> — the mirror location in Harbor; 1 when no project mirrors its registry
   local e
@@ -649,7 +661,7 @@ harbor_image_sources() {
 }
 
 harbor_push_images() {
-  local force="$1" src ref target pin line cfg present=0 pushed=0
+  local force="$1" src ref target repo pin line cfg present=0 pushed=0
   local -a todo=() refused=()
   harbor_image_sources
   while IFS='|' read -r src ref; do
@@ -661,24 +673,36 @@ harbor_push_images() {
     fi
     target="$(harbor_mirror_ref "${ref}")" || die "no Harbor mirror project for ${ref} (HARBOR_MIRRORS: ${HARBOR_MIRRORS})"
     harbor_local_config_digest "${src}"
+    if [[ -n "${pin}" ]]; then
+      # a pod spec names exactly this manifest: the bundle must hold it, or
+      # the mirror never gets what the pod pulls (G-09)
+      [[ -n "${HARBOR_LOCAL_MANIFEST}" ]] \
+        || die "${ref}@${pin}: a digest-pinned reference needs an OCI layout, not the docker archive ${src} (crane re-manifests archives)"
+      [[ "${pin}" == "${HARBOR_LOCAL_MANIFEST}" ]] \
+        || die "${ref}@${pin}: the bundle holds manifest ${HARBOR_LOCAL_MANIFEST}, not the pinned ${pin}; pods that pin it would not resolve through the mirror (was an index digest pinned? rebuild the bundle)"
+    fi
     if [[ "${ref##*/}" != *:* ]]; then
       # digest-only reference: its manifest can only be pushed by digest
       [[ -n "${HARBOR_LOCAL_MANIFEST}" ]] || die "${ref}: an untagged reference needs an OCI layout, not ${src}"
-      [[ -z "${pin}" || "${pin}" == "${HARBOR_LOCAL_MANIFEST}" ]] \
-        || warn "${ref}@${pin}: the bundle holds manifest ${HARBOR_LOCAL_MANIFEST}; pods that pin ${pin} will not resolve through the mirror"
       target="${target}@${HARBOR_LOCAL_MANIFEST}"
-      if harbor_remote_manifest "${target}"; then present=$((present + 1)); else todo+=("${src}|${target}|${ref}|"); fi
+      if harbor_remote_manifest "${target}"; then present=$((present + 1)); else todo+=("${src}|${target}|${ref}||"); fi
       continue
     fi
-    [[ -z "${pin}" ]] || warn "${ref}@${pin}: pushed by tag; a pod that pins ${pin} needs that exact manifest in the mirror"
+    repo="$(harbor_ref_repo "${target}")"
     harbor_remote_config_digest "${target}"
     if [[ -z "${HARBOR_REMOTE_CFG}" ]]; then
-      todo+=("${src}|${target}|${ref}|${HARBOR_LOCAL_CFG}")
+      todo+=("${src}|${target}|${ref}|${HARBOR_LOCAL_CFG}|${pin}")
     elif [[ "${HARBOR_REMOTE_CFG}" == "${HARBOR_LOCAL_CFG}" ]]; then
-      present=$((present + 1))
+      if [[ -z "${pin}" ]] || harbor_remote_manifest "${repo}@${pin}"; then
+        present=$((present + 1))
+      else
+        # the tag holds the same image in another manifest (an old
+        # multi-platform push): add the pinned manifest by digest, the tag stays
+        todo+=("${src}|${repo}@${pin}|${ref}||${pin}")
+      fi
     elif [[ "${force}" == "1" ]]; then
       warn "--force-images: ${target} points at another image (${HARBOR_REMOTE_CFG}); replacing it with the bundle's (${HARBOR_LOCAL_CFG})"
-      todo+=("${src}|${target}|${ref}|${HARBOR_LOCAL_CFG}")
+      todo+=("${src}|${target}|${ref}|${HARBOR_LOCAL_CFG}|${pin}")
     else
       refused+=("${target}")
     fi
@@ -687,9 +711,9 @@ harbor_push_images() {
     die "Harbor mirror tag(s) already point at a different image: $(printf '%s ' "${refused[@]}")— a mutable upstream tag moved since the last bundle. Re-run with --force-images to move them to the bundle's images"
   fi
   for line in ${todo[@]+"${todo[@]}"}; do
-    IFS='|' read -r src target ref cfg <<<"${line}"
+    IFS='|' read -r src target ref cfg pin <<<"${line}"
     if [[ "${DRY_RUN}" == "1" ]]; then
-      log "[dry-run] would push ${ref} -> ${target}"
+      log "[dry-run] would push ${ref}${pin:+@${pin}} -> ${target}"
       continue
     fi
     harbor_push_retry "crane push ${ref}" harbor_image_landed "${target}" "${cfg}" -- \
@@ -701,7 +725,11 @@ harbor_push_images() {
     else
       harbor_remote_manifest "${target}" || die "${target}: not in Harbor after the push"
     fi
-    changed "pushed image ${ref} -> ${target}"
+    if [[ -n "${pin}" ]]; then
+      repo="$(harbor_ref_repo "${target}")"
+      harbor_remote_manifest "${repo}@${pin}" || die "${repo}@${pin}: the pinned manifest is not in Harbor after the push"
+    fi
+    changed "pushed image ${ref}${pin:+@${pin}} -> ${target}"
     pushed=$((pushed + 1))
   done
   log "images: $(grep -c . <<<"${HARBOR_SOURCES}") in the bundle, ${present} already in Harbor, ${#todo[@]} to push$([[ "${DRY_RUN}" == "1" ]] || echo ", ${pushed} pushed")"

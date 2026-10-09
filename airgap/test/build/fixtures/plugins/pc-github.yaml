@@ -1,0 +1,22 @@
+# The same render with PLUGIN_CHART_REPO pointing at github.io (must fail).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: profile-controller-config
+  namespace: teknoir-system
+data:
+  ADMIN: "admin@example.test"
+  DOMAIN: "teknoir.airgapped"
+  PLUGIN_CHART_REPO: "https://teknoir.github.io/profile-plugins-helm"
+  PLUGIN_CHART_VERSION: "0.0.99"
+  OIDC_ISSUER: "https://auth.teknoir.airgapped/auth/realms/teknoir"
+---
+apiVersion: teknoir.org/v1
+kind: Profile
+metadata:
+  name: teknoir-default
+spec:
+  owner:
+    kind: User
+    name: admin@example.test

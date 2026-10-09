@@ -7,7 +7,9 @@
 # immutability rule on teknoir only; charts pushed, skipped when equal or only
 # re-packed, refused when different; images pushed from an OCI layout and a
 # docker archive, skipped when present (also inside a multi-arch index),
-# refused when a mirror tag moved unless --force-images; robot$argocd kept
+# refused when a mirror tag moved unless --force-images; a G-09 pin
+# "<repo>:<tag>@sha256:<d>" lands as exactly <repo>@<d> (crane digest equals
+# the pin) and a pin that is not the bundle's manifest is refused; robot$argocd kept
 # while an ArgoCD Secret uses it, deleted after; a second run changes nothing;
 # dry-run makes no mutating call, and plans from the bundle alone before
 # harbor-secret exists or while the cluster is unreachable; a refusal exits
@@ -183,6 +185,29 @@ if harbor phase_harbor > "${WORK}/out/run6.log" 2>&1; then bad "a moved tag is r
 fi
 harbor phase_harbor --force-images > "${WORK}/out/run7.log" 2>&1 || { bad "--force-images exits 0"; cat "${WORK}/out/run7.log"; }
 check "--force-images moves the tag to the bundle's image" bash -c "grep -q 'pushed image docker.io/library/busybox:1.36.1' '${WORK}/out/run7.log' && harbor_out=\$(cat '${WORK}/out/run7.log') && [[ \$(crane config '${REG}/dockerhub/library/busybox:1.36.1' | sha256sum | cut -d' ' -f1) == \$(jq -r .config.digest '${NODE}/images/busybox/blobs/sha256/'\$(jq -r '.manifests[0].digest' '${NODE}/images/busybox/index.json' | cut -d: -f2) | cut -d: -f2) ]]"
+
+say "images: a G-09 pin <repo>:<tag>@sha256:<d> lands as exactly that manifest"
+# the busybox layout again, under a Teknoir-style pinned ref (ghcr mirror)
+cp -a "${NODE}/images/busybox" "${NODE}/images/pintest"
+PIN_D="$(jq -r '.manifests[0].digest' "${NODE}/images/pintest/index.json")"
+cp "${NODE}/images/images.lock" "${WORK}/images.lock.orig"
+echo "ghcr.io/teknoir/pin-test:sha-1234567@${PIN_D}@${PIN_D} pintest" >> "${NODE}/images/images.lock"
+harbor phase_harbor > "${WORK}/out/run8.log" 2>&1 || { bad "a pinned image push exits 0"; cat "${WORK}/out/run8.log"; }
+check "the pinned image is pushed, without a 'pushed by tag' warning" bash -c "
+  grep -q 'pushed image ghcr.io/teknoir/pin-test:sha-1234567@${PIN_D} -> ${REG}/ghcr/teknoir/pin-test:sha-1234567' '${WORK}/out/run8.log' &&
+  ! grep -q 'pushed by tag' '${WORK}/out/run8.log'"
+check "crane digest of the mirror's <repo>@<pin> is the pin" test "$(crane digest "${REG}/ghcr/teknoir/pin-test@${PIN_D}" 2>/dev/null)" == "${PIN_D}"
+check "the mirror tag serves the same manifest" test "$(crane digest "${REG}/ghcr/teknoir/pin-test:sha-1234567" 2>/dev/null)" == "${PIN_D}"
+harbor phase_harbor > "${WORK}/out/run9.log" 2>&1 || { bad "the pinned image re-run exits 0"; cat "${WORK}/out/run9.log"; }
+check "re-run: the pinned image is present, nothing pushed" grep -q 'images: 3 in the bundle, 3 already in Harbor, 0 to push, 0 pushed' "${WORK}/out/run9.log"
+cp "${WORK}/images.lock.orig" "${NODE}/images/images.lock"
+echo "ghcr.io/teknoir/pin-test2:sha-1234567@sha256:$(printf '0%.0s' {1..64})@${PIN_D} pintest" >> "${NODE}/images/images.lock"
+if harbor phase_harbor > "${WORK}/out/run10.log" 2>&1; then bad "a pin that is not the bundle's manifest is refused"; else
+  check "a pin that is not the bundle's manifest is refused" grep -q "the bundle holds manifest ${PIN_D}, not the pinned sha256:0" "${WORK}/out/run10.log"
+fi
+check "nothing pushed for the refused pin" bash -c "! crane digest '${REG}/ghcr/teknoir/pin-test2:sha-1234567' >/dev/null 2>&1"
+cp "${WORK}/images.lock.orig" "${NODE}/images/images.lock"
+rm -rf "${NODE}/images/pintest"
 
 say "migrate, M6: retire the robot repo-creds Secret only once ArgoCD reads the public project"
 fake_argocd() {

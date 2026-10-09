@@ -329,7 +329,9 @@ _release_mirror_ref() {
 post_image_check() {
   # Every image of a running container must be re-pullable from Harbor, or at
   # least present in containerd (warned: lost on image GC). Missing from both
-  # fails.
+  # fails. A pinned "<repo>:<tag>@sha256:<d>" is checked as "<repo>@sha256:<d>"
+  # on both sides (host_normalize_image_ref): the mirror must serve exactly
+  # that manifest, and containerd names the image that way.
   local images present ref norm ok=0 local_only=0 missing=0 missing_list="" local_list=""
   if [[ ! -x "${K3S_BIN}" ]]; then
     log "live image check: skipped (no k3s binary on this host)"

@@ -78,6 +78,28 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
   cloud-image network layout of the live node, and has new sections on the
   fixed address and on name resolution for devices.
 
+### Bundle: teamspace plugins, node packages, pinned images
+
+- **Teamspaces work offline.** The bundle carries the 9 teamspace plugin
+  charts profile-controller deploys by default (profile-plugin-* 0.0.99, the
+  published archives, pinned by sha256) and their ~20 images (~1.8 GiB). The
+  node pushes the charts to `harbor.<domain>/teknoir` with the other charts;
+  profile-controller reads them from there (its `PLUGIN_CHART_REPO`). Before,
+  a teamspace's Applications pointed at teknoir.github.io and stayed
+  `Unknown`.
+- **Time packages.** chrony and util-linux-extra (hwclock) ship as pinned
+  `.deb` files in `node/debs`; the node has no NTP egress and no hwclock
+  today.
+- **Pinned Teknoir images (G-09).** The build fails on a Teknoir image that is
+  not `<repo>:<immutable tag>@sha256:<linux/amd64 manifest>`, on a pinned
+  index, and on a digest in a one-shot tier; the teamspace plugin images on
+  `:latest` only warn (listed in `MANIFEST.yaml`). The node refuses a pin that
+  is not the bundle's manifest and verifies the pinned manifest in Harbor
+  after the push; the post check looks the pinned manifest up in Harbor and
+  containerd. `airgap/build/pin-images.sh` prints and verifies pins.
+- **Size.** A bundle is about 5.8 GB; the limit is 6.5 GiB. Use exFAT or ext4
+  media, or `make-bundle.sh --split` for FAT32.
+
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
 One build command, one LAN-host command, and the same command for the first

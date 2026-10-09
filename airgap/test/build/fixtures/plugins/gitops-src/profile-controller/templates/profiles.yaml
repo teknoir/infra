@@ -1,0 +1,11 @@
+{{- range .Values.profiles }}
+---
+apiVersion: teknoir.org/v1
+kind: Profile
+metadata:
+  name: {{ .name }}
+spec:
+  owner:
+    kind: User
+    name: {{ $.Values.config.admin }}
+{{- end }}
