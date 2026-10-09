@@ -373,6 +373,8 @@ admin_clear_legacy() {
         -p "[{\"op\":\"test\",\"path\":\"/metadata/resourceVersion\",\"value\":\"${rv}\"},{\"op\":\"remove\",\"path\":\"/status/set_initial_password\"}]" 2>&1)"; then
       return 0
     fi
+    (( i < 5 )) || break
+    log "User ${name} changed meanwhile; reading it again"
     sleep 1
   done
   die "cannot remove status.set_initial_password of User ${name}: ${out}"

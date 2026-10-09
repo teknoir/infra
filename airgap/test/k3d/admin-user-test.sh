@@ -21,7 +21,10 @@
 #         catalog trails every claim change, like the real provider's schedule;
 #   - stubs/fake-keycloak.py for the Keycloak admin API (group, reset-password);
 #   - a postgres StatefulSet backstage-postgres (container postgres, the
-#     catalog table final_entities) and a pause Deployment backstage-api.
+#     catalog table final_entities) and a pause Deployment backstage-api;
+#   - kwrap, a kubectl wrapper that interferes once (WRAP_MODE): it replaces
+#     the Secret or the legacy status value right after admin-user read it, or
+#     changes the User right before admin-user patches it.
 # Every temporary password the stand-ins hand out is also kept in a 0600 side
 # file, so the test compares it with admin-user's --out file unseen.
 #
@@ -29,11 +32,15 @@
 # over once (file 0600 equal to the recorded value, then the Secret is gone or
 # the status field removed; a second run warns and writes nothing; a non-empty
 # --out is never overwritten); --reset-password (one temporary=true call, the
-# file 0600, a refused reset removes the file); owner claims on the user's own
-# teamspaces only, existing claims kept, idempotent, dry-run read-only,
-# --teamspace checks; the catalog wait covers the new owner claims of an
-# existing User (memberOf), no backstage-api restart, a timeout fails with the
-# hint; no password in any output.
+# file 0600, a refused reset removes the file, a superseded Secret or legacy
+# value is deleted afterwards); resume with an --out that already holds the
+# recorded value; a Secret or legacy value replaced between read and delete
+# survives (uid/resourceVersion preconditions, the legacy sha256 guard); owner
+# claims on the user's own teamspaces only, existing claims kept, claim_set
+# absent (a null is pruned to that), a conflicting change retried,
+# idempotent, dry-run read-only, --teamspace checks; the catalog wait covers
+# the new owner claims of an existing User (memberOf), no backstage-api
+# restart, a timeout fails with the hint; no password in any output.
 #
 # Usage: airgap/test/k3d/admin-user-test.sh [--keep]
 set -euo pipefail
@@ -53,7 +60,7 @@ KEEP=0
 [[ "${1:-}" == "--keep" ]] && KEEP=1
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/tkn2-admin.XXXXXX")"
 chmod 700 "${WORK}"
-mkdir -p "${WORK}/node/bin" "${WORK}/out" "${WORK}/secret" "${WORK}/rec" "${WORK}/files" "${WORK}/cat"
+mkdir -p "${WORK}/node/bin" "${WORK}/out" "${WORK}/secret" "${WORK}/rec" "${WORK}/files" "${WORK}/cat" "${WORK}/wrap"
 ln -s "$(command -v jq)" "${WORK}/node/bin/jq"
 printf 'secret\n' > "${WORK}/uc-mode"
 : > "${WORK}/no-catalog"
@@ -86,9 +93,13 @@ cleanup() {
 trap cleanup EXIT
 
 admin_user() {
-  env KUBECTL="kubectl --context ${CTX}" NODE_ROOT="${WORK}/node" TEKNOIR_DOMAIN=teknoir.airgapped \
+  # WRAP_MODE=<mode> WRAP_NAME=<name> admin_user ...: kubectl through kwrap
+  local kubectl="kubectl --context ${CTX}"
+  [[ -z "${WRAP_MODE:-}" ]] || kubectl="${WORK}/kwrap"
+  env KUBECTL="${kubectl}" NODE_ROOT="${WORK}/node" TEKNOIR_DOMAIN=teknoir.airgapped \
     ADMIN_KEYCLOAK_URL="http://127.0.0.1:${KC_PORT}" ADMIN_TIMEOUT=120 STUB_WAIT_INTERVAL=2 \
     ADMIN_CATALOG_TIMEOUT="${ADMIN_CATALOG_TIMEOUT:-120}" \
+    WRAP_CTX="${CTX}" WRAP_NS="${CRED_NS}" WRAP_DIR="${WORK}/wrap" WRAP_REC="${WORK}/rec" \
     "${REPO}/airgap/test/stubs/teknoir-node-stub" cmd_admin_user "$@"
 }
 kc_calls() { grep -cE "^$1" "${WORK}/out/kc.log" || true; }
@@ -101,6 +112,13 @@ unchanged_and_on_record() { [[ "$(fstate "$1")" == "$2" ]] && has_legacy "$3"; }
 fstate() { [[ -e "$1" ]] && printf '%s %s' "$(sha256sum < "$1" | cut -c1-64)" "$(stat -c %Y "$1")"; }
 same_file() { cmp -s "$1" "$2"; }
 wait_until() { local n="$1"; shift; while ! "$@"; do (( n-- > 0 )) || return 1; sleep 1; done; }
+has_k1() { [[ -n "$(K -n "${CRED_NS}" get secret "user-initial-password-$1" --ignore-not-found -o name)" ]]; }
+no_k1() { ! has_k1 "$1"; }
+k1_holds() {
+  # k1_holds <name> <file> — the Secret's password plus a newline equals <file> (unseen)
+  { K -n "${CRED_NS}" get secret "user-initial-password-$1" -o jsonpath='{.data.password}' | base64 -d; echo; } | cmp -s - "$2"
+}
+legacy_holds() { K get users.teknoir.org "$1" -o json | jq -r '.status.set_initial_password // empty' | cmp -s - "$2"; }
 cat_memberof() {
   # cat_memberof <name> — spec.memberOf of user:default/<name> in the catalog (JSON), empty when not listed
   K -n teknoir-system exec -i backstage-postgres-0 -c postgres -- psql -X -q -U backstage -d backstage_plugin_catalog -tA \
@@ -225,6 +243,50 @@ fake_controllers() {
     fake_user_provider
   done
 }
+
+# kwrap: kubectl for admin-user, with one interference per WRAP_MODE (fired
+# once: WRAP_DIR/fired-<mode>) on the User or Secret of WRAP_NAME
+cat > "${WORK}/kwrap" <<'WRAP'
+#!/usr/bin/env bash
+#   secret-swap  right after admin-user read Secret user-initial-password-<name>:
+#                a new password in it (same uid, new resourceVersion)
+#   legacy-swap  right after admin-user first read the User as JSON: a new
+#                status.set_initial_password
+#   claims-bump  right before the owner-claim patch: another change to the User
+#   status-bump  right before the status patch: another change to the User
+# A new value goes only to WRAP_REC/<name>.new (0600), never to argv or output.
+set -uo pipefail
+real=(kubectl --context "${WRAP_CTX}")
+fire() { mkdir "${WRAP_DIR}/fired-${WRAP_MODE}" 2>/dev/null; }
+bump() { "${real[@]}" annotate --overwrite users.teknoir.org "${WRAP_NAME}" "test.teknoir.org/bump=$(date +%s%N)" >/dev/null; }
+newpw() { ( umask 077; printf 'tmp-new-%s\n' "$(openssl rand -hex 12)" > "${WRAP_REC}/${WRAP_NAME}.new" ); }
+case "${WRAP_MODE}: $* " in
+  "secret-swap:"*" get secret user-initial-password-${WRAP_NAME} "*)
+    if fire; then
+      out="$("${real[@]}" "$@")"; rc=$?
+      newpw
+      "${real[@]}" -n "${WRAP_NS}" get secret "user-initial-password-${WRAP_NAME}" -o json \
+        | jq --rawfile p "${WRAP_REC}/${WRAP_NAME}.new" '.data.password = ($p | rtrimstr("\n") | @base64)' \
+        | "${real[@]}" replace -f - >/dev/null
+      printf '%s\n' "${out}"
+      exit "${rc}"
+    fi ;;
+  "legacy-swap:"*" get users.teknoir.org ${WRAP_NAME} -o json "*)
+    if fire; then
+      out="$("${real[@]}" "$@")"; rc=$?
+      newpw
+      ( umask 077; jq -n --rawfile p "${WRAP_REC}/${WRAP_NAME}.new" '{status: {set_initial_password: ($p | rtrimstr("\n"))}}' > "${WRAP_DIR}/patch.json" )
+      "${real[@]}" patch users.teknoir.org "${WRAP_NAME}" --subresource=status --type=merge --patch-file "${WRAP_DIR}/patch.json" >/dev/null
+      rm -f "${WRAP_DIR}/patch.json"
+      printf '%s\n' "${out}"
+      exit "${rc}"
+    fi ;;
+  "claims-bump:"*" patch users.teknoir.org ${WRAP_NAME} --type=json "*) fire && bump ;;
+  "status-bump:"*" patch users.teknoir.org ${WRAP_NAME} --subresource=status "*) fire && bump ;;
+esac
+exec "${real[@]}" "$@"
+WRAP
+chmod 700 "${WORK}/kwrap"
 
 say "k3d cluster ${CLUSTER}, fake Keycloak on :${KC_PORT}, fake controllers, catalog postgres"
 k3d cluster create "${CLUSTER}" --image "${K3S_IMAGE}" --servers 1 --agents 0 --no-lb \
@@ -452,8 +514,109 @@ check "dry-run: says it would add owner@team-b, changes nothing" bash -c "grep -
 admin_user --email second.admin@teknoir.ai --out "${WORK}/files/pwB3.txt" > "${WORK}/out/runB3.log" 2>&1 || { bad "re-run after the claim was removed exits 0"; cat "${WORK}/out/runB3.log"; }
 check "the re-run adds owner@team-b back, once" bash -c "kubectl --context ${CTX} get users.teknoir.org ${B} -o json | jq -e '.spec.claim_set == [{name: \"viewer\", namespace: \"foreign\"}, {name: \"owner\", namespace: \"team-b\"}]' >/dev/null && grep -q 'summary: 1 change' '${WORK}/out/runB3.log'"
 
-say "the catalog lists the user but never with its teamspace"
+say "resume: --out already holds exactly the recorded value"
 printf 'secret\n' > "${WORK}/uc-mode"
+E=resume.user-at-teknoir.ai
+new_user "${E}" resume.user@teknoir.ai
+check "the stand-in recorded a Secret for ${E}" wait_until 30 has_k1 "${E}"
+( umask 077; cp "${WORK}/rec/${E}" "${WORK}/files/pwE.txt" )
+pwE0="$(fstate "${WORK}/files/pwE.txt")"
+sleep 1
+if admin_user --email resume.user@teknoir.ai --out "${WORK}/files/pwE.txt" > "${WORK}/out/runE.log" 2>&1; then
+  ok "resume exits 0"
+else
+  bad "resume exits 0"; cat "${WORK}/out/runE.log"
+fi
+check "  ... it says the file already holds the password" grep -q "pwE.txt already holds the temporary password of resume.user@teknoir.ai" "${WORK}/out/runE.log"
+check "  ... the Secret is gone afterwards" no_k1 "${E}"
+check "  ... the file is not rewritten" test "$(fstate "${WORK}/files/pwE.txt")" == "${pwE0}"
+
+say "--reset-password while a temporary password is still on record"
+F=reset.secret-at-teknoir.ai
+new_user "${F}" reset.secret@teknoir.ai
+check "the stand-in recorded a Secret for ${F}" wait_until 30 has_k1 "${F}"
+uidF="$(kc_uid reset.secret@teknoir.ai)"
+if admin_user --email reset.secret@teknoir.ai --reset-password --out "${WORK}/files/resetF.txt" > "${WORK}/out/resetF.log" 2>&1; then
+  ok "--reset-password (Secret on record) exits 0"
+else
+  bad "--reset-password (Secret on record) exits 0"; cat "${WORK}/out/resetF.log"
+fi
+check "  ... the file (0600) holds the password Keycloak got" bash -c "cmp -s '${WORK}/files/resetF.txt' '${WORK}/rec/reset-${uidF}.txt' && [[ \$(stat -c %a '${WORK}/files/resetF.txt') == 600 ]]"
+check "  ... the superseded Secret is deleted" bash -c "grep -q 'deleted the superseded Secret ${CRED_NS}/user-initial-password-${F}' '${WORK}/out/resetF.log' && ! kubectl --context ${CTX} -n ${CRED_NS} get secret user-initial-password-${F} -o name 2>/dev/null"
+printf 'legacy\n' > "${WORK}/uc-mode"
+G=reset.legacy-at-teknoir.ai
+new_user "${G}" reset.legacy@teknoir.ai
+check "the stand-in recorded a legacy value for ${G}" wait_until 30 has_legacy "${G}"
+uidG="$(kc_uid reset.legacy@teknoir.ai)"
+if admin_user --email reset.legacy@teknoir.ai --reset-password --out "${WORK}/files/resetG.txt" > "${WORK}/out/resetG.log" 2>&1; then
+  ok "--reset-password (legacy value on record) exits 0"
+else
+  bad "--reset-password (legacy value on record) exits 0"; cat "${WORK}/out/resetG.log"
+fi
+check "  ... the file holds the password Keycloak got" same_file "${WORK}/files/resetG.txt" "${WORK}/rec/reset-${uidG}.txt"
+check "  ... the superseded status.set_initial_password is removed" bash -c "grep -q 'removed the superseded status.set_initial_password of User ${G}' '${WORK}/out/resetG.log' && ! kubectl --context ${CTX} get users.teknoir.org ${G} -o json | jq -e '.status | has(\"set_initial_password\")' >/dev/null"
+
+say "a Secret replaced between the read and the delete survives (uid/resourceVersion preconditions)"
+printf 'secret\n' > "${WORK}/uc-mode"
+H=swap.secret-at-teknoir.ai
+new_user "${H}" swap.secret@teknoir.ai
+check "the stand-in recorded a Secret for ${H}" wait_until 30 has_k1 "${H}"
+if WRAP_MODE=secret-swap WRAP_NAME="${H}" admin_user --email swap.secret@teknoir.ai --out "${WORK}/files/pwH.txt" > "${WORK}/out/runH1.log" 2>&1; then
+  bad "admin-user fails when the Secret changed after it was read"
+else
+  ok "admin-user fails when the Secret changed after it was read"
+fi
+check "  ... the interference fired" test -d "${WORK}/wrap/fired-secret-swap"
+check "  ... it says the Secret changed since it was read" grep -q "changed since it was read" "${WORK}/out/runH1.log"
+check "  ... the replaced Secret still exists with its new value" k1_holds "${H}" "${WORK}/rec/${H}.new"
+admin_user --email swap.secret@teknoir.ai --out "${WORK}/files/pwH2.txt" > "${WORK}/out/runH2.log" 2>&1 || { bad "the re-run with a new --out exits 0"; cat "${WORK}/out/runH2.log"; }
+check "  ... a re-run with a new --out hands over the new value and deletes the Secret" bash -c "cmp -s '${WORK}/files/pwH2.txt' '${WORK}/rec/${H}.new' && ! kubectl --context ${CTX} -n ${CRED_NS} get secret user-initial-password-${H} -o name 2>/dev/null"
+
+say "a legacy value replaced during the handover is kept (sha256 guard); a conflicting status change is retried"
+printf 'legacy\n' > "${WORK}/uc-mode"
+I=swap.legacy-at-teknoir.ai
+new_user "${I}" swap.legacy@teknoir.ai
+check "the stand-in recorded a legacy value for ${I}" wait_until 30 has_legacy "${I}"
+if WRAP_MODE=legacy-swap WRAP_NAME="${I}" admin_user --email swap.legacy@teknoir.ai --out "${WORK}/files/pwI.txt" > "${WORK}/out/runI1.log" 2>&1; then
+  bad "admin-user fails when the legacy value changed during the handover"
+else
+  ok "admin-user fails when the legacy value changed during the handover"
+fi
+check "  ... the interference fired" test -d "${WORK}/wrap/fired-legacy-swap"
+check "  ... it says the value changed during the handover" grep -q "status.set_initial_password of User ${I} changed during the handover" "${WORK}/out/runI1.log"
+check "  ... the new value is still on record" legacy_holds "${I}" "${WORK}/rec/${I}.new"
+if WRAP_MODE=status-bump WRAP_NAME="${I}" admin_user --email swap.legacy@teknoir.ai --out "${WORK}/files/pwI2.txt" > "${WORK}/out/runI2.log" 2>&1; then
+  ok "a re-run, with a conflicting change to the User before the status patch, exits 0"
+else
+  bad "a re-run, with a conflicting change to the User before the status patch, exits 0"; cat "${WORK}/out/runI2.log"
+fi
+check "  ... the interference fired and the status patch was retried" bash -c "[[ -d '${WORK}/wrap/fired-status-bump' ]] && grep -q 'User ${I} changed meanwhile; reading it again' '${WORK}/out/runI2.log'"
+check "  ... the file holds the new value and the field is removed" bash -c "cmp -s '${WORK}/files/pwI2.txt' '${WORK}/rec/${I}.new' && ! kubectl --context ${CTX} get users.teknoir.org ${I} -o json | jq -e '.status | has(\"set_initial_password\")' >/dev/null"
+
+say "owner claims: claim_set null, and a conflicting change to the User before the patch"
+printf 'secret\n' > "${WORK}/uc-mode"
+KN=null.claims-at-teknoir.ai
+new_profile team-k null.claims@teknoir.ai
+K apply -f - >/dev/null <<EOF
+apiVersion: teknoir.org/v1
+kind: User
+metadata: {name: ${KN}}
+spec: {email: null.claims@teknoir.ai, email_verified: true, enabled: true, claims_v0: {role: superadmin}, plugins: [], claim_set: null}
+EOF
+# the API server prunes a null (as with user-controller's CRD, where claim_set
+# is a non-nullable array); to admin-user's jq an absent claim_set and a null
+# one are the same value, so this is the null path as well
+check "claim_set: null in the manifest is stored as no claim_set" bash -c "kubectl --context ${CTX} get users.teknoir.org ${KN} -o json | jq -e '.spec | has(\"claim_set\") | not' >/dev/null"
+if WRAP_MODE=claims-bump WRAP_NAME="${KN}" admin_user --email null.claims@teknoir.ai --out "${WORK}/files/pwK.txt" > "${WORK}/out/runK.log" 2>&1; then
+  ok "admin-user exits 0"
+else
+  bad "admin-user exits 0"; cat "${WORK}/out/runK.log"
+fi
+check "  ... the interference fired and the claim patch was retried" bash -c "[[ -d '${WORK}/wrap/fired-claims-bump' ]] && grep -q 'User ${KN} changed meanwhile; reading it again' '${WORK}/out/runK.log'"
+check "  ... claim_set is exactly [owner@team-k], added once" bash -c "kubectl --context ${CTX} get users.teknoir.org ${KN} -o json | jq -e '.spec.claim_set == [{name: \"owner\", namespace: \"team-k\"}]' >/dev/null && [[ \$(grep -c 'changed: User ${KN}: claim owner@team-k' '${WORK}/out/runK.log') == 1 ]]"
+check "  ... the catalog's memberOf has group:team-k/team-k when it returned" cat_member "${KN}" group:team-k/team-k
+
+say "the catalog lists the user but never with its teamspace"
 L=no.group-at-teknoir.ai
 new_profile team-l no.group@teknoir.ai
 printf '%s\n' "${L}" >> "${WORK}/no-groups"
