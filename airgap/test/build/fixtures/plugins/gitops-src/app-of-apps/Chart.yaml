@@ -1,0 +1,5 @@
+apiVersion: v2
+name: app-of-apps
+description: gate-test fixture (renders one Application, profile-controller)
+type: application
+version: 9.9.9

@@ -3,6 +3,7 @@
 # (airgap/build/lib-build.sh, render-oneshot.sh). Offline once the pinned build
 # tools are in the cache (~/.cache/teknoir-airgap/tools); bash >= 4.4, openssl.
 #
+#   0. every fixture is committed (none is git-ignored, e.g. by '/*/**/charts/')
 #   1. secret_gate: credential-less ArgoCD repository Secrets for
 #      harbor.<domain>/<project> pass; any other Secret with data, any
 #      credential key, a foreign url, a missing label or url, and undecodable
@@ -18,12 +19,15 @@
 #      Secret passes; with basic-auth keys, or for another domain, it fails
 #   5. teamspace plugin supply (TS-C3): plugin_chart_config, fetch_plugin_chart
 #      (pin vs index vs file, cache), collect-charts.sh end to end on a fixture
-#      gitops tree with the real 9 plugin pins (downloaded once into the build
-#      cache), plugin_supply_gate (missing image, tampered archive, github.io)
+#      gitops tree (fixtures/plugins/gitops-src, copied to <tmp>/charts) with
+#      the real 9 plugin pins (downloaded once into the build cache),
+#      plugin_supply_gate (missing image, tampered archive, github.io)
 #   6. image pin policy (G-09): teknoir_pin_ok, image_policy, collect-images.sh
 #      stopping before any pull, and the pinned-index refusal
 #   7. node packages (TIME-T1): debs_gate (tampered, unlisted, lock mismatch)
-#   8. make-bundle.sh --dry-run lists the 9 plugin pins and the 2 debs
+#   8. make-bundle.sh --dry-run lists the 9 plugin pins and the 2 debs; a
+#      rollback rebuild (PROFILE_PLUGIN_CHARTS="", ALLOW_MUTABLE_TEKNOIR_TAGS=1)
+#      plans no plugin and is -mutable
 #
 # Usage: airgap/test/build/gate-test.sh        (exit 0 = every check passed)
 set -euo pipefail
@@ -50,6 +54,17 @@ not_ok() {
 check()  { if [[ "$2" == "$3" ]]; then ok "$1"; else not_ok "$1" "want: $3"$'\n'"got:  $2"; fi; }
 has()    { if grep -qF -- "$3" <<<"$2"; then ok "$1"; else not_ok "$1" "missing: $3"$'\n'"in: $2"; fi; }
 lacks()  { if ! grep -qF -- "$3" <<<"$2"; then ok "$1"; else not_ok "$1" "unexpected: $3"$'\n'"in: $2"; fi; }
+
+# --- 0. the fixtures are committed ------------------------------------------------------------
+# A fixture that .gitignore matches (e.g. a dir named charts/, *.tgz, *.pem)
+# exists only in the checkout that wrote it: a fresh clone lacks it and the
+# later sections fail. In a git checkout, no file under fixtures/ may be ignored.
+if git -C "${HERE}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  check "fixtures: no file under fixtures/ is git-ignored" \
+    "$(git -C "${FIX}" ls-files --others --ignored --exclude-standard -- . | head -5)" ""
+fi
+check "fixtures: the plugin gitops source tree is present" \
+  "$(find "${FIX}/plugins/gitops-src" -name Chart.yaml 2>/dev/null | wc -l)" "2"
 
 # --- 1. secret_gate ------------------------------------------------------------------------
 for f in "${FIX}/secrets/"*.yaml; do
@@ -213,10 +228,12 @@ PROFILE_PLUGIN_SOURCE="https://teknoir.github.io/profile-plugins-helm"
 # pins: the 9 published archives (downloaded once into the build cache,
 # offline afterwards), their teamspace-* renders and apps.jsonl lines (K8)
 make_gitops() {
-  # make_gitops <dir> [sed expression for profile-controller values.yaml] — a git checkout of the fixture
+  # make_gitops <dir> [sed expression for profile-controller values.yaml] — a git checkout of the fixture.
+  # The source is fixtures/plugins/gitops-src (not .../charts: .gitignore ignores every
+  # '/*/**/charts/' dir, so a fixture there is never committed); it becomes <dir>/charts.
   local d="$1"
   mkdir -p "${d}"
-  cp -r "${PF}/gitops/charts" "${d}/charts"
+  cp -r "${PF}/gitops-src" "${d}/charts"
   if [[ -n "${2:-}" ]]; then sed -i -e "$2" "${d}/charts/profile-controller/values.yaml"; fi
   git -C "${d}" init -q -b airgap-redesign-fixture
   git -C "${d}" add -A
@@ -461,6 +478,20 @@ for e in ${NODE_DEBS}; do
     "(pin ${PINNED_SHA256[deb-${p}-${v}-amd64]}, fallback https://snapshot.debian.org/file/${PINNED_DEB_SHA1[deb-${p}-${v}-amd64]})"
 done
 check "make-bundle --dry-run: writes nothing to the output dir" "$(find "${T}/dist" -mindepth 1 -not -name '.staging-*' 2>/dev/null | wc -l)" "0"
+
+# the rollback-rebuild exception (BUILD.md "Rollback bundles"): an app-of-apps
+# whose profile-controller predates K2, built with PROFILE_PLUGIN_CHARTS="" and
+# ALLOW_MUTABLE_TEKNOIR_TAGS=1, plans no plugin and is marked -mutable
+rc=0
+PROFILE_PLUGIN_CHARTS="" ALLOW_MUTABLE_TEKNOIR_TAGS=1 APP_OF_APPS_VERSION=9.9.9 \
+  "${BUILD}/make-bundle.sh" --gitops "${T}/gitops-nokey" --out "${T}/dist-rb" --allow-dirty --dry-run \
+  > "${T}/mb-rb.log" 2>&1 || rc=$?
+check "make-bundle --dry-run, rollback rebuild: exits 0" "${rc}" "0"
+[[ "${rc}" == 0 ]] || sed 's/^/#   /' "${T}/mb-rb.log" | tail -20
+has "make-bundle --dry-run, rollback rebuild: the bundle id is -mutable" "$(grep -m1 '] bundle ' "${T}/mb-rb.log")" "-mutable"
+check "make-bundle --dry-run, rollback rebuild: no plugin planned" "$(grep -c '\[dry-run\] teamspace plugin ' "${T}/mb-rb.log")" "0"
+has "make-bundle --dry-run, rollback rebuild: the warning names the rollback exception" "$(cat "${T}/mb-rb.log")" \
+  'the one exception: a rebuilt rollback bundle, docs/airgap/BUILD.md "Rollback bundles"'
 
 echo "1..${N}"
 if (( FAILED > 0 )); then

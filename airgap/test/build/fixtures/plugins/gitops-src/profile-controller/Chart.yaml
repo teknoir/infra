@@ -1,0 +1,5 @@
+apiVersion: v2
+name: profile-controller
+description: gate-test fixture (the K2 ConfigMap keys and one K3 Profile)
+type: application
+version: 0.0.84
