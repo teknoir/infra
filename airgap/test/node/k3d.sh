@@ -402,12 +402,23 @@ pg_pod teknoir-system harbor-database-0 database '{"app": "harbor", "component":
 pg_pod teknoir-auth keycloak-db-0 postgres '{"app": "keycloak-db"}' keycloak
 k -n teknoir-system wait --for=condition=Ready pod/harbor-database-0 --timeout=240s >/dev/null
 k -n teknoir-auth wait --for=condition=Ready pod/keycloak-db-0 --timeout=240s >/dev/null
-for _ in $(seq 1 30); do
-  k -n teknoir-auth exec keycloak-db-0 -c postgres -- pg_isready -q >/dev/null 2>&1 \
-    && k -n teknoir-system exec harbor-database-0 -c database -- pg_isready -q >/dev/null 2>&1 && break
+# The postgres entrypoint first runs a temporary server for initdb (pg_isready
+# already answers then) and stops it before the real start; a psql in between
+# fails with "the database system is shutting down". Wait for the entrypoint's
+# "init process complete" in both pods, then for pg_isready.
+pg_up() {
+  # pg_up <ns> <pod> <container>
+  k -n "$1" logs "$2" -c "$3" 2>/dev/null | grep -q 'PostgreSQL init process complete' \
+    && k -n "$1" exec "$2" -c "$3" -- pg_isready -q >/dev/null 2>&1
+}
+for _ in $(seq 1 60); do
+  pg_up teknoir-auth keycloak-db-0 postgres && pg_up teknoir-system harbor-database-0 database && break
   sleep 2
 done
-k -n teknoir-auth exec keycloak-db-0 -c postgres -- psql -U keycloak -c 'CREATE TABLE realm_marker (id int);' >/dev/null
+for _ in 1 2 3 4 5; do
+  k -n teknoir-auth exec keycloak-db-0 -c postgres -- psql -U keycloak -c 'CREATE TABLE IF NOT EXISTS realm_marker (id int);' >/dev/null && break
+  sleep 3
+done
 tn converge --site test --only backup
 check "converge skips the pre-change backup for the deployed bundle" grep -q 'already deployed: no pre-change backup' "${T}/out"
 tn converge --site test --only backup --backup
