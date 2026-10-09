@@ -75,7 +75,26 @@ The converge on the node runs these phases, each idempotent:
 | one-shot | first install only: applies platform-secrets, istio, harbor and argo once, then ArgoCD owns them |
 | harbor | Harbor projects, charts and images (skips what is already there) |
 | release | pins the root Application `app-of-apps` to the bundle's version and records the release |
-| post | waits for every Application to be Synced and Healthy, checks that every running image is available offline, prunes old payloads |
+| post | waits for the platform's Applications to be Synced and Healthy (see below), re-syncs once a platform Application whose last sync failed, checks that every running image is available offline, removes the Keycloak admin's `previous-password` once the current password works, prunes old payloads |
+
+Which Applications the post phase waits for:
+
+- **Platform**: the root `app-of-apps` and every Application it created (their
+  `argocd.argoproj.io/tracking-id` starts with `app-of-apps:`). `up` fails if one
+  of them is not Synced and Healthy at this release within the timeout.
+- **Teamspaces declared in GitOps** (an Application owned by a Profile that the
+  profile-controller chart declares, such as `teknoir-default`): the same.
+- **Every other Application** is reported, never waited for: teamspaces created in
+  Backstage (such as `teknoir-demo`) and Applications without a Teknoir owner. A
+  `WARN` line lists the ones that are not ready.
+
+A platform Application whose last sync of its current revision failed is not
+ready even when it shows Synced and Healthy, because ArgoCD never retries a sync
+that has failed for the same revision. The post phase re-syncs such an
+Application once per run, the way ArgoCD's own UI does: one patch that sets the
+sync operation and clears the old operation state. The patch never sets the
+operation alone (see section 12). If that sync fails again, `up` fails and
+names the error.
 
 CoreDNS answers the platform names itself and forwards every other name to
 `UPSTREAM_DNS` from the site config when it is set, else to the node's own
@@ -259,7 +278,10 @@ Read-only for the node and the cluster; it only refreshes the node's copy of the
 site config. Shows the bundle and site, the clock skew between the LAN host and the
 node, k3s, the nodes, the release record (deployed bundle id), the ArgoCD
 Applications and the bundle payloads on the node; when this bundle is on the
-node it adds `teknoir-node status` (Harbor, certificate expiry and more).
+node it adds `teknoir-node status` (Harbor, certificate expiry and more). Its
+`apps:` lines count the Applications per class (platform, each teamspace,
+other) with how many are not ready and whether `up` waits for them; in the
+table, a class marked `*` is reported only.
 
 ```sh
 ./teknoir-airgap doctor
@@ -593,14 +615,41 @@ not click through it.
 `/var/log/teknoir-airgap/` on the node. Fix the cause and run `up` again.
 
 **An Application stays `OutOfSync` or shows a sync error.** Each Application
-retries with back-off. To retry at once:
+retries with back-off. Once the retries are spent, ArgoCD does not sync that
+revision again on its own, even when the Application shows Synced and Healthy
+(its last operation reads `Failed`). The next `up` re-syncs a platform
+Application in that state once. To retry at once, use the ArgoCD UI
+(`https://argocd.teknoir.airgapped`, Sync), or set the operation and clear the
+old operation state in the same patch:
 
 ```sh
 kubectl --context teknoir-local -n teknoir-system patch application <name> --type merge \
-  -p '{"operation": {"initiatedBy": {"username": "operator"}, "sync": {}}}'
+  -p '{"operation": {"initiatedBy": {"username": "operator"}, "sync": {}}, "status": {"operationState": null}}'
 ```
 
-or use the ArgoCD UI (`https://argocd.teknoir.airgapped`, Sync).
+Never patch `operation` alone. The controller merges the new operation into the
+old state, sees the old failed task and the spent retry count, and fails again
+within a second.
+
+**`up` fails in post with "last sync to ... Failed".** The once-per-run re-sync of
+that Application failed too. The message after the colon is ArgoCD's; check that
+Application in the ArgoCD UI (its failing resource and events), fix the cause,
+and run `up` again: each run re-syncs it once more.
+
+**post warns "not ready, not waited for".** These are Applications of a teamspace
+that is not declared in GitOps (created in Backstage), or Applications without a
+Teknoir owner. They never block `up`. Check them in the ArgoCD UI if the
+teamspace should work.
+
+**post warns about `argocd-initial-admin-secret`.** ArgoCD's first admin password
+is still readable in that Secret. Rotate the local admin with
+`./teknoir-airgap rotate argocd-admin`, which also deletes the Secret.
+
+**post warns that `previous-password` is kept.** Secret `teknoir-auth/keycloak-admin`
+still has the master admin's old password because the current one (key
+`password`) does not log in yet. The auth sync's `keycloak-config` Job rotates
+the admin to it (its log says so). Once that has happened, the next `up` removes
+the old key.
 
 **Harbor is down.** The platform keeps running: the bootstrap images (Istio,
 ArgoCD, Harbor itself) are imported into containerd from the bundle, so they
@@ -690,9 +739,9 @@ password, mode 0600, no trailing newline). Then it detaches (the orphan Addons, 
 `manifest-*-secret` files, the 9 `teknoir-*-secret` files, the namespaces, the
 CRDs, `coredns-custom` and the root app-of-apps; `teknoir-argo` stays until M4b).
 Each file gets a `.skip` guard, is moved to
-`/opt/k3s/server/manifests-retired/<UTC>/`, its objects lose the k3s ownership
-labels, and its Addon is deleted; the object counts are checked after every
-file.
+`/opt/k3s/server/manifests-retired/<UTC>/` with mode 0600 (the files hold
+secrets), its objects lose the k3s ownership labels, and its Addon is deleted;
+the object counts are checked after every file.
 
 ```sh
 ./teknoir-airgap migrate --dry-run     # review the list; also checks the Keycloak admin password
@@ -729,7 +778,9 @@ rotates the Keycloak master admin to that password and imports realm `teknoir`;
 ArgoCD adopts the CRDs and moves the wildcard Certificate to the cert-manager
 Application; harbor-core rolls once and then stops drifting. One Secret goes
 away on purpose: Harbor's `harbor-registry-htpasswd`, replaced by
-`harbor-registry-auth`.
+`harbor-registry-auth`. Once the master admin logs in with the new password,
+the post phase removes `previous-password` from `keycloak-admin` (the same `up`,
+or the next one).
 Verify:
 
 ```sh
@@ -754,7 +805,12 @@ kubectl --context teknoir-local -n teknoir-system get application argo   # Synce
 It refuses while `argo` is not Synced/Healthy or an argoproj CRD lacks
 `Prune=false,Delete=false`, and fails if any ArgoCD pod restarts during the
 detach. Afterwards `kubectl --context teknoir-local get addons -n kube-system`
-lists only k3s's own addons.
+lists only k3s's own addons. An object of the old file counts as ArgoCD's when
+it carries the `argo` tracking annotation or is a Synced resource of the `argo`
+Application (ArgoCD writes no annotation on CRDs). `argocd-tls-certs-cm` is
+listed as owned by the converge (the secrets phase reconciles it and labels it
+`app.kubernetes.io/managed-by=teknoir-node`). Only the rest is warned about as
+having no owner; on teknoir-local that is `argocd-cm`.
 
 **M5. Restart test.**
 
@@ -770,6 +826,29 @@ that the argo chart has created the credential-less repository Secret, it delete
 the old `teknoir-system/argocd-harbor-repo` Secret, checks that app-of-apps
 still syncs, and then deletes the Harbor robot account `robot$argocd`. Before M4
 it only reports `robot: not yet`.
+
+**M6b. Finalize, once the migration is accepted.** The retired files in
+`/opt/k3s/server/manifests-retired/` are what `migrate --undo` restores from,
+and they hold the old secrets (the CA key among them). Once the migrated node
+has run for a while and you will not undo, shred them. This ends `--undo`; the
+`.skip` guards in `/opt/k3s/server/manifests/` stay and must never be removed.
+Order: first an encrypted backup (verified by decrypting it and running
+`sha256sum -c`), then the plaintext copies elsewhere, then this step.
+
+```sh
+B=/var/lib/teknoir-airgap/bundles/<bundleId>/node/bin/teknoir-node
+S=/var/lib/teknoir-airgap/site/teknoir-local.env
+ssh teknoir@192.168.5.181 sudo $B migrate --site $S --finalize --dry-run   # lists the files, changes nothing
+ssh teknoir@192.168.5.181 sudo $B migrate --site $S --finalize
+```
+
+It refuses while a Teknoir k3s file or Addon is left (run M3/M4b first), while
+a retired file name has no `.skip` guard, while a platform Application (or a
+teamspace declared in GitOps) is not Synced and Healthy, and while the node has
+no age-encrypted backup export (`/var/lib/teknoir-airgap/exports/*.tar.age`)
+taken after the last migration. If your encrypted backup taken after the
+migration lives only off the node (a `backup --recipient` stream), add
+`--i-know`. It logs file names only.
 
 **M7. Later windows.** k3s secrets encryption
 (`sudo k3s secrets-encrypt enable --data-dir /opt/k3s`, restart,
@@ -814,3 +893,29 @@ hosts:
 ```sh
 sudo ./teknoir-airgap up --local
 ```
+
+`migrate --finalize` (section 14, M6b) runs on the node only, through
+`teknoir-node`.
+
+## r5 (app-of-apps 0.0.5)
+
+What changes for an operator with the r5 bundle. Each subsection belongs to one
+part of the release.
+
+### Post phase, failed syncs, Keycloak admin clean-up and migrate --finalize
+
+- `up` waits only for the platform's Applications and for teamspaces declared
+  in GitOps (`teknoir-default`). Teamspaces created in Backstage (`teknoir-demo`)
+  are reported in a `WARN`, never waited for (section 1).
+- A platform Application whose last sync of its current revision failed is
+  re-synced once per `up` (section 1). On the live node this fixes `monitoring`
+  (failed since 2026-10-09 05:40, with an empty `caBundle` on its admission
+  webhooks); its 0.0.5 chart also starts a clean sync.
+- The manual retry in section 12 now clears the old operation state in the same
+  patch.
+- The post phase removes `previous-password` from `teknoir-auth/keycloak-admin`
+  once the master admin logs in with `password`, and warns while
+  `argocd-initial-admin-secret` exists.
+- `migrate --finalize` (section 14, M6b) shreds `manifests-retired` once the
+  migration is accepted; new retirements are mode 0600. `migrate --argo` no
+  longer reports the argoproj CRDs and `argocd-tls-certs-cm` as ownerless.

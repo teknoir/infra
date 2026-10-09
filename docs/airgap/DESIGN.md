@@ -964,3 +964,70 @@ Follow migration_for_live_env M0-M6 with the new bundle: backup, migrate --dry-r
 - Node /opt/k3s/agent/images stale tarballs not in the current bundle: goharbor *_v2.15.2, valkey-photon, busybox_1.28/latest if unused, dex, redis 8.6.4 if unused (pruned by host phase)
 - Harbor robot$argocd and the ArgoCD repo-creds Secret using it, after the credential-less repository is live
 - vpro infra-teknoir-local/bundle/teknoir-airgap-bundle-0.1.0 and the plaintext .secrets/: move to an encrypted backup, then delete
+
+## r5 (app-of-apps 0.0.5)
+
+Design changes of release r5. Each subsection belongs to one work package; the
+plan and the facts behind it are in the r5 hardening plan.
+
+### Post phase classification, failed-sync re-sync, keycloak-admin clean-up, migrate --finalize (infra lib/release.sh, lib/migrate.sh)
+
+- **Which Applications post waits for (R2).** Platform: the root `app-of-apps`
+  and every Application whose `argocd.argoproj.io/tracking-id` starts with
+  `app-of-apps:` (or `<ns>_app-of-apps:`). Teamspace: an ownerReference of kind
+  `Profile`; strict only when that Profile itself carries an ArgoCD tracking-id
+  (declared in GitOps by the profile-controller chart, contract K3) and the
+  ownerReference uid matches. Platform and strict teamspace Applications must be
+  ready; all others (teamspaces created in Backstage, Applications with no
+  Teknoir owner) are listed in one WARN and never block. The root must exist.
+  `teknoir-node status` prints one `apps:` line per class; the table has a
+  CLASS column (`*` = reported only). The same rules gate `migrate --finalize`.
+- **Failed last sync (HYG-C3).** `why()` reports `last sync to <rev> <phase>:
+  <message>` when `.status.operationState.phase` is Failed or Error, its
+  revision (`syncResult.revision[s]`, else `operation.sync.revision[s]`) equals
+  `.status.sync.revision[s]`, and no `.operation` is pending; a pending
+  `.operation` is itself not ready ("requested, not started yet"), which closes
+  the window between the re-sync patch and the controller picking it up. Post
+  re-syncs each such *platform* Application at most once per run
+  (RELEASE_RESYNCED) with one merge patch: `metadata.resourceVersion` (the
+  apiserver rejects a stale write with 409; retried at the next poll),
+  `.operation` = {initiatedBy teknoir-node, sync {revision[s] it is at,
+  prune = `spec.syncPolicy.automated.prune`, syncOptions from the spec}, retry =
+  `spec.syncPolicy.retry` or ArgoCD's default `{limit: 5}`}, and
+  `status.operationState: null`. That mirrors ArgoCD's SetAppOperation and
+  auto-sync. Setting `.operation` alone makes the controller merge the new
+  operation into the stale state (it writes operationState with a JSON merge
+  patch and the empty fields are omitempty) and fail at once (live, 05:40).
+  Dry-run records the re-sync as a would-change.
+- **keycloak-admin `previous-password` (SEC-C10).** After the wait, post reads
+  only the resourceVersion and the key names of `teknoir-auth/keycloak-admin`.
+  With `previous-password` and `password` present, it logs in to realm master
+  with `password` (admin-cli password grant, credentials in a curl config on a
+  pipe, through the gateway on NODE_IP with the platform CA). On 200 it removes
+  the key with a JSON patch whose first op tests the resourceVersion; on 400/401
+  or any other status it keeps it with a WARN. Dry-run does not log in. Post
+  also warns while `teknoir-system/argocd-initial-admin-secret` exists.
+- **`migrate --finalize [--i-know]` (SEC-C10).** Refuses unless: no Teknoir
+  K3s file or Addon is left (teknoir-argo included); every retired
+  `*.yaml|*.yml|*.json` keeps `<manifests>/<name>.skip`; the post phase's
+  strict Applications are ready; and `/var/lib/teknoir-airgap/exports` holds an
+  age file (`age-encryption.org/v1` header) whose backup stamp (UTC in its
+  name, else its mtime) is newer than the newest `manifests-retired/<UTC>` dir.
+  `--i-know` waives only the export check (an encrypted copy kept off the
+  node). It then shreds every retired file (symlinks are unlinked, never
+  followed), removes the directories and `manifests-retired`, and logs names
+  only. The `.skip` guards are never touched. New retirements are mode 0600.
+- **`migrate --argo` ownership check (HYG-C6).** An object of the detached file
+  is ArgoCD's when it carries the `argo` tracking-id or is a Synced entry of the
+  `argo` Application's `.status.resources` (mapped to `Kind.v1.` / `Kind.group`).
+  `argocd-tls-certs-cm` and objects labelled
+  `app.kubernetes.io/managed-by=teknoir-node` are logged as converge-owned; only
+  the rest is warned. The secrets phase now applies that label to
+  `argocd-tls-certs-cm` (one label-only server-side apply on the next `up`).
+- **Tests.** `airgap/test/unit/release-ready-test.sh` (classification, reasons,
+  candidates, patch body, wait loop with a stub controller, keycloak clean-up,
+  status lines), `airgap/test/unit/migrate-argo-untracked-test.sh`, k3d
+  `run.sh T10` (the real runner's post phase against stand-in Applications and
+  `stubs/fake-keycloak.py`) and `migrate-test.sh` (CRD adoption via status,
+  0600 retirements, every finalize refusal and the shred). VM: E1/E10/E15 assert
+  operationState Succeeded and a non-empty admission `caBundle` (WP-I-E2E).
