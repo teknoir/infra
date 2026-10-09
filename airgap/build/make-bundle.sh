@@ -417,7 +417,9 @@ done < "${TREE}/node/charts/pins.txt"
 if [[ -z "${PROFILE_PLUGIN_CHARTS// /}" ]]; then
   gate_warn "PROFILE_PLUGIN_CHARTS is empty: no teamspace plugin charts in this bundle (teamspaces cannot work offline)"
 else
-  plugin_supply_gate gate_fail "${WORK}/renders" "${TREE}/node/charts" "${TREE}/node/images/images.lock" "${TEKNOIR_DOMAIN}"
+  img_gate=gate_fail
+  (( INCOMPLETE )) && img_gate=gate_warn   # TEST ONLY --images-limit
+  plugin_supply_gate gate_fail "${WORK}/renders" "${TREE}/node/charts" "${TREE}/node/images/images.lock" "${TEKNOIR_DOMAIN}" "${img_gate}"
 fi
 # node packages: node/debs is exactly NODE_DEBS, each file its pin (debs_gate)
 debs_gate gate_fail "${TREE}/node/debs"

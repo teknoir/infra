@@ -425,7 +425,7 @@ fetch_plugin_chart() {
 }
 
 plugin_supply_gate() {
-  # plugin_supply_gate <fail-fn> <renders-dir> <charts-dir> <images.lock> <domain>
+  # plugin_supply_gate <fail-fn> <renders-dir> <charts-dir> <images.lock> <domain> [<image-fail-fn>]
   # — the teamspace plugin supply is complete and from the pins:
   #   - PLUGIN_CHART_REPO = harbor.<domain>/<project>, exact PLUGIN_CHART_VERSION
   #     (plugin_chart_config on <renders-dir>/<PROFILE_CONTROLLER_APP>.yaml);
@@ -433,9 +433,11 @@ plugin_supply_gate() {
   #     <charts-dir>, and equals its PINNED_SHA256 pin;
   #   - no other profile-plugin-* chart is carried (postgres and claims are
   #     not supported on the airgap);
-  #   - every image of every teamspace-<name> render is in images.lock.
+  #   - every image of every teamspace-<name> render is in images.lock
+  #     (reported through <image-fail-fn>, default <fail-fn>: a TEST ONLY
+  #     --images-limit bundle passes gate_warn).
   # Calls <fail-fn> once per finding; prints nothing else.
-  local fail="$1" renders="$2" charts="$3" lock="$4" domain="$5" name chart tgz key want got img locked
+  local fail="$1" renders="$2" charts="$3" lock="$4" domain="$5" imgfail="${6:-$1}" name chart tgz key want got img locked
   [[ -n "${PROFILE_PLUGIN_CHARTS// /}" ]] || return 0
   if ! plugin_chart_config "${renders}/${PROFILE_CONTROLLER_APP}.yaml" "${domain}"; then
     "${fail}" "teamspace plugins: ${PLUGIN_CONFIG_ERROR}"
@@ -465,7 +467,7 @@ plugin_supply_gate() {
     fi
     while IFS= read -r img; do
       [[ -n "${img}" ]] || continue
-      grep -qxF -- "${img}" <<<"${locked}" || "${fail}" "teamspace plugins: image ${img} (teamspace-${name}) is not in images.lock"
+      grep -qxF -- "${img}" <<<"${locked}" || "${imgfail}" "teamspace plugins: image ${img} (teamspace-${name}) is not in images.lock"
     done < <(extract_images < "${renders}/teamspace-${name}.yaml" | LC_ALL=C sort -u)
   done
   while read -r chart _; do
