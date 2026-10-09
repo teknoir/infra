@@ -1,6 +1,8 @@
 #!/usr/bin/env bats
 # lan_entrypoint.bats — surface checks of the LAN entrypoint airgap/teknoir-airgap
-# (I-11): the commands the design and the runbooks rely on exist.
+# (I-11): the commands the design and the runbooks rely on exist; the r5 site
+# keys are checked before any ssh; doctor's time and address checks (TIME-T4)
+# against stub ssh outputs, on this bash and on docker bash:3.2.
 #
 # Its behaviour (bash 3.2 in docker, MANIFEST verify, host-key pinning,
 # content-addressed sync, kubeconfig replacement, sudo setup, never-print)
@@ -105,6 +107,70 @@ facts() {
 }
 
 ADDR_STATIC='ADDR=2: enp4s0    inet 10.0.0.1/24 brd 10.0.0.255 scope global enp4s0\       valid_lft forever preferred_lft forever'
+ADDR_DHCP='ADDR=2: enp4s0    inet 10.0.0.1/24 metric 100 brd 10.0.0.255 scope global dynamic enp4s0\       valid_lft 83943sec preferred_lft 83943sec'
+
+@test "doctor: an RTC 93 s behind FAILs, chrony absent WARNs, a static NODE_IP is ok" {
+  require_fn "${LAN_BIN}" doctor_time
+  lan_world
+  facts NOW=1791528077 RTC=1791527984 CHRONY=absent "${ADDR_STATIC}"
+  run bash "${LAN}" doctor --site "${SITE}"
+  echo "${output}" | sed -n '/^Node /,$p'
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"FAIL  RTC -93 s from the system clock: a reboot would start the node 93 s off; up writes the RTC"* ]]
+  [[ "${output}" == *"WARN  chrony is not installed on the node; up installs it from the bundle"* ]]
+  [[ "${output}" == *"ok    NODE_IP 10.0.0.1 is configured on the node (static)"* ]]
+  [[ "${output}" == *"ssh as teknoir works"* ]]
+  [ -z "$(mutating_calls)" ]
+}
+
+@test "doctor: RTC offsets up to 5 s are ok, up to 30 s WARN" {
+  require_fn "${LAN_BIN}" doctor_time
+  lan_world
+  facts NOW=1791528077 RTC=1791528080 CHRONY=active "REF=7F7F0101 " "${ADDR_STATIC}"
+  run bash "${LAN}" doctor --site "${SITE}"
+  [[ "${output}" == *"ok    RTC 3 s from the system clock"* ]]
+  [[ "${output}" == *"ok    chrony is active on the node; reference: local clock (stratum 10, corrected by every up)"* ]]
+  facts NOW=1791528077 RTC=1791528057 CHRONY=active "REF=4D414E55 " "${ADDR_STATIC}"
+  run bash "${LAN}" doctor --site "${SITE}"
+  [[ "${output}" == *"WARN  RTC -20 s from the system clock; up writes the RTC"* ]]
+  [[ "${output}" == *"reference: LAN-time samples (manual)"* ]]
+  refute_grep -q 'FAIL  RTC' <<<"${output}"
+}
+
+@test "doctor: a 'dynamic' NODE_IP WARNs unless NODE_IP_DHCP_RESERVED=yes" {
+  require_fn "${LAN_BIN}" doctor_time
+  lan_world
+  facts NOW=1791528077 RTC=1791528077 CHRONY=active "REF=7F7F0101 " "${ADDR_DHCP}"
+  run bash "${LAN}" doctor --site "${SITE}"
+  [[ "${output}" == *"WARN  NODE_IP 10.0.0.1 is a DHCP lease (valid 83943 s); reserve it on the router (docs/HOST-SETUP.md), then set NODE_IP_DHCP_RESERVED=yes in the site config"* ]]
+  lan_world NODE_IP_DHCP_RESERVED=yes
+  facts NOW=1791528077 RTC=1791528077 CHRONY=active "REF=7F7F0101 " "${ADDR_DHCP}"
+  run bash "${LAN}" doctor --site "${SITE}"
+  [[ "${output}" == *"ok    NODE_IP 10.0.0.1 is a DHCP lease reserved on the router (NODE_IP_DHCP_RESERVED=yes)"* ]]
+  refute_grep -q 'WARN  NODE_IP' <<<"${output}"
+}
+
+@test "doctor: NODE_IP missing on the node FAILs" {
+  require_fn "${LAN_BIN}" doctor_time
+  lan_world
+  facts NOW=1791528077 RTC=1791528077 CHRONY=active "REF=7F7F0101 "
+  run bash "${LAN}" doctor --site "${SITE}"
+  [ "${status}" -eq 1 ]
+  [[ "${output}" == *"FAIL  NODE_IP 10.0.0.1 is not an address of the node"* ]]
+}
+
+@test "doctor: a TIME_SOURCE chrony does not use WARNs; a selected or combined one is ok" {
+  require_fn "${LAN_BIN}" doctor_time
+  lan_world 'TIME_SOURCE="ntp.lan 10.0.0.5"'
+  facts NOW=1791528077 RTC=1791528077 CHRONY=active "REF=7F7F0101 " "SRC=+ 10.0.0.9" "${ADDR_STATIC}"
+  run bash "${LAN}" doctor --site "${SITE}"
+  [[ "${output}" == *"WARN  chrony uses none of TIME_SOURCE (ntp.lan 10.0.0.5)"* ]]
+  facts NOW=1791528077 RTC=1791528077 CHRONY=active "REF=0A000005 10.0.0.5" "SRC=* 10.0.0.5" "SRC=+ ntp.lan" "${ADDR_STATIC}"
+  run bash "${LAN}" doctor --site "${SITE}"
+  [[ "${output}" == *"ok    chrony uses TIME_SOURCE ntp.lan 10.0.0.5"* ]]
+  [[ "${output}" == *"reference: NTP source 10.0.0.5"* ]]
+  refute_grep -q 'WARN  chrony uses none' <<<"${output}"
+}
 
 @test "site keys: an invalid TIME_SOURCE, NODE_IP_DHCP_RESERVED or age recipient stops before ssh" {
   lan_world
@@ -123,4 +189,24 @@ ADDR_STATIC='ADDR=2: enp4s0    inet 10.0.0.1/24 brd 10.0.0.255 scope global enp4
   run bash "${LAN}" doctor --site "${SITE}"
   refute_grep -q 'invalid' <<<"${output}"
   [[ "${output}" == *"Node teknoir@10.0.0.1:"* ]]
+}
+
+@test "doctor's time checks run under /bin/bash 3.2 (docker bash:3.2)" {
+  require_fn "${LAN_BIN}" doctor_time
+  command -v docker >/dev/null || skip "docker not available"
+  docker image inspect bash:3.2 >/dev/null 2>&1 || [ -n "${CI:-}" ] || skip "image bash:3.2 not present (CI pulls it)"
+  lan_world NODE_IP_DHCP_RESERVED=no
+  facts NOW=1791528077 RTC=1791527984 CHRONY=active "REF=7F7F0101 " "${ADDR_DHCP}"
+  # the same paths inside the container, as this user (bats removes the
+  # files); the recording stubs first, then the LAN tests' ssh-keygen and
+  # ssh-keyscan stand-ins (the image has no OpenSSH)
+  run docker run --rm --user "$(id -u):$(id -g)" \
+    -v "${REPO_ROOT}:${REPO_ROOT}:ro" -v "${BATS_TEST_TMPDIR}:${BATS_TEST_TMPDIR}" \
+    -e HOME -e STUB_LOG -e STUB_HANDLER \
+    -e PATH="${STUB_BIN}:${REPO_ROOT}/airgap/test/lan/stub:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    bash:3.2 bash "${LAN}" doctor --site "${SITE}"
+  echo "${output}" | sed -n '/^Node /,$p'
+  [[ "${output}" == *"FAIL  RTC -93 s from the system clock"* ]]
+  [[ "${output}" == *"ok    chrony is active on the node; reference: local clock"* ]]
+  [[ "${output}" == *"WARN  NODE_IP 10.0.0.1 is a DHCP lease (valid 83943 s)"* ]]
 }

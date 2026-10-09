@@ -31,7 +31,10 @@ Test files:
   refused, only `kubectl version --client` works) and an existing cluster (k3s active,
   every object present, every server-side diff reports a change, Harbor healthy but
   empty, so the run reaches every apply, restart and push gate).
-- `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2.
+- `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2; the
+  site-key checks; `doctor`'s time and address checks (chrony, RTC offset, `TIME_SOURCE`
+  in use, a DHCP lease and `NODE_IP_DHCP_RESERVED`) against stub ssh outputs, also
+  under docker bash:3.2.
 - `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts.
 - `static.bats`: shebangs, no xtrace in node/LAN code, public site files, no key material,
   no writes to the test host's `/etc/hosts`.
