@@ -109,10 +109,10 @@ operation alone (see section 12). If that sync fails again, `up` fails and
 names the error. Post re-syncs platform Applications only. A teamspace
 Application whose sync failed (for example one of `teknoir-default`'s, if its
 first sync spent its retries while MongoDB or EMQX was starting) blocks `up`
-until you sync it yourself; its reason says so (section 12). Right after `up` pins a new release, an Application can still
-show the failure of its previous version until ArgoCD has applied and compared
-the new one; post does not re-sync that old failure, it waits for the new
-version's own sync.
+until you sync it yourself; its reason says so (section 12). Right after `up`
+pins a new release, an Application can still show the failure of its previous
+version until ArgoCD has applied and compared the new one; post does not
+re-sync that old failure, it waits for the new version's own sync.
 
 CoreDNS answers the platform names itself and forwards every other name to
 `UPSTREAM_DNS` from the site config when it is set, else to the node's own
@@ -953,9 +953,12 @@ part of the release.
   in GitOps (`teknoir-default`). Teamspaces created in Backstage (`teknoir-demo`)
   are reported in a `WARN`, never waited for (section 1).
 - A platform Application whose last sync of its current revision failed is
-  re-synced once per `up` (section 1). On the live node this fixes `monitoring`
-  (failed since 2026-10-09 05:40, with an empty `caBundle` on its admission
-  webhooks); its 0.0.5 chart also starts a clean sync.
+  re-synced once per `up` (section 1). On the live node `monitoring`'s sync of
+  0.0.4 failed (on 2026-10-08, and again on a manual retry on 2026-10-09 at
+  05:40), leaving an empty `caBundle` on its admission webhooks. The r5 `up`
+  does not re-sync that 0.0.4 failure: the 0.0.5 pin supersedes it, and the
+  0.0.5 chart's own sync fixes it. The re-sync is the safety net for when a
+  sync of the new revision fails.
 - The manual retry in section 12 now clears the old operation state in the same
   patch.
 - `up` creates `teknoir-default`, so its post phase waits up to 45 minutes, not
