@@ -29,6 +29,10 @@ reasons for the redesign are kept here. The git history of `infra` and
   seed, finalize and rotations.
 - vpro: `~/.config/teknoir/install-devtools.sh` installs `age` and `age-keygen`
   v1.3.1 (sha256-pinned) for decryption.
+- **One recipient check.** The build, the node and the LAN tool check
+  `BACKUP_AGE_RECIPIENTS` with the same function; an age private key pasted
+  there (or anywhere in a site file, for the build) is refused as such and
+  never printed, so it reaches no log or build output.
 
 ### Node time, RTC, teamspace DNS and site keys
 

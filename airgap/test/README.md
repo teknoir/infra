@@ -37,7 +37,7 @@ Test files:
   under docker bash:3.2.
 - `lan_backup.bats`: `teknoir-airgap backup` with the site's `BACKUP_AGE_RECIPIENTS`
   (no terminal, `--recipient-site`, sha256-checked 0600 copy, `--name`, refused
-  recipients) and `rotate argocd-admin --out`, against an emulated node (the ssh
+  recipients, a private key never echoed) and `rotate argocd-admin --out`, against an emulated node (the ssh
   stub's handler runs the remote command locally with `/var/lib/teknoir-airgap`
   rewritten to a sandbox, a sudo shim and a fake runner).
 - `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts.

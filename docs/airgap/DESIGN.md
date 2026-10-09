@@ -53,11 +53,23 @@ package adds its own subsection.
 
 - **Site key `BACKUP_AGE_RECIPIENTS`** (optional): space-separated age X25519
   public keys, each `^age1[0-9a-z]{58}$`; public values in the committed site
-  file. The build and the LAN entrypoint whitelist and validate it (site-key
-  edits belong to WP-I-HOST); `lib/backup.sh` and `teknoir-airgap backup`
-  validate it again before they act and refuse an `AGE-SECRET-KEY-` value
-  without echoing it. Decision: two recipients, the operator's key and an
-  offline recovery key; no identity ever goes onto the node or into a repo.
+  file. One validator, `site_age_recipients_check VALUE [LABEL]`, checks it
+  everywhere: the build (`site_values_check`), the node (`load_site`, and
+  again in `lib/backup.sh` before a backup and for `backup --recipient`) and
+  the LAN tool (`site_load`, `backup`). The three runtimes share no sourced
+  code (the LAN tool is a self-contained bash 3.2 script), so the function is
+  the same text in `lib/common.sh`, `teknoir-airgap` and `build/lib-build.sh`,
+  and `airgap/test/unit/site-age-recipients-test.sh` fails when the copies
+  differ or a caller checks the format itself. It uses case patterns only
+  (bash 3.2, no locale-dependent ranges). A value holding `SECRET-KEY` (any
+  case, anywhere) is refused with "holds an age PRIVATE key
+  (AGE-SECRET-KEY-...) ... treat that identity as exposed" and nothing of the
+  value is printed; any other bad entry is shown with at most its first 12
+  characters (control and glob characters as `?`), so neither the run logs nor
+  the build output ever hold a key. The build's `site_check` also refuses an
+  age identity anywhere else in a site file, a comment included. Decision:
+  two recipients, the operator's key and an offline recovery key; no identity
+  ever goes onto the node or into a repo.
 - **Node backups** (I-12 superseded): with recipients, `backup_take` also writes
   `exports/<ts>.tar.age` (0600; `tar` of `backups/<ts>` piped into
   `age -r R1 -r R2 ...`; written as `.partial` and renamed). Retention:
@@ -163,7 +175,10 @@ resolve (coredns-custom knew only the platform names).
   addresses or host names; `NODE_IP_DHCP_RESERVED` is `yes`, `no` or empty;
   `BACKUP_AGE_RECIPIENTS` is a space-separated list of age public keys
   (`^age1[0-9a-z]{58}$`, consumed by the backup work). The build
-  (`site_check`), the node (`load_site`) and the LAN tool check all three.
+  (`site_check`), the node (`load_site`) and the LAN tool check all three;
+  `BACKUP_AGE_RECIPIENTS` through the one validator
+  `site_age_recipients_check` (see the backup subsection above), which never
+  prints a private key.
 - **Not in r5:** the `teknoir-node net` tool for a static or keep-lease netplan
   with a dead-man revert (TIME-T6). teknoir-local keeps its DHCP address,
   pinned by a UniFi reservation (HOST-SETUP "Fixed address").
