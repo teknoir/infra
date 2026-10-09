@@ -665,6 +665,105 @@ Scenarios. Each asserts and prints a pass/fail summary.
      - Harbor is stable for 1 h with no new harbor-core ReplicaSet.
 - Host-setup doc check, manual and once: install Debian 13 from the offline ISO into a VM attached to tkvm0 using only HOST-SETUP.md, then E1 from the netns. This validates the installer path the cloud image skips.
 
+## r5 (app-of-apps 0.0.5)
+
+### VM e2e additions (test plan 3)
+
+Each run uses a freshly created VM. The VM's Harbor keeps the first push of
+every version.
+
+- Fresh: `E1 E11 E12 E13 E14 E2 E3 E7 E8` with bundle B.
+- Upgrade: E4, A (aoa0.0.4) to B.
+- Live rehearsal: E15.
+
+The first admin is the owner of the GitOps Profile teknoir-default, so E11 can
+check its grants.
+
+- E1 adds these checks:
+  - every platform Application (the root and what it tracks) has operationState
+    Succeeded;
+  - both monitoring-admission webhook configurations have a caBundle;
+  - every digest-pinned container's imageID ends in its digest;
+  - post logs "live image check: N pullable ..., 0 missing";
+  - `/oauth2/start` returns 302 to auth.<domain>;
+  - after admin-user, no `status.set_initial_password` and no temporary-password
+    Secret remain;
+  - the `--out` password signs in under `kc-login --forbid-profile-form`;
+  - Backstage resolves the session to `user:default/<name>` within 3 minutes of the
+    User's creation;
+  - backstage-api has restartCount 0.
+- E11 checks the default teamspace:
+  - the Profile has Prune=false,Delete=false and a tracking-id, its owner is the
+    admin, and it has no spec.plugins;
+  - the namespace has its label, owner annotation and ownerReference;
+  - namespaceAdmin and the user's RoleBinding both bind teknoir-admin;
+  - the User has the claim owner@teknoir-default;
+  - the policies, the TLS Secret (checked by name only) and the ConfigMaps exist;
+  - the AppProject's sourceRepos is harbor.<domain>/teknoir only, with no cluster
+    whitelist;
+  - the 9 plugin Applications come from Harbor at PLUGIN_CHART_VERSION with
+    RespectIgnoreDifferences=true, and are Synced/Healthy within 20 minutes;
+  - every enabled plugin reports Success;
+  - every pod is Ready with the sidecar, its images are local, and nothing failed
+    to pull;
+  - an in-pod nslookup of mqtt-teknoir-default resolves to NODE_IP;
+  - TLS works on 8883 and 2222;
+  - the teamspace's Grafana and Prometheus answer 200;
+  - the Backstage system and the user's group membership appear (PT1M polling).
+- E12 checks node time:
+  - the pinned .debs are installed, timesyncd is gone, chrony is active and
+    hwclock exists;
+  - at -20 s, a plain up gets within 2 s in 60 s and changes no package;
+  - at -400 s with the RTC also off, up exits 1 with the hint, and
+    `up --sync-clock` brings both clock and RTC within 2 s;
+  - after a guest reboot, the clock is within 5 s (QEMU keeps the RTC the guest
+    wrote);
+  - SNTP from the netns gets stratum 11 or lower and an offset within 2 s;
+  - doctor reports no FAIL for the node.
+- E13 checks access and credentials:
+  - a non-admin realm user (a User CR with role viewer) gets 403 on the
+    teknoir-system monitoring UIs, no ArgoCD Applications, and 403 from Harbor
+    project creation (not a CSRF failure);
+  - the admin gets 200 and Grafana Admin by e-mail;
+  - platform-admin is disabled and its login is refused;
+  - the can-i matrix of rbac-k3d holds, and no "forbidden" appears in the
+    controller logs;
+  - keycloak-admin has no previous-password;
+  - the LAN backup without a tty decrypts with each test identity, sha256sum -c
+    passes, and one plaintext set remains;
+  - after `rotate argocd-admin`: the initial secret is gone, the old password
+    gets 401, the new one 200, and the SSO admin can still sync;
+  - after `rotate keycloak-db --i-know`, sign-in still works;
+  - Prometheus logs no "Error sending alerts" for 5 minutes.
+- E14 checks sign-in robustness:
+  - a garbage cookie gets 302 to `/oauth2/start` and two expiring Set-Cookies;
+  - CORS and XHR requests get 401 without Location;
+  - http gets 301 to https;
+  - a signed-in API call without a Backstage token gets the upstream 401/403;
+  - the logout chain ends at the login form.
+- E15 rehearses the live rollout:
+  - The setup is E10's old layout, migrate, up A, one admin login, migrate
+    --argo and M6.
+  - Then the live state is injected: Profile teknoir-demo on github.io, a stale
+    Failed monitoring operation with retryCount 5, and empty admission caBundles.
+  - Then up B runs, and these must hold:
+    - post passes;
+    - teknoir-demo moves to Harbor (a warning only if it stays unhealthy);
+    - monitoring Succeeds with its caBundle;
+    - the legacy field is cleared with the credential's created_date unchanged
+      (read-only SQL);
+    - previous-password is gone;
+    - the master legacy clients are gone, and the old teknoir secret gets 401 on
+      master;
+    - admin-user grants owner@teknoir-default and owner@teknoir-demo and writes
+      no file;
+    - the E11, E13 and E14 checks pass.
+- E2, E4, E7, E8 and E10 are extended as described in the CHANGELOG.
+
+The e2e harness itself is tested without a VM (airgap/test/README.md):
+`kc_login.bats` uses a local HTTPS stand-in for oauth2-proxy and Keycloak, and
+`harness.bats` dry-runs E11, E12 and E13's backup check against stubs.
+
 ## Work items
 
 NOTE: G-05 is superseded by D2 (dedicated realm `teknoir`, not an adoption of master). G-04 must include the Backstage/user-controller secrets above. L-01 hygiene is folded into the migration (keycloak admin rotation happens via G-05/D2).

@@ -31,7 +31,16 @@ Test files:
   every object present, every server-side diff reports a change, Harbor healthy but
   empty, so the run reaches every apply, restart and push gate).
 - `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2.
-- `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts.
+- `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts, including dry runs of
+  E11, E12 and E13's backup check against stubs (`fixtures/e2e-world.bash`: a healthy
+  teknoir-default world; `WORLD_BREAK` breaks one part, and exactly its check must fail),
+  fixture JSON for the cluster reads, `vm.sh age-key` with a stand-in age-keygen, and
+  `sntp-query.py` against a local NTP responder.
+- `kc_login.bats`: `kc-login.sh` and e2e.sh's E14 checks against `stubs/fake-sso.py`, a
+  local HTTPS stand-in for oauth2-proxy, Keycloak (realm teknoir: login form, required
+  actions, SSO cookie, logout confirmation) and an ArgoCD-like OIDC client. Throwaway CA
+  and passwords in the test's temp dir; curl maps the names to 127.0.0.1 through a
+  `.curlrc` in `CURL_HOME`. Needs openssl, python3, curl and jq.
 - `static.bats`: shebangs, no xtrace in node/LAN code, public site files, no key material,
   no writes to the test host's `/etc/hosts`.
 
@@ -94,10 +103,24 @@ ArgoCD runs in the fixture); T6 and E10 do.
 - `vm/lan-netns.sh up|down|status|hosts|exec`: the LAN host. It is network namespace `tklan`
   at 10.77.0.20, with no default route. Its own `/etc/netns/tklan/{hosts,nsswitch.conf,resolv.conf}`
   map the platform names to the VM. vpro's `/etc/hosts` and the live env are never touched.
-- `vm/e2e.sh`: scenarios E1-E8 and E10 with a pass/fail summary. E1, E6 and E10 re-create the
-  VM and run only with `--allow-destroy`. Inputs: `E2E_BUNDLE`, `E2E_BUNDLE_B`, `E2E_OLD_SETUP`
-  (see the header of the script).
+- `vm/e2e.sh`: scenarios E1-E8, E10 and E11-E15 with a pass/fail summary (the header of the
+  script lists every assertion). E1, E6, E10 and E15 re-create the VM and run only with
+  `--allow-destroy`. Inputs: `E2E_BUNDLE`, `E2E_BUNDLE_B`, `E2E_OLD_SETUP` and more (see the
+  header). The first admin is the owner of the GitOps Profile teknoir-default unless
+  `E2E_ADMIN_EMAIL` is set; it is remembered in `E2E_WORK/state/admin-email`.
   Example: `E2E_BUNDLE=dist/teknoir-airgap-<id>.tar airgap/test/vm/e2e.sh --allow-destroy E1 E2 E3`.
+  A release (r5) runs, each on a re-created VM:
+  - fresh: `E2E_BUNDLE=<B> e2e.sh --allow-destroy E1 E11 E12 E13 E14 E2 E3 E7 E8`;
+  - upgrade: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS="..." e2e.sh --allow-destroy E1 E4`
+    (`E2E_E4_ROLLBACK=0` stops after the refused A);
+  - live rehearsal: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_OLD_SETUP="$PWD/airgap/test/vm/old-setup.sh"
+    e2e.sh --allow-destroy E15`.
+- `vm/vm.sh age-key [--check SITE]`: the two test age identities behind `vmtest.env`'s
+  `BACKUP_AGE_RECIPIENTS`, `VM_DIR/age/{vmtest,vmtest-recovery}.key` (0600, made with
+  age-keygen when missing, never in the repo or on the VM). E13 decrypts the LAN backup with
+  each. After a new `VM_DIR`, put the printed recipients into `vmtest.env`.
+- `vm/sntp-query.py HOST`: one SNTP query (stratum, offset), E12's check that the node serves
+  time to the LAN.
 - `vm/old-setup.sh`: the `E2E_OLD_SETUP` command for E10. It installs the live env's old layout
   on the fresh VM with the old tooling itself (infra e9a3b7f, gitops 158b3da = app-of-apps 0.0.3)
   and dummy secrets, then adds the legacy file names and orphan Addons the live node has. Its
@@ -105,3 +128,8 @@ ArgoCD runs in the fixture); T6 and E10 do.
   (worktrees, dummy secrets, bundle in `~/vmtest/old-setup`). Example:
   `E2E_OLD_SETUP="$PWD/airgap/test/vm/old-setup.sh" E2E_BUNDLE=... airgap/test/vm/e2e.sh --allow-destroy E10`.
 - `vm/kc-login.sh`: scripted oauth2-proxy and Keycloak login. Passwords go only through files.
+  `--cookie-jar FILE` keeps the session for API calls and reuses its Keycloak SSO session
+  (ArgoCD, Harbor: `--session-cookie argocd.token|sid`, no password); `--forbid-profile-form`
+  fails on Update Profile; `--accept-status 403` for a non-admin realm user at an admin-only
+  app; `--logout` checks the sign-out chain (oauth2-proxy sign_out, Keycloak's logout
+  confirmation, back to the app, `/oauth2/start`, the login form).

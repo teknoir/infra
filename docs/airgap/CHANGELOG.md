@@ -6,6 +6,40 @@ describe only the current procedure; past procedures, incidents and the
 reasons for the redesign are kept here. The git history of `infra` and
 `platform-applications-gitops` (branch `teknoir-local`) is the full archive.
 
+## r5 (app-of-apps 0.0.5)
+
+### VM end-to-end test
+
+The VM test (`airgap/test/vm/e2e.sh`) covers the r5 changes before they reach the
+live node.
+
+- **New scenarios.** E11 checks the default teamspace `teknoir-default`. E12 checks
+  node time: the bundled chrony, skew correction, `up --sync-clock`, the RTC, a
+  reboot, SNTP from the LAN and `doctor`. E13 checks access and credentials: a
+  non-admin realm user against Grafana, Prometheus, Alertmanager, ArgoCD and Harbor;
+  the disabled platform-admin; controller RBAC; the encrypted LAN backup; and
+  `rotate argocd-admin` and `keycloak-db`. E14 checks sign-in robustness: a garbage
+  cookie, XHR 401, http to https, upstream 401/403 passthrough and the logout
+  chain. E15 rehearses the live rollout: the old layout, bundle A, the injected
+  live state, then bundle B.
+- **Extended scenarios.**
+  - E1: every platform operation Succeeded, the admission caBundle, the digest
+    pins, post's image check, `/oauth2/start`, the one-time password handover, no
+    Update Profile form, Backstage identity within 3 minutes, no backstage-api
+    restart.
+  - E2: teknoir-default is not synced again, its Secrets keep their
+    resourceVersions, and profile-controller does not restart.
+  - E4: the same release checks after the update.
+  - E7: the passwords the LAN side holds and the test age identities appear in no
+    log.
+  - E8: the pre-rotation cookie gets a login redirect.
+  - E10: no "no owner" warning, then `migrate --finalize`.
+- The first admin of a VM run is the owner of Profile teknoir-default.
+- `kc-login.sh` gains the options `--cookie-jar`, `--forbid-profile-form`,
+  `--session-cookie`, `--accept-status` and `--logout`.
+- `vmtest.env` has two test age recipients. Their identities stay on vpro
+  (`vm.sh age-key`). The VM network stays static.
+
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
 One build command, one LAN-host command, and the same command for the first
