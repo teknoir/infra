@@ -43,7 +43,8 @@
 #       hint, up --sync-clock fixes clock and RTC; after a guest reboot the
 #       clock is within 5 s; SNTP from the LAN host: stratum <= 11, offset
 #       <= 2 s; doctor reports no FAIL for the node
-#   E13 access and credentials: a non-admin realm user gets 403 from the
+#   E13 access and credentials: a non-admin realm user (its temporary-password
+#       Secret deleted once it set its own password) gets 403 from the
 #       teknoir-system Grafana, Prometheus and Alertmanager, no ArgoCD
 #       Applications and 403 creating a Harbor project; the admin gets 200
 #       and is Grafana Admin by e-mail; platform-admin cannot sign in;
@@ -59,7 +60,8 @@
 #       401/403; the logout chain (oauth2-proxy sign_out -> Keycloak logout
 #       confirmation -> https://<domain>/ -> /oauth2/start -> login form)
 #   E2  idempotency: a second up reports 0 changes; pod UIDs, k3s start time,
-#       Secret resourceVersions unchanged; Harbor receives 0 blob uploads; the
+#       Secret resourceVersions unchanged (only user-controller's own deletion
+#       of a temporary-password Secret is allowed); Harbor receives 0 blob uploads; the
 #       teknoir-default Applications were not synced again and their Secrets
 #       kept their resourceVersions; profile-controller did not restart
 #   E3  no egress from the VM or the namespace (FORWARD DROP counters grow);
@@ -68,9 +70,11 @@
 #       every platform operation Succeeded, admission caBundle set, digests
 #       match, the admin still signs in (Keycloak data kept), Harbor healthy;
 #       bundle A is refused, accepted with --rollback, and then kept. From an
-#       r5 B to a pre-r5 A the rollback is not run by default (an open design
-#       gap: B's kept Profile and Namespace, A's post); E2E_E4_ROLLBACK=1 runs
-#       it and asserts each part; E2E_E4_ROLLBACK=0 stops after the refusal
+#       r5 B to a pre-r5 A the rollback meets an open design gap (B's kept
+#       Profile and Namespace, A's post): E2E_E4_ROLLBACK=1 runs it and asserts
+#       each part; E2E_E4_ROLLBACK=0 waives it on purpose (noted in the
+#       summary row); left at auto, E4 fails, because an unrehearsed rollback
+#       is not green
 #   E5  interrupt up during payload sync, Harbor push and tarball import; each
 #       re-run completes with no manual repair
 #   E8  rotate oauth2-proxy-cookie: only that Secret changes, oauth2-proxy
@@ -98,15 +102,21 @@
 #   E15 live rehearsal: E10's old layout, migrate, up with bundle A (the admin
 #       signs in once: legacy status.set_initial_password, no required
 #       actions), migrate --argo and M6 as on the live node; then the live
-#       state is injected (Profile teknoir-demo whose Applications point at
-#       github.io, a stale Failed monitoring operation with retryCount 5 and
-#       empty admission caBundles; previous-password and the master-realm
-#       legacy clients come from the migration); then up with bundle B: post
-#       passes, teknoir-demo moves to Harbor (Synced/Healthy or a warning),
-#       monitoring syncs and gets its caBundle, the legacy field is cleared
-#       without a password change, previous-password and the master clients
-#       are gone, admin-user grants owner on teknoir-default and teknoir-demo;
-#       then the E11, E13 and E14 checks                    [--allow-destroy]
+#       state is injected: Profile teknoir-demo whose Applications point at
+#       github.io, a stale Failed monitoring operation with retryCount 5,
+#       empty admission caBundles, and realm master's legacy clients, which
+#       the live node got by hand (old AIRGAP-BOOTSTRAP 8) and neither the old
+#       layout nor A creates: teknoir (the oauth2-proxy client's secret, a
+#       service account with master-realm manage-users), argocd, harbor; the
+#       teknoir service account lists master's users (the severity); before
+#       B all 3 exist and teknoir's secret gets a master token
+#       (previous-password comes from the migration); then
+#       up with bundle B: post passes, teknoir-demo moves to Harbor
+#       (Synced/Healthy or a warning), monitoring syncs and gets its caBundle,
+#       the legacy field is cleared without a password change,
+#       previous-password and the master clients are gone (teknoir's secret
+#       gets 401 on master), admin-user grants owner on teknoir-default and
+#       teknoir-demo; then the E11, E13 and E14 checks      [--allow-destroy]
 #
 # Usage: airgap/test/vm/e2e.sh [--list] [--allow-destroy] [--stop-on-fail] [E...]
 # Environment:
@@ -118,8 +128,9 @@
 #                    plugin Applications when B's profile-controller adds that Profile
 #                    (E4 needs it)
 #   E2E_E4_ROLLBACK  E4 after the refused A: auto (default) rolls back to A unless B
-#                    is r5 and A predates it (then a warning names the gap); 1 always
-#                    (r5 -> pre-r5: each part of the expected state asserted); 0 never
+#                    is r5 and A predates it (then E4 fails and names the gap); 1
+#                    always (r5 -> pre-r5: each part of the expected state asserted;
+#                    the release run uses this); 0 never (a waiver, noted in the summary)
 #   E2E_E1_BASELINE  E1: auto (default) treats a bundle older than r5 as a baseline
 #                    (the r5-only checks warn); 1 always; 0 never (all strict)
 #   E2E_R5_AOA       the first app-of-apps version of r5 (default 0.0.5), read from
@@ -427,6 +438,18 @@ snap_pods() {
 snap_secret_rvs() {
   vm_kc get secrets -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,RV:.metadata.resourceVersion | sort
 }
+drop_cred_deletions() {
+  # drop_cred_deletions <before> <after> — snap_secret_rvs <before> without
+  # the CRED_NS Secrets that are gone in <after>: user-controller deletes a
+  # temporary-password Secret on its own requeue once the user has set a
+  # password (K1 case b), which is not a change `up` made. A Secret created
+  # or changed in CRED_NS still differs.
+  local now
+  now="$(awk -v ns="${CRED_NS}" '$1 == ns { print $2 }' <<<"$2" | tr '\n' ' ')"
+  awk -v ns="${CRED_NS}" -v now="${now}" '
+    BEGIN { n = split(now, a, " "); for (i = 1; i <= n; i++) keep[a[i]] = 1 }
+    !($1 == ns && !($2 in keep))' <<<"$1"
+}
 k3s_since() { vmx systemctl show k3s -p ActiveEnterTimestamp --value; }
 release_state() {
   # "<bundleId> <mode>" of the release record (only the current fields: the
@@ -534,6 +557,12 @@ user_claims() {
 k1_secret() {
   # k1_secret <user> — the name of the user's temporary-password Secret when it exists (K1)
   vm_kc -n "${CRED_NS}" get secret "user-initial-password-$1" --ignore-not-found -o name 2>/dev/null || true
+}
+k1_gone() {
+  # k1_gone <user> — 0 when the API server answers and the user's K1 Secret is absent
+  local v
+  v="$(vm_kc -n "${CRED_NS}" get secret "user-initial-password-$1" --ignore-not-found -o name 2>/dev/null)" || return 1
+  [[ -z "${v}" ]]
 }
 
 copy_initial_password() {
@@ -729,6 +758,7 @@ kc_user_state() {
   {
     printf 'R=%q U=%q\n' "$1" "$2"
     cat <<'EOF'
+# vm-script: kc_user_state
 kc_login
 kc_get "/realms/$R/users?username=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$U")&exact=true" > "$d/users.json"
 python3 - "$d/users.json" "$U" <<'PY'
@@ -746,6 +776,7 @@ kc_master_clients() {
   # client_credentials grant on master with the teknoir client's secret
   # (Secret keycloak-client-secrets; 401 once the client is gone)
   kc_vm 2>/dev/null <<'EOF' || echo "unknown unknown"
+# vm-script: kc_master_clients
 kc_login
 n=0
 for c in teknoir argocd harbor; do
@@ -765,6 +796,7 @@ kc_pw_created() {
   {
     printf 'U=%q\n' "$1"
     cat <<'EOF'
+# vm-script: kc_pw_created
 k3s kubectl -n teknoir-auth exec -i keycloak-db-0 -c postgres -- \
   env PGOPTIONS='-c default_transaction_read_only=on' U="$U" \
   sh -c 'psql -U "$POSTGRES_USER" -d "${POSTGRES_DB:-keycloak}" -tAq -v ON_ERROR_STOP=1 -v u="$U" -f -' <<'SQL'
@@ -1061,7 +1093,11 @@ e2() {
   else fail "the summary does not match /${ZERO_RE}/:"; tail -15 <<<"${out}" >&2; fi
   assert_eq "pod UIDs unchanged" "${pods}" "$(snap_pods)"
   assert_eq "k3s ActiveEnterTimestamp unchanged (no restart)" "${since}" "$(k3s_since)"
-  assert_eq "Secret resourceVersions unchanged" "${secrets}" "$(snap_secret_rvs)"
+  local secrets1 kept
+  secrets1="$(snap_secret_rvs)"
+  kept="$(drop_cred_deletions "${secrets}" "${secrets1}")"
+  [[ "${kept}" == "${secrets}" ]] || tl_log "user-controller deleted temporary-password Secrets during the run (K1, not up's doing): $(added_lines "${kept}" "${secrets}" | awk '{print $2}' | tr '\n' ' ')"
+  assert_eq "Secret resourceVersions unchanged (only user-controller's K1 deletions in ${CRED_NS} allowed)" "${kept}" "${secrets1}"
   puts="$(harbor_blob_puts_since "${t0}")"
   assert_eq "Harbor received 0 blob uploads" 0 "${puts}"
   if [[ -n "${ts_ops}" ]]; then
@@ -1166,10 +1202,15 @@ e4() {
   assert_eq "the refused run left the release record at B" "${idb} update" "$(release_state)"
   assert_eq "the refused run left every Application at B" "${after}" "$(app_revs)"
   case "$(e4_rollback_mode "${a}" "${b}")" in
-    off) tl_log "E2E_E4_ROLLBACK=0: no rollback to A"; return 0 ;;
+    off)
+      # an explicit waiver: the summary row says so
+      tl_warn "E2E_E4_ROLLBACK=0: the rollback to A is waived, not rehearsed"
+      TL_CASE_DESC+=" (rollback leg waived: E2E_E4_ROLLBACK=0)"
+      return 0 ;;
     gap)
-      tl_warn "rollback to A not run: ${E4_ROLLBACK_GAP} E2E_E4_ROLLBACK=1 runs it and asserts that state"
-      TL_CASE_DESC+=" (rollback leg not run: r5 -> pre-r5 gap)"
+      # an untested rollback is not green: run it (1) or waive it on purpose (0)
+      tl_warn "the rollback to A would cross r5: ${E4_ROLLBACK_GAP}"
+      fail "the rollback from the r5 B to the pre-r5 A is not rehearsed: set E2E_E4_ROLLBACK=1 to run it (each part asserted) or E2E_E4_ROLLBACK=0 to waive it on purpose"
       return 0 ;;
     cross) e4_rollback_cross "${a}" "${ida}" "${before}"; return 0 ;;
   esac
@@ -1189,7 +1230,8 @@ e4() {
 
 # A rollback from r5 to a pre-r5 bundle meets state that A neither renders nor
 # prunes. Until the rollback design settles it (WP-G-CTRL, WP-I-RELEASE,
-# WP-I-BUNDLE), E4 does not run that leg by default.
+# WP-I-BUNDLE), that leg fails E4 unless it is run (E2E_E4_ROLLBACK=1, each
+# part asserted) or waived on purpose (E2E_E4_ROLLBACK=0).
 E4_ROLLBACK_GAP="B (r5) adds the GitOps Profile ${TEAMSPACE} and the Namespace ${CRED_NS}, both Prune=false,Delete=false \
 without IgnoreExtraneous, so after a rollback to a pre-r5 A the profile-controller and user-controller Applications stay \
 OutOfSync (pruning skipped); A's profile-controller points the ${TEAMSPACE}-* Applications back at github.io (Unknown \
@@ -1197,8 +1239,9 @@ offline), and A's post waits for every Application to be Synced/Healthy. Open ro
 
 e4_rollback_mode() {
   # e4_rollback_mode <dir A> <dir B> — what E4 does after the refused A:
-  #   off    E2E_E4_ROLLBACK=0
-  #   gap    auto (the default) and B is r5 while A predates it: not run, a warning
+  #   off    E2E_E4_ROLLBACK=0: waived (the summary row says so)
+  #   gap    auto (the default) and B is r5 while A predates it: not run, and
+  #          E4 fails (an untested rollback is not green)
   #   cross  E2E_E4_ROLLBACK=1 and that same r5 -> pre-r5 rollback: run, and
   #          assert the state the rollback design must reach
   #   run    otherwise: the plain rollback (A and B on the same side of r5)
@@ -2038,8 +2081,9 @@ NA_OK=0
 nonadmin_setup() {
   # nonadmin_setup — the non-admin realm user: a User CR (role viewer, not in
   # Keycloak group admin), its temporary password copied to nonadmin.pw, a
-  # first login (forced password change) with the session in NONADMIN_JAR.
-  # Sets NA_OK.
+  # first login (forced password change) with the session in NONADMIN_JAR,
+  # then the K1 cleanup: the Secret goes once the user has set their own
+  # password. Sets NA_OK.
   local name pre="${LAN_HOME}/e2e/nonadmin" email
   NA_OK=0
   email="$(lower "${NONADMIN_EMAIL}")" name="$(user_name "${NONADMIN_EMAIL}")"
@@ -2061,7 +2105,19 @@ nonadmin_setup() {
   if kc_login "${NONADMIN_JAR}" "https://${DOMAIN}/" "${email}" "${pre}" --forbid-profile-form; then
     pass "the non-admin realm user signs in (forced password change, no Update Profile form)"; NA_OK=1
   else
-    fail "the non-admin realm user cannot sign in"
+    fail "the non-admin realm user cannot sign in"; return 0
+  fi
+  # K1 (SEC-C1 case b): with UPDATE_PASSWORD gone, the next reconcile deletes
+  # the temporary-password Secret. user-controller requeues such a User only
+  # hourly, so a changed annotation starts that reconcile now (the controller
+  # watches Users without a predicate). This also keeps the deletion out of
+  # E2's no-change window.
+  vm_kc annotate users.teknoir.org "${name}" "e2e.teknoir.org/poke=$(date +%s)" --overwrite >/dev/null 2>&1 \
+    || tl_warn "cannot annotate User ${name}: waiting for user-controller's own requeue"
+  if wait_until 300 k1_gone "${name}"; then
+    pass "the non-admin's temporary-password Secret ${CRED_NS}/user-initial-password-${name} is deleted once the user set their own password"
+  else
+    fail "Secret ${CRED_NS}/user-initial-password-${name} still exists 300 s after the user set their own password"
   fi
 }
 
@@ -2082,6 +2138,7 @@ argocd_session_vm() {
   {
     printf 'DOMAIN=%q NODE_IP=%q F=%q\n' "${DOMAIN}" "${NODE_IP}" "$1"
     cat <<'EOF'
+# vm-script: argocd_session_vm
 set -eu
 d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
 chmod 700 "$d"
@@ -2283,6 +2340,7 @@ e13_argocd_admin() {
   # admin keeps role:admin
   local dir="$1" proj="$2" saved code pw="${LAN_HOME}/e2e/argocd-admin.pw" body="${HTTP_DIR}/session.json"
   saved="$(vm_root 2>/dev/null <<'EOF' || echo unknown
+# vm-script: argocd_old_password
 set -eu
 f=/root/e2e-argocd-old.pw
 rm -f "$f"
@@ -2389,9 +2447,99 @@ not_legacy() { ! user_has_legacy_pw "$1"; }
 demo_on_harbor() { [[ "$(demo_repos)" == "harbor.${DOMAIN}/teknoir" ]]; }
 master_clients_gone() { [[ "$(kc_master_clients)" == "0 401" ]]; }
 
+e15_master_clients() {
+  # e15_master_clients — realm master's legacy clients as the live node has
+  # them (made by hand per the old AIRGAP-BOOTSTRAP 8; neither old-setup.sh nor
+  # bundle A creates them), through the master admin API:
+  #   teknoir  confidential, the secret of realm teknoir's teknoir client
+  #            (keycloak-client-secrets/teknoir, also the oauth2-proxy
+  #            client secret), a service account holding master-realm
+  #            manage-users, query-users and view-users
+  #   argocd   confidential, keycloak-client-secrets/argocd
+  #   harbor   confidential, service account and direct grants, a secret of
+  #            its own
+  # Then the severity: teknoir's client_credentials token lists realm
+  # master's users. Prints "seed <client> <status>", "grant <status> <roles>"
+  # and "sa-users <status>"; secrets and tokens stay in a 0700 dir on the VM.
+  kc_vm 2>/dev/null <<'EOF' || true
+# vm-script: e15_master_clients
+kc_login
+for c in teknoir argocd; do
+  k -n teknoir-auth get secret keycloak-client-secrets -o go-template="{{index .data \"$c\" | base64decode}}" > "${d:?}/s_$c"
+done
+( umask 077; head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "${d:?}/s_harbor" )
+python3 - "$d" "$DOMAIN" <<'PY'
+import json, os, sys
+d, dom = sys.argv[1], sys.argv[2]
+extra = {
+    "teknoir": {"serviceAccountsEnabled": True, "redirectUris": ["https://%s/oauth2/callback" % dom]},
+    "argocd": {"redirectUris": ["https://argocd.%s/auth/callback" % dom]},
+    "harbor": {"serviceAccountsEnabled": True, "directAccessGrantsEnabled": True,
+               "redirectUris": ["https://harbor.%s/c/oidc/callback" % dom]},
+}
+for c, x in extra.items():
+    body = {"clientId": c, "enabled": True, "publicClient": False, "standardFlowEnabled": True,
+            "secret": open(os.path.join(d, "s_" + c)).read()}
+    body.update(x)
+    fd = os.open(os.path.join(d, c + ".json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, json.dumps(body).encode())
+    os.close(fd)
+PY
+rm -f "${d:?}/s_argocd" "${d:?}/s_harbor"
+for c in teknoir argocd harbor; do
+  code="$(kc_curl -K "$d/hdr" -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+            --data-binary @"$d/$c.json" "$KC/admin/realms/master/clients")" || code=000
+  rm -f "${d:?}/${c:?}.json"
+  echo "seed $c $code"
+done
+first_id() {
+  python3 -c 'import json, sys
+v = json.load(open(sys.argv[1]))
+v = v[0] if isinstance(v, list) and v else v
+print(v.get("id", "") if isinstance(v, dict) else "")' "$1" 2>/dev/null || true
+}
+kc_get "/realms/master/clients?clientId=teknoir" > "$d/c.json"; cid="$(first_id "$d/c.json")"
+kc_get "/realms/master/clients?clientId=master-realm" > "$d/c.json"; mr="$(first_id "$d/c.json")"
+code=000 n=0
+if [ -n "$cid" ] && [ -n "$mr" ]; then
+  kc_get "/realms/master/clients/$cid/service-account-user" > "$d/c.json"; sa="$(first_id "$d/c.json")"
+  kc_get "/realms/master/clients/$mr/roles" > "$d/roles.json"
+  n="$(python3 - "$d/roles.json" "$d/grant.json" <<'PY'
+import json, sys
+want = {"manage-users", "query-users", "view-users"}
+roles = [r for r in json.load(open(sys.argv[1])) if r.get("name") in want]
+open(sys.argv[2], "w").write(json.dumps(roles))
+print(len(roles))
+PY
+)" || n=0
+  if [ -n "$sa" ]; then
+    code="$(kc_curl -K "$d/hdr" -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+              --data-binary @"$d/grant.json" "$KC/admin/realms/master/users/$sa/role-mappings/clients/$mr")" || code=000
+  fi
+fi
+echo "grant $code $n"
+code="$(kc_curl -o "$d/sa.json" -w '%{http_code}' --data-urlencode grant_type=client_credentials --data-urlencode client_id=teknoir \
+          --data-urlencode "client_secret@$d/s_teknoir" "$KC/realms/master/protocol/openid-connect/token")" || code=000
+rm -f "${d:?}/s_teknoir"
+u=000
+if [ "$code" = 200 ]; then
+  python3 - "$d/sa.json" "$d/sahdr" <<'PY'
+import json, os, sys
+t = json.load(open(sys.argv[1]))["access_token"]
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, ('header = "Authorization: Bearer %s"\n' % t).encode())
+os.close(fd)
+PY
+  u="$(kc_curl -K "$d/sahdr" -o /dev/null -w '%{http_code}' "$KC/admin/realms/master/users?max=1")" || u=000
+fi
+rm -f "${d:?}/sa.json" "${d:?}/sahdr"
+echo "sa-users $u"
+EOF
+}
+
 e15_inject() {
   # the live teknoir-local state that A left and B must converge
-  local rev now patch kind cfg n ops
+  local rev now patch kind cfg n ops bad="" out
   if [[ -n "${E2E_E15_DEMO_PROFILE:-}" ]]; then
     if vm_kc apply -f - < "${E2E_E15_DEMO_PROFILE}" >/dev/null; then pass "Profile teknoir-demo from ${E2E_E15_DEMO_PROFILE}"; else fail "cannot apply ${E2E_E15_DEMO_PROFILE}"; fi
   elif jq -n --arg o "$(lower "${ADMIN_EMAIL}")" \
@@ -2419,11 +2567,19 @@ e15_inject() {
     for cfg in $(vm_kc get "${kind}" -o name 2>/dev/null | grep -E '/monitoring.*admission$' || true); do
       n="$(vm_kc get "${cfg}" -o json 2>/dev/null | jq '.webhooks | length' || echo 0)"
       ops="$(jq -cn --argjson n "${n:-0}" '[range(0; $n) | {op: "add", path: "/webhooks/\(.)/clientConfig/caBundle", value: ""}]')"
-      vm_kc patch "${cfg}" --type=json -p "${ops}" >/dev/null 2>&1 || fail "cannot empty the caBundle of ${cfg}"
+      vm_kc patch "${cfg}" --type=json -p "${ops}" >/dev/null 2>&1 || bad+="${cfg%%.*}/${cfg##*/} "
     done
   done
   n="$(admission_ca)"
-  if [[ -n "${n#* }" ]]; then pass "the monitoring admission webhooks have an empty caBundle (${n#* })"; else fail "could not empty the admission caBundles"; fi
+  if [[ -z "${bad}" && -n "${n#* }" ]]; then pass "the monitoring admission webhooks have an empty caBundle (${n#* })"
+  else fail "could not empty the admission caBundles (patch refused: ${bad:-none}; configurations and empty webhooks: ${n})"; fi
+  out="$(e15_master_clients)"
+  assert_eq "realm master gets the legacy clients teknoir, argocd and harbor, as the live node has them" \
+    "teknoir=201 argocd=201 harbor=201" "$(awk '$1 == "seed" { printf "%s%s=%s", s, $2, $3; s = " " }' <<<"${out}")"
+  assert_eq "the teknoir client's service account holds master-realm manage-users, query-users and view-users" \
+    "204 3" "$(awk '$1 == "grant" { print $2, $3 }' <<<"${out}")"
+  assert_eq "the severity: teknoir's client_credentials token (the oauth2-proxy secret) lists realm master's users" \
+    200 "$(awk '$1 == "sa-users" { print $2 }' <<<"${out}")"
 }
 
 e15() {
@@ -2461,9 +2617,10 @@ e15() {
   created0="$(kc_pw_created "${ADMIN_USER}")"
   if [[ -n "${created0}" ]]; then pass "before B: the password credential's created_date is read (read-only SQL)"; else fail "cannot read the password credential's created_date"; fi
   assert_eq "before B: Secret keycloak-admin still has previous-password" "password previous-password username" "$(secret_keys teknoir-auth keycloak-admin)"
-  v="$(kc_master_clients)"
-  if [[ "${v%% *}" =~ ^[1-9]$ ]]; then pass "before B: realm master has ${v%% *} legacy clients (client_credentials with teknoir's secret: HTTP ${v#* })"
-  else fail "before B: realm master has no legacy client (${v})"; fi
+  # all three, and teknoir's shared secret gets a master token: so the
+  # deletion after B is not met by an empty realm
+  assert_eq "before B: realm master has the 3 legacy clients, and teknoir's secret gets a token there (client_credentials)" \
+    "3 200" "$(kc_master_clients)"
 
   # --- 3. up with B ---------------------------------------------------------------------
   mark="$(transcript_mark)"

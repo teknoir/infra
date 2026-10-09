@@ -436,8 +436,8 @@ EOF
   vm_root() { bash -n || echo SYNTAX-ERROR; }
   vmx() { :; }
   local f out
-  for f in "kc_user_state teknoir platform-admin" kc_master_clients "kc_pw_created a@b.c" "argocd_session_vm /root/x" \
-           rtc_offset kc_admin_codes robot_argocd_state e10_secret_hashes; do
+  for f in "kc_user_state teknoir platform-admin" kc_master_clients e15_master_clients "kc_pw_created a@b.c" \
+           "argocd_session_vm /root/x" rtc_offset kc_admin_codes robot_argocd_state e10_secret_hashes; do
     out="$(${f} 2>&1 || true)"
     [[ "${out}" != *SYNTAX-ERROR* ]] || { echo "${f}: ${out}"; return 1; }
   done
@@ -599,7 +599,7 @@ EOF
   done
 }
 
-@test "e2e.sh E4: E2E_E4_APPS=auto from the pins; r5 -> pre-r5 rollback skipped by default, asserted part by part with E2E_E4_ROLLBACK=1" {
+@test "e2e.sh E4: E2E_E4_APPS=auto from the pins; an unrehearsed r5 -> pre-r5 rollback fails unless waived; E2E_E4_ROLLBACK=1 asserts it part by part" {
   local fx="${BATS_TEST_DIRNAME}/fixtures/e2e-release.bash" c rb mode w
   for c in "auto gap" "0 gap" "1 gap" "1 fixed"; do
     read -r rb mode <<<"${c}"
@@ -625,12 +625,16 @@ EOF
     grep -q "ok   up with the older bundle A is refused" <<<"${output}"
     case "${c}" in
       "auto gap")
-        [[ "${output}" == *"FAILED=0 DESC=[update to bundle B, refusal of A, rollback to A (rollback leg not run: r5 -> pre-r5 gap)]"* ]] \
-          || { echo "${c}: ${output}"; return 1; }
-        grep -q "WARN:.*rollback to A not run: .*IgnoreExtraneous" <<<"${output}"
+        # not green: the rollback leg is neither run nor waived
+        [[ "${output}" == *"FAILED=1 DESC=[update to bundle B, refusal of A, rollback to A]"* ]] || { echo "${c}: ${output}"; return 1; }
+        grep -q "FAIL the rollback from the r5 B to the pre-r5 A is not rehearsed: set E2E_E4_ROLLBACK=1 .* or E2E_E4_ROLLBACK=0 to waive it on purpose" <<<"${output}"
+        grep -q "WARN:.*the rollback to A would cross r5: .*IgnoreExtraneous" <<<"${output}"
         refute_grep -n -- '--rollback$' <<<"${output}" ;;
       "0 gap")
-        [[ "${output}" == *"FAILED=0 DESC=[update to bundle B, refusal of A, rollback to A]"* ]] || { echo "${c}: ${output}"; return 1; }
+        # a waiver on purpose: green, and the summary row says so
+        [[ "${output}" == *"FAILED=0 DESC=[update to bundle B, refusal of A, rollback to A (rollback leg waived: E2E_E4_ROLLBACK=0)]"* ]] \
+          || { echo "${c}: ${output}"; return 1; }
+        grep -q "WARN:.*E2E_E4_ROLLBACK=0: the rollback to A is waived" <<<"${output}"
         refute_grep -n -- '--rollback$' <<<"${output}" ;;
       "1 gap")
         # today's design: each open part fails by name, nothing stops at the first
@@ -785,6 +789,175 @@ EOF
   [[ "${output}" == *"a.key decrypts the backup"*"b.key decrypts the backup"*"sha256sum -c of the decrypted backup passes"* ]] || { echo "${output}"; return 1; }
   [[ "${output}" == *"FAILED=0 PASSED=7"* ]] || { echo "${output}"; return 1; }
   [[ "${output}" == *"sha256sum -c of the decrypted backup fails"*"FAILED=1" ]] || { echo "${output}"; return 1; }
+}
+
+live_world() {
+  # live_world <mode> <row>... — dry runs of fixtures/e2e-live-world.bash
+  # (world_dry_run <mode>), one per row "<break>|<failures>|<fragment>[;...]":
+  # the run with that WORLD_BREAK ("" = healthy) has exactly <failures> failed
+  # assertions, a FAIL line for each fragment, and no unexpected call
+  local mode="$1" row b n frags f out
+  local -a breaks=() fl=()
+  shift
+  for row in "$@"; do breaks+=("'${row%%|*}'"); done
+  run bash -c "
+    W='${BATS_TEST_TMPDIR}/w' E2E_WORK='${BATS_TEST_TMPDIR}/w/work' LAN_HOME='${BATS_TEST_TMPDIR}/w/lan' VM_DIR='${BATS_TEST_TMPDIR}/w/vm'
+    source '${E2E}'; source '${BATS_TEST_DIRNAME}/fixtures/e2e-live-world.bash'
+    world_dry_run ${mode} ${breaks[*]}"
+  [ "${status}" -eq 0 ] || { echo "${output}"; return 1; }
+  for row in "$@"; do
+    IFS='|' read -r b n frags <<<"${row}"
+    out="${BATS_TEST_TMPDIR}/w/out.${b:-none}"
+    if ! grep -q "^${b:-none} FAILED=${n} " <<<"${output}"; then
+      echo "${b:-healthy}: want ${n} failed: $(grep "^${b:-none} FAILED=" <<<"${output}")"; grep -h 'FAIL' "${out}"; return 1
+    fi
+    if grep -q '^world: ' "${out}"; then echo "${b:-healthy}:"; grep '^world: ' "${out}"; return 1; fi
+    IFS=';' read -r -a fl <<<"${frags}"
+    for f in ${fl[@]+"${fl[@]}"}; do
+      grep -qF -- "FAIL ${f}" "${out}" || { echo "${b:-healthy}: no 'FAIL ${f}'"; cat "${out}"; return 1; }
+    done
+  done
+}
+
+@test "e2e.sh E13: a dry run on the live world passes; each broken part fails exactly its check" {
+  live_world e13 \
+    "|0|" \
+    "nonadmin-k1-kept|1|Secret teknoir-user-credentials/user-initial-password-e2e-viewer-at-example.com still exists 300 s after" \
+    "nonadmin-grafana|1|non-admin: https://teknoir.airgapped/teknoir-system/grafana/: HTTP 200" \
+    "admin-alertmanager|1|admin: https://teknoir.airgapped/teknoir-system/alertmanager/: HTTP 403" \
+    "grafana-anonymous|1|Grafana /api/user: the admin is known by e-mail" \
+    "grafana-viewer|1|Grafana org roles of the admin: HTTP 200 [Viewer]" \
+    "argocd-nonadmin-apps|1|non-admin: ArgoCD /api/v1/applications lists no Application: want [200 0] got [200 2]" \
+    "argocd-admin-empty|1|admin: ArgoCD Applications: 200 0" \
+    "harbor-user|1|non-admin: Harbor knows the OIDC user" \
+    "harbor-csrf|1|non-admin: Harbor POST /api/v2.0/projects: HTTP 403 [CSRF token invalid]" \
+    "harbor-create|1|non-admin: Harbor POST /api/v2.0/projects: HTTP 201" \
+    "pa-enabled|1|Keycloak user platform-admin (realm teknoir) is disabled" \
+    "pa-login|1|a platform-admin sign-in was not refused as disabled" \
+    "uc-star|1|auth can-i * * as user-controller" \
+    "pc-exec|1|auth can-i create pods --subresource=exec -n teknoir-default as profile-controller" \
+    "uc-forbidden|1|no 'forbidden' in the user-controller log" \
+    "prev-kept|1|Secret keycloak-admin has no previous-password" \
+    "backup-tampered|1|sha256sum -c of the decrypted backup fails" \
+    "backup-plaintext|1|one plaintext backup set is left on the node" \
+    "argocd-rotate|1|rotate argocd-admin failed" \
+    "argocd-initial-kept|1|argocd-initial-admin-secret is gone after the rotation" \
+    "argocd-old-accepted|1|the old ArgoCD admin password is refused" \
+    "argocd-creds-mode|1|credentials argocd-admin --out writes a 0600 file" \
+    "argocd-new-refused|1|the rotated ArgoCD admin password signs in" \
+    "argocd-sso-no-sync|1|the SSO admin may still sync app-of-apps" \
+    "kcdb-rotate|1|rotate keycloak-db --i-know failed" \
+    "kcdb-apps|1|Applications not Synced/Healthy after rotate keycloak-db: auth=OutOfSync/Healthy" \
+    "kcdb-login|1|the admin signs in after rotate keycloak-db" \
+    "alert-errors|1|Prometheus logged no 'Error sending alerts'"
+  local w="${BATS_TEST_TMPDIR}/w"
+  # the healthy run: every assertion of E13 ran, the K1 cleanup was started by
+  # a reconcile poke on the non-admin, and nothing touched the node but reads,
+  # that poke and the rotations
+  grep -qx 'none FAILED=0 PASSED=51' <<<"${output}"
+  grep -qx 'vm_kc annotate users.teknoir.org e2e-viewer-at-example.com e2e.teknoir.org/poke=[0-9]* --overwrite' "${w}/calls.none"
+  grep -q 'ok   the non-admin.s temporary-password Secret .* is deleted once the user set their own password' "${w}/out.none"
+  refute_grep -E '^vm_kc (-n [^ ]+ )?(apply|delete|patch|replace|label)( |$)' "${w}/calls.none"
+  [ "$(grep -c '^vm_root ' "${w}/calls.none")" -eq 3 ]   # platform-admin state, the old ArgoCD password, the session check
+}
+
+@test "e2e.sh E15: e15_inject on the live world injects the live state; each refused part fails exactly its check" {
+  live_world inject \
+    "|0|" \
+    "demo-create|2|cannot create Profile teknoir-demo;only 0 teknoir-demo Applications after 600 s" \
+    "demo-apps|1|only 0 teknoir-demo Applications after 600 s" \
+    "monitoring-patch|1|cannot inject the Failed monitoring operation" \
+    "webhook-patch|1|could not empty the admission caBundles (patch refused: validatingwebhookconfiguration/monitoring-kube-prometheus-admission mutatingwebhookconfiguration/monitoring-kube-prometheus-admission" \
+    "master-seed|1|realm master gets the legacy clients teknoir, argocd and harbor, as the live node has them: want [teknoir=201 argocd=201 harbor=201] got [teknoir=201 argocd=201 harbor=409]" \
+    "master-grant|1|the teknoir client's service account holds master-realm manage-users, query-users and view-users: want [204 3] got [403 3]" \
+    "master-sa|1|the severity: teknoir's client_credentials token (the oauth2-proxy secret) lists realm master's users: want [200] got [403]"
+  local w="${BATS_TEST_TMPDIR}/w"
+  grep -qx 'none FAILED=0 PASSED=7' <<<"${output}"
+  # the world accepts only the live shapes: the Failed operation of the current
+  # revision (merge patch) and an empty caBundle per webhook (JSON patch), the
+  # Profile owned by the admin; the master clients through the admin API script
+  grep -q '^vm_kc -n teknoir-system patch applications.argoproj.io monitoring --type=merge -p ' "${w}/calls.none"
+  [ "$(grep -c '^vm_kc patch [a-z]*webhookconfiguration.admissionregistration.k8s.io/monitoring-kube-prometheus-admission --type=json' "${w}/calls.none")" -eq 2 ]
+  refute_grep 'istio-validator' "${w}/calls.none"
+  grep -qx 'vm_root e15_master_clients' "${w}/calls.none"
+}
+
+@test "e2e.sh E15: the whole rehearsal on the live world, in order; every before/after check fails on its own break" {
+  live_world e15 \
+    "|0|" \
+    "master-lie|1|before B: realm master has the 3 legacy clients, and teknoir's secret gets a token there (client_credentials): want [3 200] got [0 401]" \
+    "a-no-legacy|1|before B: User owner-at-example.com carries no legacy status.set_initial_password" \
+    "a-no-prev|1|before B: Secret keycloak-admin still has previous-password" \
+    "a-required-action|1|before B: Keycloak user owner@example.com is enabled with no required action" \
+    "a-no-created|1|cannot read the password credential's created_date" \
+    "b-up|1|up with bundle B failed" \
+    "b-apps-unhealthy|1|Applications not Synced/Healthy: auth=OutOfSync/Healthy" \
+    "b-no-image-line|1|post did not report 'live image check: N pullable ..., 0 missing'" \
+    "b-monitoring-failed|2|every platform Application's last operation Succeeded: want [] got [monitoring=Failed ];monitoring's operation Succeeded: want [Succeeded] got [Failed]" \
+    "b-cabundle-empty|1|every monitoring admission webhook has a caBundle" \
+    "b-digest|1|every digest-pinned container runs that digest (imageID)" \
+    "b-demo-github|1|every teknoir-demo Application points at Harbor" \
+    "b-legacy-kept|1|User owner-at-example.com still carries status.set_initial_password" \
+    "b-k1-created|1|no temporary-password Secret for owner-at-example.com" \
+    "b-pw-changed|1|the admin's Keycloak password was not changed (credential created_date): want [1760000000000] got [1760000099000]" \
+    "b-required-action|1|Keycloak user owner@example.com still has no required action" \
+    "b-prev-kept|1|post removed previous-password from Secret keycloak-admin" \
+    "b-master-kept|1|master-realm legacy clients after B: 3 200 (want 0 clients, HTTP 401)" \
+    "b-rerun-fails|3|admin-user (B) re-run failed;User owner-at-example.com lacks owner@teknoir-default;User owner-at-example.com lacks owner@teknoir-demo" \
+    "b-rerun-writes|1|admin-user (B) wrote" \
+    "b-no-demo-claim|1|User owner-at-example.com lacks owner@teknoir-demo: [owner@teknoir-default ]" \
+    "b-login|1|the admin still signs in with the password set on A"
+  local w="${BATS_TEST_TMPDIR}/w" want
+  grep -qx 'none FAILED=0 PASSED=41' <<<"${output}"
+  # the order: the live history on A, the injected state and the before
+  # checks, B, the after checks, then E11, E13 (with B) and E14
+  want="old-setup
+tk A migrate
+tk A up --force-images
+tk A admin-user --email owner@example.com --out ${BATS_TEST_TMPDIR}/w/lan/e2e/admin.pw
+kc-login owner@example.com
+tk A migrate --argo
+tk A migrate
+vm_kc create -f -
+vm_root e15_master_clients
+vm_root kc_user_state
+vm_root kc_pw_created
+vm_root kc_master_clients
+tk B up
+vm_root kc_pw_created
+vm_root kc_user_state
+vm_root kc_master_clients
+tk B admin-user --email owner@example.com --out ${BATS_TEST_TMPDIR}/w/lan/e2e/admin-rerun.pw
+kc-login owner@example.com
+e11_checks
+e13_checks B
+e14_checks"
+  [ "$(grep -E '^(old-setup|tk |kc-login |vm_root |vm_kc create |e1[134]_checks)' "${w}/calls.none")" = "${want}" ] \
+    || { diff <(echo "${want}") <(grep -E '^(old-setup|tk |kc-login |vm_root |vm_kc create |e1[134]_checks)' "${w}/calls.none"); return 1; }
+  # a failed up with B stops before any check of B's state
+  refute_grep -E '^(e1[134]_checks|tk B admin-user)' "${w}/calls.b-up"
+}
+
+@test "e2e.sh E2: Secret resourceVersions may lose only user-controller's K1 deletions in the credentials namespace" {
+  # shellcheck source=../vm/e2e.sh
+  source "${E2E}"
+  local before after
+  before="$(printf '%s\n' 'teknoir-auth keycloak-admin 10' 'teknoir-user-credentials user-initial-password-a 11' \
+            'teknoir-user-credentials user-initial-password-b 12' 'teknoir-default emqx 13')"
+  # user-controller deleted a's Secret: allowed
+  after="$(printf '%s\n' 'teknoir-auth keycloak-admin 10' 'teknoir-user-credentials user-initial-password-b 12' 'teknoir-default emqx 13')"
+  [ "$(drop_cred_deletions "${before}" "${after}")" = "${after}" ]
+  # a deletion elsewhere, a changed K1 Secret or a new one still differ
+  after="$(printf '%s\n' 'teknoir-auth keycloak-admin 10' 'teknoir-user-credentials user-initial-password-a 11' 'teknoir-user-credentials user-initial-password-b 12')"
+  [ "$(drop_cred_deletions "${before}" "${after}")" = "${before}" ]
+  after="$(printf '%s\n' 'teknoir-auth keycloak-admin 10' 'teknoir-user-credentials user-initial-password-a 99' \
+           'teknoir-user-credentials user-initial-password-b 12' 'teknoir-default emqx 13')"
+  [ "$(drop_cred_deletions "${before}" "${after}")" = "${before}" ]
+  after="$(printf '%s\n' "${before}" 'teknoir-user-credentials user-initial-password-c 14')"
+  [ "$(drop_cred_deletions "${before}" "${after}")" != "${after}" ]
+  # no Secret in that namespace at all, before or after
+  [ "$(drop_cred_deletions 'a b 1' 'a b 1')" = 'a b 1' ]
+  [ -z "$(drop_cred_deletions 'teknoir-user-credentials x 1' '')" ]
 }
 
 @test "sntp-query.py: stratum and offset from an NTP server; no answer is exit 1" {
