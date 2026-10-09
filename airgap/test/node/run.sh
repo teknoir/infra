@@ -94,6 +94,7 @@ node_env() {
   env PATH="${HERE}/stubs:${PATH}" \
     TEKNOIR_HOST_ROOT="${ROOT}" STUB_STATE="${STUB_STATE}" STUB_CALLS="${STUB_CALLS}" \
     KUBECTL="kubectl" TEKNOIR_MIN_FREE_GB=0 WAIT_INTERVAL=1 K3S_IMPORT_WAIT=0 K3S_READY_TIMEOUT=5 \
+    K3S_SETTLE_DELAY=0 K3S_SETTLE_INTERVAL=0 K3S_SETTLE_TIMEOUT=5 \
     STUB_CTR_IMAGES="${STUB_STATE}/ctr-images" STUB_KUBECTL_MODE="${KMODE:-up}" "$@"
 }
 
@@ -362,6 +363,18 @@ check "k3s is stopped for the copy and started again" \
 check "backup prints its path on stdout" grep -qx "${B}" "${T}/out"
 check "no etcd snapshot on a sqlite node (server/db/etcd holds only its name file)" \
   bash -c "! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q 'etcd-snapshot'"
+cp "${STUB_STATE}/pods.json" "${T}/pods.json.keep"
+cat > "${STUB_STATE}/pods.json" <<'EOF'
+{"items": [
+  {"metadata": {"namespace": "teknoir-system", "name": "harbor-core-1"}, "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "False"}]}},
+  {"metadata": {"namespace": "teknoir-demo", "name": "user-app"}, "status": {"phase": "Pending"}}
+]}
+EOF
+sleep 1   # backups are named by the second
+tn backup --site test
+check "after the k3s restart the backup waits for the platform pods and only warns about one that stays unready" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'still not Ready.*teknoir-system/harbor-core-1' '${T}/out' && ! grep -q 'teknoir-demo/user-app' '${T}/out'"
+cp "${T}/pods.json.keep" "${STUB_STATE}/pods.json"
 chmod 000 "${ROOT}/opt/k3s/server/db/state.db"
 tn backup --site test
 chmod 644 "${ROOT}/opt/k3s/server/db/state.db"

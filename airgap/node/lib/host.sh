@@ -33,6 +33,11 @@ CHRONY_CONF="${CHRONY_CONF_DIR}/teknoir-airgap.conf"
 RESTART_STAMP="${STATE_DIR}/restart.stamp"
 K3S_IMPORT_WAIT="${K3S_IMPORT_WAIT:-600}"
 K3S_READY_TIMEOUT="${K3S_READY_TIMEOUT:-300}"
+K3S_SETTLE_TIMEOUT="${K3S_SETTLE_TIMEOUT:-600}"
+K3S_SETTLE_DELAY="${K3S_SETTLE_DELAY:-15}"
+K3S_SETTLE_INTERVAL="${K3S_SETTLE_INTERVAL:-10}"
+# the namespaces whose pods must be Ready again after a k3s restart
+K3S_SETTLE_NAMESPACES="${K3S_SETTLE_NAMESPACES:-kube-system istio-system cert-manager teknoir-system teknoir-auth}"
 HOSTS_BEGIN="# BEGIN teknoir-airgap"
 HOSTS_END="# END teknoir-airgap"
 # Image tarball suffixes k3s imports from agent/images (prune candidates).
@@ -497,6 +502,42 @@ host_k3s_wait_ready() {
   wait_for "the k3s node to be Ready" "${K3S_READY_TIMEOUT}" kc wait --for=condition=Ready node --all --timeout=10s
 }
 
+host_pods_unsettled() {
+  # print "ns/name" of every pod in K3S_SETTLE_NAMESPACES that should run but
+  # is not Running and Ready (Job pods and finished pods do not count)
+  local out
+  out="$(kc get pods -A -o json)" || { echo "(cannot list pods)"; return 0; }
+  # shellcheck disable=SC2016  # a jq program
+  "${JQ}" -r --arg nss " ${K3S_SETTLE_NAMESPACES} " '.items[]?
+      | select(.metadata.namespace as $ns | $nss | contains(" \($ns) "))
+      | select(.status.phase != "Succeeded" and .status.phase != "Failed")
+      | select([(.metadata.ownerReferences // [])[].kind] | index("Job") | not)
+      | select(.status.phase != "Running" or ([.status.conditions[]? | select(.type == "Ready") | .status] != ["True"]))
+      | "\(.metadata.namespace)/\(.metadata.name)"' <<<"${out}" 2>/dev/null || echo "(cannot parse the pod list)"
+}
+
+host_k3s_wait_settled() {
+  # After k3s restarts under a running platform, kubelet runs every readiness
+  # probe again and pods drop out of their Services for a while (the gateway
+  # answers 503 "no healthy upstream"; VM e2e E4 hit it in the harbor phase).
+  # Wait until every platform pod is Running and Ready in 3 checks in a row.
+  # A pod that stays unready only warns: it may be what this update fixes.
+  local ok=0 left deadline=$((SECONDS + K3S_SETTLE_TIMEOUT))
+  host_k3s_wait_ready
+  sleep "${K3S_SETTLE_DELAY}"
+  while (( ok < 3 )); do
+    left="$(host_pods_unsettled)"
+    if [[ -z "${left}" ]]; then ok=$((ok + 1)); else ok=0; fi
+    (( ok < 3 )) || break
+    if (( SECONDS >= deadline )); then
+      warn "after the k3s restart these pods are still not Ready (${K3S_SETTLE_TIMEOUT}s): $(tr '\n' ' ' <<<"${left}")"
+      return 0
+    fi
+    sleep "${K3S_SETTLE_INTERVAL}"
+  done
+  log "after the k3s restart every platform pod is Running and Ready again"
+}
+
 host_write_stamp() {
   dry_run && return 0
   mkdir -p "$(dirname "${RESTART_STAMP}")"
@@ -603,6 +644,7 @@ host_k3s_reconcile() {
       warn "could not restart CoreDNS; it keeps its old upstream until its pod is re-created"
     fi
   fi
+  [[ "${action}" != "restart" ]] || host_k3s_wait_settled
   host_write_stamp
 }
 
@@ -638,7 +680,7 @@ host_trust_ca() {
       run systemctl restart k3s
       changed "restarted k3s (the registry CA changed since its start)"
       dry_run && return 0
-      host_k3s_wait_ready
+      host_k3s_wait_settled
       host_write_stamp
     fi
   fi

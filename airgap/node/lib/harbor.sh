@@ -433,33 +433,52 @@ harbor_absent_error() {
   grep -qE 'MANIFEST_UNKNOWN|NAME_UNKNOWN|NOT_FOUND|status code 404|404 Not Found' "${HARBOR_TMP}/err"
 }
 
+harbor_transient_error() {
+  # the last crane/helm error (${HARBOR_TMP}/err) is Harbor or the gateway
+  # not answering for a moment: 5xx, "no healthy upstream", a dropped connection
+  grep -qiE 'status code 5[0-9][0-9]|: 5[0-9][0-9] |no healthy upstream|connection refused|connection reset|unexpected EOF|i/o timeout|TLS handshake timeout' \
+    "${HARBOR_TMP}/err" 2>/dev/null
+}
+
+harbor_read_retry() {
+  # harbor_read_retry <n> <what> — after a transient read error: wait for
+  # Harbor and say whether to try again (attempt <n> of HARBOR_PUSH_ATTEMPTS)
+  harbor_transient_error || return 1
+  (( $1 < HARBOR_PUSH_ATTEMPTS )) || return 1
+  warn "reading $2 from Harbor: attempt $1 of ${HARBOR_PUSH_ATTEMPTS} failed ($(tail -1 "${HARBOR_TMP}/err" | cut -c1-200)); retrying once Harbor is healthy"
+  sleep "$(( HARBOR_RETRY_DELAY * $1 ))"
+  wait_for "the Harbor API at ${HARBOR_API}" "${HARBOR_HEALTH_TIMEOUT}" harbor_healthy
+}
+
 harbor_remote_manifest() {
   # harbor_remote_manifest <ref> — 0 and HARBOR_REMOTE=<manifest json> when
-  # present, 1 when absent; dies on any other error
+  # present, 1 when absent; transient errors are retried; dies on any other
+  local n=1
   HARBOR_REMOTE=""
-  if harbor_crane manifest "$1" > "${HARBOR_TMP}/out" 2> "${HARBOR_TMP}/err"; then
-    HARBOR_REMOTE="$(cat "${HARBOR_TMP}/out")"
-    return 0
-  fi
-  harbor_absent_error && return 1
-  die "cannot read $1 from Harbor: $(tail -1 "${HARBOR_TMP}/err")"
+  until harbor_crane manifest "$1" > "${HARBOR_TMP}/out" 2> "${HARBOR_TMP}/err"; do
+    harbor_absent_error && return 1
+    harbor_read_retry "${n}" "$1" || die "cannot read $1 from Harbor: $(tail -1 "${HARBOR_TMP}/err")"
+    n=$((n + 1))
+  done
+  HARBOR_REMOTE="$(cat "${HARBOR_TMP}/out")"
 }
 
 harbor_remote_config_digest() {
   # harbor_remote_config_digest <ref> — HARBOR_REMOTE_CFG: sha256 of the image
   # config for HARBOR_PLATFORM ("" when the tag is absent, "other-platforms"
   # when the tag holds no image for that platform); dies on other errors
+  local n=1
   HARBOR_REMOTE_CFG=""
-  if harbor_crane config --platform "${HARBOR_PLATFORM}" "$1" > "${HARBOR_TMP}/out" 2> "${HARBOR_TMP}/err"; then
-    HARBOR_REMOTE_CFG="sha256:$(sha256_file "${HARBOR_TMP}/out")"
-    return 0
-  fi
-  harbor_absent_error && return 0
-  if grep -q 'no child with platform' "${HARBOR_TMP}/err"; then
-    HARBOR_REMOTE_CFG="other-platforms"
-    return 0
-  fi
-  die "cannot read $1 from Harbor: $(tail -1 "${HARBOR_TMP}/err")"
+  until harbor_crane config --platform "${HARBOR_PLATFORM}" "$1" > "${HARBOR_TMP}/out" 2> "${HARBOR_TMP}/err"; do
+    harbor_absent_error && return 0
+    if grep -q 'no child with platform' "${HARBOR_TMP}/err"; then
+      HARBOR_REMOTE_CFG="other-platforms"
+      return 0
+    fi
+    harbor_read_retry "${n}" "$1" || die "cannot read $1 from Harbor: $(tail -1 "${HARBOR_TMP}/err")"
+    n=$((n + 1))
+  done
+  HARBOR_REMOTE_CFG="sha256:$(sha256_file "${HARBOR_TMP}/out")"
 }
 
 # --- charts -----------------------------------------------------------------------

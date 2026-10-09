@@ -133,7 +133,7 @@ backup_k3s() {
     cp -a "${data}/server/db" "${out}/db" || die "backup: copying ${data}/server/db failed (k3s is restarted at exit)"
     systemctl start k3s || die "backup: cannot start k3s again"
     _K3S_STOPPED_FOR_BACKUP=0
-    host_k3s_wait_ready
+    host_k3s_wait_settled
   else
     log "backup: no datastore in ${data}/server/db"
   fi
