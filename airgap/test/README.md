@@ -5,7 +5,9 @@ CI runs everything except the VM test: [.github/workflows/airgap-ci.yml](../../.
 
 | Suite | Command | Needs | Runs in CI |
 |---|---|---|---|
-| Static + unit | `airgap/test/run-static.sh` | shellcheck, docker (bash 3.2), gitleaks, curl (first bats install) | yes |
+| Static + unit | `airgap/test/run-static.sh` | shellcheck, docker (bash 3.2), gitleaks, curl (first bats install), cc (`node/run.sh` builds its clock shim `node/fakeclock.c`) | yes |
+| coredns-custom in CoreDNS | `airgap/test/node/coredns-test.sh` | docker, dig (one image pull) | no |
+| chrony drop-in and LAN-time samples in chronyd 4.6.1 (`-x`, no clock is set) | `airgap/test/node/chrony-test.sh` | docker, network (apt in debian:trixie) | no |
 | bats only | `airgap/test/bats/run.sh [file.bats]` | bash, curl (first run only) | yes, from run-static.sh |
 | K3s ownership (k3d) | `airgap/test/k3d/run.sh [T1 ... T9]` | docker, k3d, kubectl, jq (T6 also helm, yq) | T1-T5, T4N, T9; T6 on manual dispatch |
 | VM end to end | `airgap/test/vm/e2e.sh [--allow-destroy] [E1 ...]` | vpro: KVM, sudo, the VM base image | no |
@@ -30,7 +32,10 @@ Test files:
   refused, only `kubectl version --client` works) and an existing cluster (k3s active,
   every object present, every server-side diff reports a change, Harbor healthy but
   empty, so the run reaches every apply, restart and push gate).
-- `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2.
+- `lan_entrypoint.bats`: the commands and flags of `teknoir-airgap` exist; bash 3.2; the
+  site-key checks; `doctor`'s time and address checks (chrony, RTC offset, `TIME_SOURCE`
+  in use, a DHCP lease and `NODE_IP_DHCP_RESERVED`) against stub ssh outputs, also
+  under docker bash:3.2.
 - `harness.bats`: self-tests of the k3d, VM, netns and e2e scripts.
 - `static.bats`: shebangs, no xtrace in node/LAN code, public site files, no key material,
   no writes to the test host's `/etc/hosts`.
@@ -41,7 +46,11 @@ Overrides: `COMMON_SH`, `TEKNOIR_NODE_DIR`, `TEKNOIR_LAN_BIN`.
 ### Stubs
 
 `stubs/bin/` holds recording stubs for `kubectl`, `k3s`, `ssh`, `crane`, `helm`, `curl`,
-`systemctl` and `ip` (`test_helper.bash: setup_stubs` puts them first on PATH):
+`systemctl`, `ip`, `apt-get` and `dpkg-query` (`test_helper.bash: setup_stubs` puts them
+first on PATH). `clock_tools` adds recorders for `chronyc`, `hwclock` and `date` outside
+PATH and points `CHRONYC`, `HWCLOCK` and `DATE_BIN` at them (`common_env` always uses
+the `date` recorder and treats chrony and hwclock as absent), so no test reaches the
+test host's clock:
 - every call is logged to `$STUB_LOG`;
 - a call whose arguments match `$STUB_FAIL_ON` (an ERE) exits 97;
 - `stub_<name>` functions in `$STUB_HANDLER` answer calls;
@@ -50,7 +59,9 @@ Overrides: `COMMON_SH`, `TEKNOIR_NODE_DIR`, `TEKNOIR_LAN_BIN`.
 `-f -` input is saved as `$STUB_STDIN`. `mutating_calls` lists every recorded call that
 would change something (`MUTATING_RE`: kubectl writes, `exec` and `cp`, rollout restarts,
 k3s ctr imports, systemctl state changes, crane and helm pushes, curl with POST, PUT, PATCH,
-DELETE or a body); a `kubectl ... --dry-run` call does not count.
+DELETE or a body, apt-get installs and removals, dpkg -i/-r, chronyc settime/makestep,
+hwclock writes, date -s); a `kubectl ... --dry-run` call and an `apt-get -s` simulation do
+not count.
 
 `stage_payload` copies `airgap/node` and adds stand-ins for what only the bundle build
 produces (contract #1): `k3s/` (a `k3s` that answers `--version` and hands everything else

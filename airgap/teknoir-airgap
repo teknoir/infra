@@ -93,8 +93,8 @@ Commands:
                         same command does the first install and every update,
                         and is safe to re-run at any time.
   status                Report: node, k3s, Applications, deployed release, clock
-                        skew. Changes nothing but the node's copy of the site
-                        config.
+                        skew, RTC, chrony, address lease. Changes nothing but
+                        the node's copy of the site config.
   verify                Check the extracted bundle against MANIFEST.yaml (no ssh).
   kubeconfig            Write the cluster's kubeconfig into ~/.kube/config as
                         context <site>, replacing older entries of that name.
@@ -113,7 +113,8 @@ Commands:
   migrate               One-time detach of the legacy K3s manifest files on the
                         live teknoir-local node (docs/OPERATE.md, migration).
   doctor                Check this computer and the node: tools, name
-                        resolution, CA trust, ssh, sudo, clock skew, macOS
+                        resolution, CA trust, ssh, sudo, clock skew, the
+                        node's RTC, chrony and address lease, macOS
                         quarantine.
   version               Print the bundle id and versions from MANIFEST.yaml.
   help                  Show this help.
@@ -135,7 +136,8 @@ Options for up:
                         payload is still copied to the node).
   --rollback            Accept a bundle older than the deployed release.
   --sync-clock          Set the node clock from this computer when they differ
-                        by more than 30 seconds.
+                        by more than 30 seconds (up corrects up to 30 seconds
+                        by itself).
   --reapply TIER        Break-glass: apply a one-shot tier again
                         (platform-secrets, istio, harbor, argo).
   --force-images        Allow moving a mirror tag in Harbor to another digest.
@@ -454,8 +456,9 @@ site_load() {
   case "${SITE_NAME}" in
     ''|*[!A-Za-z0-9._-]*|.*) die "invalid site name '${SITE_NAME}' (from ${SITE_FILE})" ;;
   esac
-  # shellcheck disable=SC2034  # TEKNOIR_ENV, TIME_SOURCE, UPSTREAM_DNS and K3S_DATA_DIR are the node's
+  # shellcheck disable=SC2034  # TEKNOIR_ENV, UPSTREAM_DNS and K3S_DATA_DIR are the node's
   TEKNOIR_ENV='' TEKNOIR_DOMAIN='' NODE_IP='' NODE='' TEKNOIR_HOSTNAMES='' TIME_SOURCE='' UPSTREAM_DNS='' K3S_DATA_DIR=''
+  NODE_IP_DHCP_RESERVED='' BACKUP_AGE_RECIPIENTS=''
   # shellcheck source=/dev/null
   . "${SITE_FILE}" || die "cannot read ${SITE_FILE}"
   [ -z "${OPT_NODE}" ] || NODE=${OPT_NODE}
@@ -470,11 +473,54 @@ site_load() {
   for h in ${TEKNOIR_HOSTNAMES}; do
     case "${h}" in *[!A-Za-z0-9-]*|-*) die "${SITE_FILE}: invalid name '${h}' in TEKNOIR_HOSTNAMES" ;; esac
   done
+  # the node checks these again (lib/common.sh load_site); checked here so
+  # the operator learns before ssh. No glob characters can pass the first case.
+  case "${TIME_SOURCE}" in *[!A-Za-z0-9.\ -]*) die "${SITE_FILE}: invalid TIME_SOURCE '${TIME_SOURCE}' (space-separated IPv4 addresses or host names)" ;; esac
+  for h in ${TIME_SOURCE}; do
+    site_time_source_ok "${h}" || die "${SITE_FILE}: invalid TIME_SOURCE entry '${h}' (space-separated IPv4 addresses or host names)"
+  done
+  case "${NODE_IP_DHCP_RESERVED}" in ''|yes|no) ;; *) die "${SITE_FILE}: invalid NODE_IP_DHCP_RESERVED '${NODE_IP_DHCP_RESERVED}' (yes, no or empty)" ;; esac
+  # BACKUP_AGE_RECIPIENTS is never printed whole: it may hold a pasted private
+  # key. The same messages as the node's load_site.
+  case "${BACKUP_AGE_RECIPIENTS}" in
+    *[Aa][Gg][Ee]-[Ss][Ee][Cc][Rr][Ee][Tt]-[Kk][Ee][Yy]-*)
+      die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed" ;;
+    *[!a-z0-9\ ]*) die "${SITE_FILE}: invalid BACKUP_AGE_RECIPIENTS: only space-separated age public keys (age1 followed by 58 lower-case letters and digits)" ;;
+  esac
+  for h in ${BACKUP_AGE_RECIPIENTS}; do
+    age_recipient_ok "${h}" \
+      || die "${SITE_FILE}: BACKUP_AGE_RECIPIENTS entry '$(printf '%s' "${h}" | cut -c1-8)...' is not an age public key (age1 followed by 58 lower-case letters and digits)"
+  done
   mdomain=$(manifest_get domain)
   if [ -n "${mdomain}" ] && [ "${mdomain}" != "${TEKNOIR_DOMAIN}" ]; then
     die "site ${SITE_NAME} is for domain ${TEKNOIR_DOMAIN}, but this bundle was built for ${mdomain}"
   fi
   REMOTE_SITE=${NODE_STATE_DIR}/site/${SITE_NAME}.env
+}
+
+# site_time_source_ok TOKEN: an IPv4 address or a host name (one TIME_SOURCE entry).
+site_time_source_ok() {
+  local t=$1
+  case "${t}" in ''|-*|.*|*.|*..*|*[!A-Za-z0-9.-]*) return 1 ;; esac
+  [ "${#t}" -le 253 ] || return 1
+  case "${t}" in
+    *[!0-9.]*)
+      # a host name: labels of 1-63 characters that do not start or end with '-'
+      case ".${t}." in *.-*|*-.*) return 1 ;; esac
+      printf '%s\n' "${t}" | awk -F. '{ for (i = 1; i <= NF; i++) if (length($i) > 63) exit 1 }'
+      return ;;
+  esac
+  # only digits and dots: an IPv4 address
+  [ "$(printf '%s' "${t}" | awk -F. 'NF == 4 && $1 != "" && $2 != "" && $3 != "" && $4 != "" && $1 < 256 && $2 < 256 && $3 < 256 && $4 < 256 { print "ok" }')" = ok ]
+}
+
+# age_recipient_ok KEY: an age X25519 public key (age1 and 58 lowercase characters).
+age_recipient_ok() {
+  local rest
+  case "$1" in age1*) rest=${1#age1} ;; *) return 1 ;; esac
+  [ "${#rest}" -eq 58 ] || return 1
+  case "${rest}" in *[!0-9a-z]*) return 1 ;; esac
+  return 0
 }
 
 state_init() {
@@ -1152,6 +1198,27 @@ if command -v k3s >/dev/null 2>&1 && k3s kubectl get --raw=/readyz >/dev/null 2>
 else
   echo "the Kubernetes API is not reachable"
 fi
+echo "== time"
+now=$(date +%s)
+printf "system: %s\n" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ -r /sys/class/rtc/rtc0/since_epoch ]; then
+  off=$(( $(cat /sys/class/rtc/rtc0/since_epoch) - now ))
+  case $off in -*) ;; *) off="+$off" ;; esac
+  echo "RTC: $off s from the system clock"
+else
+  echo "RTC: not readable"
+fi
+if command -v chronyc >/dev/null 2>&1; then
+  printf "chrony: %s\n" "$(systemctl is-active chrony 2>/dev/null || true)"
+  chronyc -n tracking 2>/dev/null | grep -E "^(Reference ID|Stratum|Frequency)" || echo "chronyc tracking: no answer"
+else
+  echo "chrony: not installed (up installs it from the bundle)"
+fi
+ip -o -4 addr show 2>/dev/null | awk -v ip="$2" "
+  { split(\$4, a, \"/\") }
+  a[1] == ip { v = \"\"; if (match(\$0, /valid_lft [0-9a-z]+/)) v = \", \" substr(\$0, RSTART, RLENGTH)
+               print \"NODE_IP \" ip \": \" ((\$0 ~ / dynamic /) ? \"dynamic (a DHCP lease)\" : \"static\") v; f = 1; exit }
+  END { if (!f) print \"NODE_IP \" ip \": not an address of the node\" }"
 echo "== bundle payloads in /var/lib/teknoir-airgap/bundles"
 ls -1 /var/lib/teknoir-airgap/bundles 2>/dev/null || echo "none"
 if [ -x "$runner" ]; then echo RUNNER=yes; else echo RUNNER=no; fi
@@ -1175,7 +1242,7 @@ cmd_status() {
     warn "${REMOTE_USER} has no passwordless sudo on the node yet: run ./teknoir-airgap up once in a terminal (on a live node before its migration: backup, docs/OPERATE.md section 14)"
     return 1
   fi
-  node_sh pipe "${STATUS_SCRIPT}" "$(runner_path)" </dev/null >"${TMPD}/status.out" 2>&1 || rc=$?
+  node_sh pipe "${STATUS_SCRIPT}" "$(runner_path)" "${NODE_IP}" </dev/null >"${TMPD}/status.out" 2>&1 || rc=$?
   grep -v '^RUNNER=' "${TMPD}/status.out" || true
   if grep -q '^RUNNER=yes' "${TMPD}/status.out"; then
     # the runner reads the site config the operator uses now, not a stale copy
@@ -1654,10 +1721,80 @@ doctor_node() {
   missing=$(node_user_sh 'for c in sudo tar sha256sum find awk sed cmp flock openssl update-ca-certificates curl systemctl; do command -v "$c" >/dev/null 2>&1 || printf "%s " "$c"; done; echo' </dev/null 2>/dev/null | tail -n 1) || missing="?"
   if [ -z "${missing}" ]; then d_ok "the node has the tools the converge uses"
   else d_fail "missing on the node: ${missing}(install from the Debian installation medium, docs/HOST-SETUP.md)"; fi
-  if node_user_sh 'command -v chronyc >/dev/null 2>&1' </dev/null >/dev/null 2>&1; then d_ok "chrony is installed on the node"
-  else d_warn "chrony is not installed on the node (optional: it keeps the node clock and can serve time to the LAN)"; fi
-  if node_user_sh 'ip -o -4 addr show 2>/dev/null | grep -q " $1/"' "${NODE_IP}" </dev/null >/dev/null 2>&1; then d_ok "NODE_IP ${NODE_IP} is configured on the node"
-  else d_fail "NODE_IP ${NODE_IP} is not an address of the node (static IP, docs/HOST-SETUP.md)"; fi
+  doctor_time "$(node_user_sh "${TIME_FACTS_SCRIPT}" "${NODE_IP}" </dev/null 2>/dev/null || true)"
+}
+
+# The node's clock and address facts as KEY=value lines, read as the ssh user:
+# sysfs is world-readable, chrony's monitoring commands need no root.
+#   NOW=<epoch> RTC=<epoch> CHRONY=active|inactive|absent
+#   REF=<reference id> <its address, if any>
+#   SRC=<* or +> <source> (chrony's selected and combined sources)
+#   ADDR=<the `ip -o -4 addr` line of NODE_IP>
+TIME_FACTS_SCRIPT='
+echo "NOW=$(date +%s)"
+if [ -r /sys/class/rtc/rtc0/since_epoch ]; then echo "RTC=$(cat /sys/class/rtc/rtc0/since_epoch)"; fi
+if command -v chronyc >/dev/null 2>&1; then
+  if systemctl is-active --quiet chrony 2>/dev/null; then echo CHRONY=active; else echo CHRONY=inactive; fi
+  chronyc -n tracking 2>/dev/null | sed -n "s/^Reference ID *: *\([0-9A-Fa-f]*\) *(\([^)]*\)).*/REF=\1 \2/p"
+  chronyc -n -N sources 2>/dev/null | sed -n "s/^\^\([*+]\) *\([^ ]*\).*/SRC=\1 \2/p"
+else
+  echo CHRONY=absent
+fi
+ip -o -4 addr show 2>/dev/null | awk -v ip="$1" "{ split(\$4, a, \"/\"); if (a[1] == ip) { print \"ADDR=\" \$0; exit } }"
+'
+
+# fact KEY FACTS: the value of the first KEY= line of FACTS.
+fact() { printf '%s\n' "$2" | sed -n "s/^$1=//p" | head -n 1; }
+
+# doctor_time FACTS: chrony, the RTC, TIME_SOURCE and the NODE_IP lease.
+doctor_time() {
+  local facts=$1 chrony ref label now rtc off abs t hits='' addr valid
+  chrony=$(fact CHRONY "${facts}")
+  ref=$(fact REF "${facts}")
+  case "${ref%% *}" in
+    7F7F0101|7f7f0101) label="local clock (stratum 10, corrected by every up)" ;;
+    4D414E55|4d414e55) label="LAN-time samples (manual)" ;;
+    ''|00000000) label="no reference yet" ;;
+    *) label="NTP source ${ref#* }" ;;
+  esac
+  case "${chrony}" in
+    active) d_ok "chrony is active on the node; reference: ${label}" ;;
+    inactive) d_warn "chrony is installed on the node but not active; up starts it" ;;
+    absent) d_warn "chrony is not installed on the node; up installs it from the bundle (then the node serves NTP to the LAN)" ;;
+    *) d_fail "could not read the node's clock facts" ;;
+  esac
+  now=$(fact NOW "${facts}")
+  rtc=$(fact RTC "${facts}")
+  case "${now}:${rtc}" in
+    :*|*:|*[!0-9:]*) d_warn "could not read the node's RTC (/sys/class/rtc/rtc0/since_epoch)" ;;
+    *)
+      off=$((rtc - now)); abs=${off#-}
+      if [ "${abs}" -le 5 ]; then d_ok "RTC ${off} s from the system clock"
+      elif [ "${abs}" -le "${SKEW_LIMIT}" ]; then d_warn "RTC ${off} s from the system clock; up writes the RTC"
+      else d_fail "RTC ${off} s from the system clock: a reboot would start the node ${abs} s off; up writes the RTC"; fi ;;
+  esac
+  if [ -n "${TIME_SOURCE}" ] && [ "${chrony}" = active ]; then
+    for t in ${TIME_SOURCE}; do
+      if printf '%s\n' "${facts}" | awk -v t="${t}" '$0 ~ /^SRC=/ && $2 == t { f = 1 } END { exit !f }'; then hits="${hits} ${t}"; fi
+    done
+    if [ -n "${hits}" ]; then d_ok "chrony uses TIME_SOURCE${hits}"
+    else d_warn "chrony uses none of TIME_SOURCE (${TIME_SOURCE}): no '^*' or '^+' line in chronyc sources names it; the node keeps its local clock"; fi
+  fi
+  addr=$(fact ADDR "${facts}")
+  if [ -z "${addr}" ]; then
+    d_fail "NODE_IP ${NODE_IP} is not an address of the node (fixed address, docs/HOST-SETUP.md)"
+  else
+    case " ${addr} " in
+      *" dynamic "*)
+        valid=$(printf '%s\n' "${addr}" | sed -n 's/.*valid_lft \([0-9]*\)sec.*/\1/p')
+        if [ "${NODE_IP_DHCP_RESERVED}" = yes ]; then
+          d_ok "NODE_IP ${NODE_IP} is a DHCP lease reserved on the router (NODE_IP_DHCP_RESERVED=yes)"
+        else
+          d_warn "NODE_IP ${NODE_IP} is a DHCP lease (valid ${valid:-?} s); reserve it on the router (docs/HOST-SETUP.md), then set NODE_IP_DHCP_RESERVED=yes in the site config"
+        fi ;;
+      *) d_ok "NODE_IP ${NODE_IP} is configured on the node (static)" ;;
+    esac
+  fi
 }
 
 cmd_doctor() {

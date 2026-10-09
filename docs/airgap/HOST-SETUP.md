@@ -11,7 +11,7 @@ bundle. A different site needs its own values in that file.
 
 | Setting | Value |
 |---|---|
-| Node address (`NODE_IP`) | `192.168.5.181`, static |
+| Node address (`NODE_IP`) | `192.168.5.181`, fixed: static, or a DHCP reservation on the router ([Fixed address](#fixed-address)) |
 | Node user (from `NODE`) | `teknoir` |
 | Host name | `teknoir` |
 | Platform domain | `teknoir.airgapped` (no DNS needed) |
@@ -77,6 +77,12 @@ The installer names the network interface itself (for example `enp4s0` or
 `eno1`) and writes `/etc/network/interfaces` for it; you do not need to know the
 name. Do not install NVIDIA, CUDA or any other package from an online source.
 
+A node installed from a Debian cloud image (the live teknoir-local node is a
+`genericcloud` image with cloud-init) has no `/etc/network/interfaces`: there
+cloud-init writes `/etc/netplan/50-cloud-init.yaml`, netplan renders it for
+systemd-networkd, and the address usually comes from DHCP. That works as long
+as the address stays `NODE_IP`; see [Fixed address](#fixed-address).
+
 ## 3. First boot (node console)
 
 Log in as `teknoir`.
@@ -98,28 +104,36 @@ Log in as `teknoir`.
 
    Comment out any `http://` or `https://` entry.
 
-3. Install `curl` and `chrony` from the installation medium (USB stick still
-   inserted; the converge uses `curl` for the Harbor API, and chrony keeps the
-   clock):
+3. Install `curl` from the installation medium (USB stick still inserted; the
+   converge uses `curl` for the Harbor API):
 
    ```sh
-   sudo apt-get install -y curl chrony
+   sudo apt-get install -y curl
    ```
 
    If apt cannot find the medium, register it first with `sudo apt-cdrom add`.
-   Then remove the USB stick.
+   Then remove the USB stick. chrony and `hwclock` (util-linux-extra) come with
+   the bundle: the first `up` installs them offline, so installing chrony here
+   is optional.
 
-4. Set the clock if it is wrong (`timedatectl` shows it):
+4. Set the clock if it is wrong (`date -u` shows it in UTC):
 
    ```sh
-   sudo timedatectl set-time 'YYYY-MM-DD HH:MM:SS'
+   sudo date -u -s 'YYYY-MM-DD HH:MM:SS'   # the time in UTC
    ```
 
-   `up` refuses to run when the node and the LAN host differ by more than 30
-   seconds (`./teknoir-airgap up --sync-clock` sets the node clock from the LAN
-   host instead). With chrony installed, the converge keeps the node clock and
-   lets the node serve time to the LAN; `TIME_SOURCE` in the site config names an
-   upstream time server if the LAN has one.
+   or skip this and let the first `./teknoir-airgap up --sync-clock` set the node
+   clock from the LAN host. `timedatectl set-time` is refused while an NTP
+   service (systemd-timesyncd or chrony) is active.
+
+   `up` corrects a difference of up to 30 seconds between the node and the LAN
+   host by itself (a node that is ahead is slewed back by chrony, not stepped),
+   and refuses more unless you pass `--sync-clock`. It installs
+   chrony, gives it the LAN host's time on every run and writes the hardware
+   clock (RTC), so the node keeps time between updates and after a reboot.
+   The node serves that time to the LAN (NTP on `NODE_IP`, port 123/udp):
+   point Robots and cameras at it. If the LAN has an NTP server, name it in
+   `TIME_SOURCE` in the site config (space-separated addresses or host names).
 
 5. Write down the ssh host key fingerprint; the first connection asks you to
    confirm it:
@@ -167,7 +181,47 @@ Each operator's LAN host repeats this section with its own key.
 Carry and check a bundle, then run `./teknoir-airgap up` as described in
 [OPERATE.md](OPERATE.md#3-first-install). The first `up` asks you to confirm the
 host key fingerprint from step 3.5 and asks for `teknoir`'s sudo password once.
-Afterwards, `./teknoir-airgap doctor` checks the node's address, clock and tools.
+Afterwards, `./teknoir-airgap doctor` checks the node's address (and whether it
+is a DHCP lease), clock, hardware clock, chrony and tools.
+
+## Fixed address
+
+`NODE_IP` must stay the node's address: the platform names, the k3s node
+address and the LAN hosts' name entries all point at it. Two ways:
+
+- **Static, at install time** (preferred for a new node): the manual network
+  configuration in step 2.
+- **A DHCP reservation on the router** (the live teknoir-local node, installed
+  from a cloud image with DHCP): the router always hands the node's MAC address
+  the same IPv4 address. On a UniFi gateway: Client Devices, select the node
+  (teknoir-local: `teknoir`, MAC `58:47:ca:7d:39:f0`), Settings, turn on
+  **Fixed IP Address**, enter `NODE_IP` on the node's network, apply. Nothing
+  changes on the node. After the next lease renewal, check on the node that the
+  lease still has `NODE_IP`:
+
+  ```sh
+  ip -o -4 addr show | grep ' 192.168.5.181/'   # a fresh "valid_lft" after the renewal
+  ```
+
+  Then set `NODE_IP_DHCP_RESERVED=yes` in the site config: `doctor` warns about
+  a DHCP lease (`dynamic`) until then.
+
+Keep the router as the node's default route and DNS server when the LAN host is
+on another subnet (teknoir-local: the LAN host is on 192.168.2.0/24 and reaches
+the node through 192.168.5.1). Do not switch a running node from DHCP to a
+static address remotely: the DHCP client releases the lease, and a mistake
+cuts off the ssh access `up` needs. If you need it, do it at the node console.
+
+## Name resolution for devices
+
+The cluster resolves every `<name>.<domain>` to `NODE_IP` itself (coredns-custom),
+including the per-teamspace names such as `mqtt-<teamspace>.<domain>` (MQTT on
+8883) and `deadend-<teamspace>.<domain>` (ssh tunnels on 2222). Robots, cameras
+and other LAN devices that connect to a teamspace need the same answer from
+their resolver: a wildcard `*.<domain>` record pointing at `NODE_IP` on the
+LAN's DNS server (teknoir-local: a local DNS record on the UniFi gateway), or
+an `/etc/hosts` entry per name. `./teknoir-airgap trust` only covers the
+platform names on a LAN host.
 
 ## More nodes
 

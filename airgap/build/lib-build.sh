@@ -659,7 +659,51 @@ secret_gate_report() {
 # executing them
 # ---------------------------------------------------------------------------
 SITE_KEYS_REQUIRED=(TEKNOIR_ENV TEKNOIR_DOMAIN NODE_IP NODE TEKNOIR_HOSTNAMES K3S_DATA_DIR)
-SITE_KEYS_OPTIONAL=(TIME_SOURCE UPSTREAM_DNS)
+# TIME_SOURCE: space-separated IPv4 addresses or host names (chrony servers);
+# NODE_IP_DHCP_RESERVED: yes once NODE_IP is a router reservation (doctor);
+# BACKUP_AGE_RECIPIENTS: space-separated age public keys for the backups
+SITE_KEYS_OPTIONAL=(TIME_SOURCE UPSTREAM_DNS NODE_IP_DHCP_RESERVED BACKUP_AGE_RECIPIENTS)
+
+site_time_source_ok() {
+  # site_time_source_ok <token> — an IPv4 address or a host name (the same
+  # check as the node's lib/common.sh)
+  local t="$1" o
+  if [[ "${t}" =~ ^[0-9.]+$ ]]; then
+    [[ "${t}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1}"; do (( 10#${o} <= 255 )) || return 1; done
+    return 0
+  fi
+  (( ${#t} <= 253 )) && [[ "${t}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
+}
+
+site_values_check() {
+  # site_values_check <file> — the formats of the optional keys; prints one
+  # line per problem, returns 1 when there is one
+  local f="$1" v w bad=0
+  local -a words=()
+  read -r -a words <<<"$(site_get "${f}" TIME_SOURCE)"
+  for w in ${words[@]+"${words[@]}"}; do
+    site_time_source_ok "${w}" || { echo "${f}: invalid TIME_SOURCE entry '${w}' (space-separated IPv4 addresses or host names)"; bad=1; }
+  done
+  read -r -a words <<<"$(site_get "${f}" UPSTREAM_DNS)"
+  for w in ${words[@]+"${words[@]}"}; do
+    [[ "${w}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "${f}: invalid UPSTREAM_DNS entry '${w}' (IPv4 addresses)"; bad=1; }
+  done
+  v="$(site_get "${f}" NODE_IP_DHCP_RESERVED)"
+  [[ "${v}" =~ ^(yes|no)?$ ]] || { echo "${f}: invalid NODE_IP_DHCP_RESERVED '${v}' (yes, no or empty)"; bad=1; }
+  # an entry is never printed whole: it may be a pasted private key
+  read -r -a words <<<"$(site_get "${f}" BACKUP_AGE_RECIPIENTS)"
+  for w in ${words[@]+"${words[@]}"}; do
+    if [[ "${w^^}" == AGE-SECRET-KEY-* ]]; then
+      echo "${f}: BACKUP_AGE_RECIPIENTS holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now (only public keys, age1..., belong there) and treat that identity as exposed"
+      bad=1
+    elif [[ ! "${w}" =~ ^age1[0-9a-z]{58}$ ]]; then
+      echo "${f}: BACKUP_AGE_RECIPIENTS entry '${w:0:8}...' is not an age public key (age1 followed by 58 lower-case letters and digits)"
+      bad=1
+    fi
+  done
+  return "${bad}"
+}
 
 site_check() {
   # site_check <file> — the file must be plain assignments the LAN host
@@ -684,8 +728,20 @@ site_check() {
   for key in "${SITE_KEYS_REQUIRED[@]}"; do
     [[ -n "$(site_get "${f}" "${key}")" ]] || { warn "${f}: ${key} is not set"; bad=1; }
   done
-  if grep -v '^[[:space:]]*#' "${f}" | grep -qiE '(password|passwd|secret|token|private)'; then
+  local problems
+  if ! problems="$(site_values_check "${f}")"; then
+    while IFS= read -r line; do warn "${line}"; done <<<"${problems}"
+    bad=1
+  fi
+  # (an age public key is random lowercase text: its line is not scanned for
+  # words; site_values_check checks every entry, private keys included)
+  if grep -v '^[[:space:]]*#' "${f}" | grep -v '^BACKUP_AGE_RECIPIENTS=' | grep -qiE '(password|passwd|secret|token|private)'; then
     warn "${f}: mentions a credential; site files are public and must hold none"
+    bad=1
+  fi
+  # an age private key anywhere else, comments included (never printed)
+  if grep -v '^BACKUP_AGE_RECIPIENTS=' "${f}" | grep -qi 'AGE-SECRET-KEY-'; then
+    warn "${f}: holds an age PRIVATE key (AGE-SECRET-KEY-...): remove it now and treat that identity as exposed"
     bad=1
   fi
   (( bad == 0 )) || die "invalid site file ${f}"

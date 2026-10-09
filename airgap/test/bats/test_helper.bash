@@ -26,8 +26,13 @@ VMTEST_SITE="${REPO_ROOT}/airgap/site/vmtest.env"
 # Calls that change something (or, for exec and cp, may: a dry-run has no
 # reason to run a command in a pod or copy files out of it). A kubectl call
 # with --dry-run is not one. curl: a request with a mutating method, or with a
-# body or upload (curl then sends POST or PUT).
-MUTATING_RE='^(kubectl|k3s kubectl) (.* )?(apply|create|delete|patch|replace|label|annotate|scale|edit|set|cordon|drain|taint|uncordon|exec|cp)( |$)|^(kubectl|k3s kubectl) (.* )?rollout restart|^k3s ctr .*( import| rm| delete)( |$)|^k3s (secrets-encrypt|etcd-snapshot save|server|agent)( |$)|^systemctl (start|stop|restart|reload|enable|disable|daemon-reload|mask|unmask)( |$)|^crane (push|copy|cp|tag|delete|mutate|append|rebase)( |$)|^helm (push|install|upgrade|uninstall|registry login)( |$)|^curl (.* )?(-X ?|--request[ =])(POST|PUT|PATCH|DELETE)( |$)|^curl (.* )?(-d|--data[a-z-]*|-F|--form[a-z-]*|-T|--upload-file|--json)( |=|$)'
+# body or upload (curl then sends POST or PUT). The node's packages and clock:
+# apt-get install/remove (an apt-get simulation, -s, is not one: mutating_calls
+# drops it), dpkg -i/-r, chronyc settime/makestep/manual reset (manual list
+# is a read), hwclock writes, date -s.
+MUTATING_RE='^(kubectl|k3s kubectl) (.* )?(apply|create|delete|patch|replace|label|annotate|scale|edit|set|cordon|drain|taint|uncordon|exec|cp)( |$)|^(kubectl|k3s kubectl) (.* )?rollout restart|^k3s ctr .*( import| rm| delete)( |$)|^k3s (secrets-encrypt|etcd-snapshot save|server|agent)( |$)|^systemctl (start|stop|restart|reload|enable|disable|daemon-reload|mask|unmask)( |$)|^crane (push|copy|cp|tag|delete|mutate|append|rebase)( |$)|^helm (push|install|upgrade|uninstall|registry login)( |$)|^curl (.* )?(-X ?|--request[ =])(POST|PUT|PATCH|DELETE)( |$)|^curl (.* )?(-d|--data[a-z-]*|-F|--form[a-z-]*|-T|--upload-file|--json)( |=|$)|^apt-get (.* )?(install|remove|purge|autoremove|upgrade|dist-upgrade|full-upgrade|reinstall)( |$)|^dpkg (.* )?(-i|--install|-r|--remove|-P|--purge|--configure|--unpack)( |$)|^chronyc (.* )?(settime|makestep|manual (reset|delete|on|off))( |$)|^hwclock (.* )?(-w|--systohc|-s|--hctosys|--set|-a|--adjust)( |$)|^date (.* )?(-s|--set)( |=|$)'
+# an apt-get simulation changes nothing
+APT_SIMULATE_RE='^apt-get (.* )?(-s|--simulate|--just-print|--dry-run|--recon|--no-act)( |$)'
 
 refute_grep() {
   # refute_grep <grep args...> — fail the test when grep matches (the matches
@@ -77,7 +82,28 @@ stub_calls() {
 
 mutating_calls() {
   # the recorded calls that would change a cluster, host or registry
-  grep -E "${MUTATING_RE}" "${STUB_LOG}" | grep -v -- '--dry-run' || true
+  grep -E "${MUTATING_RE}" "${STUB_LOG}" | grep -v -- '--dry-run' | grep -vE "${APT_SIMULATE_RE}" || true
+}
+
+# shellcheck disable=SC2120  # the .bats files pass the tool names
+clock_tools() {
+  # clock_tools [chronyc hwclock] - recording stubs (see _stub.bash) for the
+  # node's clock tools, outside PATH. DATE_BIN (the date that SETS the clock)
+  # always points at its recorder; CHRONYC and HWCLOCK point at theirs only
+  # when named, else at absent paths (a node without chrony or hwclock).
+  local d="${BATS_TEST_TMPDIR}/clock-tools" n
+  mkdir -p "${d}"
+  for n in chronyc hwclock date; do
+    printf '#!/usr/bin/env bash\nSTUB_NAME=%s\n. %q\n' "${n}" "${STUB_BIN}/_stub.bash" > "${d}/${n}"
+    chmod +x "${d}/${n}"
+  done
+  export DATE_BIN="${d}/date" CHRONYC="${d}/absent-chronyc" HWCLOCK="${d}/absent-hwclock"
+  for n in "$@"; do
+    case "${n}" in
+      chronyc) export CHRONYC="${d}/chronyc" ;;
+      hwclock) export HWCLOCK="${d}/hwclock" ;;
+    esac
+  done
 }
 
 common_env() {
@@ -91,6 +117,9 @@ common_env() {
   export WAIT_INTERVAL=1 STUB_WAIT_INTERVAL=1
   export NODE_ROOT="${NODE_DIR}"
   mkdir -p "${TEKNOIR_HOST_ROOT}" "${STATE_DIR}"
+  # never the test host's clock tools: no chrony, no hwclock, a recording date
+  # shellcheck disable=SC2119
+  clock_tools
 }
 
 with_common() {

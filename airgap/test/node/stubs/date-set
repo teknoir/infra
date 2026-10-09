@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Stub for DATE_BIN (the date that sets the node clock): records the call as
+# "date <args>". Under the fakeclock shim (FAKECLOCK_FILE, see fakeclock.c)
+# "-s @EPOCH" moves the shifted clock to EPOCH, as a real step does; without
+# it nothing changes. STUB_DATE_SET_RC: fail with that exit code, clock
+# unchanged (a refused date -s).
+printf 'date %s\n' "$*" >> "${STUB_CALLS:?}"
+if [[ "${STUB_DATE_SET_RC:-0}" != 0 ]]; then
+  echo "date: cannot set date: Operation not permitted" >&2
+  exit "${STUB_DATE_SET_RC}"
+fi
+want=""
+for a in "$@"; do [[ "${a}" == @* ]] && want="${a#@}"; done
+if [[ -n "${want}" && -n "${FAKECLOCK_FILE:-}" && -f "${FAKECLOCK_FILE}" ]]; then
+  # date +%s is the shifted clock here too (the shim is loaded)
+  echo "$(( $(cat "${FAKECLOCK_FILE}") + want - $(date +%s) ))" > "${FAKECLOCK_FILE}"
+fi
+exit 0
