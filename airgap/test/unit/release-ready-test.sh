@@ -18,6 +18,16 @@
 #      no pending operation are candidates; the merge patch body sets
 #      .operation (revision, prune, syncOptions, retry from the spec) and
 #      nulls status.operationState, guarded by resourceVersion;
+#  3b. ... and only while that failure is about the spec the Application
+#      keeps: spec 0.0.5 with a stale 0.0.4 Failed status gives no candidate
+#      and no patch (post waits for the new revision); a root not reconciled
+#      since this run's pin, OutOfSync, syncing or compared with its old pin
+#      gives none; the root's own failure at its pin makes it the candidate;
+#  3c. a Profile declared in GitOps is not ready until profile-controller ran
+#      for it and created an Application per enabled chart plugin (none, some,
+#      a run in progress); failed plugins (EMQX) and Profiles not in GitOps are
+#      reported only; post fails naming profile/<name>; no plugin
+#      configuration value reaches the output;
 #   4. post_wait_applications: exactly one patch per run even when the
 #      re-sync fails again (then post fails, naming the reason); a re-sync
 #      that succeeds lets post pass; teamspaces not in GitOps are reported in
@@ -85,10 +95,28 @@ unknown() { jq -c '.status.sync.status = "Unknown" | del(.status.operationState)
   app stray stray 1.0.0 | unknown
   app other-tracked x 1.0.0 "profile-controller:argoproj.io/Application:teknoir-system/other-tracked"
 } | jq -sc '{apiVersion: "v1", kind: "List", items: .}' > "${WORK}/apps.json"
-jq -cn '{items: [
-  {metadata: {name: "teknoir-default", uid: "u-default",
-               annotations: {"argocd.argoproj.io/tracking-id": "profile-controller:teknoir.org/Profile:/teknoir-default"}}},
-  {metadata: {name: "teknoir-demo", uid: "u-demo"}}]}' > "${WORK}/profiles.json"
+# profile-controller's status: run times, and per plugin enabled, chart name
+# (the Application is <profile>-<name>) and apply status (live teknoir-demo
+# shape of 2026-10-09; EMQX fails until its pod answers)
+plugin() { jq -cn --arg k "$1" --argjson e "$2" --arg n "$3" --arg s "$4" '
+  {($k): {info: {description: "x"}, applyStatus: {status: $s, applyTime: "2026-10-09T09:22:01Z"},
+          appliedConfig: {settings: {enabled: $e, specific: {}},
+                          pluginConfig: ({enabled: ($e | tostring), namespace: "ns", values: {password: "not-a-real-pass-4711"}}
+                                         + (if $n != "" then {name: $n, version: "0.0.99"} else {} end))}}}'; }
+profile() {
+  # profile <name> <uid> <tracked 0|1> <start|-> <end|-> <plugin-json>...
+  local n="$1" u="$2" t="$3" st="$4" en="$5"; shift 5
+  jq -cn --arg n "${n}" --arg u "${u}" --arg t "${t}" --arg st "${st}" --arg en "${en}" --argjson pl "$(printf '%s\n' "$@" | jq -sc 'add // {}')" '
+    {metadata: ({name: $n, uid: $u} + (if $t == "1" then {annotations: {"argocd.argoproj.io/tracking-id": "profile-controller:teknoir.org/Profile:/\($n)"}} else {} end)),
+     spec: {owner: {kind: "User", name: "owner@example.test"}}}
+    + (if $st == "-" then {} else {status: {appliedconfig: ({plugins: $pl, lastRunStart: $st} + (if $en == "-" then {} else {lastRunEnd: $en} end))}} end)'
+}
+DEFAULT_PLUGINS=("$(plugin ArgoCD true "" Success)" "$(plugin JWKS true jwks Success)" "$(plugin EMQX true emqx Fail)"
+                 "$(plugin Grafana true grafana Success)" "$(plugin Postgres false postgres Success)")
+profiles_json() { printf '%s\n' "$@" | jq -sc '{items: .}'; }
+profiles_json \
+  "$(profile teknoir-default u-default 1 2026-10-09T09:22:01Z 2026-10-09T09:22:01Z "${DEFAULT_PLUGINS[@]}")" \
+  "$(profile teknoir-demo u-demo 0 2026-10-09T09:22:01Z 2026-10-09T09:22:02Z "$(plugin JWKS true jwks Success)")" > "${WORK}/profiles.json"
 
 # --- scenario runner ----------------------------------------------------------
 # run_lib <script> - source common.sh + release.sh in a child shell with a stub
@@ -142,6 +170,12 @@ run_lib() {
 out() { cat "${WORK}/out"; }
 reset_state() { cp "${WORK}/apps.json.orig" "${WORK}/apps.json"; : > "${WORK}/patches.log"; : > "${WORK}/kc.log"; : > "${WORK}/secret-patches.log"; }
 cp "${WORK}/apps.json" "${WORK}/apps.json.orig"
+# the same with the teknoir-default Applications ready: only the strict
+# blockers a re-sync can fix are left (monitoring)
+jq -c '.items |= map(if .metadata.name | IN("teknoir-default-jwks", "teknoir-default-grafana")
+                     then .status.sync.status = "Synced" | del(.status.conditions)
+                          | .status.operationState = {phase: "Succeeded", syncResult: {revision: .status.sync.revision}}
+                     else . end)' "${WORK}/apps.json.orig" > "${WORK}/apps.json.orig2"
 reset_state
 
 echo "# 1. classification"
@@ -172,9 +206,11 @@ check "a Failed operation of an older revision gives none (auth is ready)" bash 
 check "teknoir-demo-jwks (Profile not in GitOps) does not block" bash -c "! grep -q '^teknoir-demo-jwks' '${WORK}/out'"
 check "teknoir-default-jwks Unknown (Profile in GitOps) is not ready" grep -qE '^teknoir-default-jwks	Unknown/Healthy' "${WORK}/out"
 run_lib '_release_post_reported "$(_release_classify "$(cat "${W}/apps.json")" "$(cat "${W}/profiles.json")")"'
-check "reported only: teknoir-demo-jwks (not in GitOps), the stale-uid teamspace and stray" \
-  eq "stray teknoir-demo-jwks teknoir-stale-mongodb" "$(grep -v '^rc=' "${WORK}/out" | cut -f1 | sort | tr '\n' ' ' | sed 's/ $//')"
+check "reported only: teknoir-demo-jwks (not in GitOps), the stale-uid teamspace, stray, teknoir-default's failed plugin" \
+  eq "profile/teknoir-default stray teknoir-demo-jwks teknoir-stale-mongodb" "$(grep -v '^rc=' "${WORK}/out" | cut -f1 | sort | tr '\n' ' ' | sed 's/ $//')"
 check "the report names the teamspace and why" grep -qF 'teknoir-demo-jwks	teamspace teknoir-demo, not declared in GitOps	Unknown/Healthy' "${WORK}/out"
+check "a failed plugin of a teamspace declared in GitOps is reported, not waited for" \
+  grep -qxF 'profile/teknoir-default	teamspace teknoir-default, plugin status (profile-controller retries)	plugin(s) not applied: EMQX Fail' "${WORK}/out"
 jq -c '.items |= map(select(.metadata.name != "app-of-apps"))' "${WORK}/apps.json" > "${WORK}/noroot.json"
 run_lib '_release_post_not_ready "$(_release_classify "$(cat "${W}/noroot.json")" "$(cat "${W}/profiles.json")")"'
 check "a missing root is not ready" grep -qF 'app-of-apps	not created yet' "${WORK}/out"
@@ -200,9 +236,94 @@ run_lib '_release_resync_patch "$(jq -c ".items[] | select(.metadata.name == \"m
 check "without retry/prune/syncOptions in the spec: ArgoCD's defaults (limit 5, no prune)" \
   eq '{"initiatedBy":{"username":"teknoir-node"},"sync":{"prune":false,"revision":"0.0.4"},"retry":{"limit":5}}' "$(head -1 "${WORK}/out" | jq -c .operation)"
 
+echo "# 3b. re-sync only a failure of the spec the Application keeps (after a pin)"
+cands() {
+  # cands <apps-file> [pin-at] - the re-sync candidates, space separated, in ${WORK}/out
+  run_lib "RELEASE_PIN_AT=${2:-0}"'; echo "candidates=[$(_release_resync_candidates "$(_release_classify "$(cat "${W}/'"$1"'")" "$(cat "${W}/profiles.json")")" | tr "\n" " " | sed "s/ $//")]"'
+}
+# the root pinned monitoring 0.0.5; ArgoCD has not compared it yet (status and failure still 0.0.4)
+jq -c '(.items[] | select(.metadata.name == "monitoring")) |= (.spec.source.targetRevision = "0.0.5")' "${WORK}/apps.json.orig" > "${WORK}/ahead.json"
+cands ahead.json
+check "spec 0.0.5 with a stale 0.0.4 Failed status: no candidate" grep -qxF 'candidates=[]' "${WORK}/out"
+run_lib '_release_post_not_ready "$(_release_classify "$(cat "${W}/ahead.json")" "$(cat "${W}/profiles.json")")" | grep "^monitoring"'
+check "... and it is not ready because its status is stale" \
+  grep -qF 'monitoring	last sync to 0.0.4 Failed: one or more synchronization tasks completed unsuccessfully (retried 5 times).; status not computed for the current spec yet (compared: 0.0.4); synced revision 0.0.4, pinned 0.0.5' "${WORK}/out"
+jq -c '(.items[] | select(.metadata.name == "monitoring")) |= (.spec.source.targetRevision = "0.0.5")' "${WORK}/apps.json.orig2" > "${WORK}/apps.json"
+: > "${WORK}/patches.log"
+CTRL=fail run_lib 'WAIT_TIMEOUT=2; REC_SOURCE=configmap; post_wait_applications'
+check "post with the pinned-ahead failure: no patch" eq 0 "$(grep -c . "${WORK}/patches.log" || true)"
+check "... and post waits for the new revision instead (fails here, no controller compares it)" \
+  grep -qE 'ERROR: post: after 2s .*monitoring \(last sync to 0\.0\.4 Failed: .*status not computed for the current spec yet' "${WORK}/out"
+# ArgoCD compared 0.0.5 (OutOfSync, last operation still the 0.0.4 failure): auto-sync's job, not post's
+jq -c '(.items[] | select(.metadata.name == "monitoring")) |= (.status.sync = {status: "OutOfSync", revision: "0.0.5", comparedTo: {source: .spec.source}})' "${WORK}/ahead.json" > "${WORK}/compared.json"
+cands compared.json
+check "compared at 0.0.5 with the 0.0.4 failure: no candidate (a superseded failure)" grep -qxF 'candidates=[]' "${WORK}/out"
+# the root: pinned by this run but not reconciled since; children may be about to change
+cands apps.json.orig "$(date +%s)"
+check "a root not reconciled since this run's pin: no candidate" grep -qxF 'candidates=[]' "${WORK}/out"
+cands apps.json.orig 1000
+check "a root reconciled after the pin: monitoring is a candidate" grep -qxF 'candidates=[monitoring]' "${WORK}/out"
+jq -c '(.items[] | select(.metadata.name == "app-of-apps")) |= (.status.sync.status = "OutOfSync")' "${WORK}/apps.json.orig" > "${WORK}/rootoos.json"
+cands rootoos.json
+check "a root OutOfSync (its sync has not updated the children yet): no candidate" grep -qxF 'candidates=[]' "${WORK}/out"
+jq -c '(.items[] | select(.metadata.name == "app-of-apps")) |= (.status.operationState.phase = "Running")' "${WORK}/apps.json.orig" > "${WORK}/rootrun.json"
+cands rootrun.json
+check "a root sync running: no candidate" grep -qxF 'candidates=[]' "${WORK}/out"
+jq -c '(.items[] | select(.metadata.name == "app-of-apps")) |= (.status.sync.comparedTo.source.targetRevision = "0.0.4")' "${WORK}/apps.json.orig" > "${WORK}/rootstale.json"
+cands rootstale.json
+check "a root compared with its old pin: no candidate" grep -qxF 'candidates=[]' "${WORK}/out"
+jq -c '(.items[] | select(.metadata.name == "app-of-apps")) |= (.status.sync.status = "OutOfSync"
+        | .status.operationState = {phase: "Failed", message: "x", syncResult: {revision: "0.0.5"}})' "${WORK}/apps.json.orig" > "${WORK}/rootfailed.json"
+cands rootfailed.json
+check "the root's own failure at its current pin: the root is the candidate, its children wait" grep -qxF 'candidates=[app-of-apps]' "${WORK}/out"
+
+echo "# 3c. a Profile declared in GitOps: its Applications must exist (TS-C6)"
+prof_not_ready() {
+  # prof_not_ready <apps-file> <profile-json>... - post's strict list for these Profiles, in ${WORK}/out
+  profiles_json "${@:2}" > "${WORK}/p.json"
+  run_lib '_release_post_not_ready "$(_release_classify "$(cat "${W}/'"$1"'")" "$(cat "${W}/p.json")")" | grep "^profile/" || true; _release_post_reported "$(_release_classify "$(cat "${W}/'"$1"'")" "$(cat "${W}/p.json")")" | grep "^profile/" | sed "s/^/reported: /" || true'
+}
+jq -c '.items |= map(select(.metadata.name | test("^teknoir-default-") | not))' "${WORK}/apps.json.orig" > "${WORK}/nodefault.json"
+T0=2026-10-09T09:22:01Z T1=2026-10-09T09:22:05Z
+prof_not_ready apps.json.orig "$(profile teknoir-default u-default 1 - -)"
+check "not reconciled by profile-controller yet (no status): not ready" \
+  grep -qxF 'profile/teknoir-default	not reconciled by profile-controller yet' "${WORK}/out"
+prof_not_ready nodefault.json "$(profile teknoir-default u-default 1 "${T0}" "${T0}" "${DEFAULT_PLUGINS[@]}")"
+check "reconciled, no Application: not ready, naming the expected ones" \
+  grep -qxF 'profile/teknoir-default	no Applications yet (expected 3: teknoir-default-emqx, teknoir-default-grafana, teknoir-default-jwks)' "${WORK}/out"
+jq -c '.items |= map(select(.metadata.name != "teknoir-default-grafana"))' "${WORK}/apps.json.orig" > "${WORK}/somedefault.json"
+prof_not_ready somedefault.json "$(profile teknoir-default u-default 1 "${T0}" "${T0}" "${DEFAULT_PLUGINS[@]}")"
+check "only some Applications: not ready, naming the missing one" \
+  grep -qxF 'profile/teknoir-default	Applications not created yet: teknoir-default-grafana' "${WORK}/out"
+prof_not_ready apps.json.orig "$(profile teknoir-default u-default 1 "${T1}" "${T0}" "${DEFAULT_PLUGINS[@]}")"
+check "a profile-controller run in progress (lastRunEnd before lastRunStart): not ready" \
+  grep -qxF "profile/teknoir-default	profile-controller run in progress (started ${T1})" "${WORK}/out"
+prof_not_ready apps.json.orig "$(profile teknoir-default u-default 1 "${T1}" - "${DEFAULT_PLUGINS[@]}")"
+check "a run that never ended (no lastRunEnd): not ready" grep -qF 'profile/teknoir-default	profile-controller run in progress' "${WORK}/out"
+prof_not_ready nodefault.json "$(profile teknoir-default u-default 1 "${T0}" "${T0}")"
+check "a run that applied no plugin and created nothing: not ready" grep -qxF 'profile/teknoir-default	no Applications yet' "${WORK}/out"
+prof_not_ready nodefault.json "$(profile teknoir-default u-default 1 "${T0}" "${T0}" "$(plugin ArgoCD true "" Success)" "$(plugin Postgres false postgres Success)")"
+check "every chart plugin disabled: no Application expected, ready" eq "rc=0" "$(out)"
+prof_not_ready apps.json.orig "$(profile teknoir-default u-default 1 "${T0}" "${T0}" "${DEFAULT_PLUGINS[@]}")"
+check "every Application there, EMQX Fail: ready, the failure only reported" eq "reported: profile/teknoir-default	teamspace teknoir-default, plugin status (profile-controller retries)	plugin(s) not applied: EMQX Fail
+rc=0" "$(out)"
+prof_not_ready nodefault.json "$(profile teknoir-default u-default 0 "${T0}" "${T0}" "${DEFAULT_PLUGINS[@]}")"
+check "a Profile not in GitOps without Applications: reported only" \
+  grep -qxF 'reported: profile/teknoir-default	teamspace teknoir-default, not declared in GitOps	no Applications yet (expected 3: teknoir-default-emqx, teknoir-default-grafana, teknoir-default-jwks)' "${WORK}/out"
+check "... never in post's strict list" bash -c "! grep -q '^profile/' '${WORK}/out'"
+prof_not_ready apps.json.orig "$(profile teknoir-default u-other 1 "${T0}" "${T0}" "${DEFAULT_PLUGINS[@]}")"
+check "Applications owned by another Profile uid do not count" grep -qF 'profile/teknoir-default	no Applications yet' "${WORK}/out"
+run_lib '_release_classify "$(cat "${W}/apps.json.orig")" "$(cat "${W}/profiles.json")"; release_status'
+check "no plugin configuration value reaches the classified JSON or status" bash -c "! grep -qF 'not-a-real-pass-4711' '${WORK}/out'"
+# post itself: the controller stand-in finishes monitoring; the Profile has no Application
+jq -c '.items |= map(select(.metadata.name | test("^teknoir-default-") | not))' "${WORK}/apps.json.orig2" > "${WORK}/apps.json"
+: > "${WORK}/patches.log"
+CTRL=succeed run_lib 'WAIT_TIMEOUT=2; REC_SOURCE=configmap; post_wait_applications'
+check "post: a Profile declared in GitOps with no Application fails post, named" \
+  grep -qE 'ERROR: post: after 2s these Applications are not Synced/Healthy at this release: profile/teknoir-default \(no Applications yet \(expected 3: ' "${WORK}/out"
+check "... and the table says why" grep -qF '  profile/teknoir-default: no Applications yet (expected 3:' "${WORK}/out"
+
 echo "# 4. post_wait_applications"
-# only the strict blockers that a re-sync can fix: drop the teamspace failures for these runs
-jq -c '.items |= map(select(.metadata.name | IN("teknoir-default-jwks", "teknoir-default-grafana") | not))' "${WORK}/apps.json.orig" > "${WORK}/apps.json.orig2"
 cp "${WORK}/apps.json.orig2" "${WORK}/apps.json"; : > "${WORK}/patches.log"
 CTRL=fail run_lib 'WAIT_TIMEOUT=3; REC_SOURCE=configmap; post_wait_applications'
 check "a re-sync that fails again: post fails after the timeout" grep -q '^rc=1$' "${WORK}/out"
@@ -264,6 +385,8 @@ apps:      platform: 4 Application(s), 1 not ready (up waits for them)
 apps:      teamspace teknoir-default: 1 Application(s), 1 not ready (reported only, never block up)
 apps:      teamspace teknoir-default: 3 Application(s), 2 not ready (up waits for them)
 apps:      teamspace teknoir-demo: 1 Application(s), 1 not ready (reported only, never block up)
+profile:   teknoir-default (declared in GitOps, up waits for it): 3 Application(s) created; plugin(s) not applied: EMQX Fail (reported only)
+profile:   teknoir-demo (not in GitOps, reported only): 1 Application(s) created
 rc=0
 EOF
 )" "$(out)"

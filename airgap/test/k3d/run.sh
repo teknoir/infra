@@ -41,7 +41,11 @@
 #        current revision gets exactly one re-sync patch per run (operation
 #        set, operationState cleared in the same write); post fails, naming
 #        the reason, when that re-sync fails again and passes when it
-#        succeeds; previous-password of teknoir-auth/keycloak-admin is removed
+#        succeeds; a platform Application pinned ahead of its stale Failed
+#        status is waited for but never patched; a Profile declared in
+#        GitOps blocks post until profile-controller (played by the test)
+#        has run and its Application exists, which is then strict;
+#        previous-password of teknoir-auth/keycloak-admin is removed
 #        after a 200 master login (stubs/fake-keycloak.py) and kept with a
 #        WARN on 401; no password in any log [needs python3]
 #
@@ -1310,7 +1314,7 @@ t10_fake_controller() {
 }
 
 t10() {
-  tl_case T10 "post phase: teamspace Applications not in GitOps never block; one re-sync per run of a failed platform sync; keycloak-admin previous-password clean-up"
+  tl_case T10 "post phase: teamspace Applications not in GitOps never block, a Profile in GitOps does until its Applications exist; one re-sync per run of a failed platform sync, never of a superseded revision; keycloak-admin previous-password clean-up"
   local src="${T9_NODE_DIR:-${REPO}/airgap/node}" profile_uid ops pw rv
   mkdir -p "${WORK}/t10/log" "${WORK}/t10/state" "${WORK}/t10/root" "${WORK}/t10/kc"
   rm -rf "${WORK}/t10/payload"; mkdir -p "${WORK}/t10/payload"
@@ -1336,6 +1340,14 @@ EOF
   kc -n teknoir-system patch applications.argoproj.io monitoring --type merge -p '{"status":{"operationState":{"phase":"Failed","retryCount":5,
     "message":"one or more synchronization tasks completed unsuccessfully (retried 5 times).",
     "syncResult":{"revision":"0.0.4"},"operation":{"sync":{"revision":"0.0.4"}}}}}' >/dev/null
+  # argo just pinned to 0.0.4 by the root; ArgoCD still shows 0.0.3 and that
+  # revision's failed sync: a superseded failure, never re-synced
+  t10_app argo argo 0.0.4 "app-of-apps:argoproj.io/Application:teknoir-system/argo"
+  kc -n teknoir-system patch applications.argoproj.io argo --type merge -p '{"status":{"sync":{"revision":"0.0.3",
+    "comparedTo":{"source":{"targetRevision":"0.0.3"}}},"operationState":{"phase":"Failed","message":"old revision failed",
+    "syncResult":{"revision":"0.0.3"},"operation":{"sync":{"revision":"0.0.3"}}}}}' >/dev/null
+  # teknoir-default, declared in GitOps, that profile-controller has not reconciled yet
+  printf 'apiVersion: teknoir.org/v1\nkind: Profile\nmetadata: {name: teknoir-default, annotations: {argocd.argoproj.io/tracking-id: "profile-controller:teknoir.org/Profile:/teknoir-default"}}\nspec: {owner: {kind: User, name: owner@example.test}}\n' | kc apply -f - >/dev/null
   printf 'apiVersion: teknoir.org/v1\nkind: Profile\nmetadata: {name: teknoir-demo}\nspec: {owner: {kind: User, name: owner@example.test}}\n' | kc apply -f - >/dev/null
   profile_uid="$(uid_of profiles.teknoir.org teknoir-demo)"
   jq -n --arg uid "${profile_uid}" '{apiVersion: "argoproj.io/v1alpha1", kind: "Application",
@@ -1360,9 +1372,18 @@ EOF
   # run 1: the re-sync fails again -> post fails, naming the reason, after one patch
   t10_post 20
   assert_eq "run 1 (re-sync fails again): post exits non-zero" 1 "${T10_RC}"
-  if grep -qE 'ERROR: post: after 20s these Applications are not Synced/Healthy at this release: monitoring \(last sync to 0\.0\.4 Failed: failed again\) $' <<<"${T10_OUT}"; then
+  if grep -qE 'ERROR: post: after 20s these Applications are not Synced/Healthy at this release: .*monitoring \(last sync to 0\.0\.4 Failed: failed again\) ' <<<"${T10_OUT}"; then
     pass "run 1: the error names monitoring and its failed last sync"
   else fail "run 1: no error naming monitoring's failed sync"; tail -15 <<<"${T10_OUT}" >&2; fi
+  if grep -qF 'argo (last sync to 0.0.3 Failed: old revision failed; status not computed for the current spec yet (compared: 0.0.3); synced revision 0.0.3, pinned 0.0.4)' <<<"${T10_OUT}"; then
+    pass "run 1: the pinned-ahead argo is waited for as stale"
+  else fail "run 1: argo not reported as stale"; fi
+  assert_eq "run 1: the pinned-ahead argo is never patched (its 0.0.3 failure is superseded)" "" \
+    "$(kc -n teknoir-system get applications.argoproj.io argo -o jsonpath='{.operation}')"
+  assert_eq "run 1: no re-sync of argo reported" 0 "$(grep -c 're-synced Application argo' <<<"${T10_OUT}")"
+  if grep -qF 'profile/teknoir-default (not reconciled by profile-controller yet)' <<<"${T10_OUT}"; then
+    pass "run 1: the Profile declared in GitOps without Applications is waited for"
+  else fail "run 1: profile/teknoir-default not waited for"; fi
   assert_eq "run 1: exactly one re-sync patch (one operation seen by the controller)" 1 "$(grep -c . "${WORK}/t10/ops.log")"
   assert_eq "run 1: one re-sync recorded as a change" 1 "$(grep -c 'changed: re-synced Application monitoring once (last sync to 0.0.4 Failed)' <<<"${T10_OUT}")"
   ops="$(head -1 "${WORK}/t10/ops.log")"
@@ -1378,12 +1399,27 @@ EOF
   assert_eq "run 1: previous-password untouched (post stopped before the clean-up)" 1 \
     "$(kc -n teknoir-auth get secret keycloak-admin -o json | jq '.data | has("previous-password") | if . then 1 else 0 end')"
 
-  # run 2: the re-sync succeeds -> post passes; previous-password goes after a 200 login
+  # run 2: ArgoCD has compared argo at 0.0.4 and synced it; profile-controller
+  # has run for teknoir-default and created its Application; the re-sync of
+  # monitoring succeeds -> post passes; previous-password goes after a 200 login
+  kc -n teknoir-system patch applications.argoproj.io argo --type merge -p '{"status":{"sync":{"revision":"0.0.4",
+    "comparedTo":{"source":{"targetRevision":"0.0.4"}}},"operationState":{"phase":"Succeeded","message":"ok",
+    "syncResult":{"revision":"0.0.4"},"operation":{"sync":{"revision":"0.0.4"}}}}}' >/dev/null
+  kc patch profiles.teknoir.org teknoir-default --type merge -p '{"status":{"appliedconfig":{"lastRunStart":"2026-10-09T09:22:01Z",
+    "lastRunEnd":"2026-10-09T09:22:02Z","plugins":{"JWKS":{"applyStatus":{"status":"Success"},
+    "appliedConfig":{"settings":{"enabled":true},"pluginConfig":{"name":"jwks","version":"0.0.99"}}}}}}}' >/dev/null
+  t10_app teknoir-default-jwks profile-plugin-jwks 0.0.99 -
+  kc -n teknoir-system patch applications.argoproj.io teknoir-default-jwks --type merge -p "$(jq -cn --arg uid "$(uid_of profiles.teknoir.org teknoir-default)" \
+    '{metadata: {ownerReferences: [{apiVersion: "teknoir.org/v1", kind: "Profile", name: "teknoir-default", uid: $uid}]}}')" >/dev/null
   echo succeed > "${WORK}/t10/mode"
   t10_post 60
   assert_eq "run 2 (re-sync succeeds): post exits 0 with the teamspace Application still Unknown" 0 "${T10_RC}"
   (( T10_RC == 0 )) || tail -20 <<<"${T10_OUT}" >&2
   assert_eq "run 2: one more re-sync patch (once per run)" 2 "$(grep -c . "${WORK}/t10/ops.log")"
+  assert_eq "run 2: argo still never patched" "" "$(kc -n teknoir-system get applications.argoproj.io argo -o jsonpath='{.operation}')"
+  if grep -qE '^teknoir-default-jwks +Synced +Healthy +0\.0\.99 +teamspace/teknoir-default$' <<<"${T10_OUT}"; then
+    pass "run 2: the Profile's Application is strict (no *) and ready"
+  else fail "run 2: teknoir-default-jwks not listed as a strict ready teamspace Application"; fi
   assert_eq "run 2: monitoring's last operation Succeeded" Succeeded \
     "$(kc -n teknoir-system get applications.argoproj.io monitoring -o jsonpath='{.status.operationState.phase}')"
   assert_eq "run 2: previous-password removed after the 200 login" 0 \

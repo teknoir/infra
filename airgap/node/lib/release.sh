@@ -19,13 +19,19 @@
 #   the root ("<ROOT_APP>:...", ArgoCD annotation tracking) - and the
 #   teamspace ones (an ownerReference of kind Profile) whose Profile is
 #   declared in GitOps (the Profile itself carries an ArgoCD tracking-id, e.g.
-#   teknoir-default). Other teamspaces (created in Backstage, e.g.
+#   teknoir-default). Such a Profile is itself waited for until
+#   profile-controller has run for it and created its Applications (one per
+#   enabled chart plugin); failed plugins (e.g. EMQX before its pod answers)
+#   are only reported. Other teamspaces (created in Backstage, e.g.
 #   teknoir-demo) and any other Application are reported, never waited for.
 #   A platform Application whose last sync of its current revision Failed (or
 #   Errored) and that has no operation pending is not ready, and post re-syncs
 #   it once per run the way ArgoCD's own API does: one merge patch that sets
 #   .operation and clears .status.operationState (never .operation alone: the
-#   controller would resume the stale failed state).
+#   controller would resume the stale failed state). Only while that failure
+#   is about the spec the Application keeps: its status was computed for its
+#   current spec and, for a child, the root is Synced at its own current spec
+#   (else the failure belongs to a revision a pin has just superseded).
 #   Synced/Healthy alone is not enough: right after the pin changes, ArgoCD
 #   still shows the old revision's status until it has compared again (and
 #   the children go through the same window after the root syncs). An
@@ -74,6 +80,14 @@ ARGOCD_INITIAL_ADMIN_SECRET="argocd-initial-admin-secret"
 # A Failed/Error last operation counts only when it synced the revision the
 # Application is at now (an older failure was superseded) and no operation is
 # pending (.operation set: requested or running).
+# stale($root; $pinAt) is the subset that says the status does not describe
+# the current spec yet (an operation pending or running, compared with another
+# source, another chart revision than the pin, the root not reconciled since
+# this run's pin). resync_candidate: a platform Application is re-synced only
+# when its failed operation is about the spec it has now - its own status is
+# not stale and, for a child, the root is Synced with a status that is not
+# stale either (else the child's spec may be about to change: right after a
+# pin, the old revision's failure must never be re-applied).
 RELEASE_JQ_READY='
 def exactver: test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$");
 def epoch: (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0);
@@ -84,27 +98,37 @@ def oprev: (.status.operationState.syncResult.revision // .status.operationState
 def currev: (.status.sync.revision // .status.sync.revisions // null);
 def failedop: ((.status.operationState.phase // "") | IN("Failed", "Error"))
               and .operation == null and oprev != null and oprev == currev;
-def why($root; $pinAt):
+def opwhy:
+  if ((.status.operationState.phase // "") | IN("Running", "Terminating"))
+  then "sync operation \(.status.operationState.phase)"
+  elif .operation != null then "sync operation requested, not started yet"
+  else empty end;
+def specwhy($root; $pinAt):
   (.spec.source // null) as $src
-  | [ (if (.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy"
-       then "\(.status.sync.status // "Unknown")/\(.status.health.status // "Unknown")" else empty end),
-      (if ((.status.operationState.phase // "") | IN("Running", "Terminating"))
-       then "sync operation \(.status.operationState.phase)"
-       elif .operation != null then "sync operation requested, not started yet"
-       else empty end),
-      (if failedop
-       then "last sync to \(oprev | revstr) \(.status.operationState.phase): \((.status.operationState.message // "no message") | .[0:200])"
-       else empty end),
-      (if ($src | nilempty) != (.status.sync.comparedTo.source // null | nilempty)
-          or (.spec.sources // null | nilempty) != (.status.sync.comparedTo.sources // null | nilempty)
-       then "status not computed for the current spec yet (compared: \(.status.sync.comparedTo.source.targetRevision // "nothing"))"
-       else empty end),
-      (if ($src.chart // "") != "" and (($src.targetRevision // "") | exactver)
-          and (.status.sync.revision // "") != $src.targetRevision
-       then "synced revision \(.status.sync.revision // "none"), pinned \($src.targetRevision)" else empty end),
-      (if .metadata.name == $root and $pinAt > 0 and ((.status.reconciledAt // "") | epoch) <= $pinAt
-       then "not reconciled since this run pinned it" else empty end)
-    ] | join("; ");
+  | (if ($src | nilempty) != (.status.sync.comparedTo.source // null | nilempty)
+        or (.spec.sources // null | nilempty) != (.status.sync.comparedTo.sources // null | nilempty)
+     then "status not computed for the current spec yet (compared: \(.status.sync.comparedTo.source.targetRevision // "nothing"))"
+     else empty end),
+    (if ($src.chart // "") != "" and (($src.targetRevision // "") | exactver)
+        and (.status.sync.revision // "") != $src.targetRevision
+     then "synced revision \(.status.sync.revision // "none"), pinned \($src.targetRevision)" else empty end),
+    (if .metadata.name == $root and $pinAt > 0 and ((.status.reconciledAt // "") | epoch) <= $pinAt
+     then "not reconciled since this run pinned it" else empty end);
+def stale($root; $pinAt): [opwhy, specwhy($root; $pinAt)];
+def why($root; $pinAt):
+  [ (if (.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy"
+     then "\(.status.sync.status // "Unknown")/\(.status.health.status // "Unknown")" else empty end),
+    opwhy,
+    (if failedop
+     then "last sync to \(oprev | revstr) \(.status.operationState.phase): \((.status.operationState.message // "no message") | .[0:200])"
+     else empty end),
+    specwhy($root; $pinAt)
+  ] | join("; ");
+def resync_candidate($root; $pinAt; $rootapp):
+  failedop and (stale($root; $pinAt) | length) == 0
+  and (.metadata.name == $root
+       or ($rootapp != null and ($rootapp.status.sync.status // "") == "Synced"
+           and ($rootapp | stale($root; $pinAt) | length) == 0));
 '
 
 # jq: classify($root; $profiles) - which Applications post waits for (R2).
@@ -115,6 +139,15 @@ def why($root; $pinAt):
 #   other      anything else: reported only
 # $profiles: {"<name>": {"uid": "...", "tracked": true|false}}. The result is
 # stored on each item as .teknoirPost = {class, strict, profile}.
+# A Profile itself gets a pseudo-entry (profile_why, on the summary of
+# _release_profiles_summary): its Applications must exist before there is
+# anything to wait for. Not ready while profile-controller has not run for it
+# (no appliedconfig.lastRunStart) or is running (lastRunEnd before
+# lastRunStart), while it owns no Application, or while an Application of an
+# enabled chart plugin (profile-controller names it <profile>-<chart name>) is
+# missing. A plugin whose applyStatus is not Success is only noted
+# (profile_note): EMQX's fails until the EMQX pod answers and profile-controller
+# retries it with a backoff of up to ~17 min, which would fail up on timing.
 RELEASE_JQ_CLASSIFY='
 def tracked_by($app): ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | test("^([^:]*_)?" + $app + ":"));
 def classify($root; $profiles):
@@ -125,6 +158,28 @@ def classify($root; $profiles):
       | {class: "teamspace", profile: $own.name,
          strict: ($p != null and $p.tracked and (($own.uid // "") == "" or $own.uid == $p.uid))}
     else {class: "other", strict: false, profile: ""} end;
+def profile_owned($apps):
+  .name as $n | .uid as $uid
+  | [$apps[] | select(any(.metadata.ownerReferences[]?; .kind == "Profile" and .name == $n
+                          and ((.uid // "") == "" or $uid == "" or .uid == $uid))) | .metadata.name];
+def profile_why($apps):
+  . as $p
+  | ($p | profile_owned($apps)) as $owned
+  | ([$p.plugins[] | select(.enabled and .chart != "") | "\($p.name)-\(.chart)"] | unique) as $expected
+  | ($expected - $owned) as $missing
+  | [ (if $p.lastRunStart == "" then "not reconciled by profile-controller yet"
+       elif ($p.lastRunEnd | epoch) < ($p.lastRunStart | epoch)
+       then "profile-controller run in progress (started \($p.lastRunStart))"
+       else empty end),
+      (if $p.lastRunStart == "" then empty
+       elif ($owned | length) == 0 and (($p.plugins | length) == 0 or ($expected | length) > 0)
+       then "no Applications yet\(if ($expected | length) > 0 then " (expected \($expected | length): \($expected | join(", ")))" else "" end)"
+       elif ($missing | length) > 0 then "Applications not created yet: \($missing | join(", "))"
+       else empty end)
+    ] | join("; ");
+def profile_note:
+  [.plugins[] | select(.enabled and .status != "Success") | "\(.kind) \(if .status == "" then "not applied" else .status end)"]
+  | if length > 0 then "plugin(s) not applied: \(join(", "))" else "" end;
 '
 
 # jq: resync_patch - the one merge patch that re-syncs an Application the way
@@ -296,6 +351,7 @@ release_request_refresh() {
 }
 
 release_status() {
+  local json
   release_load_record
   case "${REC_SOURCE}" in
     configmap)
@@ -306,34 +362,56 @@ release_status() {
     none) printf 'release:   nothing deployed yet\n' ;;
   esac
   crd_established "${APP_CRD}" || return 0
+  json="$(_release_applications_json)"
   # which Applications `up` waits for (R2), with how many are not ready
-  _release_applications_json | "${JQ}" -r --arg root "${ROOT_APP}" "${RELEASE_JQ_READY}"'
+  "${JQ}" -r --arg root "${ROOT_APP}" "${RELEASE_JQ_READY}"'
     [.items[] | {k: (if .teknoirPost.class == "platform" then "platform"
                      elif .teknoirPost.class == "teamspace" then "teamspace \(.teknoirPost.profile)"
                      else "other" end),
                  strict: .teknoirPost.strict, bad: (why($root; 0) != "")}]
     | group_by([.k, .strict])[]
     | "apps:      \(.[0].k): \(length) Application(s), \(map(select(.bad)) | length) not ready (\(
-        if .[0].strict then "up waits for them" else "reported only, never block up" end))"'
+        if .[0].strict then "up waits for them" else "reported only, never block up" end))"' <<<"${json}"
+  # the teamspaces' own state: has profile-controller created their Applications
+  "${JQ}" -r '
+    .teknoirProfiles[]?
+    | "profile:   \(.name) (\(if .strict then "declared in GitOps, up waits for it" else "not in GitOps, reported only" end)): \(
+        if .why == "" then "\(.apps) Application(s) created" else "not ready: \(.why)" end)\(
+        if .note != "" then "; \(.note) (reported only)" else "" end)"' <<<"${json}"
 }
 
 # ---------------------------------------------------------------------------
 # post
 # ---------------------------------------------------------------------------
-_release_profiles_map() {
-  # _release_profiles_map <profiles-list-json> - {"<name>": {uid, tracked}}:
-  # names, uids and whether ArgoCD tracks the Profile (declared in GitOps).
-  "${JQ}" -c '[.items[]? | {key: .metadata.name,
-                value: {uid: (.metadata.uid // ""),
-                        tracked: ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") != "")}}]
-              | from_entries' <<<"$1"
+_release_profiles_summary() {
+  # _release_profiles_summary <profiles-list-json> - per Profile its name, uid,
+  # whether ArgoCD tracks it (declared in GitOps) and profile-controller's run
+  # state: run times and, per plugin, enabled, chart name and apply status.
+  # Never a plugin's configuration.
+  "${JQ}" -c '[.items[]? | {name: .metadata.name, uid: (.metadata.uid // ""),
+      tracked: ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") != ""),
+      lastRunStart: (.status.appliedconfig.lastRunStart // ""),
+      lastRunEnd: (.status.appliedconfig.lastRunEnd // ""),
+      plugins: [(.status.appliedconfig.plugins // {}) | to_entries[] | {kind: .key,
+        enabled: (.value.appliedConfig.settings.enabled == true),
+        chart: ((.value.appliedConfig.pluginConfig.name // "") | if type == "string" then . else "" end),
+        status: ((.value.applyStatus.status // "") | tostring)}]}]' <<<"$1"
 }
 
 _release_classify() {
   # _release_classify <applications-list-json> <profiles-list-json> - the
-  # Application list with .teknoirPost = {class, strict, profile} on every item.
-  "${JQ}" -c --arg root "${ROOT_APP}" --argjson profiles "$(_release_profiles_map "$2")" "${RELEASE_JQ_CLASSIFY}"'
-    .items |= map(. + {teknoirPost: classify($root; $profiles)})' <<<"$1"
+  # Application list with .teknoirPost = {class, strict, profile} on every item,
+  # plus .teknoirProfiles: one pseudo-entry per Profile {name, strict (declared
+  # in GitOps), apps (owned), why (not ready: blocks post when strict), note
+  # (plugin failures: reported only)}.
+  local profiles
+  profiles="$(_release_profiles_summary "$2")"
+  "${JQ}" -c --arg root "${ROOT_APP}" --argjson profiles "${profiles}" "${RELEASE_JQ_READY}${RELEASE_JQ_CLASSIFY}"'
+    ($profiles | map({key: .name, value: .}) | from_entries) as $pmap
+    | .items |= map(. + {teknoirPost: classify($root; $pmap)})
+    | .items as $apps
+    | .teknoirProfiles = [$profiles[] | {name, strict: .tracked, apps: (profile_owned($apps) | length),
+                                         why: profile_why($apps), note: profile_note}]' <<<"$1"
 }
 
 _release_applications_json() {
@@ -369,31 +447,49 @@ post_application_table() {
   "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
     if any(.items[]; .teknoirPost.strict | not) then "(* reported only: up never waits for these)" else empty end,
     (.items[] | why($root; $pinAt) as $w | select($w != "") |
-    "  \(.metadata.name)\(if .teknoirPost.strict then "" else " [reported only]" end): \($w) | \((.status.operationState.phase // "no operation")) \((.status.operationState.message // (.status.conditions // [] | map(.message) | join("; ")) // "") | .[0:300])")' <<<"${json}"
+    "  \(.metadata.name)\(if .teknoirPost.strict then "" else " [reported only]" end): \($w) | \((.status.operationState.phase // "no operation")) \((.status.operationState.message // (.status.conditions // [] | map(.message) | join("; ")) // "") | .[0:300])"),
+    (.teknoirProfiles[]? | select(.why != "") |
+    "  profile/\(.name)\(if .strict then "" else " [reported only]" end): \(.why)"),
+    (.teknoirProfiles[]? | select(.note != "") | "  profile/\(.name) [reported only]: \(.note)")' <<<"${json}"
 }
 
 _release_post_not_ready() {
   # "name<TAB>reasons" of every strict Application (platform, or a teamspace
   # declared in GitOps) that is not ready; one line while the root
-  # Application does not exist yet.
+  # Application does not exist yet. Plus "profile/<name><TAB>reasons" for a
+  # Profile declared in GitOps whose Applications profile-controller has not
+  # created yet (profile_why).
   "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
-    if any(.items[]; .metadata.name == $root) | not then "\($root)\tnot created yet (waiting for the release phase or ArgoCD)" else
-    .items[] | select(.teknoirPost.strict) | why($root; $pinAt) as $w | select($w != "") | "\(.metadata.name)\t\($w)" end' <<<"$1"
+    (if any(.items[]; .metadata.name == $root) | not then "\($root)\tnot created yet (waiting for the release phase or ArgoCD)" else
+     .items[] | select(.teknoirPost.strict) | why($root; $pinAt) as $w | select($w != "") | "\(.metadata.name)\t\($w)" end),
+    (.teknoirProfiles[]? | select(.strict and .why != "") | "profile/\(.name)\t\(.why)")' <<<"$1"
 }
 
 _release_post_reported() {
-  # "name<TAB>class<TAB>reasons" of every not-ready Application post only
-  # reports (a teamspace not declared in GitOps, or no known owner).
+  # "name<TAB>class<TAB>reasons" of everything not ready that post only
+  # reports: Applications of a teamspace not declared in GitOps or with no
+  # known owner, such a teamspace's Profile, and any teamspace's failed
+  # plugins (profile_note).
   "${JQ}" -r --arg root "${ROOT_APP}" "${RELEASE_JQ_READY}"'
-    .items[] | select(.teknoirPost.strict | not) | why($root; 0) as $w | select($w != "")
-    | "\(.metadata.name)\t\(if .teknoirPost.class == "teamspace" then "teamspace \(.teknoirPost.profile), not declared in GitOps" else "no Teknoir owner" end)\t\($w)"' <<<"$1"
+    (.items[] | select(.teknoirPost.strict | not) | why($root; 0) as $w | select($w != "")
+     | "\(.metadata.name)\t\(if .teknoirPost.class == "teamspace" then "teamspace \(.teknoirPost.profile), not declared in GitOps" else "no Teknoir owner" end)\t\($w)"),
+    (.teknoirProfiles[]? | select((.strict | not) and .why != "")
+     | "profile/\(.name)\tteamspace \(.name), not declared in GitOps\t\(.why)"),
+    (.teknoirProfiles[]? | select(.note != "")
+     | "profile/\(.name)\tteamspace \(.name), plugin status (profile-controller retries)\t\(.note)")' <<<"$1"
 }
 
 _release_resync_candidates() {
   # Names of the platform Applications whose last sync of their current
-  # revision Failed/Errored and that have no operation pending (HYG-C3).
-  "${JQ}" -r --arg root "${ROOT_APP}" "${RELEASE_JQ_READY}"'
-    .items[] | select(.teknoirPost.class == "platform") | select(failedop) | .metadata.name' <<<"$1"
+  # revision Failed/Errored and that have no operation pending (HYG-C3), and
+  # only while that status describes the spec they will keep: their own status
+  # is not stale and, for a child, the root is Synced and not stale either
+  # (resync_candidate). Right after a pin, a failure of the superseded
+  # revision is never re-synced; the new revision's auto-sync replaces it.
+  "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
+    ([.items[] | select(.metadata.name == $root)][0] // null) as $rootapp
+    | .items[] | select(.teknoirPost.class == "platform")
+    | select(resync_candidate($root; $pinAt; $rootapp)) | .metadata.name' <<<"$1"
 }
 
 _release_resync_patch() {
@@ -485,7 +581,7 @@ post_report_unwaited() {
   local reported
   reported="$(_release_post_reported "$1")"
   [[ -n "${reported}" ]] || return 0
-  warn "not ready, not waited for (teamspaces not declared in GitOps and Applications without a Teknoir owner never block up): $(awk -F'\t' '{printf "%s [%s] (%s); ", $1, $2, $3}' <<<"${reported}")"
+  warn "not ready, not waited for (never blocks up: teamspaces not declared in GitOps, Applications without a Teknoir owner, teamspace plugin failures): $(awk -F'\t' '{printf "%s [%s] (%s); ", $1, $2, $3}' <<<"${reported}")"
 }
 
 _release_mirror_ref() {
