@@ -633,8 +633,13 @@ config.
 chrony and util-linux-extra would also change other packages (a node on another
 Debian point release), or apt failed. The converge goes on without them and
 corrects the clock with `date`; the WARN line names the packages apt wanted.
+apt plans with the bundle's `.deb` files only (the node's package lists are
+hidden from it), so the lists' age or content plays no part.
 Update the node from the Debian medium of the bundle's release, or install the
-packages by hand, then `up` again.
+packages by hand, then `up` again. If the WARN says apt had already removed
+systemd-timesyncd, the node has no time service (and serves no NTP to the LAN)
+until chrony is installed; `up` still corrects the clock with `date`. Look at
+`/var/log/apt/term.log` and `dpkg --audit` on the node first.
 
 **Interrupted run.** Run `./teknoir-airgap up` again. The payload copy resumes per
 file and every converge phase skips what is already done. If the node says a

@@ -22,7 +22,12 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
 - chrony and util-linux-extra ship in the bundle (`node/debs`) and the host
   phase installs them offline, behind an apt simulate that allows nothing but
   those two and the removal of systemd-timesyncd (else a WARN; the converge
-  goes on).
+  goes on). apt sees only the bundle's `.deb` files, not the node's package
+  lists: on the live node, whose lists offer the same versions, apt would
+  otherwise plan a download and fail offline. The install runs without
+  `--no-download`, with which apt 3.0 removed systemd-timesyncd and then
+  failed on the local `.deb` files (found by the new real-apt test,
+  `airgap/test/node/packages-test.sh`).
 - chrony serves NTP to the LAN from a local stratum-10 reference; every `up`
   gives it the LAN host's time (`chronyc settime`). It learns the drift only
   from samples at least 12 h apart (a re-run drops the earlier sample first:

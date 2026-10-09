@@ -11,6 +11,9 @@
 #   3. bats unit tests (airgap/test/bats/run.sh, pinned bats-core)
 #   4. the node runner's own unit tests (airgap/test/node/run.sh), when present,
 #      and the library unit tests (airgap/test/unit/*-test.sh)
+#   4b. host_packages against Debian 13's real apt and dpkg, offline, with and
+#      without apt lists that offer the pinned versions
+#      (airgap/test/node/packages-test.sh; docker, network for its prepare step)
 #   5. gitleaks over the history of HEAD and the working tree
 #      (config: airgap/test/gitleaks.toml)
 #
@@ -98,6 +101,24 @@ if [[ -x "${HERE}/node/run.sh" ]]; then
 else
   result SKIP "airgap/test/node/run.sh (not in the tree yet)"
 fi
+# ---------------------------------------------------------------------------
+step "host packages against Debian's apt (airgap/test/node/packages-test.sh)"
+if [[ ! -x "${HERE}/node/packages-test.sh" ]]; then
+  result SKIP "packages-test (not in the tree)"
+elif (( ! DOCKER )); then
+  result SKIP "packages-test (--no-docker)"
+elif ! command -v docker >/dev/null; then
+  missing docker packages-test
+else
+  prc=0
+  "${HERE}/node/packages-test.sh" || prc=$?
+  case "${prc}" in
+    0) result PASS "airgap/test/node/packages-test.sh (host_packages offline, real apt)" ;;
+    77) missing "an amd64 docker host" packages-test ;;
+    *) result FAIL "airgap/test/node/packages-test.sh" ;;
+  esac
+fi
+
 # ---------------------------------------------------------------------------
 step "library unit tests (airgap/test/unit)"
 for t in "${HERE}"/unit/*-test.sh; do

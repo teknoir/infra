@@ -65,6 +65,20 @@ resolve (coredns-custom knew only the platform names).
   skipped. The converge goes on: a node on another Debian point release must
   not be blocked from a platform update. The install uses
   `DPkg::Lock::Timeout=300` (unattended-upgrades) and keeps changed conffiles.
+  Both apt calls see an empty lists dir (`-o Dir::State::Lists=<scratch dir>`)
+  and no binary caches, so the local `.deb` files are the only origin apt
+  knows and nothing can be fetched. With the node's lists in view, a version
+  that a repository also offers made apt plan the fetch from that repository,
+  which `--no-download` refuses (`E: Unable to fetch some archives`, exit
+  100): the live node's lists, from its install, carry both pins (review r5).
+  The install itself runs without `--no-download`: with it, apt 3.0 never
+  runs the file method that resolves a local `.deb`'s path and fails after
+  its removals (`E: Internal Error, Pathname to install is not absolute`),
+  leaving neither systemd-timesyncd nor chrony. When an install fails after
+  apt removed systemd-timesyncd, the WARN says the node has no time service.
+  `airgap/test/node/packages-test.sh` runs `host_packages` against Debian 13's
+  apt and dpkg with no network, with and without such lists; it found the
+  `--no-download` install failure, which the stub tests cannot see.
 - **chrony (TIME-T3).** The drop-in `/etc/chrony/conf.d/teknoir-airgap.conf`
   holds one `server <s> iburst prefer` line per `TIME_SOURCE` entry, then
   `allow <NODE_IP network>/<prefix>`, `local stratum 10`, `manual` and

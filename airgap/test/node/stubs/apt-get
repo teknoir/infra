@@ -3,13 +3,26 @@
 # `install -s ...`: prints $STUB_STATE/apt-sim.txt when it exists, else the
 # plan apt prints for the given .debs on a node that lacks them (each one
 # Inst, plus Remv systemd-timesyncd for chrony); exits $STUB_APT_SIM_RC (0).
-# `install` without -s: "installs" each .deb (name_version_arch.deb) into the
-# stub dpkg database $STUB_STATE/dpkg/<pkg>; exits $STUB_APT_RC (0).
+# `install` without -s: like apt, first removes what the plan removes
+# (systemd-timesyncd from the stub dpkg database, for chrony), then exits
+# $STUB_APT_RC when it is not 0, else "installs" each .deb
+# (name_version_arch.deb) into the stub dpkg database $STUB_STATE/dpkg/<pkg>.
+# `-o Dir::State::Lists=<dir>`: appends "<empty|nonempty|missing> <dir>" to
+# $STUB_STATE/apt-lists.log (empty: nothing in <dir> but partial/).
 printf 'apt-get %s\n' "$*" >> "${STUB_CALLS:?}"
 sim=0 debs=()
 for a in "$@"; do
   case "${a}" in
     -s|--simulate|--dry-run) sim=1 ;;
+    Dir::State::Lists=*)
+      d="${a#*=}" s=empty
+      if [[ ! -d "${d}" ]]; then
+        s=missing
+      elif [[ -n "$(find "${d}" -mindepth 1 ! -path "${d}/partial" -print -quit)" ]]; then
+        s=nonempty
+      fi
+      printf '%s %s\n' "${s}" "${d}" >> "${STUB_STATE}/apt-lists.log"
+      ;;
     *.deb) debs+=("${a}") ;;
   esac
 done
@@ -30,6 +43,9 @@ if (( sim )); then
   exit "${STUB_APT_SIM_RC:-0}"
 fi
 if [[ "${1:-}" == install || " $* " == *" install "* ]]; then
+  for d in "${debs[@]}"; do
+    [[ "$(basename "${d}")" == chrony_* ]] && rm -f "${STUB_STATE}/dpkg/systemd-timesyncd"
+  done
   [[ "${STUB_APT_RC:-0}" == 0 ]] || exit "${STUB_APT_RC}"
   mkdir -p "${STUB_STATE}/dpkg"
   for d in "${debs[@]}"; do
