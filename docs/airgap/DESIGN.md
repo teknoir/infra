@@ -13,7 +13,7 @@ implementation differs, update this file in the same commit.
 | D3 | **Harbor `teknoir` chart project is public** (LAN-only; charts are on public GitHub anyway). No robot account, no repo-creds credential, no robot env file. Tag immutability stays on the `teknoir` project. |
 | D4 | **Sequencing: redesign first.** user-controller + Backstage ship inside the redesign (app-of-apps 0.0.4). The full procedure is tested end to end in the airgapped KVM VM before the live teknoir-local is migrated. Staging (r415) gets the user-controller secret fix afterwards. |
 | D5 | **Toolbox image** for in-cluster Jobs (platform-secrets, Harbor OIDC config, misc): `docker.io/alpine/k8s:1.34.11` (sh, kubectl, curl, jq). Mirrored like every other image. |
-| D6 | Datastore stays sqlite for now (etcd later). New installs set `secrets-encryption: true`; the live node gets it in a later window. Time: chrony on the node when installed; `up` refuses when node/LAN skew > 30 s unless `--sync-clock`. |
+| D6 | Datastore stays sqlite for now (etcd later). New installs set `secrets-encryption: true`; the live node gets it in a later window. Time (r5): chrony and hwclock ship in the bundle (`node/debs`, installed offline by the host phase); chrony serves NTP to the LAN from a local stratum-10 reference fed by a LAN-host sample on every `up`, or from `TIME_SOURCE` when set; a node/LAN skew up to 30 s is corrected automatically, more only with `--sync-clock`; `up` writes the RTC. |
 | D7 | The bundle ships `kubectl` for the LAN host (linux-amd64, darwin-arm64) as a convenience; `up` itself needs only ssh, tar and sha256sum/shasum. |
 | D8 | Teknoir image tags stay mutable for now (warn only); `images.lock` records digests. Immutable image tags need CI changes in the image repos (out of scope). |
 | D9 | No tag immutability on the mirror projects (only on `teknoir`). |
@@ -43,6 +43,85 @@ Verified facts and agreed deviations that supersede the text below where they di
   - Istio gateway pods created before istiod answered its injection webhook keep `image: auto` and never start; after the istio tier the converge waits for istiod and re-creates those pods.
   - The Backstage postgres StatefulSet stayed OutOfSync on client-side diff (defaulted fields); every Application, the root one included, uses `ServerSideDiff=true`.
 - Known residuals: over HTTP/2 the ingress gateway resets the stream (RST_STREAM PROTOCOL_ERROR) right after ext_authz's 302 to `/oauth2/start` (`content-length: 0`), on staging and production as well; browsers tolerate it, curl does not (the e2e login uses HTTP/1.1); `grafana.<domain>` is in the hosts list but has no route (Grafana is at `/teknoir-system/grafana/`); Backstage logout hard-codes realm `master` (backstage repo `Header.tsx`, needs an image rebuild); Keycloak asks for Update Profile at first login (user-controller sets no lastName); teamspace creation needs the profile-plugins charts mirrored (out of scope).
+
+## r5 (app-of-apps 0.0.5)
+
+### Node time, RTC, teamspace DNS and site keys (WP-I-HOST)
+
+Live facts this answers (2026-10-09, read-only): the node had no chrony and no
+`hwclock` (util-linux-extra not installed), systemd-timesyncd's NTP queries were
+blocked by the gateway, the clock lost 118 s in 30.65 days (about -3.85 s/day),
+and the RTC was 93 s behind, so a reboot would have started the node outside
+the 30 s window. Inside the cluster `mqtt-teknoir-default.<domain>` did not
+resolve (coredns-custom knew only the platform names).
+
+- **Packages (TIME-T2).** The bundle carries `node/debs` (chrony and
+  util-linux-extra, pinned by sha256 in `node/debs/debs.lock`, built by
+  WP-I-BUNDLE). The host phase installs a package only when `dpkg-query` does
+  not report exactly the pinned version. apt simulates first, offline
+  (`apt-get install -s --no-download`); a plan with anything but installing
+  those packages and removing `systemd-timesyncd` (chrony replaces it: both
+  provide `time-daemon`), or a failing simulate, is a WARN and the step is
+  skipped. The converge goes on: a node on another Debian point release must
+  not be blocked from a platform update. The install uses
+  `DPkg::Lock::Timeout=300` (unattended-upgrades) and keeps changed conffiles.
+- **chrony (TIME-T3).** The drop-in `/etc/chrony/conf.d/teknoir-airgap.conf`
+  holds one `server <s> iburst prefer` line per `TIME_SOURCE` entry, then
+  `allow <NODE_IP network>/<prefix>`, `local stratum 10` and `manual`. chrony
+  restarts only when the drop-in changes, and is enabled and started when it
+  is installed but not active. Debian's own `pool 2.debian.pool.ntp.org` line
+  stays: a drop-in cannot remove it, it fails or times out on an airgap, and
+  it is a valid source if egress ever opens.
+- **Clock policy (TIME-T3).** Preflight compares the node with `--lan-time`:
+  up to 2 s nothing; up to 30 s corrected by this run (with an active chrony
+  through the host-phase sample, else stepped at once with `date -u -s`); more
+  is refused unless `--sync-clock`, which steps at once (`chronyc settime` +
+  `makestep`, or `date -u -s`) and writes the RTC. The host phase gives chrony
+  one sample per `up` (`TZ=UTC chronyc settime`) while its reference is LOCAL,
+  MANU or none and no source is selected (`^*`); chrony learns the drift from
+  the samples of successive runs (driftfile). Deviation from the
+  investigation: when the sample is more than 2 s off, the host phase also
+  runs `chronyc makestep`, so the correction applies at once instead of
+  slewing for minutes (20 s at chrony's maximum slew rate takes about 4 min)
+  and the VM e2e can assert it within 60 s. The RTC is written
+  (`hwclock --systohc --utc`) when it is more than 2 s off the system clock;
+  never when `/etc/adjtime` says the RTC keeps local time. A routine sample is
+  not a recorded change, so an unchanged second `up` still reports 0 changes.
+- **Indirection.** `CHRONYC`, `HWCLOCK` and `DATE_BIN` (the date that sets the
+  clock) can be overridden, so the sandbox tests run against stubs and never
+  touch the test host's clock or packages.
+- **Status and doctor (TIME-T4).** `teknoir-node status` prints
+  `time: <utc> source=<LOCAL|MANU|none|name> stratum N freq X ppm ...
+  NTPSynchronized=..; RTC <+-N> s; chrony <state>`. The LAN `status` adds the
+  RTC offset, chrony's Reference ID, Stratum and Frequency, and whether
+  `NODE_IP` is static or a DHCP lease. `doctor` reads the same facts as the ssh
+  user and reports: chrony active (ok) or not (WARN); the RTC offset (ok up to
+  5 s, WARN up to 30 s, FAIL above: a reboot would start the node that far
+  off); with `TIME_SOURCE` set, WARN unless chrony uses one of its entries
+  (`^*` or `^+`); a `dynamic` `NODE_IP` is a WARN unless the site says
+  `NODE_IP_DHCP_RESERVED=yes`.
+- **Teamspace DNS in the cluster (TS-C5).** coredns-custom answers the apex and
+  every `<name>.<domain>` with `NODE_IP` (A) and NODATA (AAAA) from a
+  `template`, so `mqtt-<ns>`, `deadend-<ns>` and `emqx-dashboard-<ns>` resolve
+  for every teamspace, also ones created in Backstage later; the hosts block
+  stays for the other types. Deviations from the investigation, both checked
+  against CoreDNS 1.12.3 (the live version) by
+  `airgap/test/node/coredns-test.sh`: CoreDNS orders its plugins at compile
+  time and runs `template` before `hosts`, so `fallthrough` on hosts would only
+  turn today's silent SERVFAIL for unknown names into an error log line, and
+  is left out; and the template matches one label below the domain only
+  (`match ^([a-z0-9-]+[.])?<domain>[.]$`, the reach of the wildcard
+  certificate), so a search-path expansion such as `github.com.<domain>` keeps
+  its SERVFAIL instead of resolving to the node. No k3s restart: the names are
+  not in config.yaml.
+- **Site keys (R9).** `TIME_SOURCE` is a space-separated list of IPv4
+  addresses or host names; `NODE_IP_DHCP_RESERVED` is `yes`, `no` or empty;
+  `BACKUP_AGE_RECIPIENTS` is a space-separated list of age public keys
+  (`^age1[0-9a-z]{58}$`, consumed by the backup work). The build
+  (`site_check`), the node (`load_site`) and the LAN tool check all three.
+- **Not in r5:** the `teknoir-node net` tool for a static or keep-lease netplan
+  with a dead-man revert (TIME-T6). teknoir-local keeps its DHCP address,
+  pinned by a UniFi reservation (HOST-SETUP "Fixed address").
 
 ## Backstage + user-controller (folded into the redesign)
 
@@ -203,8 +282,8 @@ RANKED CRITIQUE (the 5 reviews merged; contested points checked read-only on 202
 7. MAJOR: host and operations basics are missing.
    - The host-setup runbook was never run on the real node: it was built with cloud-init and netplan, its interface is enp4s0, and it has online NVIDIA apt sources.
    - NODE_IP is baked into coredns-custom at build time, so `--node-ip` is a no-op for pods.
-   - DHCP in the docs contradicts the static NODE_IP.
-   - There is no time sync. Verified: NTPSynchronized=no.
+   - DHCP in the docs contradicts the static NODE_IP. (r5: HOST-SETUP "Fixed address": static, or a router reservation; doctor warns about a lease.)
+   - There is no time sync. Verified: NTPSynchronized=no. (r5: chrony and hwclock from the bundle, a LAN-time sample on every up, the RTC written; see "r5".)
    - There are no backups of the Harbor DB, the Keycloak DB, the k3s sqlite datastore or the token.
    - Secrets encryption is off.
    - The datastore is sqlite, with no join or agent path and no nodeAffinity on the hostPath PVs.
@@ -414,7 +493,7 @@ ONE FILE: teknoir-airgap-<bundleId>.tar plus teknoir-airgap-<bundleId>.tar.sha25
 Layout inside teknoir-airgap-<bundleId>/:
   teknoir-airgap                LAN entrypoint (bash 3.2 compatible; uses only ssh, tar, sha256sum or shasum, mktemp; works from any CWD; finds its bundle via its own path)
   MANIFEST.yaml                 bundleId, env, domain, createdAt, infraCommit, gitopsCommit, dirty flag, appOfApps, k3sVersion, platforms, broken app-of-apps list, the sha256 of EVERY file (unlisted files fail verify), and the image ref -> digest map
-  site/teknoir-local.env        default site config (public, committed): TEKNOIR_DOMAIN, NODE_IP, NODE (ssh target), NODES list with roles, TEKNOIR_HOSTNAMES, TIME_SOURCE
+  site/teknoir-local.env        default site config (public, committed): TEKNOIR_DOMAIN, NODE_IP, NODE (ssh target), NODES list with roles, TEKNOIR_HOSTNAMES, TIME_SOURCE, UPSTREAM_DNS, NODE_IP_DHCP_RESERVED, BACKUP_AGE_RECIPIENTS
   docs/                         BUILD.md, HOST-SETUP.md, OPERATE.md (bootstrap, update, rollback, backup and restore, rotate, troubleshooting), CHANGELOG.md, readable offline
   tools/linux-amd64/kubectl, tools/darwin-arm64/kubectl, tools/darwin-amd64/kubectl
                                 operator convenience only; `up` does not need them
@@ -834,7 +913,7 @@ Implement the test_plan: shellcheck plus bats unit tests, the k3d suite T1-T9 on
 - depends on: I-06, I-12
 - files: airgap/node/lib/host.sh, airgap/site/teknoir-local.env
 
-config.yaml carries secrets-encryption: true and, per decision, cluster-init: true with etcd-snapshot-schedule-cron and retention. For existing clusters: an explicit `teknoir-node host enable-encryption` (enable, restart, reencrypt, verify) and `migrate-etcd` (backup first). nftables allow-list from site env: 22, 443 and 6443 from ADMIN_CIDR; 80/443 from the LAN for services; device ports as configured; default accept until enabled by a site flag.
+config.yaml carries secrets-encryption: true and, per decision, cluster-init: true with etcd-snapshot-schedule-cron and retention. For existing clusters: an explicit `teknoir-node host enable-encryption` (enable, restart, reencrypt, verify) and `migrate-etcd` (backup first). nftables allow-list from site env: 22, 443 and 6443 from ADMIN_CIDR; 80/443 from the LAN for services; udp/123 from the LAN (since r5 the node serves NTP to Robots and cameras); device ports as configured; default accept until enabled by a site flag.
 
 **Test:** VM: after enable-encryption, `k3s secrets-encrypt status --data-dir /opt/k3s` shows Enabled and Secrets read back fine. With etcd, `etcd-snapshot ls` lists the scheduled snapshots. With the firewall on, 6443 is unreachable from a non-admin netns.
 
