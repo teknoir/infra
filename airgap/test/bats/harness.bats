@@ -27,10 +27,10 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
 # ---------------------------------------------------------------------------
 # k3d suite
 # ---------------------------------------------------------------------------
-@test "k3d: --list names T1-T6, T4N and T9" {
+@test "k3d: --list names T1-T6, T4N, T9 and T10" {
   run "${K3D}" --list
   [ "${status}" -eq 0 ]
-  [ "$(echo "${output}" | tr '\n' ' ')" = "T1 T2 T3 T4 T4N T5 T6 T9 " ]
+  [ "$(echo "${output}" | tr '\n' ' ')" = "T1 T2 T3 T4 T4N T5 T6 T9 T10 " ]
 }
 
 @test "k3d: an unknown test is refused" {

@@ -108,8 +108,8 @@ jobs:
           sudo install -m 0755 /tmp/k3d /usr/local/bin/k3d
           docker pull -q "${K3S_IMAGE}"
           k3d version; kubectl version --client; jq --version
-      - name: K3s ownership suite T1-T5, T4N, T9
-        run: airgap/test/k3d/run.sh T1 T2 T3 T4 T4N T5 T9
+      - name: K3s ownership suite T1-T5, T4N, T9, T10
+        run: airgap/test/k3d/run.sh T1 T2 T3 T4 T4N T5 T9 T10
       - name: Migrate implementer's k3d test
         if: hashFiles('airgap/test/k3d/migrate-test.sh') != ''
         run: airgap/test/k3d/migrate-test.sh
