@@ -435,19 +435,21 @@ teknoir_fqdns() {
 
 render_template() {
   # render_template <template> [KEY=VALUE ...] - print the template with every
-  # __KEY__ replaced. Built-in keys: DOMAIN NODE_IP HARBOR_HOST K3S_DATA_DIR
-  # K3S_CA_FILE APP_OF_APPS_VERSION HOSTS_ENTRIES. A line holding only a
+  # __KEY__ replaced. Built-in keys: DOMAIN DOMAIN_RE (the domain as a regex:
+  # each dot is [.]) NODE_IP HARBOR_HOST K3S_DATA_DIR K3S_CA_FILE
+  # APP_OF_APPS_VERSION HOSTS_ENTRIES. A line holding only a
   # placeholder expands a multi-line value with the line's indentation, or
   # disappears when the value is empty. Dies on any unknown placeholder.
   local tmpl="$1" kv line key indent val out="" l h
   shift
   [[ -f "${tmpl}" ]] || die "missing template ${tmpl}"
-  local hosts=""
+  local hosts="" domain="${TEKNOIR_DOMAIN:-}"
   for h in $(teknoir_fqdns); do
     hosts+="${NODE_IP} ${h}"$'\n'
   done
   local -A vars=(
-    [DOMAIN]="${TEKNOIR_DOMAIN:-}"
+    [DOMAIN]="${domain}"
+    [DOMAIN_RE]="${domain//./[.]}"
     [NODE_IP]="${NODE_IP:-}"
     [HARBOR_HOST]="${HARBOR_HOST:-}"
     [K3S_DATA_DIR]="${K3S_DATA_DIR:-}"

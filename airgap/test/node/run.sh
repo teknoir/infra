@@ -3,7 +3,8 @@
 # k3s, systemctl, ip and install.sh, in a sandbox (TEKNOIR_HOST_ROOT): no
 # root, no cluster, nothing outside a temp dir is touched.
 #
-# Covers: template rendering (byte-equal to the live coredns-custom), payload
+# Covers: template rendering (coredns-custom golden: the live hosts block
+# plus the wildcard template for teamspace names), payload
 # verify (tamper, unlisted file), error-vs-absent in in_cluster, lock
 # contention (exit 75), dry-run on a fresh node makes no mutating call, the
 # host phase (fresh install, idempotent re-run, restart only on a desired
@@ -124,8 +125,25 @@ new_sandbox 1
   APP_OF_APPS_VERSION=0.0.4 render_template "${PAYLOAD}/templates/app-of-apps.yaml.tmpl" > "${T}/aoa.yaml"
   render_template "${PAYLOAD}/templates/config.yaml.tmpl" SECRETS_ENCRYPTION= FLANNEL_IFACE= RESOLV_CONF= > "${T}/config-noenc.yaml"
 )
-live='teknoir.airgapped:53 {
+# r5 (TS-C5): the hosts block of the live teknoir-local ConfigMap, after a
+# template that answers NODE_IP for the apex and every <name>.<domain>
+# (teamspace hostnames such as mqtt-teknoir-default) and NODATA for AAAA.
+# Checked against CoreDNS 1.12.3 by airgap/test/node/coredns-test.sh.
+want='teknoir.airgapped:53 {
     errors
+    # CoreDNS runs template before hosts: the apex and every <name>.<domain>
+    # (the platform and every teamspace hostname) answer NODE_IP for A and
+    # NODATA for AAAA; deeper names and other types get the hosts answers.
+    template IN A teknoir.airgapped {
+        match ^([a-z0-9-]+[.])?teknoir[.]airgapped[.]$
+        answer "{{ .Name }} 60 IN A 192.168.5.181"
+        fallthrough
+    }
+    template IN AAAA teknoir.airgapped {
+        match ^([a-z0-9-]+[.])?teknoir[.]airgapped[.]$
+        rcode NOERROR
+        fallthrough
+    }
     hosts {
         192.168.5.181 harbor.teknoir.airgapped
         192.168.5.181 argocd.teknoir.airgapped
@@ -136,7 +154,10 @@ live='teknoir.airgapped:53 {
     }
 }'
 rendered="$(awk '/teknoir.server: \|/{f=1; next} f {sub(/^    /, ""); print}' "${T}/coredns.yaml")"
-check "coredns-custom renders byte-equal to the live teknoir-local ConfigMap data" [ "${rendered}" == "${live}" ]
+check "coredns-custom renders the wildcard template and the live hosts block (golden)" [ "${rendered}" == "${want}" ]
+check "the A template answers NODE_IP" grep -qF 'answer "{{ .Name }} 60 IN A 192.168.5.181"' "${T}/coredns.yaml"
+check "the hosts block keeps the live entries" \
+  bash -c "awk '/hosts \\{/{f=1; next} f && /\\}/{f=0} f' '${T}/coredns.yaml' | grep -c '192.168.5.181 ' | grep -qx 6"
 check "registries.yaml mirrors 5 registries to harbor with the CA" \
   [ "$(grep -c '"https://harbor.teknoir.airgapped"' "${T}/registries.yaml")" == 5 -a "$(grep -c 'ca_file: /etc/rancher/k3s/teknoir-root-ca.crt' "${T}/registries.yaml")" == 1 ]
 check "app-of-apps root pins 0.0.4 from harbor.<domain>/teknoir" grep -q 'targetRevision: 0.0.4' "${T}/aoa.yaml"
