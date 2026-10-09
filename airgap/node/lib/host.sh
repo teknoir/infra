@@ -369,6 +369,13 @@ host_packages() {
 # |skew| at or below this many seconds needs no correction
 CLOCK_OK_SKEW="${CLOCK_OK_SKEW:-2}"
 RTC_EPOCH_FILE="${HOST_ROOT}/sys/class/rtc/rtc0/since_epoch"
+# chrony fits a clock rate only across LAN-time samples at least this many
+# seconds apart (clock_manual_guard): a second of sample error over 12 h is
+# a rate error of 23 ppm (over 1 min, 16700 ppm)
+CLOCK_RATE_MIN_AGE="${CLOCK_RATE_MIN_AGE:-43200}"
+# chrony's maxdrift (ppm) in the drop-in: the largest clock rate correction
+# chrony may use, 8.6 s a day (chrony's default is 500000)
+CHRONY_MAXDRIFT=100
 # 1 once this run gave chrony its LAN-time sample (settime runs once per up)
 CLOCK_SAMPLE_SENT=0
 # 1 once this run wrote (in dry-run: would write) the RTC
@@ -463,13 +470,55 @@ clock_write_rtc() {
   fi
 }
 
+clock_manual_guard() {
+  # clock_manual_guard - before a LAN-time sample. chrony fits a clock rate
+  # (frequency) across its manual samples, and each sample is only good to
+  # about a second (whole seconds, ssh latency): two samples a minute apart
+  # taught the bundled chrony 4.6.1 a rate error of 16455 ppm. So when its
+  # newest sample is younger than CLOCK_RATE_MIN_AGE (a re-run, a second up
+  # the same day), or the list cannot be read, the samples are dropped
+  # (manual reset): the new sample then corrects the offset only and the rate
+  # learned so far stays. Samples at least that far apart still teach chrony
+  # the node's drift (live: about 45 ppm); maxdrift bounds any fit.
+  local out newest="" age=""
+  if out="$("${CHRONYC}" -c manual list 2>/dev/null)"; then
+    # chrony 4.6: "<index>,<YYYY-MM-DD HH:MM:SS (UTC)>,<slewed>,<original>,
+    # <residual>" per sample, nothing when there is none
+    newest="$(awk -F, '
+      NF == 0 { next }
+      $2 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]$/ { if ($2 > m) m = $2; next }
+      { bad = 1 }
+      END { if (bad) print "unknown"; else print m }' <<<"${out}")"
+    [[ -n "${newest}" ]] || return 0
+    [[ "${newest}" == unknown ]] || newest="$(date -u -d "${newest}" +%s 2>/dev/null)" || newest=unknown
+  else
+    newest=unknown
+  fi
+  if [[ "${newest}" != unknown ]]; then
+    age=$(( $(date +%s) - newest ))
+    if (( age >= CLOCK_RATE_MIN_AGE )); then
+      log "chrony: its newest LAN-time sample is ${age}s old: this one may also refine the clock rate"
+      return 0
+    fi
+  fi
+  local why="their list could not be read"
+  [[ -z "${age}" ]] || why="the newest is ${age}s old, under ${CLOCK_RATE_MIN_AGE}s"
+  if run "${CHRONYC}" manual reset >/dev/null; then
+    log "chrony: dropped its manual samples (${why}): this sample corrects the offset only"
+  else
+    warn "chronyc manual reset failed: chrony may fit a clock rate across close samples (maxdrift ${CHRONY_MAXDRIFT} ppm bounds it)"
+  fi
+}
+
 clock_settime() {
   # clock_settime <epoch> - give chrony the LAN host's time as a manual sample
   # (needs 'manual' in its configuration, which host_chrony writes). chrony
-  # corrects the clock from it and learns the drift from the samples of
-  # successive runs (driftfile). Returns non-zero when chrony refuses it.
+  # corrects the clock from it, and learns the drift from samples at least
+  # CLOCK_RATE_MIN_AGE apart (clock_manual_guard; driftfile). Returns
+  # non-zero when chrony refuses it.
   local when out
   when="$(LC_ALL=C date -u -d "@$1" '+%b %d, %Y %H:%M:%S')" || return 1
+  clock_manual_guard
   out="$(run env TZ=UTC "${CHRONYC}" settime "${when}" 2>&1)" || { warn "chronyc settime failed: $(tr '\n' ' ' <<<"${out}")"; return 1; }
   CLOCK_SAMPLE_SENT=1
   log "chrony: LAN-time sample ${when} UTC: $(grep -v '^200 OK' <<<"${out}" | tr '\n' ' ')"
@@ -601,12 +650,14 @@ host_chrony() {
     printf '# Serves NTP to the LAN (Robots, cameras: server NODE_IP). Without an\n'
     printf '# answering server below, the reference is the local clock (stratum 10),\n'
     printf '# which up corrects with the LAN host time (chronyc settime, needs manual).\n'
+    printf '# maxdrift bounds the clock rate chrony may learn (%s ppm).\n' "${CHRONY_MAXDRIFT}"
     for s in ${sources[@]+"${sources[@]}"}; do
       printf 'server %s iburst prefer\n' "${s}"
     done
     printf 'allow %s\n' "${net}"
     printf 'local stratum 10\n'
     printf 'manual\n'
+    printf 'maxdrift %s\n' "${CHRONY_MAXDRIFT}"
   } > "${conf}"
   ensure_dir "${CHRONY_CONF_DIR}" 0755
   install_file "${conf}" "${CHRONY_CONF}" 0644 "chrony: serve ${net}${TIME_SOURCE:+, source ${TIME_SOURCE}}"

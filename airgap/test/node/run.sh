@@ -20,8 +20,9 @@
 # preflight refusal of an unmigrated cluster (live Teknoir K3s files), r5 time
 # (offline install of node/debs behind apt's simulate guard; chrony drop-in
 # goldens and restart only on change; one LAN-time sample per up while chrony
-# has only its local/manual reference, none with a selected source; RTC
-# writes above 2 s; the preflight matrix 0/+-20/+-400 s x
+# has only its local/manual reference, none with a selected source; manual
+# samples under 12 h old dropped first, so chrony fits no clock rate across
+# them; RTC writes above 2 s; the preflight matrix 0/+-20/+-400 s x
 # --sync-clock x chrony, no automatic step back, a refused date a WARN only
 # without --sync-clock; status's time line), the LAN-time estimate across a
 # clock step (under the fakeclock.c LD_PRELOAD shim, built with cc, which
@@ -630,10 +631,12 @@ DROPIN="${ROOT}/etc/chrony/conf.d/teknoir-airgap.conf"
 golden_head='# Managed by teknoir-node (host phase); every up rewrites it.
 # Serves NTP to the LAN (Robots, cameras: server NODE_IP). Without an
 # answering server below, the reference is the local clock (stratum 10),
-# which up corrects with the LAN host time (chronyc settime, needs manual).'
+# which up corrects with the LAN host time (chronyc settime, needs manual).
+# maxdrift bounds the clock rate chrony may learn (100 ppm).'
 golden_tail='allow 10.77.0.0/24
 local stratum 10
-manual'
+manual
+maxdrift 100'
 before="$(ncalls)"
 lt="$(date +%s)"
 tn converge --site test --only host --lan-time "${lt}"
@@ -646,11 +649,16 @@ for d in 0 1 2; do want_any+="chronyc settime $(LC_ALL=C date -u -d "@$(( lt + d
 check "reference LOCAL: exactly one settime, with the LAN time in UTC" \
   bash -c "[ \"\$(grep -c . <<<'${st}')\" = 1 ] && grep -qxF '${st}' <<<'${want_any}'"
 check "a skew within 2 s needs no makestep" [ -z "$(since "${before}" '^chronyc makestep')" ]
+check "chrony's first manual sample: nothing to drop (no manual reset)" [ -z "$(since "${before}" '^chronyc manual reset')" ]
 check "no RTC write when the RTC is right" [ -z "$(since "${before}" '^hwclock')" ]
 before="$(ncalls)"
 tn converge --site test --only host --lan-time "$(date +%s)"
 check "an unchanged drop-in does not restart chrony" [ -z "$(since "${before}" '^systemctl restart chrony')" ]
 check "every up gives chrony one sample" [ "$(since "${before}" '^chronyc settime' | grep -c .)" == 1 ]
+# guard_seq - the manual-list, manual-reset and settime calls since $before
+guard_seq() { since "${before}" '^chronyc (-c manual list|manual reset|settime)' | sed -E 's/^chronyc (-c manual list|manual reset|settime).*/\1/' | tr '\n' ','; }
+check "a second up within 12 h drops the samples first, so chrony fits no clock rate across them" \
+  [ "$(guard_seq)" == "-c manual list,manual reset,settime," ]
 check "a routine sample is not a change (0 changes)" grep -q 'summary: 0 changes' "${T}/out"
 printf 'TEKNOIR_ENV=teknoir-local\nTEKNOIR_DOMAIN=teknoir.airgapped\nNODE_IP=10.77.0.10\nNODE=teknoir@10.77.0.10\nTEKNOIR_HOSTNAMES="harbor"\nTIME_SOURCE="a.example 10.0.0.5"\nK3S_DATA_DIR=/opt/k3s\n' > "${T}/ts.env"
 before="$(ncalls)"
@@ -686,6 +694,23 @@ rm -f "${STUB_STATE}/chrony.ref"
 before="$(ncalls)"
 tn converge --site test --only host
 check "without --lan-time: no sample" [ -z "$(since "${before}" '^chronyc settime')" ]
+echo "$(( $(date +%s) - 50000 ))" > "${STUB_STATE}/chrony.manual"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+check "the newest sample 50000 s old (over 12 h): kept, chrony may refine the rate" \
+  bash -c "[ '$(guard_seq)' = '-c manual list,settime,' ] && grep -q 'its newest LAN-time sample is 500[0-9][0-9]s old' '${T}/out'"
+echo 1 > "${STUB_STATE}/chrony.manual-list-rc"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+rm -f "${STUB_STATE}/chrony.manual-list-rc"
+check "an unreadable manual list: the samples are dropped (offset only)" \
+  bash -c "[ '$(guard_seq)' = '-c manual list,manual reset,settime,' ] && grep -q 'dropped its manual samples (their list could not be read)' '${T}/out'"
+echo 1 > "${STUB_STATE}/chrony.reset-rc"
+before="$(ncalls)"
+tn converge --site test --only host --lan-time "$(date +%s)"
+rm -f "${STUB_STATE}/chrony.reset-rc"
+check "a failed manual reset is a WARN; the sample is still given (rc 0)" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: chronyc manual reset failed: .*maxdrift 100 ppm bounds it' '${T}/out' && [ \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -c '^chronyc settime')\" = 1 ]"
 
 echo "# RTC (TIME-T3)"
 echo "$(( $(date +%s) - 93 ))" > "${ROOT}/sys/class/rtc/rtc0/since_epoch"

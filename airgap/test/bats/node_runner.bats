@@ -289,13 +289,13 @@ host_files() {
            "curl -sS --data-binary \\{\\} https://h/api" "curl -XPUT https://h" \
            "kubectl apply --server-side -f -" "crane push a b" "helm registry login h" \
            "apt-get install -y --no-download /p/debs/chrony.deb" "apt-get remove systemd-timesyncd" \
-           "dpkg -i x.deb" "dpkg -r chrony" "chronyc settime Oct\\ 09\\,\\ 2026\\ 06:41:17" "chronyc makestep" \
+           "dpkg -i x.deb" "dpkg -r chrony" "chronyc settime Oct\\ 09\\,\\ 2026\\ 06:41:17" "chronyc makestep" "chronyc manual reset" \
            "hwclock --systohc --utc" "date -u -s @1791528077"; do
     grep -qE "${MUTATING_RE}" <<<"${l}" || { echo "not mutating: ${l}"; return 1; }
   done
   for l in "kubectl get pods -o json" "kubectl diff --server-side -f x" "curl -sS -X GET https://h/api" \
            "curl -sS -o /tmp/b -w %\\{http_code\\} https://h/health" "crane manifest a" "kubectl get secret x -o name" \
-           "chronyc -n tracking" "chronyc -n sources" "hwclock --show" "date -u +%s" "dpkg-query -W chrony"; do
+           "chronyc -n tracking" "chronyc -n sources" "chronyc -c manual list" "hwclock --show" "date -u +%s" "dpkg-query -W chrony"; do
     if grep -qE "${MUTATING_RE}" <<<"${l}"; then echo "wrongly mutating: ${l}"; return 1; fi
   done
   # an apt-get simulation is not mutating; the install it plans is
@@ -340,7 +340,11 @@ stub_systemctl() {
   return 0
 }
 stub_chronyc() {
-  case " $* " in *" tracking "*) printf 'Reference ID    : 7F7F0101 ()\nStratum         : 10\nFrequency       : 45.123 ppm slow\n' ;; esac
+  case " $* " in
+    *" tracking "*) printf 'Reference ID    : 7F7F0101 ()\nStratum         : 10\nFrequency       : 45.123 ppm slow\n' ;;
+    # a sample from a minute ago: a real run would drop it (manual reset)
+    *" manual list "*) printf '0,%s,-4.64,-4.64,0.00\n' "$(date -u -d "@$(( $(date +%s) - 60 ))" '+%Y-%m-%d %H:%M:%S')" ;;
+  esac
   return 0
 }
 stub_dpkg_query() { echo "dpkg-query: no packages found matching ${*: -1}" >&2; return 1; }
@@ -356,8 +360,9 @@ STUBS
   [ "${status}" -eq 0 ]
   m="$(mutating_calls)"
   [ -z "${m}" ] || { echo "mutating calls: ${m}"; return 1; }
-  refute_grep -E '^(chronyc (settime|makestep)|hwclock|date |apt-get install -y|systemctl (restart|enable) chrony)' "${STUB_LOG}"
+  refute_grep -E '^(chronyc (settime|makestep|manual reset)|hwclock|date |apt-get install -y|systemctl (restart|enable) chrony)' "${STUB_LOG}"
   # the plan names each step it skipped
+  [[ "${output}" == *"[dry-run] would run: ${CHRONYC} manual reset"* ]]
   [[ "${output}" == *"would change: node clock set from the LAN host through chrony (skew was -40"* ]]
   [[ "${output}" == *"would change: RTC set from the system clock (after --sync-clock)"* ]]
   [[ "${output}" == *"would change: install chrony 4.6.1-3+deb13u2, util-linux-extra 2.41.5-0+deb13u1 from the bundle (removes systemd-timesyncd)"* ]]
@@ -370,7 +375,7 @@ STUBS
   run "${NODE_BIN}" converge --dry-run --site "${VMTEST_SITE}" --lan-time "$(date +%s)"
   [ "${status}" -eq 0 ]
   [ -z "$(mutating_calls)" ]
-  refute_grep -E '^(chronyc (settime|makestep)|hwclock|date )' "${STUB_LOG}"
+  refute_grep -E '^(chronyc (settime|makestep|manual reset)|hwclock|date )' "${STUB_LOG}"
   [[ "${output}" == *"would change: set the RTC from the system clock (it is -9"* ]]
   [[ "${output}" == *"chrony (reference LOCAL) would get a LAN-time sample"* ]]
   [ "$(host_files)" = "${before}" ]
