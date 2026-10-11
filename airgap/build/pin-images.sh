@@ -15,6 +15,8 @@
 #       each pinned reference: the tag still resolves to that linux/amd64
 #       manifest, and the digest is an image manifest of that platform
 #
+# The immutable-tag rule applies to Teknoir images only; an upstream image keeps
+# its version tag and is pinned by the digest.
 # Uses the pinned crane of the bundle build (airgap/versions.env). Exit 0 when
 # every argument resolved (or verified), 1 otherwise.
 set -euo pipefail
@@ -46,7 +48,9 @@ for ref in "${refs[@]}"; do
   base="${ref%%@*}"
   tag="$(image_tag "${base}")"
   repo="$(image_repo "${base}")"
-  if [[ -z "${tag}" || ! "${tag}" =~ ${IMMUTABLE_TAG_RE} ]]; then
+  # Only Teknoir images need an immutable tag (K5); an upstream image is pinned
+  # by its digest and keeps its version tag (postgres:17.11-alpine@sha256:...).
+  if [[ -z "${tag}" ]] || { is_teknoir_image "${base}" && [[ ! "${tag}" =~ ${IMMUTABLE_TAG_RE} ]]; }; then
     warn "${ref}: tag '${tag:-none}' is not immutable (sha-<hex>, <branch>-YYYYMMDD-HHMMSS or semver); use the sha- tag CI pushed for that commit"
     rc=1
     continue
