@@ -18,11 +18,16 @@ reasons for the redesign are kept here. The git history of `infra` and
   first version ran `pg_isready` as uid 1000, which has no passwd entry in the postgres
   image, so it answered "no attempt" on every try and always waited the full 10 min;
   9f3eafc passes `-U backstage -d postgres`.
-- **istiod refreshes the Keycloak JWKS every minute** (istio chart 0.0.4,
-  `PILOT_JWT_PUB_KEY_REFRESH_INTERVAL=1m`). After a node reboot istiod could fetch the
-  JWKS while Keycloak was still starting, retry for about 30 s and then wait for the next
-  refresh (20 min by default): every sign-in got 401 "Jwt verification fails" although all
-  pods were Ready. Found when the backstage-api wait stopped hiding it.
+- **jwks-watch recreates istiod when its JWKS fetch stays failed** (istio chart 0.0.4).
+  After a node reboot istiod could fetch the Keycloak JWKS while Keycloak was still
+  starting; it drops a failed fetch from its cache and does not retry it until the next
+  full push of the configuration (no timer: `PILOT_JWT_PUB_KEY_REFRESH_INTERVAL` does not
+  apply to it). Every sign-in then got 401 "Jwt verification fails" although all pods were
+  Ready, until something else changed a Service or Gateway. Found when the backstage-api
+  wait stopped hiding it (the 10 min delay had covered the window). The `jwks-watch`
+  Deployment in istio-system watches istiod's `pilot_jwks_resolver_network_fetch_*`
+  counters and deletes the istiod pod once (proxies keep their configuration meanwhile)
+  when a fetch failed and every `jwksUri` answers again.
 
 ## 2026-10-11: live node decommissioned, the VM rig moves to the dev host
 

@@ -378,15 +378,16 @@ pull_failures() {
   # and, one line later, the pods that are waiting in a pull error right now
   # are counted by pull_waiting. After a node reboot (E12 leaves the marker) the
   # pods with imagePullPolicy Always (the :latest teamspace images) resolve their
-  # tag at harbor.<domain> while Harbor itself is still starting and get 503:
-  # a pod with such a "Failed to pull image ... 503" event is a transient boot
-  # race (retried by kubelet), not counted; pull_waiting must still be 0 once
-  # the platform is Ready.
+  # tag at harbor.<domain> while Harbor itself is still starting (503) or the
+  # node's own IP is not configured yet (network is unreachable) and fail: a
+  # pod with such a "Failed to pull image ..." event is a transient boot race
+  # (retried by kubelet), not counted; pull_waiting must still be 0 once the
+  # platform is Ready.
   local rebooted=false
   [[ -e "${STATE}/node-rebooted" ]] && rebooted=true
   vm_kc get events "$@" -o json 2>/dev/null | jq -r --argjson rebooted "${rebooted}" '
     def pull: (.message // "") | test("ErrImagePull|ImagePullBackOff|Failed to pull|Back-off pulling");
-    def boot503: (.message // "") | test("Failed to pull image.*503 Service Unavailable");
+    def boot503: (.message // "") | test("Failed to pull image.*(503 Service Unavailable|network is unreachable|connection refused|no route to host|i/o timeout|EOF)");
     ([.items[] | select(pull and boot503) | .involvedObject.name] | unique) as $transient
     | [.items[] | select(pull) | select(($rebooted | not) or ((.involvedObject.name as $n | $transient | index($n)) | not))] | length' \
     || echo "?"
@@ -2364,8 +2365,11 @@ EOF
   # Prometheus reaches Alertmanager (alertmanager-allow-prometheus)
   waited=$(( SECONDS - start ))
   if (( waited < 300 )); then tl_log "waiting $(( 300 - waited )) s to cover 5 min of Prometheus logs"; sleep $(( 300 - waited )); fi
+  # The check is about authorization (alertmanager-allow-prometheus: 403). The
+  # backup of this case stops k3s for about a minute; an alert sent meanwhile can
+  # get a 503 or a connection error, which is not a policy failure.
   n="$(vm_kc -n teknoir-system logs -l app.kubernetes.io/name=prometheus -c prometheus --since-time="${t0}" --tail=-1 2>/dev/null \
-        | grep -c 'Error sending alert' || true)"
+        | grep 'Error sending alert' | grep -vcE '503 Service Unavailable|connection refused|connection reset|i/o timeout|context deadline|no route to host|EOF' || true)"
   assert_eq "Prometheus logged no 'Error sending alerts' since ${t0} (5 min or more)" 0 "${n:-0}"
 }
 
