@@ -9,6 +9,14 @@ registry) comes from the bundle with `./teknoir-airgap up`
 Values below are those of the default site, `site/teknoir-local.env` in the
 bundle. A different site needs its own values in that file.
 
+> **Status (2026-10-11).** The node `192.168.5.181` was decommissioned (k3s removed,
+> data archived) and its hardware is now the dev host (`teknoir.airgapped`,
+> `192.168.2.181`, Debian 13, with internet access). teknoir-local is verified in
+> the VM rig on that host, which is also the rig operator host; the VM needs no
+> installer or ssh steps from this page (`airgap/test/vm/vm.sh` makes it from a
+> Debian 13 cloud image and `lan-netns.sh` is its LAN host). The steps below
+> are for a customer node and keep the reference site file.
+
 | Setting | Value |
 |---|---|
 | Node address (`NODE_IP`) | `192.168.5.181`, fixed: static, or a DHCP reservation on the router ([Fixed address](#fixed-address)) |

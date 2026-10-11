@@ -10,6 +10,18 @@ node, ssh access from the LAN host). Bundles are built as described in
 [BUILD.md](BUILD.md). History and the reasons behind this design are in
 [CHANGELOG.md](CHANGELOG.md).
 
+> **Status (2026-10-11).** The live teknoir-local node (`192.168.5.181`) was
+> decommissioned: k3s is removed and its data archived. teknoir-local is now
+> verified only in the VM rig on the dev host (`teknoir.airgapped`,
+> `192.168.2.181`), which is also the rig operator host: `airgap/test/vm/`
+> (`vm.sh`, `lan-netns.sh`, `e2e.sh`; [airgap/test/README.md](../../airgap/test/README.md)).
+> The VM is `10.77.0.10` behind the network namespace `tklan` (site
+> `site/vmtest.env`); the dev host's own name is the platform domain, so every
+> check goes through `lan-netns.sh exec`. The runbook below is unchanged: it is
+> what a customer install follows, and `site/teknoir-local.env` stays the
+> reference site file. Where it says "the live node", read "a customer node on
+> the legacy layout"; E10 and E15 rehearse that migration in the VM.
+
 The examples use the default site, `site/teknoir-local.env` in the bundle:
 
 | Setting | Value |
@@ -543,7 +555,7 @@ ssh teknoir@192.168.5.181 sudo /var/lib/teknoir-airgap/bundles/<bundleId>/node/b
 
 Use two `age` identities: yours, and a recovery identity kept offline, so that
 losing one does not lose the backups. On your machine (the `age` and
-`age-keygen` tools; vpro has them from `~/.config/teknoir/install-devtools.sh`):
+`age-keygen` tools; the dev host has them from `~/.config/teknoir/install-devtools.sh`):
 
 ```sh
 install -d -m 0700 ~/.config/teknoir/age
@@ -956,6 +968,10 @@ auto-deploy directory (`/opt/k3s/server/manifests`).
 
 ## 14. Migrating the live teknoir-local (temporary)
 
+> The live node this section was written for was decommissioned on 2026-10-11, so
+> nobody runs it there any more. It stays as the procedure for a customer install
+> still on the legacy layout; E10 and E15 rehearse it in the VM on the dev host.
+
 This section exists until the live `teknoir-local` runs on this model; then it,
 the `migrate` command and the remaining legacy code are removed. Do not start
 before all prerequisites hold, and only in an agreed maintenance window with
@@ -1176,8 +1192,8 @@ once around it. Each package of r5 adds its own subsection here.
 
 ### Rehearse on the test VM first
 
-Before an r5 bundle reaches teknoir-local, it must pass the VM test on vpro
-(`airgap/test/README.md`), each run on a freshly created VM:
+Before an r5 bundle reaches a customer's teknoir-local, it must pass the VM test on the
+dev host (`airgap/test/README.md`; there is no live node to try it on), each run on a freshly created VM:
 
 - fresh install: E1, E11, E12, E13, E14, E2, E3, E7 and E8;
 - update from the deployed bundle: E1 with the deployed bundle as a baseline,
@@ -1186,8 +1202,9 @@ Before an r5 bundle reaches teknoir-local, it must pass the VM test on vpro
   open design gap (DESIGN.md, r5), and E4 stays red on it until the gap is
   settled. Do not count on `up --rollback` to app-of-apps 0.0.4 converging before
   then;
-- live rehearsal: E15. It reproduces the live node's history and state, then
-  runs `up` with the new bundle.
+- legacy-layout rehearsal: E15. It reproduces the history and state of the former
+  live node (decommissioned 2026-10-11), the layout customer installs may still
+  have, then runs `up` with the new bundle.
 
 The r5 rollout drops every session and briefly restarts Keycloak and Backstage.
 E15 shows what the first `./teknoir-airgap up` does to the live state:

@@ -6,6 +6,32 @@ describe only the current procedure; past procedures, incidents and the
 reasons for the redesign are kept here. The git history of `infra` and
 `platform-applications-gitops` (branch `teknoir-local`) is the full archive.
 
+## 2026-10-11: live node decommissioned, the VM rig moves to the dev host
+
+- **Live teknoir-local node decommissioned.** `192.168.5.181`: k3s removed, data
+  archived on that machine in `/opt/teknoir-local.decommissioned-20261011T110224Z`.
+  The hardware is now the dev host (`teknoir.airgapped`, `192.168.2.181`).
+  teknoir-local is verified only in the VM rig (`airgap/test/vm/`); the
+  `teknoir-local` branches stay the release branches for customer installs, and
+  `site/teknoir-local.env` stays the reference site file (header comment only).
+- **The rig operator host is the dev host** (it was vpro). The rig scripts changed
+  for it, with no change to the VM or the platform:
+  - `lan-netns.sh`: the host is called `teknoir.airgapped`, the platform domain, so
+    the namespace hosts file no longer gets `127.0.1.1 <host name>` (the domain
+    would have resolved to loopback first); `up` and `status` check that every
+    platform name resolves to `NODE_IP` only inside the namespace.
+  - `vm.sh net-up`: Docker re-inserts its FORWARD jumps at the top whenever its
+    daemon starts, so the bridge DROP rules are kept ahead of them (`lan-netns.sh
+    up` keeps its accept rule ahead of the DROPs). The VM may ping `10.77.0.1`
+    but reaches no host service (INPUT drop); IPv6 is off on the bridge and tap.
+    New `net-down` and `ram-check`.
+  - `vm.sh start` and `e2e.sh` refuse to boot the VM when MemAvailable is below
+    `VM_MEM_MB` (default 10240) plus 2048 MiB, instead of an OOM kill; `e2e.sh`
+    also checks sudo, KVM and the bridge subnet up front.
+- **Profile plugin charts 0.0.100** are pinned in the bundle (deadend 0.0.100 runs
+  its tls-terminator from `ghcr.io/teknoir/stunnel` instead of `apk add stunnel`);
+  the 0.0.99 pins stay so a rollback bundle still builds.
+
 ## r5 (app-of-apps 0.0.5)
 
 ### Controllers: least privilege, admission policies, teknoir-default (gitops)
@@ -112,7 +138,7 @@ reasons for the redesign are kept here. The git history of `infra` and
 ### Bundle: teamspace plugins, node packages, pinned images
 
 - **Teamspaces work offline.** The bundle carries the 9 teamspace plugin
-  charts profile-controller deploys by default (profile-plugin-* 0.0.100, the
+  charts profile-controller deploys by default (profile-plugin-* 0.0.99, the
   published archives, pinned by sha256) and their ~20 images (~1.8 GiB). The
   node pushes the charts to `harbor.<domain>/teknoir` with the other charts;
   profile-controller reads them from there (its `PLUGIN_CHART_REPO`). Before,

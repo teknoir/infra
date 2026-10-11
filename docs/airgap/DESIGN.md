@@ -4,6 +4,13 @@ Status: APPROVED DESIGN for the `airgap-redesign` branches (infra + platform-app
 2026-10-08. This file is the contract every implementer works against. When the
 implementation differs, update this file in the same commit.
 
+**Status 2026-10-11.** The live teknoir-local node (192.168.5.181) was decommissioned: k3s removed, data
+archived, the hardware is now the dev host (`teknoir.airgapped`, 192.168.2.181). From now on teknoir-local is verified
+only in the VM rig on the dev host, which is the rig operator host (`airgap/test/vm/`). The `teknoir-local` branches stay the
+release branches for customer installs, `airgap/site/teknoir-local.env` stays the reference site file, and the live-node
+parts of this document (migration, window, rehearsal E15) describe the node as it was and are now rehearsals for customer
+installs on the legacy layout. Older text below still says vpro for the former rig host.
+
 ## Decisions (owner: Anders Åslund, 2026-10-08)
 
 | # | Decision |
@@ -20,7 +27,7 @@ implementation differs, update this file in the same commit.
 | D10 | ArgoCD becomes **self-managed** (argo chart moves to gitops, G-07). Local admin is kept as break-glass; `argocd-initial-admin-secret` is deleted after SSO works. r5: `teknoir-node rotate argocd-admin` sets a new local admin password (bcrypt inside argocd-server, stored in `teknoir-system/argocd-admin-break-glass`, which `credentials argocd-admin` reads and every backup includes) and deletes `argocd-initial-admin-secret` after a successful login with it. |
 | D11 | Multi-node: keep the `role=server|agent` parameter in the host phase, but do not implement/test agent join in this round. |
 | D12 | Bundle authenticity: sha256 only for now (signing later). |
-| D13 | Domain stays per env branch (`teknoir.airgapped`). The VM e2e test uses the same domain inside an isolated LAN network namespace, so vpro's real /etc/hosts and the live env are never touched. |
+| D13 | Domain stays per env branch (`teknoir.airgapped`). The VM e2e test uses the same domain inside an isolated LAN network namespace, so the rig host's real /etc/hosts and the live env are never touched (the dev host is itself called `teknoir.airgapped`, so its namespace hosts file has no 127.0.1.1 line and tests never run on the host). |
 | D14 | Chart versions for this release (Harbor already has the older ones; never reuse a version): istio 0.0.3, cert-manager 0.0.2, auth 0.0.8, harbor 0.0.9 (from the 0.0.5 source; 0.0.8 in Harbor is the unadopted Harbor 2.15), platform-secrets 0.0.1, argo 0.0.3 (moved to gitops), backstage 0.0.83, user-controller 0.0.84, app-of-apps 0.0.4. Controllers 0.0.83 and monitoring 0.0.4 unchanged unless a work item needs them. |
 
 ## Implementation notes (integration, 2026-10-08)
@@ -1498,16 +1505,16 @@ Tests:
     - Object counts must equal the baseline, and there must be no Teknoir Addons but teknoir-argo.
     - Not in T9: CRD adoption by ArgoCD (the fixture runs no ArgoCD). T6 covers it on k3d and E10 on the VM: the CRDs are Synced resources of their Applications (ArgoCD 3.5 writes no tracking-id on CRDs). The oneshot, harbor, release and post phases need the built bundle and run in E10.
 
-3. END-TO-END AIRGAP TEST IN A KVM VM ON vpro (airgap/test/vm/e2e.sh)
+3. END-TO-END AIRGAP TEST IN A KVM VM ON THE RIG HOST (vpro until 2026-10-11, now the dev host; airgap/test/vm/e2e.sh)
 Environment:
 - The existing harness /home/anders/vmtest/vm.sh moves into airgap/test/vm/vm.sh.
 - qemu-system-x86_64 is in fact installed already, and VM tk-airgap is running.
 - The VM runs Debian 13 genericcloud through cloud-init with 8 vCPU, 10 GiB RAM and a 120 GB disk, on the isolated bridge tkvm0 10.77.0.0/24 with iptables FORWARD DROP both ways and no NAT.
 - The VM domain is changed to teknoir.airgapped, because the bundle is per env, and VM_IP is 10.77.0.10. site/vmtest.env sets NODE_IP=10.77.0.10 and NODE=teknoir@10.77.0.10.
-- The LAN host is a network namespace on vpro: `airgap/test/vm/lan-netns.sh up` creates netns tklan with a veth into tkvm0 at 10.77.0.20 and no default route. /etc/netns/tklan/hosts maps the *.teknoir.airgapped names to 10.77.0.10, and `ip netns exec` bind-mounts it over /etc/hosts. vpro's own /etc/hosts and the real 192.168.5.181 env are never touched.
+- The LAN host is a network namespace on the rig host: `airgap/test/vm/lan-netns.sh up` creates netns tklan with a veth into tkvm0 at 10.77.0.20 and no default route. /etc/netns/tklan/hosts maps the *.teknoir.airgapped names to 10.77.0.10, and `ip netns exec` bind-mounts it over /etc/hosts. the host's own /etc/hosts is never touched (nor the former 192.168.5.181 env); on the dev host, whose name is teknoir.airgapped, the namespace hosts file omits the 127.0.1.1 line and `lan-netns.sh up` checks that every platform name resolves to 10.77.0.10 only.
 - Commands run as:
   sudo ip netns exec tklan sudo -u anders env HOME=/home/anders/vmtest/lanhome ./teknoir-airgap up --site site/vmtest.env
-- Memory: stop other docker workloads on vpro during the run. If 10 GiB OOMs, raise it to 11 GiB. The agent-node scenario E9 needs a second VM of 2-3 GiB and is optional.
+- Memory: stop other docker workloads and the k3d suites on the host during the run (they do not run at the same time). `vm.sh start` refuses to boot the VM when MemAvailable is below VM_MEM_MB (default 10240) plus 2048 MiB (`vm.sh ram-check`) instead of risking an OOM kill. If 10 GiB OOMs, raise it to 11 GiB. The agent-node scenario E9 needs a second VM of 2-3 GiB and is optional.
 - Add anders to group kvm. The script uses `sg kvm`.
 
 Scenarios. Each asserts and prints a pass/fail summary.
@@ -1528,7 +1535,7 @@ Scenarios. Each asserts and prints a pass/fail summary.
 - E3 no egress:
   - In the VM, `curl -m5 https://registry-1.docker.io/v2/` and `getent hosts github.com` fail.
   - In the netns, curl to a public IP fails.
-  - The vpro `iptables -L FORWARD -v` DROP counters for tkvm0 grow.
+  - The rig host's `iptables -L FORWARD -v` DROP counters for tkvm0 grow. On the dev host Docker re-inserts its FORWARD jumps whenever the daemon starts, so `vm.sh net-up` keeps the DROP rules ahead of them and `lan-netns.sh up` its accept rule ahead of the DROPs; the VM can ping the bridge address 10.77.0.1 but reaches no host service (INPUT drop).
   - Every image in `k3s crictl images` was imported or came from the harbor.teknoir.airgapped mirror.
   - There are no ErrImagePull events.
 - E4 update and rollback:
