@@ -814,3 +814,107 @@ hosts:
 ```sh
 sudo ./teknoir-airgap up --local
 ```
+
+## r5 (app-of-apps 0.0.5)
+
+### Monitoring, ArgoCD and Harbor: who gets in, and the break-glass
+
+monitoring 0.0.5, argo 0.0.4 and harbor 0.0.10 let only the Keycloak group
+`admin` (realm `teknoir`) in:
+
+| Where | Group `admin` | Any other realm user |
+|---|---|---|
+| `https://teknoir.airgapped/teknoir-system/grafana/` | signed in as Grafana Admin; the login is the Keycloak username (the e-mail address for users made by user-controller or `admin-user`) | `403` `RBAC: access denied` |
+| `https://teknoir.airgapped/teknoir-system/prometheus/` and `.../alertmanager/` | as before | `403` `RBAC: access denied` |
+| `https://argocd.teknoir.airgapped` | `role:admin` | signs in, sees no Applications, projects or settings; actions fail with "permission denied" |
+| `https://harbor.teknoir.airgapped` | Harbor admin; creates projects | signs in; creating a project gets `403` |
+
+A `403` on the monitoring paths is not a sign-in problem. Put the person in
+group `admin` (`./teknoir-airgap admin-user` for a new named admin, section 9,
+or the Keycloak console: realm `teknoir`, Users, the user, Groups). Then they
+sign out and in again, because the groups travel in the token.
+
+After the update (kubeconfig from section 7):
+
+- Grafana restarted once. An admin opens it signed in with their Keycloak
+  username and the Admin role (before r5 everyone was an anonymous Admin).
+  For users that user-controller creates the username is the e-mail address;
+  a user made by hand in the Keycloak console keeps its own username.
+- Alerts reach Alertmanager. Before r5, Prometheus logged "Error sending
+  alerts" continuously. Prometheus reloads its configuration without a
+  restart, so wait 10 minutes after `monitoring` synced; then this should
+  print `0`:
+
+  ```sh
+  kubectl --context teknoir-local -n teknoir-system logs statefulset/prometheus-monitoring-prometheus \
+    -c prometheus --since=5m | grep -c 'Error sending alerts'
+  ```
+
+**After Secret `teknoir-root-ca-bundle` is created or rotated, restart
+Grafana.** Grafana verifies each user's token with the realm keys from
+`https://auth.teknoir.airgapped`, trusting the Teknoir Root CA from that
+Secret (mounted in teknoir-system). It reads the CA only when it starts. The
+converge writes the Secret before the platform starts, so a normal install or
+update needs nothing. If the Secret was missing when Grafana started, or the
+CA changed, every sign-in to Grafana fails, while Prometheus and Alertmanager
+still work. The Grafana log then shows a certificate error for the JWKS
+fetch. Restart Grafana:
+
+```sh
+kubectl --context teknoir-local -n teknoir-system rollout restart deployment/monitoring-grafana
+```
+
+**Grafana break-glass: basic auth on the API, not in the browser.** Use it
+when no admin can sign in to Grafana through the gateway, for example when
+Keycloak is down. The login form is off (`auth.disable_login_form`), so the
+local administrator cannot sign in in a browser. It can call Grafana's HTTP
+API with basic auth over a port-forward, which goes to the pod directly,
+past the gateway and the Istio policies. The user is `admin`, and the
+password is the `grafana-admin` credential (section 8):
+
+```sh
+./teknoir-airgap credentials grafana-admin --out ~/teknoir-grafana-admin.txt
+kubectl --context teknoir-local -n teknoir-system port-forward svc/monitoring-grafana 3000:80
+# in another terminal; curl asks for the password (the file's content):
+curl -u admin http://127.0.0.1:3000/teknoir-system/grafana/api/user
+curl -u admin http://127.0.0.1:3000/teknoir-system/grafana/api/datasources
+curl -u admin 'http://127.0.0.1:3000/teknoir-system/grafana/api/search?query='
+```
+
+Grafana serves under `/teknoir-system/grafana/` on the port-forward too.
+Delete the password file afterwards. A role changed through the API does not
+last: Grafana sets each user's role from the token's groups at every sign-in.
+
+Prometheus and Alertmanager have no login of their own. A port-forward to
+their Service works in a browser:
+
+```sh
+kubectl --context teknoir-local -n teknoir-system port-forward svc/monitoring-prometheus 9090:9090
+# http://127.0.0.1:9090/teknoir-system/prometheus/
+kubectl --context teknoir-local -n teknoir-system port-forward svc/monitoring-alertmanager 9093:9093
+# http://127.0.0.1:9093/teknoir-system/alertmanager/
+```
+
+**A `403` on `.../-/reload` or `.../-/quit` is by design**, for group `admin`
+too and from any pod. The lifecycle endpoints are closed to every source
+(DESIGN.md, "r5 (app-of-apps 0.0.5)"). Prometheus and Alertmanager reload
+their configuration by themselves through their config-reloader sidecars.
+To reload one by hand, use the port-forward above, which does not pass the
+sidecar:
+
+```sh
+curl -X POST http://127.0.0.1:9090/teknoir-system/prometheus/-/reload
+curl -X POST http://127.0.0.1:9093/teknoir-system/alertmanager/-/reload
+```
+
+Alertmanager runs one replica. The monitoring chart refuses to render more
+(alerts go to its Service, so a second replica would get only part of them),
+and it also refuses a render that would weaken the access setup. Either
+shows as a ComparisonError on the `monitoring` Application that names the
+value; it can only come from a chart change, because the platform passes no
+values.
+
+The ArgoCD break-glass is the local `admin` (`argocd-admin`, section 8), at
+`https://argocd.teknoir.airgapped` with the "Log in" form, not "Log in via
+Keycloak". Harbor's is the local `admin` (`harbor-admin`) at
+`https://harbor.teknoir.airgapped/account/sign-in`.

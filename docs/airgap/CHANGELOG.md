@@ -6,6 +6,67 @@ describe only the current procedure; past procedures, incidents and the
 reasons for the redesign are kept here. The git history of `infra` and
 `platform-applications-gitops` (branch `teknoir-local`) is the full archive.
 
+## r5 (app-of-apps 0.0.5)
+
+### monitoring 0.0.5, argo 0.0.4, harbor 0.0.10: access for group admin only (gitops)
+
+- **Grafana, Prometheus and Alertmanager are for Keycloak group `admin`
+  only.** Before, every realm user who signed in at the gateway reached all
+  three, and Grafana gave everyone the Admin role (anonymous access with
+  `org_role: Admin`). Now each of the three checks the access token that
+  oauth2-proxy forwards, against realm `teknoir`, and lets the gateway in only
+  when the token's `groups` claim holds `admin`. Any other realm user gets
+  `403` (`RBAC: access denied`) on
+  `https://teknoir.airgapped/teknoir-system/{grafana,prometheus,alertmanager}/`.
+  Grafana signs the user in from the same token. The login is the Keycloak
+  username (`preferred_username`): the e-mail address for users that
+  user-controller creates (`./teknoir-airgap admin-user` included), while a
+  user made by hand in the Keycloak console signs in with the username it was
+  given. Group `admin` is Grafana Admin. Anonymous access and self sign-up are
+  off.
+- **Alerts reach Alertmanager again.** Prometheus sent alerts to
+  Alertmanager's pod IP. That request left the mesh in plaintext, and
+  Alertmanager's sidecar (STRICT mTLS) reset it, so every notification failed
+  with `503` ("Error sending alerts" in the Prometheus log). Prometheus now
+  addresses Alertmanager's Service, over mTLS, and a new policy lets
+  Prometheus in. Alertmanager stays at one replica, and the chart now refuses
+  to render more: with Service addressing, each batch of alerts would reach
+  one replica only.
+- **Prometheus' and Alertmanager's lifecycle endpoints are closed.** Every
+  request to `.../-/quit` or `.../-/reload` gets `403` from any source: through
+  the gateway (group `admin` included) and from pods in the mesh, also when a
+  slash is percent-encoded (`-%2Fquit`). Before, a cross-site POST from a page
+  that an admin visited could stop Prometheus through the gateway (the
+  oauth2-proxy cookie is `SameSite=None`), and any teknoir-system or
+  teknoir-auth pod could stop it without a token. The config-reloader
+  sidecars reload through `127.0.0.1`, which does not pass the sidecar, so
+  configuration changes still apply.
+- **Render guards.** The monitoring chart refuses to render (ArgoCD shows a
+  ComparisonError and syncs nothing) when a values change would weaken the
+  access setup: Grafana's issuer differs from `monitoring.access.issuer`,
+  `auth.jwt` is off, anonymous access is on, alerts would not go to
+  Alertmanager's Service, or Alertmanager has more than one replica.
+- **Grafana trusts the Teknoir Root CA.** Grafana fetches the realm's signing
+  keys from `https://auth.teknoir.airgapped`, so it mounts Secret
+  `teknoir-root-ca-bundle` (optional). Grafana must be restarted after that
+  Secret is created or rotated (OPERATE.md, "r5 (app-of-apps 0.0.5)").
+- **ArgoCD: group `admin` only.** Group `admin` is `role:admin`. The default
+  role `role:readonly` is gone, and so is group `argocd-admins` (realm
+  `teknoir` has no such group).
+  Other realm users can still sign in, but they see no Applications, projects
+  or settings. The local `admin` stays enabled as break-glass (`argocd-admin`).
+- **Harbor: only admins create projects.** Project creation is limited to
+  Harbor admins: the local `admin` and group `admin`
+  (`project_creation_restriction: adminonly`). Before, every user who signed
+  in could create a project. The five `fix-permissions` init containers run
+  `busybox:1.36.1` (was `latest`), which the bundle already carries.
+- The update restarts Grafana once. Because the init image changed, it also
+  restarts `harbor-database`, `harbor-redis`, `harbor-trivy`,
+  `harbor-registry` and `harbor-jobservice` once during the sync, so image
+  pulls retry for a short while. The Istio policies and ArgoCD's RBAC apply
+  without a restart. Harbor's OIDC Job runs again and changes only
+  `project_creation_restriction`.
+
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
 One build command, one LAN-host command, and the same command for the first
