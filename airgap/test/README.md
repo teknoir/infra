@@ -12,7 +12,7 @@ CI runs everything except the VM test: [.github/workflows/airgap-ci.yml](../../.
 | bats only | `airgap/test/bats/run.sh [file.bats]` | bash, curl (first run only) | yes, from run-static.sh |
 | K3s ownership (k3d) | `airgap/test/k3d/run.sh [T1 ... T10]` | docker, k3d, kubectl, jq (T6 also helm, yq; T10 python3) | T1-T5, T4N, T9, T10; T6 on manual dispatch |
 | Node runner cluster phases (k3d) | `airgap/test/node/k3d.sh [-v] [--keep]` | docker, k3d, kubectl, jq, openssl (pulls postgres:16-alpine) | yes |
-| VM end to end | `airgap/test/vm/e2e.sh [--allow-destroy] [E1 ...]` | vpro: KVM, sudo, the VM base image | no |
+| VM end to end | `airgap/test/vm/e2e.sh [--allow-destroy] [E1 ...]` | the dev host: KVM, passwordless sudo, ~12 GiB free RAM, the VM base image | no |
 
 ## bats (pinned, offline-friendly)
 
@@ -128,14 +128,26 @@ real throwaway CA (generated into the work dir, 0600), so the secrets phase can 
 the gateway placeholder as on the live node. T9 does not check CRD adoption by ArgoCD (no
 ArgoCD runs in the fixture); T6 and E10 do.
 
-## VM end to end (vpro)
+## VM end to end (dev host)
+
+Since 2026-10-11 the live teknoir-local node (192.168.5.181) is decommissioned. Airgapped
+installs are verified only in this rig, on the dev host (`teknoir.airgapped`, 192.168.2.181; it
+was vpro before). The host's own name is the platform domain, so tests never run on the host:
+everything that talks to the platform goes through `lan-netns.sh exec`. The VM takes
+`VM_MEM_MB` (default 10240) and `vm.sh start` refuses to boot when MemAvailable is below that
+plus 2048 MiB (`vm.sh ram-check`); do not run the k3d suites at the same time.
 
 - `vm/vm.sh`: the airgapped KVM node `tk-airgap`, domain `teknoir.airgapped`, 10.77.0.10.
   It sits on bridge `tkvm0`, which has no NAT and drops all forwarded traffic. VM state lives
   in `VM_DIR` (default `~/vmtest`).
 - `vm/lan-netns.sh up|down|status|hosts|exec`: the LAN host. It is network namespace `tklan`
   at 10.77.0.20, with no default route. Its own `/etc/netns/tklan/{hosts,nsswitch.conf,resolv.conf}`
-  map the platform names to the VM. vpro's `/etc/hosts` and the live env are never touched.
+  map the platform names to the VM and to nothing else: the hosts file has no 127.0.1.1 line
+  for the host name, and `up`/`status` check that every platform name resolves to `NODE_IP`
+  only inside the namespace. The host's `/etc/hosts` and every live env are never touched.
+  `vm.sh net-up` keeps the bridge's FORWARD DROP rules ahead of Docker's jumps and lets the VM
+  ping the host's bridge address but reach no host service; `vm.sh net-down` removes the rig
+  (after `lan-netns.sh down`).
 - `vm/e2e.sh`: scenarios E1-E8, E10 and E11-E15 with a pass/fail summary (the header of the
   script lists every assertion). E1, E6, E10 and E15 re-create the VM and run only with
   `--allow-destroy`. Inputs: `E2E_BUNDLE`, `E2E_BUNDLE_B`, `E2E_OLD_SETUP` and more (see the
@@ -144,7 +156,7 @@ ArgoCD runs in the fixture); T6 and E10 do.
   Example: `E2E_BUNDLE=dist/teknoir-airgap-<id>.tar airgap/test/vm/e2e.sh --allow-destroy E1 E2 E3`.
   A release (r5) runs, each on a re-created VM:
   - fresh: `E2E_BUNDLE=<B> e2e.sh --allow-destroy E1 E11 E12 E13 E14 E2 E3 E7 E8`;
-  - upgrade, with A = the deployed `dist/teknoir-airgap-teknoir-local-aoa0.0.4-….tar`:
+  - upgrade, with A = the last deployed release (`dist/teknoir-airgap-teknoir-local-aoa0.0.4-….tar`, the legacy layout of the decommissioned node):
     `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto E2E_E4_ROLLBACK=1 e2e.sh --allow-destroy E1 E4`.
     - E1 installs A. A predates r5 (its app-of-apps, from `MANIFEST.yaml` or
       `node/charts/pins.txt`, is below `E2E_R5_AOA`, default 0.0.5), so E1 treats it as a
@@ -180,7 +192,7 @@ ArgoCD runs in the fixture); T6 and E10 do.
 - `vm/old-setup.sh`: the `E2E_OLD_SETUP` command for E10. It installs the live env's old layout
   on the fresh VM with the old tooling itself (infra e9a3b7f, gitops 158b3da = app-of-apps 0.0.3)
   and dummy secrets, then adds the legacy file names and orphan Addons the live node has. Its
-  test-environment workarounds are listed in its header. `--build-only` runs only the vpro side
+  test-environment workarounds are listed in its header. `--build-only` runs only the workstation side
   (worktrees, dummy secrets, bundle in `~/vmtest/old-setup`). Example:
   `E2E_OLD_SETUP="$PWD/airgap/test/vm/old-setup.sh" E2E_BUNDLE=... airgap/test/vm/e2e.sh --allow-destroy E10`.
 - `vm/kc-login.sh`: scripted oauth2-proxy and Keycloak login. Passwords go only through files.
@@ -189,8 +201,8 @@ ArgoCD runs in the fixture); T6 and E10 do.
   fails on Update Profile; `--accept-status 403` for a non-admin realm user at an admin-only
   app; `--logout` checks the sign-out chain (oauth2-proxy sign_out, Keycloak's logout
   confirmation, back to the app, `/oauth2/start`, the login form).
-- apt state: the VM's genericcloud image may have no apt lists, while the live node's lists (from its
-  install) offer the same chrony and util-linux-extra versions as the bundle. `host_packages` hides the
+- apt state: the VM's genericcloud image may have no apt lists, while the decommissioned live node's lists (from its
+  install) offered the same chrony and util-linux-extra versions as the bundle. `host_packages` hides the
   lists from apt, and `node/packages-test.sh` covers both states. To make an r5 up on the VM (E12, the
   E15 rehearsal) reproduce the live node, give the VM apt lists that offer the bundled versions first,
   for example a copy of the live node's `/var/lib/apt/lists`.

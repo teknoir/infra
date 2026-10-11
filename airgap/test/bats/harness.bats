@@ -120,6 +120,33 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
   grep -qE '^127\.0\.0\.1[[:space:]]+localhost' <<<"${output}"
 }
 
+@test "lan-netns.sh hosts: a host named like the domain gets no 127.0.1.1 line (the dev host is teknoir.airgapped)" {
+  printf 'TEKNOIR_ENV=x\nTEKNOIR_DOMAIN=%s\nNODE_IP=10.9.8.7\nTEKNOIR_HOSTNAMES="a"\n' "$(uname -n)" > "${BATS_TEST_TMPDIR}/s.env"
+  LAN_SITE="${BATS_TEST_TMPDIR}/s.env" run "${NETNS}" hosts
+  [ "${status}" -eq 0 ]
+  refute_grep -n '^127\.0\.1\.1' <<<"${output}"
+  grep -qE "^10\.9\.8\.7[[:space:]]+$(uname -n) a\.$(uname -n)\$" <<<"${output}"
+}
+
+@test "lan-netns.sh hosts: another host name keeps its 127.0.1.1 line" {
+  printf 'TEKNOIR_ENV=x\nTEKNOIR_DOMAIN=not-%s.test\nNODE_IP=10.9.8.7\nTEKNOIR_HOSTNAMES="a"\n' "$(uname -n)" > "${BATS_TEST_TMPDIR}/s.env"
+  LAN_SITE="${BATS_TEST_TMPDIR}/s.env" run "${NETNS}" hosts
+  [ "${status}" -eq 0 ]
+  grep -qE "^127\.0\.1\.1[[:space:]]+$(uname -n)\$" <<<"${output}"
+}
+
+@test "vm.sh ram-check: refuses a VM that does not fit, VM_SKIP_RAM_CHECK=1 overrides" {
+  VM_MEM_MB=99999999 run "${VM}" ram-check
+  [ "${status}" -ne 0 ]
+  [[ "${output}" == *"not enough free RAM"* ]]
+  VM_MEM_MB=99999999 VM_SKIP_RAM_CHECK=1 run "${VM}" ram-check
+  [ "${status}" -eq 0 ]
+}
+
+@test "vm.sh: the default VM memory is at least 10240 MiB" {
+  grep -q 'MEM_MB="${VM_MEM_MB:-10240}"' "${VM}"
+}
+
 @test "lan-netns.sh hosts: follows the site file" {
   printf 'TEKNOIR_ENV=x\nTEKNOIR_DOMAIN=example.test\nNODE_IP=10.9.8.7\nTEKNOIR_HOSTNAMES="a b"\n' > "${BATS_TEST_TMPDIR}/s.env"
   LAN_SITE="${BATS_TEST_TMPDIR}/s.env" run "${NETNS}" hosts
@@ -127,7 +154,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
   grep -qE '^10\.9\.8\.7[[:space:]]+example\.test a\.example\.test b\.example\.test$' <<<"${output}"
 }
 
-@test "lan-netns.sh: never edits vpro's /etc/hosts, adds no default route" {
+@test "lan-netns.sh: never edits the host's /etc/hosts, adds no default route" {
   refute_grep -nE '(>|tee|sed -i|install)[^#]* /etc/hosts' "${NETNS}"
   refute_grep -nE 'route add default|route replace default' "${NETNS}"
   grep -q 'ETC="/etc/netns/${NS}"' "${NETNS}"

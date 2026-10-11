@@ -2,7 +2,7 @@
 # testlib.sh — assertions and a pass/fail summary for the k3d and VM suites.
 #
 # Sourced by airgap/test/k3d/run.sh and airgap/test/vm/e2e.sh. These run on
-# vpro or a CI runner (bash >= 4.4), never on the LAN host or the node.
+# the dev host or a CI runner (bash >= 4.4), never on the LAN host or the node.
 #
 #   tl_case <ID> <description>     start a test case (prints a header)
 #   pass <msg> / fail <msg>        record one assertion result in the case

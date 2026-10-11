@@ -2,8 +2,9 @@
 # lan-netns.sh — the "LAN host" of the VM e2e test: network namespace tklan.
 #
 # DESIGN D13 / I-16: the e2e test uses the real domain (teknoir.airgapped)
-# without touching vpro's /etc/hosts or the live env. The LAN host is a
-# network namespace on vpro:
+# without touching the rig host's /etc/hosts or any live env. The LAN host is
+# a network namespace on the rig host (the dev host, teknoir.airgapped;
+# earlier: vpro):
 #   - netns tklan with a veth (tklan0, 10.77.0.20/24) whose peer (tklan-br) is
 #     a port of the isolated bridge tkvm0 (created by vm.sh net-up);
 #   - no default route: the namespace reaches 10.77.0.0/24 and nothing else;
@@ -11,13 +12,22 @@
 #     TEKNOIR_HOSTNAMES entry of the site file to NODE_IP (10.77.0.10);
 #     `ip netns exec` bind-mounts it over /etc/hosts inside the namespace
 #     only. /etc/netns/tklan/nsswitch.conf ("hosts: files") and an empty
-#     resolv.conf keep vpro's resolver (systemd-resolved) out of the LAN view;
+#     resolv.conf keep the host's resolver (systemd-resolved) out of the LAN
+#     view. The host's own name is the platform domain here (the dev host is
+#     called teknoir.airgapped, 127.0.1.1 in ITS /etc/hosts and "myhostname"
+#     in its nsswitch): the namespace hosts file therefore has NO 127.0.1.1
+#     line for the host name, or the domain would resolve to loopback first.
+#     `up` and `status` verify that every platform name resolves to NODE_IP
+#     only, inside the namespace, and that the host's default namespace does
+#     not map the domain to NODE_IP;
 #   - one iptables FORWARD rule accepts bridged frames between ports of tkvm0
 #     (br_netfilter passes bridged traffic through FORWARD, where vm.sh's
 #     "-i tkvm0 -j DROP" would otherwise drop LAN<->VM traffic); routed
-#     traffic out of the bridge stays dropped.
-# Nothing else in vpro's default namespace changes: no route, no address, no
-# /etc/hosts entry.
+#     traffic out of the bridge stays dropped. The rule is kept as the first
+#     rule of FORWARD, ahead of Docker's jumps and of vm.sh's DROP rules
+#     (Docker re-inserts its own jumps at the top whenever the daemon starts).
+# Nothing else in the host's default namespace changes: no route, no address,
+# no /etc/hosts entry.
 #
 # Usage: lan-netns.sh up|down|status|hosts|exec [--root] [--] CMD...
 #   up      create or repair everything (idempotent)
@@ -61,19 +71,39 @@ site_var() {
   ( set +u; . "${SITE}"; eval "printf '%s' \"\${$1:-}\"" )
 }
 
-hosts_content() {
-  local domain node_ip names h
-  domain="$(site_var TEKNOIR_DOMAIN)"; node_ip="$(site_var NODE_IP)"
-  [[ -n "${domain}" && -n "${node_ip}" ]] || die "${SITE} must set TEKNOIR_DOMAIN and NODE_IP"
+name_listed() {
+  # name_listed <name> <space-separated names> — 0 when <name> is one of them
+  local n
+  for n in $2; do [[ "${n}" == "$1" ]] && return 0; done
+  return 1
+}
+
+platform_names() {
+  # platform_names — the domain and <name>.<domain> for every TEKNOIR_HOSTNAMES entry
+  local domain h names
+  domain="$(site_var TEKNOIR_DOMAIN)"
+  [[ -n "${domain}" ]] || die "${SITE} must set TEKNOIR_DOMAIN"
   names="${domain}"
   for h in $(site_var TEKNOIR_HOSTNAMES); do names+=" ${h}.${domain}"; done
-  printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n::1\tlocalhost ip6-localhost ip6-loopback\n' "$(uname -n)"
+  printf '%s' "${names}"
+}
+
+hosts_content() {
+  local domain node_ip names
+  domain="$(site_var TEKNOIR_DOMAIN)"; node_ip="$(site_var NODE_IP)"
+  [[ -n "${domain}" && -n "${node_ip}" ]] || die "${SITE} must set TEKNOIR_DOMAIN and NODE_IP"
+  names="$(platform_names)"
+  printf '127.0.0.1\tlocalhost\n'
+  # The UTS namespace is shared with the host, so uname -n is the host's name,
+  # which on the dev host IS the platform domain: never map it to loopback.
+  if ! name_listed "$(uname -n)" "${names}"; then printf '127.0.1.1\t%s\n' "$(uname -n)"; fi
+  printf '::1\tlocalhost ip6-localhost ip6-loopback\n'
   printf '# managed by airgap/test/vm/lan-netns.sh (site %s): the airgapped LAN view\n' "$(basename "${SITE}")"
   printf '%s\t%s\n' "${node_ip}" "${names}"
 }
 
 nsswitch_content() {
-  # vpro's nsswitch.conf with name resolution limited to the hosts file
+  # the host's nsswitch.conf with name resolution limited to the hosts file
   if [[ -f /etc/nsswitch.conf ]]; then
     sed -E 's/^hosts:.*/hosts:          files/' /etc/nsswitch.conf
   else
@@ -99,7 +129,28 @@ write_if_changed() {
 
 rule_first() {
   # true when the accept rule is the first rule of FORWARD
-  [[ "$(as_root iptables -S FORWARD | sed -n 2p)" == *"teknoir-lan-netns:"* ]]
+  [[ "$(as_root iptables -S FORWARD | awk '/^-A /{print; exit}')" == *"teknoir-lan-netns:"* ]]
+}
+
+verify_view() {
+  # verify_view — the name view of the rig, both sides:
+  #  - inside the namespace every platform name resolves to NODE_IP and
+  #    nothing else (a name that resolved to the host would send a test to the
+  #    dev host, whose own name is the platform domain);
+  #  - the host's default namespace must not map them to NODE_IP (the rig
+  #    never writes the host's /etc/hosts; a leftover entry is only warned).
+  local node_ip n got bad=""
+  node_ip="$(site_var NODE_IP)"
+  for n in $(platform_names); do
+    got="$(as_root ip netns exec "${NS}" getent ahostsv4 "${n}" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd' ')"
+    [[ "${got}" == "${node_ip}" ]] || bad+=" ${n} -> [${got:-nothing}]"
+  done
+  [[ -z "${bad}" ]] || die "namespace ${NS}: platform names must resolve to ${node_ip} only, but:${bad} (see ${ETC}/hosts)"
+  for n in $(platform_names); do
+    if getent ahostsv4 "${n}" 2>/dev/null | awk '{print $1}' | grep -qx -- "${node_ip}"; then
+      log "WARNING: the host itself resolves ${n} to ${node_ip} (a leftover /etc/hosts entry?); the rig does not need it"
+    fi
+  done
 }
 
 up() {
@@ -112,7 +163,7 @@ up() {
     as_root ip link add "${VETH_HOST}" type veth peer name "${VETH_NS}" netns "${NS}"
     log "created veth ${VETH_HOST} <-> ${NS}/${VETH_NS}"
   fi
-  # a bridge port needs no address of its own (no IPv6 link-local in vpro's namespace)
+  # a bridge port needs no address of its own (no IPv6 link-local in the host's namespace)
   as_root sh -c "echo 1 > /proc/sys/net/ipv6/conf/${VETH_HOST}/disable_ipv6"
   as_root ip link set "${VETH_HOST}" master "${BR}" up
   as_root ip -n "${NS}" link set lo up
@@ -132,6 +183,7 @@ up() {
     log "FORWARD: accept bridged ${BR} port-to-port traffic (rule 1)"
   fi
   install -d -m 0700 "${LAN_HOME}"
+  verify_view
   log "netns ${NS} up: ${LAN_IP}/${CIDR} on ${BR}, no default route, hosts -> $(site_var NODE_IP)"
 }
 
@@ -154,6 +206,7 @@ status() {
   printf 'default route: %s\n' "$(as_root ip -n "${NS}" route show default | grep -q . && echo PRESENT || echo none)"
   printf 'hosts (%s):\n' "${ETC}/hosts"; as_root cat "${ETC}/hosts" 2>/dev/null || echo "  missing"
   printf 'FORWARD rule first: %s\n' "$(rule_first && echo yes || echo no)"
+  ( verify_view ) && printf 'name view: platform names -> %s only, inside the namespace\n' "$(site_var NODE_IP)" || printf 'name view: WRONG (see above)\n'
   local ip; ip="$(site_var NODE_IP)"
   if as_root ip netns exec "${NS}" ping -c1 -W2 "${ip}" >/dev/null 2>&1; then
     printf 'node %s: reachable\n' "${ip}"

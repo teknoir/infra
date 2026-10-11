@@ -135,7 +135,7 @@
 #                    (the r5-only checks warn); 1 always; 0 never (all strict)
 #   E2E_R5_AOA       the first app-of-apps version of r5 (default 0.0.5), read from
 #                    MANIFEST.yaml appOfAppsVersion or node/charts/pins.txt
-#   E2E_OLD_SETUP    E10, E15: command (run on vpro, VM_IP exported) that installs the
+#   E2E_OLD_SETUP    E10, E15: command (run on the rig host, VM_IP exported) that installs the
 #                    old (e9a3b7f) layout with dummy secrets on the fresh VM
 #                    (airgap/test/vm/old-setup.sh)
 #   E2E_E10_SECRETS  E10: ns/name of the Secrets that must stay unchanged
@@ -166,7 +166,10 @@
 #                    else the bundle's node/bin/age); the identities are
 #                    VM_DIR/age/*.key (vm.sh age-key)
 #   E2E_E6_RESTORE_CMD  E6: restore command run after the rebuild (OPERATE.md); unset = skip
-# Nothing here touches vpro's /etc/hosts, its default route, or the live env.
+# Nothing here touches the rig host's /etc/hosts, its default route, or any live env.
+# The rig host is the dev host (teknoir.airgapped): its own name is the platform
+# domain, so everything that talks to the platform runs inside the tklan netns
+# (lan-netns.sh exec), never on the host.
 set -euo pipefail
 # iptables, ip and sysctl live in the sbin dirs, which not every shell has on PATH
 PATH="${PATH}:/usr/local/sbin:/usr/sbin:/sbin"
@@ -339,11 +342,19 @@ prepare() {
   # the first admin chosen by an earlier E1/E10/E15 (the teknoir-default owner)
   if [[ -z "${E2E_ADMIN_EMAIL:-}" && -s "${STATE}/admin-email" ]]; then set_admin "$(head -n1 "${STATE}/admin-email")"; fi
   start_agent
-  local avail
-  avail="$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)"
-  if ! "${VM}" status 2>&1 | grep -q 'running (pid' && (( avail < 11 )); then
-    tl_warn "only ${avail} GiB available; the VM needs 10 GiB (stop other docker workloads)"
-  fi
+  rig_preflight
+}
+
+rig_preflight() {
+  # rig_preflight — fail early and clearly when the rig host cannot run the VM
+  # (sudo without a password, KVM, no clash with the bridge subnet, RAM for
+  # the VM unless it already runs: vm.sh ram-check, VM_MEM_MB + headroom)
+  sudo -n true 2>/dev/null || tl_die "passwordless sudo is required (bridge, netns and firewall rules)"
+  [[ -e /dev/kvm ]] || tl_die "/dev/kvm is missing: the VM needs KVM"
+  local clash
+  clash="$(ip -4 route show to match "${NODE_IP}" 2>/dev/null | awk '$0 !~ /dev tkvm0( |$)/ && $1 != "default"')"
+  [[ -z "${clash}" ]] || tl_die "a host route other than tkvm0 covers the VM subnet (${NODE_IP}): ${clash}"
+  if ! "${VM}" status 2>&1 | grep -q 'running (pid'; then "${VM}" ram-check || tl_die "not enough free RAM for the VM (see above)"; fi
 }
 
 ensure_vm() {
@@ -1132,17 +1143,17 @@ e3() {
   before="$(forward_drops)"
   assert_not_cmd "VM: https://registry-1.docker.io/v2/ is unreachable" vmx curl -sS -m 5 -o /dev/null https://registry-1.docker.io/v2/
   assert_not_cmd "VM: github.com does not resolve" vmx getent hosts github.com
-  # A host route via vpro makes the VM and the namespace actually send
+  # A host route via the bridge address (the rig host) makes the VM and the namespace actually send
   # packets towards the internet, so the FORWARD DROP counters must grow.
   vmx sudo ip route replace 1.1.1.1/32 via 10.77.0.1 >/dev/null
-  assert_not_cmd "VM: https://1.1.1.1 via vpro is dropped" vmx curl -sS -m 5 -o /dev/null https://1.1.1.1/
+  assert_not_cmd "VM: https://1.1.1.1 via the rig host is dropped" vmx curl -sS -m 5 -o /dev/null https://1.1.1.1/
   vmx sudo ip route del 1.1.1.1/32 >/dev/null || true
   "${NETNS}" exec --root ip route replace 1.1.1.1/32 via 10.77.0.1
-  assert_not_cmd "netns: https://1.1.1.1 via vpro is dropped" lan "${E2E_WORK}" curl -sS -m 5 -o /dev/null https://1.1.1.1/
+  assert_not_cmd "netns: https://1.1.1.1 via the rig host is dropped" lan "${E2E_WORK}" curl -sS -m 5 -o /dev/null https://1.1.1.1/
   "${NETNS}" exec --root ip route del 1.1.1.1/32 || true
   assert_not_cmd "netns: a public name does not resolve" lan "${E2E_WORK}" getent hosts github.com
   after="$(forward_drops)"
-  if (( after > before )); then pass "vpro FORWARD DROP counters for tkvm0 grew (${before} -> ${after})"
+  if (( after > before )); then pass "rig host FORWARD DROP counters for tkvm0 grew (${before} -> ${after})"
   else fail "FORWARD DROP counters did not grow (${before} -> ${after})"; fi
   bad="$(images_missing)"
   assert_eq "every pod image is present in containerd (imported, or pulled through the harbor.${DOMAIN} mirror)" "" "${bad}"
@@ -2045,7 +2056,7 @@ e12() {
   else fail "RTC offset ${rtc} s after up --sync-clock (want within 2 s)"; fi
 
   # a reboot: the clock comes back from the RTC that up wrote (a guest reboot
-  # keeps QEMU and its RTC; a QEMU restart would reset the RTC to vpro's clock)
+  # keeps QEMU and its RTC; a QEMU restart would reset the RTC to the rig host's clock)
   boot0="$(vmx cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
   vmx sudo systemctl reboot >/dev/null 2>&1 || true
   sleep 20

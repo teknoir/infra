@@ -2,14 +2,29 @@
 # vm.sh — disposable airgapped k3s test node for the Teknoir airgap procedure.
 #
 # The VM sits on an isolated Linux bridge (tkvm0, 10.77.0.0/24) with NO NAT
-# and NO forwarding: it can reach vpro (10.77.0.1) and the LAN namespace
-# (airgap/test/vm/lan-netns.sh, 10.77.0.20) and nothing else, exactly like
-# the real airgapped node.
+# and NO forwarding: it can reach the LAN namespace (airgap/test/vm/
+# lan-netns.sh, 10.77.0.20) and, by ping only, the rig host's bridge address
+# (10.77.0.1); no service of the host answers it and nothing is forwarded
+# (the airgapped node never sees the internet either).
+#
+# The rig host is the dev host (hostname teknoir.airgapped, Debian 13, Docker,
+# k3d); it was vpro before 2026-10-11. Docker keeps FORWARD's policy at DROP
+# and puts its own jumps at the top of the chain whenever its daemon starts,
+# so net-up keeps the DROP rules ahead of them (lan-netns.sh up then restores
+# its accept rule ahead of the DROPs; e2e.sh does both on every start).
 #
 # DESIGN D13: the VM uses the real env's domain (teknoir.airgapped) at
 # VM_IP 10.77.0.10 (airgap/site/vmtest.env). Name resolution for that domain
 # exists only inside the LAN network namespace (its own /etc/hosts); this
-# script never touches vpro's /etc/hosts.
+# script never touches the host's /etc/hosts. The host's OWN name is
+# teknoir.airgapped too (127.0.1.1), so nothing on the host may be used to
+# test the platform: every test goes through `lan-netns.sh exec`.
+#
+# RAM: the VM takes VM_MEM_MB (default 10240) of the host's RAM; `start`
+# refuses to boot it when MemAvailable is less than VM_MEM_MB plus
+# VM_RAM_HEADROOM_MB (default 2048) instead of letting the kernel OOM-kill
+# something (stop the k3d suites and other Docker workloads first: the VM and
+# the k3d suites do not run at the same time). VM_SKIP_RAM_CHECK=1 skips it.
 #
 # VM state (disk overlay, cloud-init seed, ssh key, pid, console log) lives in
 # VM_DIR (default ~/vmtest), never in the repo. The Debian 13 genericcloud
@@ -26,8 +41,11 @@
 # exactly these two (after a new VM_DIR: put the printed recipients into
 # vmtest.env).
 #
-# Usage: vm.sh net-up|create|start|stop|destroy|ssh [cmd...]|status|key
-#              |age-key [--check SITE]
+# Usage: vm.sh net-up|net-down|create|start|stop|destroy|ssh [cmd...]|status|key
+#              |age-key [--check SITE]|ram-check
+#   net-down  remove the bridge, the tap and the firewall rules (the VM must
+#             be stopped; run lan-netns.sh down first)
+#   ram-check exit 1 unless the host has the RAM for the VM
 # Every subcommand is idempotent. Requires: sudo, qemu-system-x86_64,
 # qemu-img, cloud-localds, membership of group kvm (used through `sg kvm`);
 # age-keygen for age-key.
@@ -39,7 +57,7 @@ VM_DIR="${VM_DIR:-${HOME}/vmtest}"
 NAME="${VM_NAME:-tk-airgap}"
 BR=tkvm0; TAP=tktap0
 HOST_IP=10.77.0.1; VM_IP="${VM_IP:-10.77.0.10}"; CIDR=24
-MEM_MB="${VM_MEM_MB:-10240}"; CPUS="${VM_CPUS:-8}"; DISK_GB="${VM_DISK_GB:-120}"
+MEM_MB="${VM_MEM_MB:-10240}"; RAM_HEADROOM_MB="${VM_RAM_HEADROOM_MB:-2048}"; CPUS="${VM_CPUS:-8}"; DISK_GB="${VM_DISK_GB:-120}"
 DOMAIN="${VM_DOMAIN:-teknoir.airgapped}"
 BASE="${VM_DIR}/images/debian-13-genericcloud-amd64.qcow2"
 DISK="${VM_DIR}/${NAME}.qcow2"; SEED="${VM_DIR}/${NAME}-seed.iso"; PIDF="${VM_DIR}/${NAME}.pid"
@@ -58,6 +76,22 @@ ssh_vm() {
       -o LogLevel=ERROR -o ConnectTimeout=5 -o BatchMode=yes "teknoir@${VM_IP}" "$@"
 }
 
+ipt() { sudo iptables "$@"; }
+
+forward_ours_on_top() {
+  # forward_ours_on_top — 0 when both bridge DROP rules sit ahead of every
+  # foreign rule of FORWARD (lan-netns.sh's accept rule is ours as well).
+  # Docker (re-)inserts DOCKER-USER/DOCKER-FORWARD jumps at the top when its
+  # daemon starts; a published port or a container network behind them could
+  # otherwise accept traffic that comes in on the bridge.
+  ipt -S FORWARD | awk -v i="-A FORWARD -i ${BR} -j DROP" -v o="-A FORWARD -o ${BR} -j DROP" '
+    /^-A / { if (stop) next
+             if ($0 ~ /teknoir-lan-netns:/) next
+             if ($0 == i || $0 == o) { d++; next }
+             stop = 1 }
+    END { exit (d == 2 ? 0 : 1) }'
+}
+
 net_up() {
   if ! ip link show "${BR}" >/dev/null 2>&1; then
     log "creating isolated bridge ${BR} (${HOST_IP}/${CIDR}, no NAT)"
@@ -69,10 +103,45 @@ net_up() {
     sudo ip tuntap add dev "${TAP}" mode tap user "$(id -un)"
     sudo ip link set "${TAP}" master "${BR}" up
   fi
+  # IPv4 only: no IPv6 link-local on the bridge or the tap
+  sudo sysctl -q -w "net.ipv6.conf.${BR}.disable_ipv6=1" "net.ipv6.conf.${TAP}.disable_ipv6=1" >/dev/null
   # Airgap: never forward or masquerade anything from or to the bridge.
-  sudo iptables -C FORWARD -i "${BR}" -j DROP 2>/dev/null || sudo iptables -I FORWARD -i "${BR}" -j DROP
-  sudo iptables -C FORWARD -o "${BR}" -j DROP 2>/dev/null || sudo iptables -I FORWARD -o "${BR}" -j DROP
-  log "bridge ${BR} up; forwarding to/from it is dropped"
+  if ! ipt -C FORWARD -i "${BR}" -j DROP 2>/dev/null || ! ipt -C FORWARD -o "${BR}" -j DROP 2>/dev/null || ! forward_ours_on_top; then
+    while ipt -D FORWARD -i "${BR}" -j DROP 2>/dev/null; do :; done
+    while ipt -D FORWARD -o "${BR}" -j DROP 2>/dev/null; do :; done
+    ipt -I FORWARD 1 -o "${BR}" -j DROP
+    ipt -I FORWARD 1 -i "${BR}" -j DROP
+    log "FORWARD: DROP rules for ${BR} are at the top (run lan-netns.sh up to restore the LAN accept rule)"
+  fi
+  # The host is not part of the airgapped LAN: the VM may ping the bridge
+  # address (routing tests, diagnostics) but reaches no host service.
+  ipt -C INPUT -i "${BR}" -j DROP 2>/dev/null || ipt -I INPUT 1 -i "${BR}" -j DROP
+  ipt -C INPUT -i "${BR}" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null \
+    || ipt -I INPUT 1 -i "${BR}" -p icmp --icmp-type echo-request -j ACCEPT
+  log "bridge ${BR} up; forwarding to/from it is dropped, the host answers ping only"
+}
+
+net_down() {
+  running && die "the VM is running: vm.sh stop first"
+  while ipt -D FORWARD -i "${BR}" -j DROP 2>/dev/null; do :; done
+  while ipt -D FORWARD -o "${BR}" -j DROP 2>/dev/null; do :; done
+  while ipt -D INPUT -i "${BR}" -j DROP 2>/dev/null; do :; done
+  while ipt -D INPUT -i "${BR}" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do :; done
+  if ip link show "${TAP}" >/dev/null 2>&1; then sudo ip link del "${TAP}"; fi
+  if ip link show "${BR}" >/dev/null 2>&1; then sudo ip link del "${BR}"; fi
+  log "bridge ${BR}, tap ${TAP} and their firewall rules removed"
+}
+
+ram_check() {
+  # ram_check — fail clearly when the host cannot hold the VM
+  local avail need
+  [[ "${VM_SKIP_RAM_CHECK:-0}" == 1 ]] && return 0
+  avail="$(awk '/^MemAvailable:/ {print int($2 / 1024)}' /proc/meminfo)"
+  need=$(( MEM_MB + RAM_HEADROOM_MB ))
+  if (( avail < need )); then
+    die "not enough free RAM for the VM: MemAvailable ${avail} MiB < ${need} MiB (VM_MEM_MB ${MEM_MB} + headroom ${RAM_HEADROOM_MB}). Stop k3d clusters or Docker workloads (the VM and the k3d suites do not run at the same time), or lower VM_MEM_MB only if the scenarios allow it (E15 needs 10240); VM_SKIP_RAM_CHECK=1 overrides"
+  fi
+  log "RAM ok: MemAvailable ${avail} MiB >= ${need} MiB"
 }
 
 create() {
@@ -119,6 +188,8 @@ start() {
   net_up
   [[ -f "${DISK}" && -f "${SEED}" ]] || create
   if running; then log "already running (pid $(cat "${PIDF}"))"; else
+    [[ -r /dev/kvm ]] || sg kvm -c 'test -r /dev/kvm' 2>/dev/null || die "/dev/kvm is not usable (is $(id -un) in group kvm?)"
+    ram_check
     log "starting ${NAME}: ${CPUS} vCPU, ${MEM_MB} MiB"
     sg kvm -c "qemu-system-x86_64 -name ${NAME} -machine q35,accel=kvm -cpu host -smp ${CPUS} -m ${MEM_MB} \
       -drive file=${DISK},if=virtio,cache=none,discard=unmap \
@@ -190,7 +261,7 @@ usage() { sed -n '2,/^set -euo/p' "$0" | sed -e '$d' -e 's/^# \{0,1\}//'; }
 
 cmd="${1:-status}"; shift || true
 case "${cmd}" in
-  net-up) net_up ;; create) create ;; start) start ;; stop) stop ;; destroy) destroy ;;
+  net-up) net_up ;; net-down) net_down ;; ram-check) ram_check ;; create) create ;; start) start ;; stop) stop ;; destroy) destroy ;;
   ssh) ssh_vm "$@" ;; status) status ;;
   key) printf '%s\n' "${KEY}" ;;
   age-key) age_key "$@" ;;

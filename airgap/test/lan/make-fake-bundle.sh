@@ -10,7 +10,7 @@ set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repo=$(cd "${here}/../../.." && pwd)
 out='' node_ip='' node='' format=list kubectl='' docs=${repo}/docs/airgap
-# a domain no resolver knows (vpro resolves teknoir.airgapped)
+# a domain no resolver knows (the dev host resolves teknoir.airgapped to itself)
 domain=teknoir.lantest
 while [ $# -gt 0 ]; do
   case $1 in

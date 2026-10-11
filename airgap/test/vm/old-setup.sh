@@ -4,12 +4,12 @@
 # install the OLD teknoir-local layout on the fresh test VM with DUMMY secrets,
 # using the old tooling itself (infra e9a3b7f, gitops 158b3da = app-of-apps
 # 0.0.3), so that e2e.sh E10 can run the new migrate, up and migrate --argo
-# on it. e2e.sh runs it as E2E_OLD_SETUP, on vpro, with VM_IP exported, right
+# on it. e2e.sh runs it as E2E_OLD_SETUP, on the rig host (the dev host), with VM_IP exported, right
 # after it re-created the VM and brought up the LAN namespace tklan.
 #
 # Steps, in the order of the old runbooks at e9a3b7f (docs/AIRGAP-HOST-SETUP.md,
 # AIRGAP-BOOTSTRAP.md, AIRGAP-UPDATE.md):
-#   connected workstation (vpro, work dir OLD_SETUP_DIR):
+#   connected workstation (the rig host, work dir OLD_SETUP_DIR):
 #    1. throwaway detached worktrees: infra at e9a3b7f, gitops at 158b3da
 #    2. dummy secrets from the old scripts/gen-*.sh (their output, which
 #       echoes the values, is discarded)
