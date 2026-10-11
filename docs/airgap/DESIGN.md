@@ -280,6 +280,195 @@ The LAN tool passes `--teamspace` and `--reset-password` through; `--reset-passw
 
 Tests: `airgap/test/k3d/admin-user-test.sh` (stand-in controllers in K1-Secret and legacy modes, stand-in Profiles, a postgres catalog whose stand-in user provider trails every claim change, fake Keycloak with reset-password, and a kubectl wrapper that replaces the Secret or the legacy value right after admin-user read it, or changes the User right before a patch: resume, reset over a pending value, the delete preconditions, the sha256 guard and both conflict retries are covered, and so is an existing empty 0600 `--out` as node_mktemp creates it, filled by a handover and by `--reset-password` without a temp file left behind), `airgap/test/unit/admin-out-file-test.sh` (no cluster, run by run-static: the never-overwrite checks refuse only a non-empty `--out`, so a tightening to "exists" fails it), `airgap/test/bats/lan_entrypoint.bats` (admin-user flags through `--local` with a path-mapping sudo stub) and `airgap/test/lan/` (bash 3.2, real sshd).
 
+## r5 (app-of-apps 0.0.5)
+
+Changes of release r5 that supersede the text below where they differ. Each
+package adds its own subsection.
+
+### monitoring 0.0.5, argo 0.0.4, harbor 0.0.10 (WP-G-ACCESS: SEC-C5, HYG-C8)
+
+- **Monitoring access (SEC-C5, K7).** New values `monitoring.access.issuer`
+  (`https://auth.<domain>/auth/realms/teknoir`) and `monitoring.access.groups`
+  (default `[admin]`).
+  - `templates/requestauthentication.yaml`: one RequestAuthentication each for
+    Grafana, Prometheus and Alertmanager. The issuer comes from
+    `monitoring.access.issuer`, and `jwksUri` is the issuer plus
+    `/protocol/openid-connect/certs` (istiod fetches it and trusts the CA
+    through the istio chart). The token is read from
+    `X-Auth-Request-Access-Token` or `X-Forwarded-Access-Token`, and
+    `forwardOriginalToken: true` keeps it for Grafana. An invalid token gets
+    `401`. Only `X-Auth-Request-Access-Token` comes from oauth2-proxy: its
+    auth endpoint sets it, and the gateway passes it upstream in place of any
+    value the client sent. oauth2-proxy never sets `X-Forwarded-Access-Token`
+    (the plan's header list, as in the Backstage chart), so only a client
+    sends it, and it passes the gateway unchanged. It counts only as a valid,
+    unexpired token of realm `teknoir`, so using it needs a group-admin token
+    as well as a session at the gateway. Grafana reads only
+    `X-Auth-Request-Access-Token`. Dropping the second header from `jwtRules`
+    would close that path; that is a plan change, left for a later release.
+  - `grafana-`, `prometheus-` and `alertmanager-allow-ingress` require the
+    ingress gateway's principal AND `request.auth.claims[groups]` in
+    `monitoring.access.groups`. A list claim matches when any element
+    matches.
+  - In-namespace ALLOWs: `prometheus-allow-internal` (namespace
+    `teknoir-system`: Grafana's Prometheus datasource, the operator) and the
+    new `alertmanager-allow-prometheus` (principal
+    `cluster.local/ns/teknoir-system/sa/monitoring-prometheus`).
+  - `templates/access-check.yaml` fails the render (so ArgoCD shows a
+    ComparisonError and syncs nothing) when:
+    - `grafana.ini`'s issuer (`expect_claims.iss`) or JWKS URL differs from
+      `monitoring.access.issuer`, or the issuer is not https;
+    - `auth.jwt` is off or anonymous access is on. Both are read as Grafana
+      reads booleans, so the string `"false"` counts as off and `"on"` as on;
+    - `kube-prometheus-stack.namespaceOverride` is not the namespace the
+      policies are rendered into;
+    - an alerting endpoint is not this release's Alertmanager Service
+      (namespace, name, `routePrefix` and the one `__address__` rewrite);
+    - `alertmanagerSpec.replicas` is more than 1 (see alert delivery below).
+- **Grafana sign-in.** `grafana.ini` `auth.jwt` reads the token from
+  `X-Auth-Request-Access-Token`. The login is `preferred_username`, the
+  Keycloak username: the e-mail address for users that user-controller
+  creates (`admin-user` included), while a user made by hand in the Keycloak
+  console keeps the username it was given. So the login is not always the
+  e-mail. The e-mail is `email` (docker test G3 tells the two apart), and
+  `expect_claims` pins `iss`. `auto_sign_up` is on.
+  `role_attribute_path` gives group `admin` the Admin role and everyone else
+  Viewer, and `role_attribute_strict` refuses a token that maps to no role.
+  The role is set again from the token at every sign-in. Anonymous access and
+  `users.allow_sign_up` are off. `auth.basic` stays on for the dashboard and
+  datasource sidecars, and `auth.disable_login_form` stays `true` (unchanged
+  from 0.0.4). So the local admin's only way in is basic auth against the
+  HTTP API over a port-forward, not the browser (OPERATE.md). Update checks
+  and usage reporting are off.
+- **Why Grafana's `jwk_set_url` is https (a deviation from SEC-C5).** SEC-C5
+  specified the in-mesh `http://keycloak-http.teknoir-auth.svc.cluster.local`
+  JWKS URL. Grafana 12.4.2 refuses to start with an http `jwk_set_url`
+  ("jwt_set_url must have https scheme"), so that URL would have taken Grafana
+  down. Grafana therefore fetches the issuer's own
+  `https://auth.<domain>/auth/realms/teknoir/protocol/openid-connect/certs`,
+  the same path argocd-server's OIDC uses. This needs two things:
+  - The pod must resolve `auth.<domain>` to the node: coredns-custom's hosts
+    block, which TS-C5 keeps.
+  - It must trust the Teknoir Root CA. Secret `teknoir-root-ca-bundle` (public
+    `ca.crt`, written by the secrets phase on every run) is mounted optional
+    at `/etc/teknoir/ca`, and `SSL_CERT_DIR=/etc/ssl/certs:/etc/teknoir/ca`, as
+    for argocd-server.
+
+  Go loads the trusted roots once per process, so a CA Secret that appears or
+  changes after Grafana started is used only after a restart (docker test
+  G11). On an install the secrets phase writes the Secret before the release
+  phase creates the Applications, so Grafana starts with it; on teknoir-local
+  it already exists. Without the CA, Grafana starts but no token verifies.
+- **Alert delivery (found while implementing SEC-C5).** The live "Error
+  sending alerts ... 503" was not an authorization denial. Read-only sidecar
+  stats on teknoir-local showed every Prometheus request to Alertmanager's pod
+  IP going to the PassthroughCluster in plaintext, with response flag UC, and
+  no RBAC decision at Alertmanager's sidecar. The upstream chart's default
+  discovers Alertmanager's pod IPs, and the sidecar does not apply mTLS to a
+  bare pod IP, while Alertmanager is STRICT. `prometheusSpec.alertingEndpoints`
+  keeps the same endpoint but rewrites `__address__` to
+  `monitoring-alertmanager.teknoir-system.svc.cluster.local:9093`. The request
+  is then routed through the mesh over mTLS as `monitoring-prometheus`, which
+  `alertmanager-allow-prometheus` admits. VM E13 proves it: no "Error sending
+  alerts" for 5 minutes. Every replica now gets the same Service address, so
+  each batch reaches one Alertmanager replica only, and replicas do not share
+  alerts. Alertmanager therefore stays at one replica (the upstream default,
+  unchanged), and the render refuses more; HA needs per-pod addresses over
+  mTLS first.
+- **Lifecycle endpoints (found while implementing SEC-C5).** The operator
+  runs Prometheus with `--web.enable-lifecycle` (read on teknoir-local), so
+  POST or PUT `/teknoir-system/prometheus/-/quit` stops it and `/-/reload`
+  reloads it; Alertmanager serves `/-/reload`. Both accept a simple
+  cross-site POST, and the oauth2-proxy cookie is `SameSite=None`, so a page
+  an admin visited could stop Prometheus through the gateway with the
+  admin's token. In the mesh, `prometheus-allow-internal` and
+  `harbor-allow-internal` let any teknoir-system or teknoir-auth pod do the
+  same without a token. `prometheus-deny-lifecycle` and
+  `alertmanager-deny-lifecycle` (selector `app.kubernetes.io/name`, no
+  source condition) DENY both endpoints from every source; DENY is evaluated
+  before every ALLOW, whichever chart renders it.
+  - Istio matches paths without the query and after the mesh's path
+    normalization, which is BASE (the istio chart sets none, unchanged in
+    r5). BASE resolves dot segments and decodes encoded unreserved
+    characters (`%2D`, `%71`), but keeps an encoded slash, while Prometheus
+    and Alertmanager (Go) decode `%2F` before they route. A plain
+    `*/-/quit` therefore let `.../prometheus/-%2Fquit` and
+    `.../prometheus%2F-/quit` through, and Prometheus stopped. The paths are
+    `*-/quit`, `*-%2Fquit`, `*-%2fquit` and the same for `reload`; matching
+    from the `-` covers the slash before it in every spelling. A doubled or
+    trailing slash gets a redirect to the clean path, which goes back
+    through the sidecar.
+  - The config-reloader sidecars call `http://127.0.0.1:9090/...` and
+    `:9093/...` (read on teknoir-local). Loopback traffic does not pass the
+    inbound sidecar, so reloads keep working, and so does a manual reload
+    over a port-forward.
+  - A mesh-wide `pathNormalization: DECODE_AND_MERGE_SLASHES` would close
+    encoded slashes for every path-based policy. It is an istio chart change
+    for a later release.
+- **What "group admin only" does not cover.** The harbor chart's
+  `harbor-allow-internal` has no selector, so it applies to every workload in
+  teknoir-system, the monitoring stack included. It admits any mTLS source in
+  teknoir-system and teknoir-auth without a token. Platform pods in those two
+  namespaces can therefore use the Prometheus and Alertmanager APIs, silences
+  included; teamspaces and the gateway without the groups claim cannot. Today
+  Grafana's Alertmanager datasource works only through that policy.
+  `charts/monitoring/tests/namespace-authz-test.sh` evaluates every policy
+  that applies to the three workloads, whichever chart renders it. Planned
+  for the next release, with VM tests: a selector on `harbor-allow-internal`
+  plus explicit in-namespace ALLOWs for every workload that relies on it.
+- **Known residual, not changed in r5.** Prometheus scrapes sidecar-injected
+  pods by pod IP, so those scrapes also go to the PassthroughCluster in
+  plaintext and get `503` (UC) under STRICT mTLS. The live stats show this for
+  two targets. Scraping under STRICT mTLS is a wider change for a later
+  release.
+- **ArgoCD RBAC (argo 0.0.4, SEC-C5).** `policy.default: ""` (was
+  `role:readonly`), and `policy.csv` is only `g, admin, role:admin`. The scope
+  stays `[groups]`, and `admin.enabled: "true"` is now explicit. Only
+  `argocd-rbac-cm` changes, which ArgoCD reloads without a restart. The plan's
+  lock-out risk is covered because the admin's token carries `groups: [admin]`
+  (E13 checks that the admin can sync), and the local `admin` is the
+  break-glass (`argocd-admin`).
+- **Harbor (harbor 0.0.10).** `oidcConfig.settings.project_creation_restriction:
+  adminonly` (SEC-C5): the PostSync OIDC Job PUTs only the settings that
+  differ, so on teknoir-local it PUTs only this one. HYG-C8:
+  `busybox:1.36.1` in all five `fix-permissions` init containers (database,
+  redis, trivy, registry and jobservice; the plan listed four). It is pinned
+  by tag only, because harbor is a one-shot tier whose images the bootstrap
+  imports from docker archives (G-09). `airgap/images-extra.txt` already
+  carries it.
+- **Tests** (gitops repo):
+  - `charts/monitoring/tests/render-test.sh` M1-M11: the RequestAuthentications,
+    the groups conditions, alert delivery and the one Alertmanager replica,
+    the `grafana.ini` keys (the login form off included), the CA mount, every
+    render guard, `istioctl validate`, and the two lifecycle DENYs (with no
+    other DENY in the chart).
+  - `charts/monitoring/tests/namespace-authz-test.sh` N1-N4: every policy from
+    any chart that applies to the three workloads. With `--renders DIR` it
+    reads `tests/render.sh --out DIR`, so render.sh's monitoring-authz check
+    can use the same evaluator. It treats `prometheus-allow-internal`,
+    `alertmanager-allow-prometheus` and `harbor-allow-internal` as in-mesh
+    ALLOWs that admit no gateway, and ignores a DENY limited to operations
+    (the lifecycle DENYs); its self-test proves both.
+  - `charts/monitoring/tests/grafana-jwt-docker-test.sh` G1-G11: the chart's
+    Grafana image with the rendered `grafana.ini`, a test CA in a Secret
+    volume's layout and an https JWKS. It covers sign-in, Admin and Viewer
+    (G3 tells the login, `preferred_username`, from the e-mail), rejected
+    tokens, basic auth on the API, the login form off, TLS verification, a
+    late CA needing a restart, the https rule and no secrets in the logs.
+  - `charts/monitoring/tests/lifecycle-deny-docker-test.sh` L1-L5: Envoy
+    from the istio chart's proxyv2 version, with BASE normalization and the
+    rendered lifecycle DENYs as RBAC, in front of the chart's Prometheus and
+    Alertmanager. The API stays reachable; every spelling of quit and reload
+    gets `403`, or at least never a 2xx; Prometheus survives every quit probe;
+    and a self-test shows that a plain `*/-/quit` lets `-%2Fquit` stop
+    Prometheus.
+  - `charts/argo/tests/render-test.sh` A1-A2 and
+    `charts/harbor/tests/render-test.sh` H1-H3 and O1-O3 (the OIDC Job's
+    script against a stub Harbor API).
+
+  The VM e2e E13 proves the gateway path, Grafana's in-mesh JWKS fetch and
+  alert delivery on a real node.
+
 ## Backstage + user-controller (folded into the redesign)
 
 Findings that the implementation must respect (from the read-only investigation of 2026-10-08):
