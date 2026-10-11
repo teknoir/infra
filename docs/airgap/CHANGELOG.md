@@ -13,9 +13,16 @@ reasons for the redesign are kept here. The git history of `infra` and
   on the TLS listener 8883 (the EMQX 4 `EMQX_LISTENER__SSL__*` env names were
   ignored by emqx 5.8.9, so it served the built-in self-signed "EMQ RootCA"), and
   the max packet size uses `EMQX_MQTT__MAX_PACKET_SIZE=3MB`.
-- **backstage-api waits for Postgres** (gitops 926b0b4): an initContainer, so it no
-  longer starts before its database after a node reboot and stays unready.
-  Not yet VM-verified.
+- **backstage-api waits for Postgres** (gitops 926b0b4, 9f3eafc): an initContainer, so it no
+  longer starts before its database after a node reboot and stays unready. The
+  first version ran `pg_isready` as uid 1000, which has no passwd entry in the postgres
+  image, so it answered "no attempt" on every try and always waited the full 10 min;
+  9f3eafc passes `-U backstage -d postgres`.
+- **istiod refreshes the Keycloak JWKS every minute** (istio chart 0.0.4,
+  `PILOT_JWT_PUB_KEY_REFRESH_INTERVAL=1m`). After a node reboot istiod could fetch the
+  JWKS while Keycloak was still starting, retry for about 30 s and then wait for the next
+  refresh (20 min by default): every sign-in got 401 "Jwt verification fails" although all
+  pods were Ready. Found when the backstage-api wait stopped hiding it.
 
 ## 2026-10-11: live node decommissioned, the VM rig moves to the dev host
 
