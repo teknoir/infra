@@ -200,25 +200,18 @@ works with your key) and you hold a checked bundle (section 2).
    ./teknoir-airgap doctor
    ```
 
-4. Get the initial platform admin's password into a file and sign in:
-
-   ```sh
-   ./teknoir-airgap credentials platform-admin --out ~/teknoir-platform-admin.txt
-   ```
-
-   Sign in at `https://auth.teknoir.airgapped/auth/realms/teknoir/account` as
-   `platform-admin` with that password. Keycloak asks for a new password at
-   once. Then delete the file. The auth chart's realm import creates
-   `platform-admin` (e-mail `platform-admin@teknoir.airgapped`) in the Keycloak
-   group `admin`, which makes it an administrator in ArgoCD and Harbor. It has
-   no Backstage user: Backstage needs the named admin of the next step.
-
-5. Create a named admin for each person, and sign in to Backstage with it
-   (section 9):
+4. Create the first admin: a named admin for each person (section 9):
 
    ```sh
    ./teknoir-airgap admin-user --email anders.aslund@teknoir.ai --out ~/teknoir-admin.txt
    ```
+
+   Sign in at `https://teknoir.airgapped/` with the e-mail address and the
+   temporary password from the file. Keycloak asks for a new password at once.
+   Then delete the file. The user is in the Keycloak group `admin`, which makes
+   it an administrator in ArgoCD, Harbor and Backstage. Do not use
+   `platform-admin`: the realm import creates it disabled (section 8), and its
+   sign-in fails with "Account is disabled".
 
 The Keycloak realm `teknoir` (clients, scopes, the `admin` group), the Harbor
 OIDC settings and every secret are created by the converge and GitOps; there are
@@ -424,7 +417,7 @@ when you no longer need it, and never paste a credential into a chat or ticket.
 
 | Name | What |
 |---|---|
-| `platform-admin` | the initial Keycloak administrator in realm `teknoir` (group `admin`: ArgoCD, Harbor), created by the realm import; its password must be changed at the first sign-in. No Backstage user: use `admin-user` (section 9) |
+| `platform-admin` | a **disabled** break-glass user in realm `teknoir` (group `admin`: ArgoCD, Harbor), created by the realm import (auth 0.0.9 and later). To use it, the master admin (`keycloak-admin`) enables it in the Keycloak console (realm `teknoir`, Users); the next sync of the `auth` Application disables it again. Its initial password must be changed at the first sign-in. No Backstage user: the first admin comes from `admin-user` (section 9) |
 | `keycloak-admin`, `keycloak-admin-username` | the Keycloak master realm administrator (break-glass) |
 | `harbor-admin` | Harbor's local `admin` (break-glass; also `https://harbor.teknoir.airgapped/account/sign-in` when OIDC is on) |
 | `argocd-admin` | ArgoCD's local `admin` (break-glass), from `teknoir-system/argocd-admin-break-glass` once `rotate argocd-admin` ran (section 11); before that ArgoCD's initial password, with a warning |
@@ -917,10 +910,19 @@ ArgoCD, Harbor itself) are imported into containerd from the bundle, so they
 start without Harbor. Check `kubectl --context teknoir-local -n teknoir-system get pods -l app=harbor`
 and the events; `up` re-pushes missing images once Harbor is back.
 
-**ArgoCD UI actions fail with "Request has been terminated".** The signed-in user
-is not an ArgoCD admin (not in the Keycloak group `admin`), and the gateway turns
-ArgoCD's `403` into a redirect the UI cannot follow. Add the user to the group
-(or use `./teknoir-airgap admin-user`), then sign out and in again.
+**ArgoCD UI actions fail with "permission denied".** The signed-in user is not
+an ArgoCD admin (not in the Keycloak group `admin`), and ArgoCD answers `403`.
+(Before auth 0.0.9 the gateway turned that `403` into a redirect the UI could
+not follow, and the UI said "Request has been terminated".) Add the user to the
+group (or use `./teknoir-airgap admin-user`), then sign out and in again.
+
+**A controller log says `is forbidden`.** Since r5, user-controller and
+profile-controller run with least-privilege RBAC and three admission
+policies. When the message goes on with `ValidatingAdmissionPolicy '<policy>'
+with binding '<binding>' denied request`, a policy refused the write;
+otherwise the RBAC did. The section [r5: controllers](#controllers-rbac-admission-policies-and-teknoir-default)
+explains how to tell a refusal that is meant from a bug, and has the
+break-glass for both.
 
 **Backstage says "user not found in catalog", or shows no teamspace.**
 Backstage's user provider reads the User objects every minute (backstage chart
@@ -1193,6 +1195,177 @@ E15 shows what the first `./teknoir-airgap up` does to the live state:
 - monitoring syncs;
 - the legacy password field is cleared;
 - previous-password and the master-realm legacy clients are removed.
+
+### Controllers: RBAC, admission policies and teknoir-default
+
+**What the update does.**
+
+- The five controller pods restart once, on images pinned by digest.
+  device-, devstudio- and notebook-controller get the image content they
+  already run.
+- ArgoCD prunes the `cluster-admin` bindings of user-controller and
+  profile-controller, and profile-controller's leader-election Role. It
+  creates their new ClusterRoles and Roles, the namespace
+  `teknoir-user-credentials`, and three ValidatingAdmissionPolicies with their
+  bindings.
+- The Profile `teknoir-default` is created. profile-controller creates its
+  namespace and its 9 plugin Applications from Harbor, and `up` waits for
+  them. At its next reconcile, profile-controller also moves the Applications
+  of `teknoir-demo` to Harbor.
+- No existing Secret, Keycloak user or teamspace data changes. A user created
+  from now on gets a temporary password in a Secret in
+  `teknoir-user-credentials`, not in the User status.
+
+**Checks after the update.**
+
+```sh
+# both say "no": neither controller is cluster-admin any more
+kubectl --context teknoir-local auth can-i '*' '*' --as=system:serviceaccount:teknoir-system:user-controller
+kubectl --context teknoir-local auth can-i '*' '*' --as=system:serviceaccount:teknoir-system:profile-controller
+# profile-controller-argocd, profile-controller-teamspaces, user-controller-teamspace-access
+kubectl --context teknoir-local get validatingadmissionpolicybindings
+# 0 for each controller
+for d in user-controller profile-controller; do
+  kubectl --context teknoir-local -n teknoir-system logs deploy/$d --since=1h | grep -ci forbidden
+done
+```
+
+**When a controller is refused.** The admission policies apply only to the
+ServiceAccounts of user-controller and profile-controller. People, ArgoCD and
+the other controllers are never affected, so a refusal cannot lock an operator
+out. It shows up as a teamspace that does not reconcile, or a user who does not
+get access to a teamspace. List the refusals:
+
+```sh
+for d in user-controller profile-controller; do
+  kubectl --context teknoir-local -n teknoir-system logs deploy/$d --since=24h \
+    | grep -o 'is forbidden: .*' | sort | uniq -c
+done
+```
+
+- `is forbidden: ValidatingAdmissionPolicy '<policy>' with binding '<binding>'
+  denied request: <reason>` means an admission policy refused the write. The
+  reason says what the controller may do.
+  - A write outside a teamspace is refused on purpose. Examples: a claim on a
+    namespace that is not a teamspace, such as `owner@teknoir-system`
+    (user-controller grants access only in teamspaces), or a Profile named
+    after a namespace that profile-controller did not create (it does not
+    take over such a namespace). Fix the claim or the Profile. Never add the
+    teamspace label, annotation or ownerReference to a namespace by hand.
+  - A refusal of a teamspace's own objects is a bug in the policy, and a new
+    chart version fixes it. Until that bundle is live, the break-glass below
+    lifts that one policy.
+- `is forbidden` without `ValidatingAdmissionPolicy` means the RBAC has no rule
+  for the write, which is a bug in the chart. Until a fixed chart is live, give
+  that controller its old binding back by hand, and remove it once the fix is
+  live:
+
+  ```sh
+  kubectl --context teknoir-local create clusterrolebinding <controller>-break-glass \
+    --clusterrole=cluster-admin --serviceaccount=teknoir-system:<controller>
+  # once the fixed chart is live
+  kubectl --context teknoir-local delete clusterrolebinding <controller>-break-glass
+  ```
+
+  ArgoCD does not track this binding, so it neither prunes nor restores it.
+  The admission policies still apply.
+
+**Break-glass for an admission policy.** Setting
+`admissionPolicies.enabled: false` in the chart's values removes the policies
+only with a new chart version, an app-of-apps bump and a new bundle, because
+the app-of-apps Applications pass no Helm values and Harbor takes each chart
+version only once. That is the permanent switch, for a later release. On the
+live cluster, lift only the policy named in the refusal. Keep this order; each
+step stops ArgoCD from undoing the next one:
+
+```sh
+# 1. Turn off the root's auto-sync. Otherwise it undoes step 2 within seconds.
+kubectl --context teknoir-local -n teknoir-system patch application app-of-apps --type json \
+  -p '[{"op":"remove","path":"/spec/syncPolicy/automated"}]'
+# 2. Turn off the auto-sync of the controller's Application (profile-controller
+#    or user-controller). Otherwise it re-creates the binding within seconds.
+kubectl --context teknoir-local -n teknoir-system patch application profile-controller --type json \
+  -p '[{"op":"remove","path":"/spec/syncPolicy/automated"}]'
+# 3. Delete the binding named in the refusal: profile-controller-teamspaces,
+#    profile-controller-argocd or user-controller-teamspace-access. The policy
+#    itself stays, and does nothing without its binding.
+kubectl --context teknoir-local delete validatingadmissionpolicybinding profile-controller-argocd
+```
+
+The ArgoCD UI can do steps 1 and 2 instead: Disable Auto-Sync in each
+Application's details, the root first. Do not edit or delete a policy itself.
+The controller retries on its own with a growing back-off (up to about 17
+minutes).
+
+While the break-glass is in place:
+
+- `app-of-apps` and the controller's Application are `OutOfSync` and have no
+  auto-sync. No GitOps change reaches the cluster until the revert, because new
+  versions arrive through the root.
+- For the kinds the lifted policy covers, only its RBAC limits that
+  controller; for example, it could bind `teknoir-admin` in any namespace.
+  Keep the window short.
+- Any `up` ends the break-glass: it applies the root with its auto-sync again,
+  and ArgoCD then restores the policy. Run `up` only with a bundle that fixes
+  the policy.
+
+**Revert.** Turn the root's auto-sync back on:
+
+```sh
+kubectl --context teknoir-local -n teknoir-system patch application app-of-apps --type merge \
+  -p '{"spec":{"syncPolicy":{"automated":{"prune":true,"selfHeal":true,"enabled":true}}}}'
+```
+
+`./teknoir-airgap up` with the live bundle does the same. The root then turns
+the controller Application's auto-sync back on, and that Application
+re-creates the binding, usually within a few minutes. Check:
+
+```sh
+kubectl --context teknoir-local -n teknoir-system get application app-of-apps user-controller profile-controller \
+  -o custom-columns=NAME:.metadata.name,SELFHEAL:.spec.syncPolicy.automated.selfHeal,SYNC:.status.sync.status
+kubectl --context teknoir-local get validatingadmissionpolicybindings
+```
+
+All three Applications show `true` and `Synced`, and the three bindings are
+back.
+
+### auth 0.0.9: before and after the update
+
+The first sync of auth 0.0.9 on an existing install changes Keycloak in ways
+that matter for the order of the r5 steps:
+
+- **Take the encrypted backup first, and verify it** (the r5 one-time steps,
+  "Encrypted backup", or section 10). auth 0.0.9's PostSync Job deletes the
+  legacy clients `teknoir`, `argocd` and `harbor` from realm `master`, with
+  their service-account users, each only when realm `teknoir` has a client of
+  the same name. Only a restore of the Keycloak database from a backup taken
+  before the update brings them back. After the deletion, `migrate --undo`
+  can no longer give a working old layout: the retired k3s files configure
+  oauth2-proxy, ArgoCD and Harbor with those master-realm clients. A rollback
+  to app-of-apps 0.0.4 does not restore them either.
+- **`platform-admin` is disabled** from now on (section 8). Sign in with your
+  named admin from `admin-user`. A rollback to app-of-apps 0.0.4 (auth 0.0.8)
+  enables it again.
+- **VERIFY_PROFILE is off**: users without a last name no longer get the
+  Update Profile form at sign-in. **Signing out** returns to
+  `https://teknoir.airgapped/` (client `teknoir` now allows that post-logout
+  redirect).
+- **Everyone signs in again.** `keycloak-0`, `keycloak-db-0` and
+  `oauth2-proxy-redis-0` restart once (same image content, no database
+  migration). Keycloak is away for 1-2 minutes and every session is dropped.
+  The gateway filters reload without a restart, and k3s does not restart.
+- After the update, a request that oauth2-proxy denies (an expired or garbage
+  session cookie) leads to the sign-in page instead of a bare `403`.
+
+Check after the `up`:
+
+```sh
+kubectl --context teknoir-local -n teknoir-auth logs job/keycloak-config -c admin-check
+```
+
+It names each legacy client it deleted (`deleted legacy client 'teknoir' from
+realm master ...`) or kept, and the reason; no credential is printed. A later
+sync only reports `realm master has no legacy client ...`.
 
 ### Encrypted backup, plaintext clean-up and ArgoCD break-glass (SEC-C12)
 

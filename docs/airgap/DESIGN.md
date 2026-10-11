@@ -32,7 +32,7 @@ Verified facts and agreed deviations that supersede the text below where they di
 - **CRD adoption check**: ArgoCD v3.5.1 writes no tracking-id annotation on CRDs; "adopted" means the CRD is a Synced resource in the Application's `.status.resources`.
 - **ArgoCD**: app-of-apps 0.0.4 ships the `argo` Application, so the live migration runs `migrate` (all Teknoir K3s files except `teknoir-argo`) → `up` (ArgoCD adopts argo while the K3s file is still there; the one-shot argo tier is skipped) → `migrate --argo` (detach `teknoir-argo`).
 - **Secrets the charts render that are not site secrets** are allowed by the build gate: Harbor 1.18.3's chart-default internal Secrets (internal DB password `changeit`, registry credential) and argo's credential-less `argocd-repo-harbor-teknoir` repository Secret. Rotating Harbor's internal DB password is a follow-up (needs an in-database change).
-- **Credentials**: `platform-admin` (realm `teknoir`, group `admin`, temporary password from `teknoir-auth/keycloak-platform-admin`, forced change at first login) is the break-glass/initial admin; `admin-user --email` creates the Backstage superadmin User CR.
+- **Credentials**: the first admin is a named user from `admin-user --email`: a Backstage superadmin User CR, which user-controller turns into a Keycloak user of realm `teknoir` in group `admin`. The master-realm admin (`teknoir-auth/keycloak-admin`) is the Keycloak break-glass. `platform-admin` (realm `teknoir`, group `admin`, password from `teknoir-auth/keycloak-platform-admin`) is created disabled since auth 0.0.9 (r5) and disabled again by every sync of `auth`; before r5 it was the initial admin.
 - **Payload layout**: the LAN entrypoint copies `MANIFEST.yaml` next to `node/` (`/var/lib/teknoir-airgap/bundles/<id>/MANIFEST.yaml`) and the site file to `/var/lib/teknoir-airgap/site/<site>.env`; converge takes `--lan-user` (alias `--operator`).
 - **Image digests**: Harbor comparisons use the linux/amd64 image config digest (old pushes left multi-arch indexes; crane rewrites docker-archive manifests); charts compare the content layer digest, then the unpacked files.
 - **Size gate**: 4.5 GiB (backstage, keycloak-config-cli and the toolbox add ~650 MiB); 6.5 GiB since r5 (the teamspace plugin images add ~1.8 GiB).
@@ -48,6 +48,227 @@ Verified facts and agreed deviations that supersede the text below where they di
 
 Changes of release r5 that supersede the text below where they differ. Each
 work package adds its own subsection.
+
+### Controller charts (WP-G-CTRL: SEC-C6, SEC-C7, TS-C2, HYG-C7, R13)
+
+- **user-controller 0.0.85 RBAC (SEC-C6).** The ClusterRole `user-controller`
+  replaces the binding to `cluster-admin`. Its ClusterRoleBinding has a new
+  name, because roleRef is immutable, and ArgoCD prunes the old
+  `user-controller-cluster-role-binding`. The ClusterRole grants:
+  - `users` get/list/watch/update/patch, plus `users/status` and
+    `users/finalizers`;
+  - `claims`, `claimsets` and `profiles` read-only;
+  - `rolebindings` (no deletecollection), plus `bind` on `teknoir-admin`,
+    `teknoir-edit` and `teknoir-view` only;
+  - Istio `authorizationpolicies`;
+  - `events` create/patch.
+
+  Two Roles complete it. `teknoir-system/user-controller-leader-election`
+  holds its leases. `teknoir-user-credentials/user-controller-credentials`
+  grants `secrets` get/create/update/delete, with no list or watch, so the
+  controller can read only Secrets it names. The chart's RBAC equals the
+  controller's kubebuilder markers (`config/rbac/role.yaml`).
+- **Temporary-password Secrets (K1).** The values `credentials.namespace`
+  (`teknoir-user-credentials`) and `credentials.initialPasswordTTL` (`72h`)
+  become the ConfigMap keys `USER_CREDENTIALS_NAMESPACE` and
+  `INITIAL_PASSWORD_TTL`. The chart creates the Namespace with
+  `Prune=false,Delete=false` and Pod Security `restricted`. The render fails
+  when the value names a shared or reserved namespace. The controller writes
+  the Secret before it calls SetPassword; if the namespace is missing, the
+  reconcile fails and no password is set.
+- **profile-controller 0.0.84 RBAC (SEC-C7).** The ClusterRole
+  `profile-controller` replaces `cluster-admin`, and ArgoCD prunes
+  `profile-controller-cluster-role-binding` and the unused leader-election
+  Role and RoleBinding. The ClusterRole grants:
+  - `profiles` (with status and finalizers);
+  - `namespaces` without delete: a teamspace namespace is removed by garbage
+    collection when its Profile owner goes;
+  - `secrets`, `configmaps`, `services`, `serviceaccounts` and
+    `resourcequotas`;
+  - `rolebindings`, plus `bind` on `teknoir-admin`, `teknoir-edit` and
+    `teknoir-view`;
+  - Istio `authorizationpolicies` and `requestauthentications`;
+  - read-only `deployments`, `statefulsets`, `roles`, `virtualservices`,
+    `envoyfilters`, `helmcharts`, `applications` and `appprojects`.
+
+  The Role `teknoir-system/profile-controller-argocd` adds create, update,
+  patch and delete on `applications` and `appprojects`. The controller still
+  reads Secrets in every namespace through its informer; that changes in the
+  next release (SEC-C7 parts c and d).
+- **profile-controller configuration (K2).** The values
+  `config.pluginChartRepo`, `pluginChartVersion`, `oidcIssuer` and
+  `oidcJwksUri` become the ConfigMap keys `PLUGIN_CHART_REPO`,
+  `PLUGIN_CHART_VERSION`, `OIDC_ISSUER` and `OIDC_JWKS_URI`. They are read
+  from the environment, not passed as arguments, so an older image ignores
+  them. A key is rendered only when its value is set, so other env branches
+  keep the compiled defaults. The template refuses an `oci://` repository,
+  and refuses an issuer or JWKS URL that is not `https://` or is on a
+  cluster-internal host (`*.svc`, `*.cluster.local`): istiod fetches the JWKS
+  (by default from the issuer) in `istio-system` without a sidecar, so an
+  in-mesh URL fails under STRICT mTLS. On `teknoir-local`
+  `OIDC_JWKS_URI` stays unset and the controller uses the issuer's
+  `/protocol/openid-connect/certs`. `PLUGIN_CHART_REPO` equals app-of-apps'
+  `repoURL`, and the bundle build reads both from this ConfigMap.
+- **Profiles in GitOps (K3, TS-C2).** The value
+  `profiles: [{name, owner?, resourceQuotaSpec?}]` is
+  `[{name: teknoir-default}]` on `teknoir-local`. The owner defaults to
+  `config.admin` and is lower-cased. Each Profile carries
+  `Prune=false,Delete=false` and sync-wave `1`, and has no `spec.plugins`:
+  the controller fills in the plugins, and ArgoCD would fight it over them.
+  The template fails on an empty owner, a name that is not DNS-1123, a
+  duplicate, an unknown key, or a reserved name. The reserved names are
+  `default`, `teknoir`, `teknoir-local`, `teknoir-cloud`, `teknoir-online`,
+  `teknoir-system`, `teknoir-auth`, `teknoir-user-credentials`,
+  `istio-system`, `cert-manager` and `kube-*`. The owner must be right at the
+  first sync, because the namespace's `owner` annotation is set only once.
+- **Admission policies (R13).** The RBAC above has to allow RoleBindings,
+  Secrets and Istio policies in every namespace, because teamspaces appear at
+  run time. It also lets profile-controller change every Application and
+  AppProject in `teknoir-system`. Without more, a compromised controller
+  could bind `teknoir-admin` to itself in `teknoir-auth` or `kube-system`. It
+  could also widen the platform project `teknoir-local`, or add an
+  Application to it, and ArgoCD would then apply anything it asked for. Three
+  ValidatingAdmissionPolicies (admissionregistration.k8s.io/v1, Kubernetes
+  1.30+) close that gap. Each has `failurePolicy: Fail` and one binding of
+  the same name with `validationActions: [Deny]`. They match only requests
+  whose `userInfo.username` is the controller's ServiceAccount:
+  - A *teamspace namespace* has the label
+    `app.kubernetes.io/part-of=teknoir-profile`, an `owner` annotation, an
+    ownerReference to the Profile of the same name, and no reserved name.
+    For a write inside a namespace, admission sees only the namespace's
+    labels and annotations, not its ownerReferences. The namespace rule
+    below therefore keeps the controller from putting the marker on a
+    namespace that its Profile does not own. The live `teknoir-demo`
+    carries all three marks.
+  - `profile-controller-teamspaces` covers namespaces, secrets, configmaps,
+    services, serviceaccounts, resourcequotas, rolebindings and the Istio
+    policies. Namespaces must be owned by the Profile of the same name before
+    and after the change, and must not have a reserved name. Every other
+    kind may be written only inside a teamspace namespace. RoleBindings may
+    bind only `teknoir-admin`, `-edit` or `-view`, to users or groups whose
+    names do not start with `system:`, or to ServiceAccounts of the same
+    namespace.
+  - `profile-controller-argocd` covers Applications and AppProjects. Exactly
+    one teamspace Profile must own the object, before and after the change,
+    so the platform's own objects are out of reach. The AppProject must be
+    named after the teamspace. It may list only `PLUGIN_CHART_REPO`, may
+    deploy only into the teamspace on this cluster, and may have no
+    cluster-scoped kinds and no source namespaces. Each Application must be
+    `<teamspace>-<plugin>`, in that AppProject, with one source from that
+    repository and the teamspace as its destination.
+  - `user-controller-teamspace-access` covers RoleBindings and
+    AuthorizationPolicies. The controller may write only its own objects,
+    `user-<User>-teknoir-role-binding` and
+    `user-<User>-teknoir-authorization-policy`, owned by a User. It may
+    create or change them only in a teamspace namespace, but may delete them
+    anywhere, so it can still revoke access. RoleBindings may bind only
+    `teknoir-admin`, `-edit` or `-view`, to users that are not `system:`.
+    AuthorizationPolicies may only ALLOW. Its reserved list is the
+    profile-controller chart's plus the credentials namespace.
+  - Not covered: reads, the Secret Role in `teknoir-user-credentials`, and
+    Profiles that do not exist. An ownerReference can name a Profile that
+    does not exist, so a compromised profile-controller can still create a
+    teamspace-shaped AppProject for any name that is not reserved, and deploy
+    plugin charts into that namespace. Every namespace that exists on
+    `teknoir-local` today is reserved, or is the teamspace `teknoir-demo`.
+  - Off switch: `admissionPolicies.enabled` (default `true`) in each chart.
+    `false` is the permanent switch, for a later release. The app-of-apps
+    Applications pass no Helm values, and Harbor takes each chart version
+    once, so it needs a new chart version, an app-of-apps bump and a bundle.
+    It is not a break-glass. The live break-glass (stop the auto-sync, delete
+    the binding) is in OPERATE.md (r5).
+  - Lock-out risk: a wrong policy blocks the controllers' real work, never
+    people or ArgoCD. A policy denial logs `is forbidden`, so E13's check
+    that the controller logs contain no `forbidden` catches it. E11 and E15
+    cover the real shapes (`teknoir-default`, and `teknoir-demo` on Harbor).
+- **Image pins (HYG-C7, K5).** All five controller charts pin
+  `<repo>:<immutable tag>@sha256:<linux/amd64 manifest>` with
+  `IfNotPresent`. device-controller `sha-9780e409`, devstudio-controller
+  `sha-4ec934c4` and notebook-controller `sha-c751073b` (0.0.84 each) are the
+  images that ran under floating tags on 2026-10-09, re-checked with
+  `crane digest --platform linux/amd64`. user-controller 0.0.85 and
+  profile-controller 0.0.84 pin the CI builds of their r5 branches.
+- **Tests (gitops).** `charts/user-controller/tests/render-test.sh` and
+  `charts/profile-controller/tests/render-test.sh` cover the RBAC rules, the
+  K1, K2 and K3 values and their refusals, the policies (bindings named like
+  their policies) and kubeconform. `tests/rbac-k3d.sh` (k3s v1.33.5) runs
+  the can-i matrices, real escalation attempts, both controllers end to end
+  under the policies (Profiles, the User flow with the K1 Secret, revocation,
+  Profile deletion, no `forbidden` in the logs), dry-run probes of every
+  policy rule (R13), and the break-glass and its revert (R14).
+  `--policies-only` needs no images; `--legacy` runs the images from before
+  r5 without the policies.
+
+### auth 0.0.9 (WP-G-AUTH: SEC-C4, SIGN-C2, SIGN-C3, HYG-C7, HYG-C8)
+
+- **Legacy master clients (SEC-C4).** The `admin-check` init container of the
+  `keycloak-config` PostSync Job gets a last step that runs after the master
+  admin login (or rotation). It deletes from realm `master` each clientId in
+  `keycloakConfig.masterLegacyClients` (default `[teknoir, argocd, harbor]`,
+  env `KC_MASTER_LEGACY_CLIENTS`); Keycloak deletes the client's
+  service-account user with it. Guards:
+  - the same clientId must exist in realm `KC_REALM` (`teknoir`); when that
+    realm does not exist yet (`404`) or lacks the clientId, the client is kept
+    ("not migrated");
+  - built-in clients (`admin-cli`, `security-admin-console`, `broker`,
+    `master-realm`, `realm-management`, `account*`, `*-realm`) and non-plain
+    names are refused, at render time and again in the script;
+    `KC_REALM=master` turns the step off;
+  - a failed lookup, an unexpected status, or a clientId that appears more
+    than once fails the Job before anything is deleted.
+
+  The step is idempotent and logs client names only. It is irreversible
+  except from a backup. On `teknoir-local`, where auth 0.0.8's import already
+  created the three clients in realm `teknoir`, the first 0.0.9 sync deletes
+  all three from realm `master`.
+- **platform-admin (SEC-C4).** `realm.platformAdmin.enabled` is
+  now `false`, and every import applies it, so a console re-enable lasts only
+  until the next sync of `auth`. The user and the Secret
+  `keycloak-platform-admin` still exist. A rollback to auth 0.0.8 (app-of-apps
+  0.0.4) enables the user again, because 0.0.8's import applies
+  `enabled: true`, but it does not bring the master clients back.
+- **Gateway sign-in (SIGN-C2).** All three `HTTP_FILTER` patches of the
+  EnvoyFilter match `portNumber: 443`, so plain HTTP on port 80 stays a bare
+  redirect to HTTPS (the Gateway's `httpsRedirect`). A new Lua filter
+  `envoy.filters.http.lua.authz_ok`, inserted after ext_authz, sets the
+  dynamic metadata `oauth2_proxy.authz=ok`, so only requests that ext_authz
+  let through, or for which it is disabled, carry the mark. The redirect Lua
+  no longer guesses from the session cookie (`has_session`). It rewrites a
+  `401` or `403` only when the mark is missing and the path is not
+  `/oauth2/...`:
+  - a page load gets a `302` to `https://<domain>/oauth2/start?rd=<url>`, with
+    `rd` built from `:authority` and `:path` (never `X-Forwarded-*`), and two
+    `Set-Cookie` headers that expire the session cookie (with and without
+    `Domain`);
+  - fetch, XHR and websocket requests (`Sec-Fetch-Mode` other than `navigate`,
+    or `X-Requested-With`) get a bare `401` without `Location`.
+
+  The body is emptied in both cases. A backend's own `401` or `403` (marked)
+  passes through: on the ArgoCD host ext_authz is disabled, so ArgoCD's `403`
+  reaches its UI unchanged. `istio.bypassAuth` (default `[]`, ported from
+  staging) disables ext_authz and the redirect for a vhost that its backend
+  authenticates. When oauth2-proxy is unreachable, ext_authz answers `403`,
+  which now becomes a sign-in redirect.
+- **Realm (SIGN-C3).** Client `teknoir` gets `post.logout.redirect.uris`
+  `https://<domain>/*`. A realm-level `requiredActions` entry keeps
+  VERIFY_PROFILE disabled (`realm.verifyProfile`, default `false`); no user
+  profile document is imported. This fixes the known residual "Keycloak asks
+  for Update Profile at first login".
+- **Images (HYG-C7, HYG-C8, G-09).** keycloak-theme
+  `ghcr.io/teknoir/keycloak-theme:sha-29d2ed6a@sha256:ab392e6e...` (the tag also
+  sets the label `app.kubernetes.io/version`). The hard-coded postgres and redis
+  images moved into values: `docker.io/library/postgres:16.15@sha256:75adc2a6...`
+  and `docker.io/library/redis:7.2.16-alpine@sha256:84bab713...`. httpbin is
+  pinned by digest only (`docker.io/kennethreitz/httpbin@sha256:599fe5e5...`;
+  upstream publishes only `latest`). All four are linux/amd64 manifest digests
+  with `IfNotPresent`. The floating `redis:7.2-alpine` and `postgres:16` entries in
+  `airgap/images-extra.txt` are no longer needed by auth.
+- **Tests** (gitops repo, `charts/auth/tests/`): `render-test.sh` (pins, filter
+  order, env, realm values, kubeconform), `lua-test.sh` (both Lua filters in a
+  pinned LuaJIT with a stub of Envoy's Lua API), `admin-check-test.sh` (every
+  branch of the legacy-client step with a stub curl, under dash and busybox
+  sh), and `realm-docker-test.sh` R11-R13 against Keycloak 26.5.3. The VM e2e
+  (E13, E14) proves the gateway and platform-admin behaviour on a real node.
 
 ### Bundle supply: teamspace plugins, node packages, pinned images
 

@@ -8,10 +8,111 @@ reasons for the redesign are kept here. The git history of `infra` and
 
 ## r5 (app-of-apps 0.0.5)
 
+### Controllers: least privilege, admission policies, teknoir-default (gitops)
+
+- **No controller is cluster-admin any more.** Before r5, user-controller and
+  profile-controller were bound to `cluster-admin`, so either one could read
+  every Secret, exec into any pod and grant itself anything.
+  user-controller 0.0.85 and profile-controller 0.0.84 have their own
+  ClusterRoles with only what they use. They can bind only `teknoir-admin`,
+  `teknoir-edit` and `teknoir-view`. Neither can create ClusterRoles,
+  ClusterRoleBindings, Roles or pods, or exec into a pod. ArgoCD prunes the
+  old `cluster-admin` bindings and profile-controller's unused
+  leader-election Role on the first sync.
+- **Temporary passwords leave the User status.** user-controller writes a
+  new user's temporary password to the Secret `user-initial-password-<User>`
+  in the new namespace `teknoir-user-credentials`, before it sets the password
+  in Keycloak. The Secret lasts 72 h, or until the user sets their own
+  password. The controller no longer writes the password to
+  `status.set_initial_password`. Its only Secret access is get, create,
+  update and delete in that namespace (no list, no watch). The namespace has
+  `Prune=false,Delete=false` and Pod Security `restricted`.
+- **Admission policies keep both controllers inside the teamspaces.** Their
+  RBAC still has to allow RoleBindings and Istio policies in every namespace,
+  because teamspaces appear at run time. profile-controller also writes
+  Applications and AppProjects in `teknoir-system`. RBAC cannot say "only in
+  a teamspace", so three ValidatingAdmissionPolicies do:
+  `user-controller-teamspace-access`, `profile-controller-teamspaces` and
+  `profile-controller-argocd`. Each has `failurePolicy: Fail` and a binding
+  with `Deny`. They refuse these writes from the two ServiceAccounts:
+  - a write outside a namespace that a Profile owns;
+  - a RoleBinding to any other role, or to a `system:` subject;
+  - a change to an Application or AppProject that no teamspace Profile owns,
+    such as the platform's projects `teknoir-local` and `default` and their
+    Applications;
+  - a teamspace AppProject or Application wider than the teamspace: it may
+    use only the plugin chart repository, deploy only into the teamspace,
+    and include no cluster-scoped kinds.
+
+  The policies apply to no one else: people, ArgoCD and the other
+  controllers are not affected. A denial shows in the controller log as
+  `... is forbidden: ValidatingAdmissionPolicy '<policy>' with binding
+  '<binding>' denied request: ...`. OPERATE.md (r5) has the break-glass.
+- **Teamspaces install from Harbor.** The ConfigMap `profile-controller-config`
+  now sets the plugin chart repository `harbor.teknoir.airgapped/teknoir`, the
+  version `0.0.100` and the issuer
+  `https://auth.teknoir.airgapped/auth/realms/teknoir`. The JWKS URL is left
+  unset, so it defaults to the issuer's `/protocol/openid-connect/certs`.
+  Before, teamspace Applications pointed at teknoir.github.io, and the
+  teamspace RequestAuthentication trusted realm `master` on
+  `auth.teknoir.online`. The r5 profile-controller also limits each
+  teamspace AppProject to that repository, with no cluster-scoped kinds.
+- **The default teamspace `teknoir-default` is declared in GitOps.** The
+  profile-controller chart renders the Profile `teknoir-default` with owner
+  `anders.aslund@teknoir.ai` and `Prune=false,Delete=false`, and
+  profile-controller gives it its 9 default plugins. Before, a teamspace
+  existed only when someone created it in Backstage.
+- **Controller images pinned by digest.** device-, devstudio- and
+  notebook-controller 0.0.84 pin the images they already ran under floating
+  tags: `sha-9780e409`, `sha-4ec934c4` and `sha-c751073b`.
+  user-controller 0.0.85 and profile-controller 0.0.84 pin their r5 builds.
+  Each pin is the linux/amd64 digest, with `IfNotPresent`.
+- The platform AppProject allows the namespace `teknoir-user-credentials` and
+  the kinds `ValidatingAdmissionPolicy` and `ValidatingAdmissionPolicyBinding`.
+
+### auth 0.0.9: legacy master clients, platform-admin, sign-in (gitops)
+
+- **The legacy master-realm clients are deleted.** Before the redesign the
+  platform clients `teknoir`, `argocd` and `harbor` lived in realm `master`.
+  The migration moved them to realm `teknoir` and left the old ones in place.
+  The legacy `teknoir` client's service account has master-realm
+  `manage-users`, which is enough to reset the master admin's password, and its
+  secret is the one oauth2-proxy uses. On its first sync, auth 0.0.9's
+  PostSync Job deletes the three clients and their service-account users from
+  realm `master`. It deletes each one only when realm `teknoir` has a client
+  with the same clientId, and never touches a built-in client. The deletion is
+  irreversible except from a backup, so take the encrypted backup first
+  (OPERATE.md, "r5 (app-of-apps 0.0.5)"). After the deletion,
+  `migrate --undo` can no longer give a working old layout.
+- **platform-admin is disabled.** The realm import now creates `platform-admin`
+  disabled, and every sync of `auth` disables it again. On a fresh install the
+  first admin comes from `teknoir-airgap admin-user`, whose group `admin` gives
+  ArgoCD, Harbor and Backstage. The master admin (`keycloak-admin`) stays the
+  Keycloak break-glass.
+- **Every denied request ends at the sign-in page.** On the HTTPS listener, a
+  request that oauth2-proxy denies is now redirected to `/oauth2/start` when it
+  is a page load, and the stale session cookie is expired. A fetch, XHR or
+  websocket request gets a plain `401` instead. Before, a request with a stale
+  or garbage cookie got a bare `403`. A backend's own `401` or `403` for a
+  signed-in user passes through unchanged, so ArgoCD's `403` for a non-admin
+  is no longer turned into a redirect.
+- **Sign-out and profile.** Client `teknoir` allows the post-logout redirect to
+  `https://teknoir.airgapped/...`, so signing out returns to the platform.
+  Keycloak's VERIFY_PROFILE required action is off, so a user without a last
+  name (user-controller sets none) no longer gets the Update Profile form at
+  the first sign-in.
+- **Images pinned by digest.** keycloak-theme `sha-29d2ed6a` (was `latest`),
+  keycloak-db `postgres:16.15` (was `16`), oauth2-proxy-redis
+  `redis:7.2.16-alpine` (was `7.2-alpine`) and httpbin (was `latest`), each by
+  its linux/amd64 digest, all `IfNotPresent`.
+- The update restarts `keycloak-0`, `keycloak-db-0` and `oauth2-proxy-redis-0`
+  once, with the same image content and no database migration. Keycloak is
+  away for 1-2 minutes, every session is dropped, and everyone signs in again.
+
 ### Bundle: teamspace plugins, node packages, pinned images
 
 - **Teamspaces work offline.** The bundle carries the 9 teamspace plugin
-  charts profile-controller deploys by default (profile-plugin-* 0.0.99, the
+  charts profile-controller deploys by default (profile-plugin-* 0.0.100, the
   published archives, pinned by sha256) and their ~20 images (~1.8 GiB). The
   node pushes the charts to `harbor.<domain>/teknoir` with the other charts;
   profile-controller reads them from there (its `PLUGIN_CHART_REPO`). Before,
