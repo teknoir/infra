@@ -5,7 +5,7 @@ CI runs everything except the VM test: [.github/workflows/airgap-ci.yml](../../.
 
 | Suite | Command | Needs | Runs in CI |
 |---|---|---|---|
-| Static + unit | `airgap/test/run-static.sh` | shellcheck, docker (bash 3.2, `node/packages-test.sh`), network (its apt prepare step), gitleaks, curl (first bats install), cc (`node/run.sh` builds its clock shim `node/fakeclock.c`) | yes |
+| Static + unit | `airgap/test/run-static.sh` | shellcheck, docker (bash 3.2, `node/packages-test.sh`), network (its apt prepare step), gitleaks, curl (first bats install), cc (`node/run.sh` builds its clock shim `node/fakeclock.c`); age and age-keygen plus the git history with 8610f8d for `node/run.sh`'s real-age and r5 runbook checks (skipped without) | yes |
 | host_packages against Debian 13's apt and dpkg, offline, with and without apt lists that offer the pins | `airgap/test/node/packages-test.sh` | docker on amd64, network (prepare step: apt in debian:trixie; a pin Debian no longer serves comes from snapshot.debian.org); `APT_TEST_DEBS_DIR=<node/debs>` tests a bundle's own `.deb` files | yes, from run-static.sh |
 | coredns-custom in CoreDNS | `airgap/test/node/coredns-test.sh` | docker, dig (one image pull) | no |
 | chrony drop-in and LAN-time samples in chronyd 4.6.1 (`-x`, no clock is set) | `airgap/test/node/chrony-test.sh` | docker, network (apt in debian:trixie) | no |

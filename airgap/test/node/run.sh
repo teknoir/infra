@@ -28,10 +28,12 @@
 # clock step (under the fakeclock.c LD_PRELOAD shim, built with cc, which
 # moves date and bash's SECONDS like a real step), the site keys TIME_SOURCE,
 # NODE_IP_DHCP_RESERVED and BACKUP_AGE_RECIPIENTS (load_site and the build's
-# site_check; an age private key is refused and never printed), and the leak
-# check. With lib/oneshot.sh and lib/harbor.sh present the real phases
-# parse the flags (only their cluster/Harbor work is replaced); without them
-# a stand-in with their interface is used.
+# site_check; an age private key is refused and never printed), the leak
+# check, and the r5 runbook (OPERATE.md SEC-C12 steps 2 and 4: the sh blocks
+# as written, against the deployed 0.0.4 payload from git 8610f8d and the
+# real age; skipped without them). With lib/oneshot.sh and lib/harbor.sh
+# present the real phases parse the flags (only their cluster/Harbor work is
+# replaced); without them a stand-in with their interface is used.
 #
 # Usage: airgap/test/node/run.sh [-v]
 #   TEKNOIR_NODE_SRC=DIR   test another airgap/node tree
@@ -583,6 +585,199 @@ if [[ -n "${REAL_AGE}" && "${REAL_AGE}" != "${HERE}/stubs/age" && -x "$(dirname 
   done
 else
   echo "skip real age (no age and age-keygen on PATH)"
+fi
+
+# ---------------------------------------------------------------------------
+echo "# r5 runbook (OPERATE.md SEC-C12 steps 2 and 4) as written, against the deployed 0.0.4 payload"
+# The deployed payload (git 8610f8d) keeps only the newest 3 sets on --take
+# and would prune the pre-migration set 20261009T041534Z. Step 2 streams and
+# verifies that set before the take, and the take runs with BACKUP_KEEP=99.
+# The ```sh blocks are cut out of OPERATE.md and run in one bash like the
+# operator's shell (no -e, -u or pipefail of its own) with HOME in the temp
+# dir. ssh is a function that runs the remote command in a sandbox holding
+# the 0.0.4 payload and the real age (sudo is a no-op, /var/lib/teknoir-airgap
+# is mapped into the sandbox). R5_FAIL_TAR=remote|local puts a tar in front
+# that writes a truncated archive and exits 2, like a read error halfway.
+REPO_TOP="$(git -C "${HERE}" rev-parse --show-toplevel 2>/dev/null || true)"
+OPERATE="${HERE}/../../../docs/airgap/OPERATE.md"
+REAL_AGE="$(command -v age || true)"
+if [[ -n "${REAL_AGE}" && "${REAL_AGE}" != "${HERE}/stubs/age" && -x "$(dirname "${REAL_AGE}")/age-keygen" \
+      && -n "${REPO_TOP}" && -d /dev/shm && -w /dev/shm ]] \
+   && git -C "${REPO_TOP}" cat-file -e '8610f8d^{commit}' 2>/dev/null; then
+  AGE_KEYGEN="$(dirname "${REAL_AGE}")/age-keygen"
+  doc_blocks() {
+    # doc_blocks <start regex> <end regex> <prefix>: the ```sh blocks between
+    # the two lines of OPERATE.md into <prefix>1.sh, <prefix>2.sh, ...; prints
+    # how many
+    awk -v s="$1" -v e="$2" -v p="$3" '
+      $0 ~ s { on = 1 }
+      on && $0 ~ e { on = 0 }
+      on && /^```sh$/ { n++; f = p n ".sh"; inb = 1; printf "" > f; next }
+      inb && /^```$/ { inb = 0; close(f); next }
+      inb { print > f }
+      END { print n + 0 }' "${OPERATE}"
+  }
+  check "OPERATE.md step 2 has 4 sh blocks (setup, a, b, c)" \
+    [ "$(doc_blocks '^[*][*]2[.] Encrypted backup' '^[*][*]3[.] ' "${T}/r5-s2-")" == 4 ]
+  check "OPERATE.md step 4 has 1 sh block" \
+    [ "$(doc_blocks '^[*][*]4[.] vpro clean-up' '^[*][*]5[.] ' "${T}/r5-s4-")" == 1 ]
+  # the deployed payload in a sandbox at the runbook's bundle id
+  mkdir -p "${T}/node004"
+  git -C "${REPO_TOP}" archive 8610f8d airgap/node | tar -C "${T}/node004" -xf -
+  R5_BID="$(sed -n 's|^P=/var/lib/teknoir-airgap/bundles/\([^/]*\)/node$|\1|p' "${T}/r5-s2-1.sh")"
+  check "step 2 names the deployed 0.0.4 bundle" [ "${R5_BID}" == teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af ]
+  # its own sandbox; the sections after this one go on in the current one
+  r5_keep=("${SRC}" "${ROOT}" "${BID}" "${PAYLOAD}" "${STUB_STATE}" "${STUB_CALLS}")
+  SRC="${T}/node004/airgap/node"
+  new_sandbox r5
+  SRC="${r5_keep[0]}"
+  mv "$(dirname "${PAYLOAD}")" "${ROOT}/var/lib/teknoir-airgap/bundles/${R5_BID}"
+  BID="${R5_BID}"; PAYLOAD="${ROOT}/var/lib/teknoir-airgap/bundles/${BID}/node"
+  cp "${REAL_AGE}" "${PAYLOAD}/bin/age"
+  reseal
+  echo '{"items": []}' > "${STUB_STATE}/pods.json"
+  mkdir -p "${ROOT}/opt/k3s/server/db/etcd" "${ROOT}/opt/k3s/server/tls" "${ROOT}/opt/k3s/server/cred" \
+    "${ROOT}/var/lib/teknoir-airgap/site"
+  echo "sqlite" > "${ROOT}/opt/k3s/server/db/state.db"
+  echo "token" > "${ROOT}/opt/k3s/server/token"
+  cp "${PAYLOAD}/site/test.env" "${ROOT}/var/lib/teknoir-airgap/site/teknoir-local.env"
+  R5_BK="${ROOT}/var/lib/teknoir-airgap/backups"
+  for s in 20261009T041534Z 20261009T044252Z 20261009T051050Z; do
+    # the three sets on the live node: > 10 KiB each, so a truncated tar cuts into them
+    ( umask 077; mkdir -p "${R5_BK}/${s}/db" )
+    head -c 65536 /dev/urandom > "${R5_BK}/${s}/db/keycloak.sql.gz"
+    printf 'createdAt=%s\nlabel=test\n' "${s}" > "${R5_BK}/${s}/BACKUP.info"
+    ( cd "${R5_BK}/${s}" && find . -type f -print0 | sort -z | xargs -0 sha256sum > "${T}/r5.sums" ) && mv "${T}/r5.sums" "${R5_BK}/${s}/SHA256SUMS"
+  done
+  # the operator's key where step 1 puts it, and the recovery key
+  R5_HOME="${T}/r5-home"
+  ( umask 077; mkdir -p "${R5_HOME}/.config/teknoir/age" )
+  "${AGE_KEYGEN}" -o "${R5_HOME}/.config/teknoir/age/teknoir-local.key" 2>/dev/null
+  "${AGE_KEYGEN}" -o "${T}/r5-recovery.key" 2>/dev/null
+  R5_REC="$("${AGE_KEYGEN}" -y "${T}/r5-recovery.key")"
+  sed -i "s|^REC=age1<recovery public key>$|REC=${R5_REC}|" "${T}/r5-s2-1.sh"
+  check "step 2 takes the recovery key as REC=age1<recovery public key>" grep -qx "REC=${R5_REC}" "${T}/r5-s2-1.sh"
+  sed -i "s|^cd /home/anders/git/ai/infra-teknoir-local$|cd ${T}/r5-infra|" "${T}/r5-s4-1.sh"
+  check "step 4 works in /home/anders/git/ai/infra-teknoir-local" grep -qx "cd ${T}/r5-infra" "${T}/r5-s4-1.sh"
+  mkdir -p "${T}/r5-failbin"
+  cat > "${T}/r5-failbin/tar" <<EOF
+#!/usr/bin/env bash
+# tar that writes a truncated archive and fails when it creates one
+for a in "\$@"; do
+  case "\${a}" in
+    -c*) "$(command -v tar)" "\$@" | head -c 10240; exit 2 ;;
+  esac
+done
+exec "$(command -v tar)" "\$@"
+EOF
+  chmod +x "${T}/r5-failbin/tar"
+  r5_sh() {
+    # r5_sh <block file>...: run runbook blocks in one bash; output in ${T}/r5.out
+    : > "${T}/r5.out"
+    (
+      set +euo pipefail
+      export HOME="${R5_HOME}"
+      [[ "${R5_FAIL_TAR:-}" != local ]] || PATH="${T}/r5-failbin:${PATH}"
+      # shellcheck disable=SC2317 # called by the sourced runbook blocks
+      ssh() {
+        [[ "$1" == teknoir@192.168.5.181 ]] || { echo "r5 test: unexpected ssh target $1" >&2; return 255; }
+        shift
+        local c="$*" p="${PATH}"
+        c="${c//\/var\/lib\/teknoir-airgap/${ROOT}/var/lib/teknoir-airgap}"
+        printf 'ssh %s\n' "${c}" >> "${T}/r5.ssh"
+        [[ "${R5_FAIL_TAR:-}" != remote ]] || p="${T}/r5-failbin:${PATH}"
+        PATH="${p}" node_env bash -c 'sudo() { "$@"; }; '"${c}"
+      }
+      for b in "$@"; do
+        # shellcheck source=/dev/null
+        source "${b}"
+      done
+    ) >> "${T}/r5.out" 2>&1 || true   # the last block's status; the checks look at the results
+    (( VERBOSE )) && sed 's/^/    | /' "${T}/r5.out"
+    return 0
+  }
+  R5_OUT="${R5_HOME}/teknoir-backups"
+  shm_before="$(find /dev/shm -maxdepth 1 -name 'teknoir-verify.*' 2>/dev/null | wc -l)"
+  : > "${T}/r5.ssh"
+  sleep 1   # backups are named by the second
+  r5_sh "${T}"/r5-s2-{1,2,3,4}.sh
+  cp "${T}/r5.out" "${T}/r5-step2.out"
+  check "step 2: the keys check passes" grep -qx 'keys ok' "${T}/r5.out"
+  v_line="$(grep -n -m1 -x 'verified teknoir-local-20261009T041534Z.tar.age (set 20261009T041534Z)' "${T}/r5.out" | cut -d: -f1 || true)"
+  t_line="$(grep -n -m1 'backup (for export)' "${T}/r5.out" | cut -d: -f1 || true)"
+  check "step 2 (a): the pre-migration set is streamed and verified before the take starts" \
+    bash -c "[ -n '${v_line}' ] && [ -n '${t_line}' ] && [ '${v_line}' -lt '${t_line}' ]"
+  check "step 2 (b): the take prunes nothing (BACKUP_KEEP=99): the pre-migration set is still on the node" \
+    bash -c "[ -d '${R5_BK}/20261009T041534Z' ] && [ \$(find '${R5_BK}' -mindepth 1 -maxdepth 1 -type d -name '2*Z' | wc -l) = 4 ] && ! grep -q 'pruned' '${T}/r5.out'"
+  R5_NEW="$(find "${R5_BK}" -mindepth 1 -maxdepth 1 -type d -name '2*Z' | sort | tail -1)"; R5_NEW="$(basename "${R5_NEW}")"
+  check "step 2 (b): the new backup's file is verified too" grep -qE "^verified teknoir-local-2[0-9]{7}T[0-9]{6}Z\.tar\.age \(set ${R5_NEW}\)$" "${T}/r5.out"
+  check "step 2: three ssh calls (stream, take, list)" [ "$(wc -l < "${T}/r5.ssh")" == 3 ]
+  check "step 2: no FAILED and no STOP" bash -c "! grep -qE '^(FAILED|STOP)' '${T}/r5.out'"
+  check "step 2 (c): four .tar.age files, all 0600, no .partial left" \
+    bash -c "[ \$(find '${R5_OUT}' -name '*.tar.age' -perm 600 | wc -l) = 4 ] && [ \$(find '${R5_OUT}' -type f | wc -l) = 4 ]"
+  for f in "${R5_OUT}"/*.recovery.tar.age; do
+    rm -rf "${T}/r5-dec"; mkdir -p "${T}/r5-dec"
+    check "step 2 (c): $(basename "${f}") decrypts with the recovery key and SHA256SUMS verifies" \
+      bash -c "'${REAL_AGE}' -d -i '${T}/r5-recovery.key' '${f}' | tar -C '${T}/r5-dec' -xf - && cd '${T}/r5-dec'/2*Z && sha256sum --quiet -c SHA256SUMS"
+    check "  ...and only with the recovery key" \
+      bash -c "! '${REAL_AGE}' -d -i '${R5_HOME}/.config/teknoir/age/teknoir-local.key' '${f}' >/dev/null 2>&1"
+  done
+  check "step 2: verify leaves no plaintext in /dev/shm" \
+    [ "$(find /dev/shm -maxdepth 1 -name 'teknoir-verify.*' 2>/dev/null | wc -l)" == "${shm_before}" ]
+
+  echo "# r5 runbook step 2: a tar failure on the node leaves no .tar.age and no 'verified'"
+  rm -rf "${R5_OUT}"
+  R5_FAIL_TAR=remote r5_sh "${T}"/r5-s2-{1,2}.sh
+  check "with pipefail the failed stream leaves no teknoir-local-20261009T041534Z.tar.age" \
+    bash -c "[ ! -e '${R5_OUT}/teknoir-local-20261009T041534Z.tar.age' ] && ! grep -q '^verified' '${T}/r5.out'"
+  sed 's/sudo bash -o pipefail -c/sudo sh -c/' "${T}/r5-s2-2.sh" > "${T}/r5-s2-2-nopipefail.sh"
+  rm -rf "${R5_OUT}"
+  R5_FAIL_TAR=remote r5_sh "${T}/r5-s2-1.sh" "${T}/r5-s2-2-nopipefail.sh"
+  check "mutation: with the old sh -c the truncated stream is kept as a .tar.age, and verify reports FAILED" \
+    bash -c "[ -s '${R5_OUT}/teknoir-local-20261009T041534Z.tar.age' ] && grep -qx 'FAILED teknoir-local-20261009T041534Z.tar.age' '${T}/r5.out' && ! grep -q '^verified' '${T}/r5.out'"
+
+  echo "# r5 runbook step 4: encrypt, verify by content, only then delete"
+  r5_infra() {
+    rm -rf "${T}/r5-infra"
+    mkdir -p "${T}/r5-infra/.secrets" "${T}/r5-infra/airgap/.secrets"
+    echo "dummy-ca-key" > "${T}/r5-infra/.secrets/ca.key"
+    head -c 32768 /dev/urandom > "${T}/r5-infra/.secrets/blob.bin"
+    echo "ROBOT=dummy${1:-}" > "${T}/r5-infra/airgap/.secrets/robot-argocd.env"
+    rm -rf "${T}/r5-infra-copy"; cp -a "${T}/r5-infra" "${T}/r5-infra-copy"
+  }
+  r5_infra
+  rm -rf "${R5_OUT}"
+  r5_sh "${T}/r5-s2-1.sh" "${T}/r5-s4-1.sh"
+  R5_S="${R5_OUT}/infra-teknoir-local-secrets.tar.age"
+  check "step 4: the archive is verified, then both .secrets directories are deleted" \
+    bash -c "grep -qx 'verified ${R5_S}' '${T}/r5.out' && [ ! -e '${T}/r5-infra/.secrets' ] && [ ! -e '${T}/r5-infra/airgap/.secrets' ]"
+  for k in "${R5_HOME}/.config/teknoir/age/teknoir-local.key" "${T}/r5-recovery.key"; do
+    rm -rf "${T}/r5-dec"; mkdir -p "${T}/r5-dec"
+    check "step 4: the archive (0600) decrypts with $(basename "${k}") to the deleted content" \
+      bash -c "[ \$(stat -c %a '${R5_S}') = 600 ] && '${REAL_AGE}' -d -i '${k}' '${R5_S}' | tar -C '${T}/r5-dec' -xf - && diff -rq '${T}/r5-infra-copy' '${T}/r5-dec' >/dev/null"
+  done
+  r5_infra 2
+  R5_FAIL_TAR=local r5_sh "${T}/r5-s2-1.sh" "${T}/r5-s4-1.sh"
+  check "step 4: a failed tar (with an older archive in place) deletes nothing" \
+    bash -c "! grep -q '^verified' '${T}/r5.out' && diff -rq '${T}/r5-infra-copy' '${T}/r5-infra' >/dev/null"
+  check "step 4: verify leaves no plaintext in /dev/shm" \
+    [ "$(find /dev/shm -maxdepth 1 -name 'teknoir-verify.*' 2>/dev/null | wc -l)" == "${shm_before}" ]
+
+  echo "# r5 runbook step 2 mutation: without BACKUP_KEEP=99 the 0.0.4 take prunes the pre-migration set"
+  if [[ "$(date -u +%Y%m%dT%H%M%SZ)" > 20261009T051050Z ]]; then
+    sed 's/sudo env BACKUP_KEEP=99 /sudo /' "${T}/r5-s2-3.sh" > "${T}/r5-s2-3-keep3.sh"
+    check "  (the mutation removed BACKUP_KEEP=99)" bash -c "! grep -q BACKUP_KEEP '${T}/r5-s2-3-keep3.sh' && grep -q 'teknoir-node backup --recipient' '${T}/r5-s2-3-keep3.sh'"
+    rm -rf "${R5_OUT}"
+    sleep 1
+    r5_sh "${T}/r5-s2-1.sh" "${T}/r5-s2-3-keep3.sh"
+    check "mutation: the plain 0.0.4 --take deletes 20261009T041534Z (the hazard the runbook avoids)" \
+      bash -c "[ ! -d '${R5_BK}/20261009T041534Z' ] && grep -q 'pruned .*20261009T041534Z' '${T}/r5.out'"
+  else
+    echo "skip the keep-3 mutation (the clock is before 20261009T051050Z)"
+  fi
+  ROOT="${r5_keep[1]}"; BID="${r5_keep[2]}"; PAYLOAD="${r5_keep[3]}"; STUB_STATE="${r5_keep[4]}"; STUB_CALLS="${r5_keep[5]}"
+else
+  echo "skip r5 runbook (needs the real age and age-keygen, git with commit 8610f8d, and /dev/shm)"
 fi
 
 # ---------------------------------------------------------------------------

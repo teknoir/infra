@@ -1054,30 +1054,73 @@ as in [Encryption keys](#encryption-keys). Both public keys go into
 with the r5 bundle.
 
 **2. Encrypted backup, with the deployed payload (vpro; no bundle, no restart
-besides the k3s stop of about a minute during `--take`; pods keep running).** The
-0.0.4 payload encrypts to one recipient per run, and its `--take` prunes the
-oldest of its 3 sets, so stream the pre-migration set `20261009T041534Z` first:
+besides the k3s stop of about a minute during `--take`; pods keep running).**
+The 0.0.4 payload encrypts to one recipient per run. Its `--take` keeps only
+the newest 3 sets (`BACKUP_KEEP`) and checks the recipient only after it has
+taken and pruned, so a plain `--take` deletes the pre-migration set
+`20261009T041534Z`, the only rollback point from before the migration. So:
+(a) stream that set and verify the file, (b) only then take a new backup, with
+`BACKUP_KEEP=99` so that it prunes nothing, and verify that file too, (c)
+re-encrypt both for the recovery key. Run the blocks in order in one bash
+shell. `pipefail` makes a failed `tar` or `age` fail the whole pipe instead of
+leaving a short file that looks complete; `verify` decrypts into `/dev/shm`,
+checks `SHA256SUMS` (names only) and removes the plaintext.
 
 ```sh
+set -o pipefail; umask 077
 P=/var/lib/teknoir-airgap/bundles/teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af/node
-ME=$(age-keygen -y ~/.config/teknoir/age/teknoir-local.key)
+SITE=/var/lib/teknoir-airgap/site/teknoir-local.env
+KEY=~/.config/teknoir/age/teknoir-local.key
+ME=$(age-keygen -y "$KEY")
 REC=age1<recovery public key>
+[[ $ME =~ ^age1[0-9a-z]{58}$ && $REC =~ ^age1[0-9a-z]{58}$ ]] && echo "keys ok" || echo "STOP: ME or REC is not an age public key"
 install -d -m 0700 ~/teknoir-backups && cd ~/teknoir-backups
-ssh teknoir@192.168.5.181 "sudo sh -c 'tar -C /var/lib/teknoir-airgap/backups -cf - 20261009T041534Z | $P/bin/age -r $ME'" \
-  > teknoir-local-20261009T041534Z.tar.age
-ssh teknoir@192.168.5.181 "sudo $P/bin/teknoir-node backup --recipient $ME --take --site /var/lib/teknoir-airgap/site/teknoir-local.env" \
-  > "teknoir-local-$(date -u +%Y%m%dT%H%M%SZ).tar.age"
-chmod 600 ./*.tar.age
-# copies for the recovery key, re-encrypted without plaintext on disk
-for f in teknoir-local-*.tar.age; do
-  age -d -i ~/.config/teknoir/age/teknoir-local.key "$f" | age -r "$REC" > "${f%.tar.age}.recovery.tar.age"
-done
+verify() {  # verify FILE: decrypt into /dev/shm, check SHA256SUMS, remove the plaintext
+  local d s rc
+  d=$(mktemp -d /dev/shm/teknoir-verify.XXXXXX) || return 1
+  age -d -i "$KEY" "$1" | tar -C "$d" -xf - && s=$(cd "$d" && echo 2*Z) && (cd "$d/$s" && sha256sum --quiet -c SHA256SUMS)
+  rc=$?
+  rm -rf "$d"
+  if [ "$rc" = 0 ]; then echo "verified $1 (set $s)"; else echo "FAILED $1"; fi
+  return "$rc"
+}
 ```
 
-Verify every file before step 3: decrypt into `/dev/shm`, run `sha256sum -c`,
-remove the plaintext (section 10, "A copy off the node"; for the `.recovery`
-files this needs the offline key, or at least `age-keygen -y` on it matching
-`REC`). Then copy all files to a second medium.
+(a) The pre-migration set, streamed from the node (`bash -o pipefail`, so a
+failed `tar` there fails the command and no `.tar.age` appears):
+
+```sh
+f=teknoir-local-20261009T041534Z.tar.age
+ssh teknoir@192.168.5.181 "sudo bash -o pipefail -c 'tar -C /var/lib/teknoir-airgap/backups -cf - 20261009T041534Z | $P/bin/age -r $ME'" \
+  > "$f.partial" && mv "$f.partial" "$f" && verify "$f"
+```
+
+Go on only when it printed `verified teknoir-local-20261009T041534Z.tar.age (set 20261009T041534Z)`.
+
+(b) A new backup. `BACKUP_KEEP=99` applies to this run only (the 0.0.4 code
+reads it from the environment), so the listing afterwards still shows
+`20261009T041534Z`, the two other old sets and the new one:
+
+```sh
+f=teknoir-local-$(date -u +%Y%m%dT%H%M%SZ).tar.age
+ssh teknoir@192.168.5.181 "sudo env BACKUP_KEEP=99 $P/bin/teknoir-node backup --recipient $ME --take --site $SITE" \
+  > "$f.partial" && mv "$f.partial" "$f" && verify "$f"
+ssh teknoir@192.168.5.181 'sudo ls /var/lib/teknoir-airgap/backups'   # names only
+```
+
+(c) Copies for the recovery key, re-encrypted without plaintext on disk:
+
+```sh
+for f in teknoir-local-2*Z.tar.age; do   # the two files above, not the .recovery ones
+  age -d -i "$KEY" "$f" | age -r "$REC" > "${f%.tar.age}.recovery.tar.age" || echo "FAILED $f"
+done
+ls -l   # four .tar.age files, all -rw-------
+```
+
+Step 3 starts only after (a) and (b) printed `verified` and (c) printed no
+`FAILED`. The `.recovery` files need the offline key to verify (at least check
+that `age-keygen -y` on it prints `REC`). Then copy all four files to a second
+medium.
 
 **3. Node clean-up (after step 2 is verified).** In a root shell on the node
 (`ssh -t teknoir@192.168.5.181 sudo -i`):
@@ -1097,19 +1140,25 @@ including the CA key. `20261009T051050Z` and the set step 2 took stay; the r5
 `/opt/k3s/server/manifests-retired/` until step 6; the cloud-init seed holds a
 plaintext console password, rotated in step 7.
 
-**4. vpro clean-up** (and any other machine with an infra checkout; `ME` and
-`REC` as in step 2). Shred `~/teknoir-local-migration/teknoir-local-admin.txt`
+**4. vpro clean-up** (and any other machine with an infra checkout), in the
+step-2 shell (or run step 2's first block again: `pipefail`, `umask 077`,
+`KEY`, `ME`, `REC`). Shred `~/teknoir-local-migration/teknoir-local-admin.txt`
 and the dead `robot$argocd` copies under `/home/anders/git/ai/infra-teknoir-local/`
 (`.secrets/manifest-argocd-harbor-repo-secret.yaml`, `airgap/.secrets/robot-argocd.env`,
 `bundle/teknoir-airgap-bundle-0.1.0/bootstrap/secrets/manifest-argocd-harbor-repo-secret.yaml`).
 Review `~/teknoir-local-migration/env.sh`. Encrypt, verify, then delete the
-infra `.secrets` directories (the CA key's source):
+infra `.secrets` directories (the CA key's source). The check extracts the
+archive into `/dev/shm` and compares it with the directories (`diff -rq`
+prints names only); the deletion runs only when they match:
 
 ```sh
 cd /home/anders/git/ai/infra-teknoir-local
-tar -cf - .secrets airgap/.secrets | age -r "$ME" -r "$REC" > ~/teknoir-backups/infra-teknoir-local-secrets.tar.age
-age -d -i ~/.config/teknoir/age/teknoir-local.key ~/teknoir-backups/infra-teknoir-local-secrets.tar.age | tar -t
-find .secrets airgap/.secrets -type f -exec shred -u {} + && rm -rf .secrets airgap/.secrets
+s=~/teknoir-backups/infra-teknoir-local-secrets.tar.age
+tar -cf - .secrets airgap/.secrets | age -r "$ME" -r "$REC" > "$s.partial" && mv "$s.partial" "$s"
+d=$(mktemp -d /dev/shm/teknoir-verify.XXXXXX)
+age -d -i "$KEY" "$s" | tar -C "$d" -xf - && diff -rq .secrets "$d/.secrets" && diff -rq airgap/.secrets "$d/airgap/.secrets"
+rc=$?; rm -rf "$d"
+[ "$rc" = 0 ] && echo "verified $s" && find .secrets airgap/.secrets -type f -exec shred -u {} + && rm -rf .secrets airgap/.secrets
 ```
 
 **5. After the r5 `up`.** Every backup is now encrypted on the node, and the node

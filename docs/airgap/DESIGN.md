@@ -117,7 +117,16 @@ package adds its own subsection.
   `credentials argocd-admin`.
 - **Runbook**: OPERATE.md "r5 (app-of-apps 0.0.5)" orders the one-time clean-up:
   verified encrypted backup first, then deleting plaintext copies (node, vpro,
-  cloud-init seed mode), then finalize and rotations.
+  cloud-init seed mode), then finalize and rotations. Step 2 runs on the
+  deployed 0.0.4 payload, whose `--take` keeps 3 sets and so would prune the
+  pre-migration set: that set is streamed (`bash -o pipefail` on the node) and
+  decrypted and checked (`sha256sum -c` in `/dev/shm`) first, and the take
+  runs with `BACKUP_KEEP=99`, which 0.0.4 reads from the environment. Every
+  stream lands as `.partial` and is renamed only on success; step 4 deletes
+  the vpro `.secrets` only when the decrypted archive equals them
+  (`diff -rq`). `airgap/test/node/run.sh` runs the step 2 and 4 blocks as
+  written against the 0.0.4 payload (`git archive 8610f8d`) and the real age,
+  including a tar that fails halfway and the plain `--take` that prunes.
 
 ### Node time, RTC, teamspace DNS and site keys (WP-I-HOST)
 

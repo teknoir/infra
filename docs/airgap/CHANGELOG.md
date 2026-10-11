@@ -26,7 +26,10 @@ reasons for the redesign are kept here. The git history of `infra` and
   password logs in. `rotate argocd-admin --out FILE` writes it to a 0600 file.
 - **One-time clean-up runbook** (OPERATE.md, r5): encrypted backup first, then
   the plaintext copies on the node and on vpro, the world-readable cloud-init
-  seed, finalize and rotations.
+  seed, finalize and rotations. The pre-migration set is streamed and verified
+  before the deployed payload's `--take`, which runs with `BACKUP_KEEP=99` so
+  that it prunes nothing; every stream fails on a failed `tar` (`pipefail`).
+  The node unit tests run these blocks against the deployed 0.0.4 payload.
 - vpro: `~/.config/teknoir/install-devtools.sh` installs `age` and `age-keygen`
   v1.3.1 (sha256-pinned) for decryption.
 - **One recipient check.** The build, the node and the LAN tool check
