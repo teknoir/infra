@@ -10,7 +10,8 @@ CI runs everything except the VM test: [.github/workflows/airgap-ci.yml](../../.
 | coredns-custom in CoreDNS | `airgap/test/node/coredns-test.sh` | docker, dig (one image pull) | no |
 | chrony drop-in and LAN-time samples in chronyd 4.6.1 (`-x`, no clock is set) | `airgap/test/node/chrony-test.sh` | docker, network (apt in debian:trixie) | no |
 | bats only | `airgap/test/bats/run.sh [file.bats]` | bash, curl (first run only) | yes, from run-static.sh |
-| K3s ownership (k3d) | `airgap/test/k3d/run.sh [T1 ... T9]` | docker, k3d, kubectl, jq (T6 also helm, yq) | T1-T5, T4N, T9; T6 on manual dispatch |
+| K3s ownership (k3d) | `airgap/test/k3d/run.sh [T1 ... T10]` | docker, k3d, kubectl, jq (T6 also helm, yq; T10 python3) | T1-T5, T4N, T9, T10; T6 on manual dispatch |
+| Node runner cluster phases (k3d) | `airgap/test/node/k3d.sh [-v] [--keep]` | docker, k3d, kubectl, jq, openssl (pulls postgres:16-alpine) | yes |
 | VM end to end | `airgap/test/vm/e2e.sh [--allow-destroy] [E1 ...]` | vpro: KVM, sudo, the VM base image | no |
 
 ## bats (pinned, offline-friendly)
@@ -87,7 +88,11 @@ objects owned by K3s manifest files:
 - T5 a restart reverts edits;
 - T6 ArgoCD adoption;
 - T9 `teknoir-node migrate`, then converge's cluster phases twice and across a restart, on a
-  fixture of the live layout.
+  fixture of the live layout;
+- T10 the post phase (r5) on stand-in Applications, with a bash loop playing ArgoCD's controller
+  and `stubs/fake-keycloak.py`: a teamspace not declared in GitOps never blocks, a failed
+  platform sync gets one re-sync patch per run, and `previous-password` of `keycloak-admin` goes
+  only after a 200 login.
 
 Note on T6: ArgoCD 3.5.1 writes no `argocd.argoproj.io/tracking-id` annotation on CRDs, whether it
 adopted them or created them. teknoir-local's monitoring CRDs are the same. A CRD therefore belongs

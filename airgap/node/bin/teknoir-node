@@ -117,7 +117,7 @@ converge options:
   --force-images           let the harbor phase move a mirror tag to another digest
   --no-backup              skip the automatic pre-change backup
   --backup                 take the pre-change backup even for an already deployed bundle
-  --wait-timeout SECONDS   post phase wait for Synced/Healthy (default 1200; 2700 on first install)
+  --wait-timeout SECONDS   post phase wait for Synced/Healthy (default 1200; 2700 on a first install or an update that creates a GitOps teamspace)
   --only PHASE[,PHASE]     run only these phases (testing, break-glass)
   --skip PHASE[,PHASE]     skip these phases (testing, break-glass)
   --role server|agent      node role (agent join is not implemented yet)

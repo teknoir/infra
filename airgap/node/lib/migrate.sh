@@ -13,6 +13,12 @@
 #                                        M7a: detach teknoir-argo once the argo
 #                                        Application (app-of-apps 0.0.4) runs ArgoCD
 #   teknoir-node migrate --undo NAME     re-adopt one detached file (K3s re-applies it)
+#   teknoir-node migrate --finalize [--i-know] [--dry-run]
+#                                        once the migration is accepted: shred the
+#                                        retired files (ends --undo); refuses unless
+#                                        it is complete, every retired name keeps its
+#                                        .skip guard, the platform is ready and an
+#                                        encrypted export newer than it exists
 #
 # Detach recipe, per name (never the K3s `disable:` list, which deletes objects):
 #   1. create <manifests>/<name>.yaml.skip, so K3s ignores any later copy of the file;
@@ -29,6 +35,8 @@
 # Secrets per namespace, CRDs, Applications and the istio/cert-manager kinds of
 # DESIGN M2. After every name all of it is compared again: a lost or
 # re-created object, or any changed count, stops the run with the undo command.
+# Retired files are moved with mode 0600 (they hold secrets); --finalize
+# shreds them once the migration is accepted (r5, SEC-C10).
 # Order: orphan Addons (file gone), legacy manifest-*-secret, teknoir-*-secret,
 # 00-teknoir-namespaces, teknoir-coredns-custom and teknoir-app-of-apps, the CRD
 # files, then any other allow-listed name. teknoir-argo is detached only by
@@ -57,20 +65,26 @@ MIGRATE_COUNT_KINDS="Application.argoproj.io VirtualService.networking.istio.io 
 MIGRATE_ARGO_APP="argo"
 MIGRATE_ARGO_APP_NS="${MIGRATE_ARGO_APP_NS:-teknoir-system}"
 MIGRATE_ARGO_SETTLE="${MIGRATE_ARGO_SETTLE:-20}"
+# what the converge's secrets phase owns next to ArgoCD (lib/secrets.sh)
+MIGRATE_MANAGED_BY="${MANAGED_BY_LABEL:-app.kubernetes.io/managed-by=teknoir-node}"
+MIGRATE_ARGOCD_TLS_CM="ConfigMap.v1.|${ARGOCD_NS:-teknoir-system}|${ARGOCD_TLS_CM:-argocd-tls-certs-cm}"
 
 cmd_migrate() {
   local -a undo=()
-  local argo=0
+  local argo=0 finalize=0 iknow=0 kcpw=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --dry-run) DRY_RUN=1; shift ;;
       --argo) argo=1; shift ;;
+      --finalize) finalize=1; shift ;;
+      --i-know) iknow=1; shift ;;
       --keycloak-admin-password-stdin)
         # the master admin's current password, when it is no longer the one in
         # the Keycloak StatefulSet (changed by hand): read once, never printed
         IFS= read -r MIGRATE_KC_PASSWORD || [[ -n "${MIGRATE_KC_PASSWORD}" ]] \
           || die "--keycloak-admin-password-stdin: nothing on stdin"
         mark_sensitive "${MIGRATE_KC_PASSWORD}"
+        kcpw=1
         shift ;;
       --undo) [[ $# -ge 2 ]] || die "--undo needs a name"; undo+=("$2"); shift 2 ;;
       --undo=*) undo+=("${1#*=}"); shift ;;
@@ -79,8 +93,18 @@ cmd_migrate() {
     esac
   done
   [[ "${argo}" == "0" || ${#undo[@]} -eq 0 ]] || die "migrate: --argo and --undo cannot be combined"
+  if [[ "${finalize}" == "1" ]]; then
+    [[ "${argo}" == "0" && ${#undo[@]} -eq 0 && "${kcpw}" == "0" ]] \
+      || die "migrate: --finalize cannot be combined with --argo, --undo or --keycloak-admin-password-stdin"
+  else
+    [[ "${iknow}" == "0" ]] || die "migrate: --i-know goes with --finalize only"
+  fi
   migrate_init
   local name
+  if [[ "${finalize}" == "1" ]]; then
+    migrate_finalize "${iknow}"
+    return 0
+  fi
   if [[ ${#undo[@]} -gt 0 ]]; then
     for name in "${undo[@]}"; do
       migrate_undo "${name}"
@@ -102,6 +126,7 @@ migrate_usage() {
 Usage: teknoir-node migrate [--dry-run] [--keycloak-admin-password-stdin]
        teknoir-node migrate --argo [--dry-run]
        teknoir-node migrate --undo NAME [--undo NAME]...
+       teknoir-node migrate --finalize [--i-know] [--dry-run]
 
 First carries the Keycloak master admin over to the auth chart: when Secret
 teknoir-auth/keycloak-admin is absent, it is created with the admin's current
@@ -116,6 +141,13 @@ re-run. teknoir-argo stays until --argo (M7a), which needs the Application argo
 (app-of-apps 0.0.4) Synced/Healthy and the argoproj CRDs protected
 (Prune=false,Delete=false), and checks that no ArgoCD pod restarts.
 --undo NAME puts a detached file back.
+--finalize, once the migration is accepted, shreds the retired files under
+<data-dir>/server/manifests-retired/ and removes that directory, which ends
+--undo; the .skip guards stay. It refuses while a Teknoir K3s file or Addon is
+left, a retired name has no .skip guard, a platform Application is not
+Synced/Healthy, or no age-encrypted backup export newer than the last
+migration is on the node (/var/lib/teknoir-airgap/exports; --i-know accepts an
+encrypted copy kept off the node instead).
 EOF
 }
 
@@ -426,7 +458,9 @@ migrate_detach() {
     install -d -m 0700 "${MIGRATE_RETIRED_ROOT}" "${MIGRATE_RETIRED}" || die "cannot create ${MIGRATE_RETIRED}"
     [[ ! -e "${MIGRATE_RETIRED}/${base}" ]] || die "${MIGRATE_RETIRED}/${base} exists already"
     mv -- "${file}" "${MIGRATE_RETIRED}/${base}" || die "cannot move ${file}"
-    changed "retired ${base} to ${MIGRATE_RETIRED}/"
+    # the files hold secrets: root-only, whatever mode K3s's copy had
+    chmod 0600 "${MIGRATE_RETIRED}/${base}" || die "cannot set mode 0600 on ${MIGRATE_RETIRED}/${base}"
+    changed "retired ${base} to ${MIGRATE_RETIRED}/ (mode 0600)"
   fi
   # 3. strip K3s's ownership from the objects (they stay where they are)
   local res ns oname uid
@@ -797,6 +831,8 @@ migrate_argo() {
   migrate_argo_crds_protected || die "migrate --argo: argoproj CRD(s) lost Prune=false,Delete=false: ${MIGRATE_UNPROTECTED}"
   migrate_argo_untracked
   untracked="${MIGRATE_UNTRACKED}"
+  [[ -z "${MIGRATE_CONVERGE_OWNED}" ]] \
+    || log "migrate --argo: owned by the converge (secrets phase), not by the Application ${MIGRATE_ARGO_APP}: ${MIGRATE_CONVERGE_OWNED}"
   [[ -z "${untracked}" ]] \
     || warn "migrate --argo: these objects of ${MIGRATE_ONLY}.yaml are not in the Application ${MIGRATE_ARGO_APP} and now have no owner (left in place; delete them by hand once you know they are unused): ${untracked}"
   state="$(kc -n "${MIGRATE_ARGO_APP_NS}" get applications.argoproj.io "${MIGRATE_ARGO_APP}" \
@@ -829,16 +865,161 @@ migrate_argo_crds_protected() {
 }
 
 migrate_argo_untracked() {
-  # MIGRATE_UNTRACKED: baseline objects without the argo Application's
-  # tracking annotation (ArgoCD's default annotation tracking: "<app>:...")
-  local res out
-  MIGRATE_UNTRACKED=""
+  # Sorts the baseline objects (this run's Addons) by who owns them now:
+  #   tracked by the argo Application: its tracking annotation ("<app>:..."
+  #     or "<ns>_<app>:...", ArgoCD's annotation tracking), or a Synced entry
+  #     in its .status.resources (ArgoCD 3.5 writes no tracking-id on CRDs;
+  #     DESIGN "CRD adoption check");
+  #   MIGRATE_CONVERGE_OWNED: the node converge's (MANAGED_BY_LABEL, or
+  #     argocd-tls-certs-cm, which the secrets phase reconciles);
+  #   MIGRATE_UNTRACKED: the rest ("resource ns/name; ").
+  # Names, annotations and labels only leave kubectl. Not for $(...): dies.
+  local res out app managed lines line kind rest
+  MIGRATE_UNTRACKED="" MIGRATE_CONVERGE_OWNED=""
+  app="$(kc -n "${MIGRATE_ARGO_APP_NS}" get applications.argoproj.io "${MIGRATE_ARGO_APP}" -o json)" \
+    || die "cannot read Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}"
+  # "resource|namespace|name" in the baseline's naming (Kind.v1. for core)
+  managed="$("${MIGRATE_JQ}" -r '.status.resources[]? | select(.status == "Synced")
+      | "\(.kind).\(if (.group // "") == "" then "\(.version // "v1")." else .group end)|\(.namespace // "")|\(.name)"' <<<"${app}")" \
+    || die "cannot parse Application ${MIGRATE_ARGO_APP_NS}/${MIGRATE_ARGO_APP}"
   for res in ${MIGRATE_BASE_RES}; do
-    out="$(kc get "${res}" -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"\n"}{end}')" \
+    out="$(kc get "${res}" -A -o jsonpath='{range .items[*]}{.metadata.namespace}{"|"}{.metadata.name}{"|"}{.metadata.annotations.argocd\.argoproj\.io/tracking-id}{"|"}{.metadata.labels.app\.kubernetes\.io/managed-by}{"\n"}{end}')" \
       || die "cannot list ${res}"
-    MIGRATE_UNTRACKED+="$(awk -F '|' -v r="${res}" -v app="${MIGRATE_ARGO_APP}" '
-        NR == FNR { if ($1 == r) want[$2 "|" $3] = 1; next }
-        ($1 "|" $2) in want && $3 !~ ("^([^:]*_)?" app ":") { printf "%s %s%s; ", r, ($1 == "" ? "" : $1 "/"), $2 }' \
-      <(printf '%s\n' "${MIGRATE_BASE_OBJS}") <(printf '%s\n' "${out}"))"
+    lines="$(awk -F '|' -v r="${res}" -v app="${MIGRATE_ARGO_APP}" -v mb="${MIGRATE_MANAGED_BY#*=}" -v tls="${MIGRATE_ARGOCD_TLS_CM}" '
+        FNR == 1 { f++ }
+        f == 1 { if ($1 == r) want[$2 "|" $3] = 1; next }
+        f == 2 { managed[$0] = 1; next }
+        ($1 "|" $2) in want && $3 !~ ("^([^:]*_)?" app ":") && !((r "|" $1 "|" $2) in managed) {
+          print ((($4 != "" && $4 == mb) || (r "|" $1 "|" $2) == tls) ? "C" : "U") " " r " " ($1 == "" ? "" : $1 "/") $2
+        }' <(printf '%s\n' "${MIGRATE_BASE_OBJS}") <(printf '%s\n' "${managed}") <(printf '%s\n' "${out}"))"
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      kind="${line%% *}" rest="${line#* }"
+      if [[ "${kind}" == "C" ]]; then
+        MIGRATE_CONVERGE_OWNED+="${rest}; "
+      else
+        MIGRATE_UNTRACKED+="${rest}; "
+      fi
+    done <<<"${lines}"
   done
+}
+
+# --- finalize (r5, SEC-C10) --------------------------------------------------------
+
+migrate_need_release_lib() {
+  # The Application readiness rules of the post phase (lib/release.sh): the
+  # runner has sourced it already; a test driver may not have.
+  declare -F _release_post_not_ready >/dev/null && return 0
+  # shellcheck source=release.sh
+  source "$(dirname "${BASH_SOURCE[0]}")/release.sh"
+}
+
+migrate_ts_epoch() {
+  # migrate_ts_epoch <YYYYMMDDTHHMMSSZ> - seconds since the epoch (capture only)
+  local t="$1"
+  date -u -d "${t:0:4}-${t:4:2}-${t:6:2}T${t:9:2}:${t:11:2}:${t:13:2}Z" +%s
+}
+
+migrate_finalize_export() {
+  # migrate_finalize_export <since-epoch> - MIGRATE_EXPORT: the newest
+  # age-encrypted backup export on the node (exports/*.tar.age with the age
+  # header) whose backup set is newer than <since-epoch>: the UTC stamp in its
+  # name, else its mtime. Empty when there is none. Not for $(...).
+  local since="$1" dir f name t best=0
+  dir="${EXPORT_DIR:-${STATE_DIR}/exports}"
+  MIGRATE_EXPORT=""
+  [[ -d "${dir}" ]] || return 0
+  for f in "${dir}"/*.tar.age; do
+    [[ -f "${f}" && ! -L "${f}" && -s "${f}" ]] || continue
+    if [[ "$(head -c 21 "${f}")" != "age-encryption.org/v1" ]]; then
+      warn "migrate --finalize: ${f} is not an age-encrypted file; ignored"
+      continue
+    fi
+    name="$(basename "${f}")"
+    if [[ "${name}" =~ ([0-9]{8}T[0-9]{6}Z) ]]; then
+      t="$(migrate_ts_epoch "${BASH_REMATCH[1]}")" || continue
+    else
+      t="$(stat -c %Y "${f}")" || continue
+    fi
+    if (( t > since && t > best )); then
+      best="${t}"
+      MIGRATE_EXPORT="${f}"
+    fi
+  done
+}
+
+migrate_finalize() {
+  # migrate_finalize <i-know 0|1> - once the migration is accepted, shred the
+  # retired K3s files and remove MIGRATE_RETIRED_ROOT (ends --undo; the .skip
+  # guards stay). Logs names only.
+  local iknow="$1" root="${MIGRATE_RETIRED_ROOT:?}" f base missing="" n=0 newest="" d since json bad
+  local -a files=()
+  [[ ! -L "${root}" ]] || die "migrate --finalize: ${root} is a symlink; refusing"
+  if [[ ! -d "${root}" ]]; then
+    log "migrate --finalize: ${root} does not exist: nothing to finalize"
+    return 0
+  fi
+  mapfile -t files < <(find "${root}" -mindepth 1 \( -type f -o -type l \) -printf '%P\n' | LC_ALL=C sort)
+  log "migrate --finalize: ${#files[@]} retired file(s) under ${root}"
+  # 1. the migration is complete: no Teknoir K3s file or Addon left, teknoir-argo included
+  local MIGRATE_ONLY="" MIGRATE_EXCLUDED=""
+  migrate_inventory
+  [[ -z "${MIGRATE_INVENTORY}" ]] \
+    || die "migrate --finalize: the migration is not complete, K3s still owns: $(cut -d '|' -f2 <<<"${MIGRATE_INVENTORY}" | tr '\n' ' ')(run teknoir-airgap migrate, and migrate --argo, first)"
+  # 2. every retired K3s file name keeps its .skip guard (an old bundle's copy stays ignored)
+  for f in ${files[@]+"${files[@]}"}; do
+    base="$(basename "${f}")"
+    [[ "${base}" =~ \.(ya?ml|json)$ ]] || continue
+    [[ -e "${MIGRATE_MANIFESTS}/${base}.skip" ]] || missing+="${base} "
+  done
+  [[ -z "${missing}" ]] \
+    || die "migrate --finalize: no .skip guard in ${MIGRATE_MANIFESTS} for the retired: ${missing}(an --undo in progress? run migrate again first)"
+  # 3. the platform is Synced/Healthy (the post phase's rules; teamspaces not in GitOps only warn)
+  crd_established applications.argoproj.io \
+    || die "migrate --finalize: ArgoCD is not installed (CRD applications.argoproj.io): the migration cannot be complete"
+  migrate_need_release_lib
+  json="$(_release_applications_json)"
+  bad="$(_release_post_not_ready "${json}")"
+  [[ -z "${bad}" ]] \
+    || die "migrate --finalize: these Applications are not Synced/Healthy: $(awk -F'\t' '{printf "%s (%s) ", $1, $2}' <<<"${bad}")- finalize once the platform is ready (teknoir-airgap up, status)"
+  post_report_unwaited "${json}"
+  # 4. an encrypted backup taken after the last migration
+  for d in "${root}"/*/; do
+    d="$(basename "${d}")"
+    if [[ "${d}" =~ ^[0-9]{8}T[0-9]{6}Z$ && "${d}" > "${newest}" ]]; then
+      newest="${d}"
+    fi
+  done
+  if [[ -n "${newest}" ]]; then
+    since="$(migrate_ts_epoch "${newest}")" || die "cannot read the time of ${root}/${newest}"
+  else
+    since="$(stat -c %Y "${root}")" || die "cannot stat ${root}"
+  fi
+  migrate_finalize_export "${since}"
+  if [[ -n "${MIGRATE_EXPORT}" ]]; then
+    log "migrate --finalize: encrypted backup export newer than the migration (${newest:-${root}}): ${MIGRATE_EXPORT}"
+  elif [[ "${iknow}" == "1" ]]; then
+    warn "migrate --finalize: no age-encrypted export newer than the migration (${newest:-${root}}) on the node; --i-know: you hold an encrypted backup taken after the migration elsewhere"
+  else
+    die "migrate --finalize: no age-encrypted backup export newer than the migration (${newest:-${root}}) in ${EXPORT_DIR:-${STATE_DIR}/exports}. Take one first (teknoir-airgap backup), or pass --i-know if you hold an encrypted backup taken after the migration off the node"
+  fi
+  # 5. shred, names only
+  if dry_run; then
+    log "[dry-run] migrate --finalize: would shred ${#files[@]} retired file(s) and remove ${root} (migrate --undo ends; the .skip guards stay):"
+    for f in ${files[@]+"${files[@]}"}; do log "[dry-run]   ${f}"; done
+    return 0
+  fi
+  for f in ${files[@]+"${files[@]}"}; do
+    [[ -n "${f}" ]] || continue
+    if [[ -L "${root}/${f}" ]]; then
+      unlink -- "${root}/${f}" || die "cannot remove the symlink ${root}/${f}"
+    else
+      shred -u -- "${root}/${f}" || die "cannot shred ${root}/${f}"
+    fi
+    log "  shredded ${f}"
+    n=$(( n + 1 ))
+  done
+  find "${root}" -mindepth 1 -depth -type d -empty -delete || die "cannot remove the directories under ${root}"
+  rmdir -- "${root}" || die "cannot remove ${root} (not empty?)"
+  changed "finalized the migration: shredded ${n} retired file(s) and removed ${root} (migrate --undo is no longer possible; the .skip guards stay)"
 }

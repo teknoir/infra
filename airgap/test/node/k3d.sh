@@ -13,7 +13,8 @@
 #       placeholder verifies against the CA
 #   I-10 downgrade refused, --rollback accepted and recorded, the next plain
 #       run with the rolled-back bundle keeps it; broken versions refused;
-#       post fails naming an Application that is not Synced/Healthy, and
+#       post fails naming a platform Application (tracked by the root) that
+#       is not Synced/Healthy and only warns about an untracked one, and
 #       treats a stale status as not ready (compared with the old pin, a
 #       running sync, another chart revision, or - after this run's pin - no
 #       reconcile since); release requests a root refresh, and with a
@@ -322,21 +323,36 @@ tn converge --site test --only release,post --wait-timeout 60
 FAKE_RC=0
 wait "${FAKE_PID}" || FAKE_RC=$?
 check "release + post pass once ArgoCD has reconciled the root after the pin" \
-  bash -c "[ ${RC} = 0 ] && [ ${FAKE_RC} = 0 ] && grep -q 'every Application is Synced/Healthy at its current spec' '${T}/out'"
-cat <<'APP' | k apply -f - >/dev/null
+  bash -c "[ ${RC} = 0 ] && [ ${FAKE_RC} = 0 ] && grep -q 'every platform Application (and every teamspace declared in GitOps) is Synced/Healthy at its current spec' '${T}/out'"
+broken_app() {
+  # broken_app <name> [tracking-id] - an Application that failed to apply
+  # (with the tracking-id, the root manages it: a platform Application)
+  cat <<APP | k apply -f - >/dev/null
 apiVersion: argoproj.io/v1alpha1
 kind: Application
-metadata: {name: broken, namespace: teknoir-system}
+metadata:
+  name: $1
+  namespace: teknoir-system
+  annotations: {${2:+argocd.argoproj.io/tracking-id: "$2"}}
 spec: {project: default}
 status:
   sync: {status: OutOfSync}
   health: {status: Degraded}
   operationState: {phase: Failed, message: "one or more objects failed to apply"}
 APP
+}
+broken_app broken app-of-apps:argoproj.io/Application:teknoir-system/broken
 tn converge --site test --only post --wait-timeout 3
-check "post fails and names the failing Application" \
+check "post fails and names the failing platform Application" \
   bash -c "[ ${RC} != 0 ] && grep -qF 'not Synced/Healthy at this release: broken (OutOfSync/Degraded' '${T}/out' && grep -qF 'broken: OutOfSync/Degraded | Failed one or more objects failed to apply' '${T}/out'"
 k -n teknoir-system delete applications.argoproj.io broken >/dev/null
+broken_app stray
+tn converge --site test --only post --wait-timeout 3
+check "an Application the root does not manage only warns: post passes" \
+  bash -c "[ ${RC} = 0 ] && grep -qF 'WARN: not ready, not waited for' '${T}/out' && grep -qF 'stray [no Teknoir owner] (OutOfSync/Degraded' '${T}/out' && ! grep -qF 'not Synced/Healthy at this release' '${T}/out'"
+check "... and the table marks it reported only" \
+  bash -c "grep -qE '^stray +OutOfSync +Degraded +- +other[*]$' '${T}/out' && grep -qF 'stray [reported only]: OutOfSync/Degraded' '${T}/out'"
+k -n teknoir-system delete applications.argoproj.io stray >/dev/null
 
 echo "# status"
 tn status --site test

@@ -113,6 +113,47 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
   nobody has rehearsed it. OPERATE.md ("Rolling back from r5") explains how to
   confirm it.
 
+### Post phase, failed syncs and migrate --finalize (infra)
+
+- **The post phase waits for the platform only.** Since 2026-10-09 06:30 the
+  live cluster has 9 Applications of the teamspace `teknoir-demo`, created in
+  Backstage, whose chart repository (`teknoir.github.io`) is unreachable
+  offline. The 0.0.4 tooling waited for every Application, so the next `up`
+  would have failed after 20 minutes. Now `up` waits for the root and the
+  Applications it tracks, and for teamspaces declared in GitOps
+  (`teknoir-default`); other Applications are reported in a `WARN`. For such a
+  teamspace it also waits until the profile-controller has created its
+  Applications, so a controller that cannot create them fails `up` instead of
+  passing with an empty teamspace. An update that creates such a teamspace
+  (r5 creates `teknoir-default`) waits 45 minutes instead of 20, because its
+  first chart syncs come on top of the platform's own restarts. A failed sync
+  of a teamspace Application is not re-synced by post; its reason says to sync
+  it in the ArgoCD UI, since re-running `up` alone would never clear it.
+- **A failed sync is no longer missed or left behind.** On 2026-10-08
+  `monitoring`'s first sync failed while its 1-replica Prometheus had no ready
+  pod; ArgoCD spent its 5 retries, then never retried that revision. The
+  Application still showed Synced and Healthy, so `up` passed, the PostSync hook
+  never ran and both admission webhooks kept an empty `caBundle` (PrometheusRule
+  validation silently off), with self-heal off. A manual retry at 05:40 failed
+  in 22 ms: it set `.operation` alone, so the controller resumed the stale
+  failed state and the spent retry count. Now a failed last sync of the current
+  revision counts as not ready, and post re-syncs such a platform Application
+  once per run, setting the operation and clearing the old state in one patch,
+  as ArgoCD's own API does. The troubleshooting command in OPERATE does the same.
+  Post re-syncs only a failure of the version the Application stays at: right
+  after r5 pins `monitoring` 0.0.5, its 0.0.4 failure is left to the new
+  version's own sync.
+- **Secrets left over from the migration.** Post removes the Keycloak admin's
+  `previous-password` once the current password logs in (it was removed by hand
+  on live). `migrate` retires files with mode 0600, and `migrate --finalize`
+  shreds `manifests-retired` (the CA key and the old secrets) once the migration
+  is accepted. It refuses without an encrypted backup taken after the migration.
+- **`migrate --argo` reported false "no owner" warnings.** ArgoCD 3.5 writes no
+  tracking annotation on CRDs, so the argoproj CRDs looked ownerless although
+  the `argo` Application lists them as Synced; `argocd-tls-certs-cm` belongs to
+  the converge. The k3d test passed only because it annotated the CRDs by hand.
+  The check now reads the Application's status.
+
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
 One build command, one LAN-host command, and the same command for the first

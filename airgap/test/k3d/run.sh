@@ -33,9 +33,25 @@
 #        Teknoir Addons left but teknoir-argo, nothing re-created. CRD
 #        adoption by ArgoCD is T6's and E10's (the fixture runs no ArgoCD)
 #        [needs airgap/node/bin/teknoir-node with migrate and converge]
+#   T10  post phase (r5): `teknoir-node converge --only post` against stand-in
+#        ArgoCD Applications (no ArgoCD runs; a bash loop plays its
+#        controller): a teamspace Application of a Profile not declared in
+#        GitOps, with an unreachable repo, is reported and never blocks; a
+#        platform Application with an injected Failed operation on its
+#        current revision gets exactly one re-sync patch per run (operation
+#        set, operationState cleared in the same write); post fails, naming
+#        the reason, when that re-sync fails again and passes when it
+#        succeeds; a platform Application pinned ahead of its stale Failed
+#        status is waited for but never patched; a Profile declared in
+#        GitOps blocks post until profile-controller (played by the test)
+#        has run and its Application exists, which is then strict; an
+#        update that creates that teamspace waits the first-install time;
+#        previous-password of teknoir-auth/keycloak-admin is removed
+#        after a 200 master login (stubs/fake-keycloak.py) and kept with a
+#        WARN on 401; no password in any log [needs python3]
 #
-# T1-T5 and T4N share one cluster; T6 and T9 each get a fresh cluster, because
-# both install the same CRD names (istio, argoproj) by different means.
+# T1-T5 and T4N share one cluster; T6, T9 and T10 each get a fresh cluster,
+# because they install the same CRD names (istio, argoproj) by different means.
 #
 # Usage: airgap/test/k3d/run.sh [--list] [--keep] [--reuse] [TEST...]
 #   (default: all tests; T6/T9 are skipped when their inputs are missing)
@@ -50,7 +66,8 @@
 #   T6_ISTIO_CHART   istio chart dir or .tgz (gitops charts/istio >= 0.0.3)
 #   T6_ARGO_CHART    ArgoCD chart dir or .tgz; default: upstream argo-cd
 #                    ${T6_ARGOCD_CHART_VERSION:-10.4.0} (what infra charts/argo pins)
-#   T9_NODE_DIR      node payload dir, default <repo>/airgap/node
+#   T9_NODE_DIR      node payload dir, default <repo>/airgap/node (T9, T10)
+#   T10_KC_PORT      port of the fake Keycloak on 127.0.0.1 (default 5067)
 #
 # Every kubectl call passes --context k3d-<name> and a kubeconfig in the work
 # dir; the default kubeconfig is never modified.
@@ -69,7 +86,7 @@ QUIET="${K3D_QUIET:-35}"
 K3S_MANIFESTS=/var/lib/rancher/k3s/server/manifests
 IN_MAN="${K3S_MANIFESTS}/teknoir"   # set per cluster by use_cluster
 KEEP=0 REUSE=0
-ALL_TESTS=(T1 T2 T3 T4 T4N T5 T6 T9)
+ALL_TESTS=(T1 T2 T3 T4 T4N T5 T6 T9 T10)
 # Names of the Teknoir files and Addons on the live node (I-13 allow-list).
 TEKNOIR_ADDON_RE='^(teknoir-.*|00-teknoir-.*|05-teknoir-.*|10-teknoir-.*|manifest-.*-secret|app-of-apps)$'
 
@@ -152,6 +169,7 @@ cleanup() {
   for c in "${CREATED_CLUSTERS[@]}"; do drop_cluster "${c}"; done
   CREATED_CLUSTERS=()
   [[ -n "${PF_PID:-}" ]] && kill "${PF_PID}" 2>/dev/null
+  t10_stop_helpers
   return "${rc}"
 }
 
@@ -1227,6 +1245,229 @@ t9_assert_detached() {
 }
 
 # ---------------------------------------------------------------------------
+# T10 — post phase on stand-in Applications (r5: R2, HYG-C3, SEC-C10)
+# ---------------------------------------------------------------------------
+T10_KC_PORT="${T10_KC_PORT:-5067}"
+T10_PIDS=()
+
+t10_ready() {
+  [[ -x "$(t9_node_bin)" ]] || { T10_WHY="$(t9_node_bin) not found"; return 1; }
+  grep -q '^post_keycloak_admin_cleanup()' "${T9_NODE_DIR:-${REPO}/airgap/node}/lib/release.sh" 2>/dev/null \
+    || { T10_WHY="no post_keycloak_admin_cleanup in lib/release.sh (r5 not in this tree)"; return 1; }
+  command -v python3 >/dev/null || { T10_WHY="needs python3 (stubs/fake-keycloak.py)"; return 1; }
+}
+
+t10_stop_helpers() {
+  local p
+  for p in "${T10_PIDS[@]}"; do kill "${p}" 2>/dev/null || true; done
+  T10_PIDS=()
+}
+
+t10_node() {
+  # the real node runner, as in t9_node, with the post phase's test knobs:
+  # a short poll, short default waits when the caller sets them, and Keycloak
+  # at the fake on 127.0.0.1
+  env KUBECTL="kubectl --context ${CTX}" KUBECONFIG="${KUBECONFIG}" POST_POLL=2 \
+    ${POST_WAIT_DEFAULT:+POST_WAIT_DEFAULT="${POST_WAIT_DEFAULT}"} ${POST_WAIT_FIRST_INSTALL:+POST_WAIT_FIRST_INSTALL="${POST_WAIT_FIRST_INSTALL}"} \
+    RELEASE_KEYCLOAK_URL="http://127.0.0.1:${T10_KC_PORT}" \
+    TEKNOIR_HOST_ROOT="${WORK}/t10/root" TEKNOIR_LOCK_FILE="${WORK}/t10/teknoir-airgap.lock" \
+    TEKNOIR_LOG_DIR="${WORK}/t10/log" STATE_DIR="${WORK}/t10/state" \
+    "${WORK}/t10/payload/node/bin/teknoir-node" "$@"
+}
+
+t10_post() {
+  # t10_post <wait-timeout|-> — converge --only post; output T10_OUT, exit code
+  # T10_RC. "-": no --wait-timeout, so post's own waits apply, shortened to 8s
+  # (update) and 20s (first install, or an update that creates a teamspace)
+  set +e
+  if [[ "$1" == - ]]; then
+    T10_OUT="$(POST_WAIT_DEFAULT=8 POST_WAIT_FIRST_INSTALL=20 t10_node converge --only post --site "${WORK}/t10/site.env" 2>&1)"
+  else
+    T10_OUT="$(t10_node converge --only post --site "${WORK}/t10/site.env" --wait-timeout "$1" 2>&1)"
+  fi
+  T10_RC=$?
+  set -e
+  printf '%s\n' "${T10_OUT}" >> "${WORK}/t10/outputs.log"
+}
+
+t10_app() {
+  # t10_app <name> <chart> <version> <tracking-id|-> — a ready-looking chart Application
+  local src
+  src="{\"repoURL\":\"harbor.teknoir.airgapped/teknoir\",\"chart\":\"$2\",\"targetRevision\":\"$3\"}"
+  jq -n --arg n "$1" --argjson src "${src}" --arg t "$4" '{apiVersion: "argoproj.io/v1alpha1", kind: "Application",
+    metadata: ({name: $n, namespace: "teknoir-system"} + (if $t != "-" then {annotations: {"argocd.argoproj.io/tracking-id": $t}} else {} end)),
+    spec: {project: "default", destination: {namespace: "teknoir-system", server: "https://kubernetes.default.svc"}, source: $src,
+           syncPolicy: {automated: {enabled: true, prune: true, selfHeal: true}, syncOptions: ["ServerSideApply=true"],
+                        retry: {limit: 10, backoff: {duration: "30s", factor: 2, maxDuration: "5m"}}}}}' | kc apply -f - >/dev/null
+  # ArgoCD's view: Synced/Healthy at the spec, last operation Succeeded
+  kc -n teknoir-system patch applications.argoproj.io "$1" --type merge -p "$(jq -cn --argjson src "${src}" --arg v "$3" '
+    {status: {sync: {status: "Synced", revision: $v, comparedTo: {source: $src}}, health: {status: "Healthy"},
+              operationState: {phase: "Succeeded", message: "successfully synced (all tasks run)", syncResult: {revision: $v}}}}')" >/dev/null
+}
+
+t10_fake_controller() {
+  # plays ArgoCD's application-controller for monitoring: a requested
+  # operation is run at once and ends as ${WORK}/t10/mode says (fail|succeed);
+  # every operation it sees is logged with whether operationState was cleared
+  local app mode phase msg
+  while sleep 1; do
+    app="$(kc -n teknoir-system get applications.argoproj.io monitoring -o json 2>/dev/null)" || continue
+    [[ "$(jq -r '.operation != null' <<<"${app}")" == true ]] || continue
+    jq -c '{operation, stateCleared: ((.status // {}) | has("operationState") | not)}' <<<"${app}" >> "${WORK}/t10/ops.log"
+    mode="$(cat "${WORK}/t10/mode")"
+    if [[ "${mode}" == succeed ]]; then phase=Succeeded msg="successfully synced (all tasks run)"; else phase=Failed msg="failed again"; fi
+    kc -n teknoir-system patch applications.argoproj.io monitoring --type merge -p "$(jq -cn --arg p "${phase}" --arg m "${msg}" '
+      {operation: null, status: {operationState: {phase: $p, message: $m, retryCount: 10,
+        syncResult: {revision: "0.0.4"}, operation: {sync: {revision: "0.0.4"}}}}}')" >/dev/null 2>&1 || true
+  done
+}
+
+t10() {
+  tl_case T10 "post phase: teamspace Applications not in GitOps never block, a Profile in GitOps does until its Applications exist; one re-sync per run of a failed platform sync, never of a superseded revision; keycloak-admin previous-password clean-up"
+  local src="${T9_NODE_DIR:-${REPO}/airgap/node}" profile_uid ops pw rv
+  mkdir -p "${WORK}/t10/log" "${WORK}/t10/state" "${WORK}/t10/root" "${WORK}/t10/kc"
+  rm -rf "${WORK}/t10/payload"; mkdir -p "${WORK}/t10/payload"
+  cp -a "${src}" "${WORK}/t10/payload/node"
+  cat > "${WORK}/t10/site.env" <<EOF
+TEKNOIR_ENV=k3d
+TEKNOIR_DOMAIN=teknoir.airgapped
+NODE_IP=127.0.0.1
+NODE=root@127.0.0.1
+TEKNOIR_HOSTNAMES="harbor argocd auth keycloak grafana"
+EOF
+  # stand-ins: the Application and Profile CRDs, the namespaces, the platform
+  # and a Backstage-created teamspace (live teknoir-local on 2026-10-09)
+  { crd_yaml applications argoproj.io Application v1alpha1; echo ---
+    crd_yaml profiles teknoir.org Profile v1 | sed 's/scope: Namespaced/scope: Cluster/'; } | kc apply -f - >/dev/null
+  kc wait --for=condition=Established crd/applications.argoproj.io crd/profiles.teknoir.org --timeout=60s >/dev/null
+  kc create namespace teknoir-system >/dev/null
+  kc create namespace teknoir-auth >/dev/null
+  # a recorded release: this post is an update's (8s below, not a first install's)
+  kc -n teknoir-system create configmap teknoir-airgap-release --from-literal=appOfAppsVersion=0.0.5 \
+    --from-literal=bundleId=t10 --from-literal=mode=update >/dev/null
+  t10_app app-of-apps app-of-apps 0.0.5 -
+  t10_app auth auth 0.0.9 "app-of-apps:argoproj.io/Application:teknoir-system/auth"
+  t10_app monitoring monitoring 0.0.4 "app-of-apps:argoproj.io/Application:teknoir-system/monitoring"
+  # monitoring as live had it: Synced/Healthy, last sync of 0.0.4 Failed, retries spent
+  kc -n teknoir-system patch applications.argoproj.io monitoring --type merge -p '{"status":{"operationState":{"phase":"Failed","retryCount":5,
+    "message":"one or more synchronization tasks completed unsuccessfully (retried 5 times).",
+    "syncResult":{"revision":"0.0.4"},"operation":{"sync":{"revision":"0.0.4"}}}}}' >/dev/null
+  # argo just pinned to 0.0.4 by the root; ArgoCD still shows 0.0.3 and that
+  # revision's failed sync: a superseded failure, never re-synced
+  t10_app argo argo 0.0.4 "app-of-apps:argoproj.io/Application:teknoir-system/argo"
+  kc -n teknoir-system patch applications.argoproj.io argo --type merge -p '{"status":{"sync":{"revision":"0.0.3",
+    "comparedTo":{"source":{"targetRevision":"0.0.3"}}},"operationState":{"phase":"Failed","message":"old revision failed",
+    "syncResult":{"revision":"0.0.3"},"operation":{"sync":{"revision":"0.0.3"}}}}}' >/dev/null
+  # teknoir-default, declared in GitOps, that profile-controller has not reconciled yet
+  printf 'apiVersion: teknoir.org/v1\nkind: Profile\nmetadata: {name: teknoir-default, annotations: {argocd.argoproj.io/tracking-id: "profile-controller:teknoir.org/Profile:/teknoir-default"}}\nspec: {owner: {kind: User, name: owner@example.test}}\n' | kc apply -f - >/dev/null
+  printf 'apiVersion: teknoir.org/v1\nkind: Profile\nmetadata: {name: teknoir-demo}\nspec: {owner: {kind: User, name: owner@example.test}}\n' | kc apply -f - >/dev/null
+  profile_uid="$(uid_of profiles.teknoir.org teknoir-demo)"
+  jq -n --arg uid "${profile_uid}" '{apiVersion: "argoproj.io/v1alpha1", kind: "Application",
+    metadata: {name: "teknoir-demo-jwks", namespace: "teknoir-system",
+      ownerReferences: [{apiVersion: "teknoir.org/v1", kind: "Profile", name: "teknoir-demo", uid: $uid}]},
+    spec: {project: "teknoir-demo", source: {repoURL: "https://teknoir.github.io/profile-plugins-helm", chart: "profile-plugin-jwks", targetRevision: "0.0.99"},
+           destination: {namespace: "teknoir-demo", server: "https://kubernetes.default.svc"}}}' | kc apply -f - >/dev/null
+  kc -n teknoir-system patch applications.argoproj.io teknoir-demo-jwks --type merge -p '{"status":{"sync":{"status":"Unknown"},"health":{"status":"Healthy"},
+    "conditions":[{"type":"ComparisonError","message":"Failed to load target state: failed to fetch chart: helm pull https://teknoir.github.io/profile-plugins-helm: dial tcp: lookup teknoir.github.io: no such host"}]}}' >/dev/null
+  # the master admin's Secret after the migration: password and previous-password (dummy values)
+  ( umask 077; printf 'admin' > "${WORK}/t10/kc/user"; dummy | tr -d '\n' > "${WORK}/t10/kc/password"; dummy | tr -d '\n' > "${WORK}/t10/kc/previous" )
+  kc -n teknoir-auth create secret generic keycloak-admin --from-file=username="${WORK}/t10/kc/user" \
+    --from-file=password="${WORK}/t10/kc/password" --from-file=previous-password="${WORK}/t10/kc/previous" >/dev/null
+  python3 -I "${REPO}/airgap/test/stubs/fake-keycloak.py" "${T10_KC_PORT}" "${WORK}/t10/kc/user" "${WORK}/t10/kc/password" "${WORK}/t10/kc/requests.log" &
+  T10_PIDS+=($!)
+  wait_until 20 curl -fs -o /dev/null -X POST "http://127.0.0.1:${T10_KC_PORT}/test/user?username=probe" || tl_die "the fake Keycloak did not start on :${T10_KC_PORT}"
+  echo fail > "${WORK}/t10/mode"
+  : > "${WORK}/t10/ops.log"
+  t10_fake_controller &
+  T10_PIDS+=($!)
+
+  # run 1: the re-sync fails again -> post fails, naming the reason, after one
+  # patch; the update creates teknoir-default, so it waits the first-install time
+  t10_post -
+  assert_eq "run 1 (re-sync fails again): post exits non-zero" 1 "${T10_RC}"
+  assert_eq "run 1: an update creating teknoir-default waits the first-install time, from the start" 1 \
+    "$(grep -c 'this run creates teamspace(s) declared in GitOps (teknoir-default): post waits up to 20s in all, as on a first install' <<<"${T10_OUT}")"
+  if grep -qE 'ERROR: post: after 20s these Applications are not Synced/Healthy at this release: .*monitoring \(last sync to 0\.0\.4 Failed: failed again\) ' <<<"${T10_OUT}"; then
+    pass "run 1: the error names monitoring and its failed last sync"
+  else fail "run 1: no error naming monitoring's failed sync"; tail -15 <<<"${T10_OUT}" >&2; fi
+  if grep -qF 'argo (last sync to 0.0.3 Failed: old revision failed; status not computed for the current spec yet (compared: 0.0.3); synced revision 0.0.3, pinned 0.0.4)' <<<"${T10_OUT}"; then
+    pass "run 1: the pinned-ahead argo is waited for as stale"
+  else fail "run 1: argo not reported as stale"; fi
+  assert_eq "run 1: the pinned-ahead argo is never patched (its 0.0.3 failure is superseded)" "" \
+    "$(kc -n teknoir-system get applications.argoproj.io argo -o jsonpath='{.operation}')"
+  assert_eq "run 1: no re-sync of argo reported" 0 "$(grep -c 're-synced Application argo' <<<"${T10_OUT}")"
+  if grep -qF 'profile/teknoir-default (not reconciled by profile-controller yet)' <<<"${T10_OUT}"; then
+    pass "run 1: the Profile declared in GitOps without Applications is waited for"
+  else fail "run 1: profile/teknoir-default not waited for"; fi
+  assert_eq "run 1: exactly one re-sync patch (one operation seen by the controller)" 1 "$(grep -c . "${WORK}/t10/ops.log")"
+  assert_eq "run 1: one re-sync recorded as a change" 1 "$(grep -c 'changed: re-synced Application monitoring once (last sync to 0.0.4 Failed)' <<<"${T10_OUT}")"
+  ops="$(head -1 "${WORK}/t10/ops.log")"
+  assert_eq "run 1: the operation came with operationState cleared in the same write" true "$(jq -r .stateCleared <<<"${ops}")"
+  assert_eq "run 1: the operation is the spec's sync (revision, prune, syncOptions, retry, initiator)" \
+    '{"initiatedBy":{"username":"teknoir-node"},"retry":{"backoff":{"duration":"30s","factor":2,"maxDuration":"5m"},"limit":10},"sync":{"prune":true,"revision":"0.0.4","syncOptions":["ServerSideApply=true"]}}' \
+    "$(jq -cS .operation <<<"${ops}")"
+  if grep -qE 'WARN: not ready, not waited for .*teknoir-demo-jwks \[teamspace teknoir-demo, not declared in GitOps\] \(Unknown/Healthy' <<<"${T10_OUT}"; then
+    pass "run 1: the unreachable teamspace Application is reported as a WARN, not waited for"
+  else fail "run 1: teknoir-demo-jwks not reported"; fi
+  if grep -qE 'these Applications are not Synced/Healthy.*teknoir-demo-jwks' <<<"${T10_OUT}"; then fail "run 1: post waited for teknoir-demo-jwks"
+  else pass "run 1: post never waited for teknoir-demo-jwks"; fi
+  assert_eq "run 1: previous-password untouched (post stopped before the clean-up)" 1 \
+    "$(kc -n teknoir-auth get secret keycloak-admin -o json | jq '.data | has("previous-password") | if . then 1 else 0 end')"
+
+  # run 2: ArgoCD has compared argo at 0.0.4 and synced it; profile-controller
+  # has run for teknoir-default and created its Application; the re-sync of
+  # monitoring succeeds -> post passes; previous-password goes after a 200 login
+  kc -n teknoir-system patch applications.argoproj.io argo --type merge -p '{"status":{"sync":{"revision":"0.0.4",
+    "comparedTo":{"source":{"targetRevision":"0.0.4"}}},"operationState":{"phase":"Succeeded","message":"ok",
+    "syncResult":{"revision":"0.0.4"},"operation":{"sync":{"revision":"0.0.4"}}}}}' >/dev/null
+  kc patch profiles.teknoir.org teknoir-default --type merge -p '{"status":{"appliedconfig":{"lastRunStart":"2026-10-09T09:22:01Z",
+    "lastRunEnd":"2026-10-09T09:22:02Z","plugins":{"JWKS":{"applyStatus":{"status":"Success"},
+    "appliedConfig":{"settings":{"enabled":true},"pluginConfig":{"name":"jwks","version":"0.0.99"}}}}}}}' >/dev/null
+  t10_app teknoir-default-jwks profile-plugin-jwks 0.0.99 -
+  kc -n teknoir-system patch applications.argoproj.io teknoir-default-jwks --type merge -p "$(jq -cn --arg uid "$(uid_of profiles.teknoir.org teknoir-default)" \
+    '{metadata: {ownerReferences: [{apiVersion: "teknoir.org/v1", kind: "Profile", name: "teknoir-default", uid: $uid}]}}')" >/dev/null
+  echo succeed > "${WORK}/t10/mode"
+  t10_post 60
+  assert_eq "run 2 (re-sync succeeds): post exits 0 with the teamspace Application still Unknown" 0 "${T10_RC}"
+  (( T10_RC == 0 )) || tail -20 <<<"${T10_OUT}" >&2
+  assert_eq "run 2: one more re-sync patch (once per run)" 2 "$(grep -c . "${WORK}/t10/ops.log")"
+  assert_eq "run 2: argo still never patched" "" "$(kc -n teknoir-system get applications.argoproj.io argo -o jsonpath='{.operation}')"
+  if grep -qE '^teknoir-default-jwks +Synced +Healthy +0\.0\.99 +teamspace/teknoir-default$' <<<"${T10_OUT}"; then
+    pass "run 2: the Profile's Application is strict (no *) and ready"
+  else fail "run 2: teknoir-default-jwks not listed as a strict ready teamspace Application"; fi
+  assert_eq "run 2: monitoring's last operation Succeeded" Succeeded \
+    "$(kc -n teknoir-system get applications.argoproj.io monitoring -o jsonpath='{.status.operationState.phase}')"
+  assert_eq "run 2: previous-password removed after the 200 login" 0 \
+    "$(kc -n teknoir-auth get secret keycloak-admin -o json | jq '.data | has("previous-password") | if . then 1 else 0 end')"
+  assert_eq "run 2: username and password kept" '["password","username"]' "$(kc -n teknoir-auth get secret keycloak-admin -o json | jq -c '.data | keys')"
+  assert_eq "run 2: the removal is reported" 1 "$(grep -c 'changed: removed key previous-password from Secret teknoir-auth/keycloak-admin' <<<"${T10_OUT}")"
+  assert_eq "run 2: one master-realm token request" 1 "$(grep -c '^POST /realms/master/protocol/openid-connect/token$' "${WORK}/t10/kc/requests.log")"
+
+  # run 3: key password does not log in (401) -> previous-password is kept, with a WARN
+  pw="$(dummy | tr -d '\n')"
+  rv="$(kc -n teknoir-auth get secret keycloak-admin -o jsonpath='{.metadata.resourceVersion}')"
+  kc -n teknoir-auth patch secret keycloak-admin --type merge \
+    -p "{\"data\":{\"password\":\"$(printf '%s' "${pw}" | base64 -w0)\",\"previous-password\":\"$(base64 -w0 < "${WORK}/t10/kc/previous")\"}}" >/dev/null
+  t10_post 30
+  assert_eq "run 3 (401): post exits 0" 0 "${T10_RC}"
+  assert_eq "run 3: no re-sync (monitoring's last sync Succeeded)" 2 "$(grep -c . "${WORK}/t10/ops.log")"
+  assert_eq "run 3: previous-password kept" 1 \
+    "$(kc -n teknoir-auth get secret keycloak-admin -o json | jq '.data | has("previous-password") | if . then 1 else 0 end')"
+  if grep -q 'WARN: keycloak-admin: the master admin does not log in with key password of Secret teknoir-auth/keycloak-admin (HTTP 401): previous-password is kept' <<<"${T10_OUT}"; then
+    pass "run 3: the WARN says why it is kept"
+  else fail "run 3: no WARN for the 401"; fi
+  [[ "$(kc -n teknoir-auth get secret keycloak-admin -o jsonpath='{.metadata.resourceVersion}')" != "${rv}" ]] || fail "run 3: the test's own patch did not apply"
+  t10_stop_helpers
+
+  # nothing secret in any output or node log (the dummy values as grep patterns)
+  ( umask 077; { cat "${WORK}/t10/kc/password"; echo; cat "${WORK}/t10/kc/previous"; echo; printf '%s\n' "${pw}"; } > "${WORK}/t10/kc/patterns" )
+  if grep -rqF -f "${WORK}/t10/kc/patterns" "${WORK}/t10/log" "${WORK}/t10/outputs.log"; then
+    fail "a Keycloak admin password reached the output or a node log"
+  else pass "no Keycloak admin password in the output or the node logs"; fi
+  assert_eq "every run log is mode 0600" 0 "$(find "${WORK}/t10/log" -type f ! -perm 600 | wc -l)"
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 main() {
@@ -1248,7 +1489,7 @@ main() {
   trap cleanup EXIT
 
   local t basic=()
-  for t in "${tests[@]}"; do case "${t}" in T6|T9) ;; *) basic+=("${t}") ;; esac; done
+  for t in "${tests[@]}"; do case "${t}" in T6|T9|T10) ;; *) basic+=("${t}") ;; esac; done
   if (( ${#basic[@]} )); then
     use_cluster "${PREFIX}"
     for t in "${basic[@]}"; do "${t,,}"; done
@@ -1263,6 +1504,10 @@ main() {
   if [[ " ${tests[*]} " == *" T9 "* ]]; then
     if t9_ready; then use_cluster "${PREFIX}-t9" top; t9; finish_cluster
     else tl_case T9 "migration rehearsal on the legacy fixture"; skip_case "${T9_WHY}"; fi
+  fi
+  if [[ " ${tests[*]} " == *" T10 "* ]]; then
+    if t10_ready; then use_cluster "${PREFIX}-t10"; t10; finish_cluster
+    else tl_case T10 "post phase on stand-in Applications"; skip_case "${T10_WHY}"; fi
   fi
   tl_summary
 }

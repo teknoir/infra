@@ -1180,3 +1180,116 @@ Follow migration_for_live_env M0-M6 with the new bundle: backup, migrate --dry-r
 - Node /opt/k3s/agent/images stale tarballs not in the current bundle: goharbor *_v2.15.2, valkey-photon, busybox_1.28/latest if unused, dex, redis 8.6.4 if unused (pruned by host phase)
 - Harbor robot$argocd and the ArgoCD repo-creds Secret using it, after the credential-less repository is live
 - vpro infra-teknoir-local/bundle/teknoir-airgap-bundle-0.1.0 and the plaintext .secrets/: move to an encrypted backup, then delete
+
+## r5 (app-of-apps 0.0.5)
+
+Design changes of release r5. Each subsection belongs to one work package; the
+plan and the facts behind it are in the r5 hardening plan.
+
+### Post phase classification, failed-sync re-sync, keycloak-admin clean-up, migrate --finalize (infra lib/release.sh, lib/migrate.sh)
+
+- **Which Applications post waits for (R2).** Platform: the root `app-of-apps`
+  and every Application whose `argocd.argoproj.io/tracking-id` starts with
+  `app-of-apps:` (or `<ns>_app-of-apps:`). Teamspace: an ownerReference of kind
+  `Profile`; strict only when that Profile itself carries an ArgoCD tracking-id
+  (declared in GitOps by the profile-controller chart, contract K3) and the
+  ownerReference uid matches. Platform and strict teamspace Applications must be
+  ready; all others (teamspaces created in Backstage, Applications with no
+  Teknoir owner) are listed in one WARN and never block. The root must exist.
+  `teknoir-node status` prints one `apps:` line per class; the table has a
+  CLASS column (`*` = reported only). The same rules gate `migrate --finalize`.
+- **A Profile declared in GitOps is itself waited for (TS-C6).** Its
+  Applications only exist once profile-controller has reconciled it, so without
+  this a Profile with none (profile-controller down, or Forbidden by its RBAC)
+  or only some would add nothing to wait for. Post adds a strict entry
+  `profile/<name>` that is not ready while `status.appliedconfig.lastRunStart`
+  is missing ("not reconciled by profile-controller yet"), while `lastRunEnd`
+  is missing or earlier ("run in progress"), while the Profile owns no
+  Application (owner uid checked), or while an enabled chart plugin's
+  Application is missing (profile-controller names it
+  `<profile>-<pluginConfig.name>`). A plugin whose `applyStatus.status` is not
+  `Success` is only reported: EMQX's fails until the EMQX pod answers its API,
+  and profile-controller retries with a backoff of up to ~17 min, which would
+  fail `up` on timing alone (E11 asserts every plugin `Success` on the VM).
+  Profiles not declared in GitOps get the same entry, reported only. Only
+  names, uids, run times and plugin kind/enabled/chart/status are read; never
+  a plugin's configuration. `status` prints one `profile:` line per Profile.
+- **The wait (TS-C6).** Without `--wait-timeout`, post waits
+  POST_WAIT_DEFAULT (1200 s) on an update and POST_WAIT_FIRST_INSTALL (2700 s)
+  on a first install. An update that creates a teamspace declared in GitOps
+  gets 2700 s too, counted from the start of the wait, as soon as one poll
+  sees it being created (`_release_post_creating`): a strict Profile that
+  profile-controller has not run for, or whose Applications are not all
+  created yet (a run in progress alone does not count), or a strict teamspace
+  Application that is not ready and has an empty `status.history` (ArgoCD adds
+  an entry per successful sync, so it has never synced). The r5 update creates
+  `teknoir-default` this way: the root pin, the profile-controller sync, its
+  reconcile and the first sync of 9 charts (MongoDB's init included) all fall
+  in one `up`, next to Keycloak, Harbor and Backstage restarts, which can take
+  longer than 20 min. An explicit `--wait-timeout` is never extended. The
+  timeout error says that re-running `up` is safe.
+- **Failed last sync (HYG-C3).** `why()` reports `last sync to <rev> <phase>:
+  <message>` when `.status.operationState.phase` is Failed or Error, its
+  revision (`syncResult.revision[s]`, else `operation.sync.revision[s]`) equals
+  `.status.sync.revision[s]`, and no `.operation` is pending; a pending
+  `.operation` is itself not ready ("requested, not started yet"), which closes
+  the window between the re-sync patch and the controller picking it up. Post
+  re-syncs each such *platform* Application, but only while that failure is
+  about the spec the Application keeps: its own status is not stale (no
+  operation pending or running, `comparedTo` equals the spec's source[s], an
+  exact chart pin equals `status.sync.revision`, the root reconciled since this
+  run's pin) and, for a child, the root is `Synced` with a status that is not
+  stale either. Right after a pin the old revision's failure is still in the
+  status (the root has not synced the new child spec yet, or ArgoCD has not
+  compared the child's new spec); re-syncing it would re-apply the superseded
+  chart, spend the once-per-run budget and, with the spec's retry, hold an
+  operation that blocks the new revision's auto-sync. The root's own failure
+  at its current pin makes the root the candidate. At most once per run
+  (RELEASE_RESYNCED) with one merge patch: `metadata.resourceVersion` (the
+  apiserver rejects a stale write with 409; retried at the next poll),
+  `.operation` = {initiatedBy teknoir-node, sync {revision[s] it is at,
+  prune = `spec.syncPolicy.automated.prune`, syncOptions from the spec}, retry =
+  `spec.syncPolicy.retry` or ArgoCD's default `{limit: 5}`}, and
+  `status.operationState: null`. That mirrors ArgoCD's SetAppOperation and
+  auto-sync. Setting `.operation` alone makes the controller merge the new
+  operation into the stale state (it writes operationState with a JSON merge
+  patch and the empty fields are omitempty) and fail at once (live, 05:40).
+  Dry-run records the re-sync as a would-change. Teamspace (and other)
+  Applications are never re-synced (R2). ArgoCD never retries a failed
+  revision either, so `why()` adds to such an Application's failed-sync reason
+  that post re-syncs platform Applications only and how to sync it (ArgoCD UI,
+  or the OPERATE section 12 patch). Otherwise a strict teamspace Application
+  whose first sync spent its retries would fail every `up` with no way out
+  named.
+- **keycloak-admin `previous-password` (SEC-C10).** After the wait, post reads
+  only the resourceVersion and the key names of `teknoir-auth/keycloak-admin`.
+  With `previous-password` and `password` present, it logs in to realm master
+  with `password` (admin-cli password grant, credentials in a curl config on a
+  pipe, through the gateway on NODE_IP with the platform CA). On 200 it removes
+  the key with a JSON patch whose first op tests the resourceVersion; on 400/401
+  or any other status it keeps it with a WARN. Dry-run does not log in. Post
+  also warns while `teknoir-system/argocd-initial-admin-secret` exists.
+- **`migrate --finalize [--i-know]` (SEC-C10).** Refuses unless: no Teknoir
+  K3s file or Addon is left (teknoir-argo included); every retired
+  `*.yaml|*.yml|*.json` keeps `<manifests>/<name>.skip`; the post phase's
+  strict Applications are ready; and `/var/lib/teknoir-airgap/exports` holds an
+  age file (`age-encryption.org/v1` header) whose backup stamp (UTC in its
+  name, else its mtime) is newer than the newest `manifests-retired/<UTC>` dir.
+  `--i-know` waives only the export check (an encrypted copy kept off the
+  node). It then shreds every retired file (symlinks are unlinked, never
+  followed), removes the directories and `manifests-retired`, and logs names
+  only. The `.skip` guards are never touched. New retirements are mode 0600.
+- **`migrate --argo` ownership check (HYG-C6).** An object of the detached file
+  is ArgoCD's when it carries the `argo` tracking-id or is a Synced entry of the
+  `argo` Application's `.status.resources` (mapped to `Kind.v1.` / `Kind.group`).
+  `argocd-tls-certs-cm` and objects labelled
+  `app.kubernetes.io/managed-by=teknoir-node` are logged as converge-owned; only
+  the rest is warned. The secrets phase now applies that label to
+  `argocd-tls-certs-cm` (one label-only server-side apply on the next `up`).
+- **Tests.** `airgap/test/unit/release-ready-test.sh` (classification, reasons,
+  candidates, patch body, wait loop with a stub controller, keycloak clean-up,
+  status lines), `airgap/test/unit/migrate-argo-untracked-test.sh`, k3d
+  `run.sh T10` (the real runner's post phase against stand-in Applications and
+  `stubs/fake-keycloak.py`) and `migrate-test.sh` (CRD adoption via status,
+  0600 retirements, every finalize refusal and the shred). VM: E1/E10/E15 assert
+  operationState Succeeded and a non-empty admission `caBundle` (WP-I-E2E).

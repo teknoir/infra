@@ -9,10 +9,32 @@
 #   Guard: versions in the broken list are always refused; a version older
 #   than the deployed one only with --rollback (which is recorded, so the
 #   next plain converge with that bundle is not a downgrade any more).
-# post: wait until every Application is Synced/Healthy at its current spec
-#   (report per app on timeout), check every running image is re-pullable
-#   (Harbor) or present (containerd), and prune old bundle payloads (keep
-#   current + previous).
+# post: wait until every Application of the platform is Synced/Healthy at its
+#   current spec (report per app on timeout), check every running image is
+#   re-pullable (Harbor) or present (containerd), remove the Keycloak admin's
+#   previous-password once the current one works, and prune old bundle
+#   payloads (keep current + previous).
+#   Which Applications post waits for (r5, R2): the platform ones - the root
+#   ROOT_APP and every Application whose argocd.argoproj.io/tracking-id names
+#   the root ("<ROOT_APP>:...", ArgoCD annotation tracking) - and the
+#   teamspace ones (an ownerReference of kind Profile) whose Profile is
+#   declared in GitOps (the Profile itself carries an ArgoCD tracking-id, e.g.
+#   teknoir-default). Such a Profile is itself waited for until
+#   profile-controller has run for it and created its Applications (one per
+#   enabled chart plugin); failed plugins (e.g. EMQX before its pod answers)
+#   are only reported. Other teamspaces (created in Backstage, e.g.
+#   teknoir-demo) and any other Application are reported, never waited for.
+#   An update that creates such a teamspace waits as long as a first install.
+#   post never re-syncs a teamspace Application; the reason of its failed sync
+#   says how to retry it.
+#   A platform Application whose last sync of its current revision Failed (or
+#   Errored) and that has no operation pending is not ready, and post re-syncs
+#   it once per run the way ArgoCD's own API does: one merge patch that sets
+#   .operation and clears .status.operationState (never .operation alone: the
+#   controller would resume the stale failed state). Only while that failure
+#   is about the spec the Application keeps: its status was computed for its
+#   current spec and, for a child, the root is Synced at its own current spec
+#   (else the failure belongs to a revision a pin has just superseded).
 #   Synced/Healthy alone is not enough: right after the pin changes, ArgoCD
 #   still shows the old revision's status until it has compared again (and
 #   the children go through the same window after the root syncs). An
@@ -24,8 +46,12 @@
 #   ArgoCD to refresh the root right after the pin, so that wait is seconds.
 # shellcheck source-path=SCRIPTDIR
 # shellcheck disable=SC2016 # jq programs use $variables in single quotes
-# shellcheck source=common.sh
-source "${NODE_ROOT}/lib/common.sh"
+# lib/migrate.sh sources this file lazily (migrate --finalize) after
+# common.sh is loaded, possibly from a payload without lib/ (test drivers).
+if [[ -z "${TEKNOIR_COMMON_SOURCED:-}" ]]; then
+  # shellcheck source=common.sh
+  source "${NODE_ROOT}/lib/common.sh"
+fi
 
 RELEASE_NS="teknoir-system"
 RELEASE_CM="teknoir-airgap-release"
@@ -37,34 +63,164 @@ APP_CRD="applications.argoproj.io"
 # (brokenAppOfApps).
 BROKEN_APP_OF_APPS_DEFAULT="0.0.1 0.0.2"
 RELEASE_HISTORY_MAX=10
-POST_WAIT_DEFAULT=1200
-POST_WAIT_FIRST_INSTALL=2700
+# post's wait without --wait-timeout: an update, and a first install (also
+# used when this run creates a teamspace declared in GitOps, see
+# post_wait_applications). Environment overrides are test knobs.
+POST_WAIT_DEFAULT="${POST_WAIT_DEFAULT:-1200}"
+POST_WAIT_FIRST_INSTALL="${POST_WAIT_FIRST_INSTALL:-2700}"
 POST_POLL="${POST_POLL:-15}"
 BUNDLES_KEEP_PREVIOUS=1
 # Epoch second just before this run applied the root pin (0: not this run).
 RELEASE_PIN_AT=0
+PROFILE_CRD="profiles.teknoir.org"
+# Platform Applications re-synced by this run (post re-syncs each at most once).
+declare -gA RELEASE_RESYNCED=()
+# Keycloak master admin (gitops charts/auth): key previous-password is only
+# needed until the auth sync has rotated the admin to key password.
+RELEASE_KC_NS="teknoir-auth"
+RELEASE_KC_SECRET="keycloak-admin"
+RELEASE_KC_CODE=""
+ARGOCD_INITIAL_ADMIN_SECRET="argocd-initial-admin-secret"
 
 # jq: why($root; $pinAt) is "" for a ready Application, else the reasons.
+# A Failed/Error last operation counts only when it synced the revision the
+# Application is at now (an older failure was superseded) and no operation is
+# pending (.operation set: requested or running).
+# stale($root; $pinAt) is the subset that says the status does not describe
+# the current spec yet (an operation pending or running, compared with another
+# source, another chart revision than the pin, the root not reconciled since
+# this run's pin). resync_candidate: a platform Application is re-synced only
+# when its failed operation is about the spec it has now - its own status is
+# not stale and, for a child, the root is Synced with a status that is not
+# stale either (else the child's spec may be about to change: right after a
+# pin, the old revision's failure must never be re-applied). resync_hint: post
+# never re-syncs a teamspace (or other) Application (R2) and ArgoCD never
+# retries a failed revision, so the reason of such a failure says how to retry
+# (and, when it blocks post, to run up again afterwards).
 RELEASE_JQ_READY='
 def exactver: test("^[0-9]+\\.[0-9]+\\.[0-9]+([-+][0-9A-Za-z.-]+)?$");
 def epoch: (try (sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) catch 0);
 def nilempty: if . == [] or . == {} then null else . end;
-def why($root; $pinAt):
+def revstr: if type == "array" then join(",") else tostring end;
+def oprev: (.status.operationState.syncResult.revision // .status.operationState.syncResult.revisions
+            // .status.operationState.operation.sync.revision // .status.operationState.operation.sync.revisions // null);
+def currev: (.status.sync.revision // .status.sync.revisions // null);
+def failedop: ((.status.operationState.phase // "") | IN("Failed", "Error"))
+              and .operation == null and oprev != null and oprev == currev;
+def opwhy:
+  if ((.status.operationState.phase // "") | IN("Running", "Terminating"))
+  then "sync operation \(.status.operationState.phase)"
+  elif .operation != null then "sync operation requested, not started yet"
+  else empty end;
+def specwhy($root; $pinAt):
   (.spec.source // null) as $src
-  | [ (if (.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy"
-       then "\(.status.sync.status // "Unknown")/\(.status.health.status // "Unknown")" else empty end),
-      (if ((.status.operationState.phase // "") | IN("Running", "Terminating"))
-       then "sync operation \(.status.operationState.phase)" else empty end),
-      (if ($src | nilempty) != (.status.sync.comparedTo.source // null | nilempty)
-          or (.spec.sources // null | nilempty) != (.status.sync.comparedTo.sources // null | nilempty)
-       then "status not computed for the current spec yet (compared: \(.status.sync.comparedTo.source.targetRevision // "nothing"))"
-       else empty end),
-      (if ($src.chart // "") != "" and (($src.targetRevision // "") | exactver)
-          and (.status.sync.revision // "") != $src.targetRevision
-       then "synced revision \(.status.sync.revision // "none"), pinned \($src.targetRevision)" else empty end),
-      (if .metadata.name == $root and $pinAt > 0 and ((.status.reconciledAt // "") | epoch) <= $pinAt
-       then "not reconciled since this run pinned it" else empty end)
-    ] | join("; ");
+  | (if ($src | nilempty) != (.status.sync.comparedTo.source // null | nilempty)
+        or (.spec.sources // null | nilempty) != (.status.sync.comparedTo.sources // null | nilempty)
+     then "status not computed for the current spec yet (compared: \(.status.sync.comparedTo.source.targetRevision // "nothing"))"
+     else empty end),
+    (if ($src.chart // "") != "" and (($src.targetRevision // "") | exactver)
+        and (.status.sync.revision // "") != $src.targetRevision
+     then "synced revision \(.status.sync.revision // "none"), pinned \($src.targetRevision)" else empty end),
+    (if .metadata.name == $root and $pinAt > 0 and ((.status.reconciledAt // "") | epoch) <= $pinAt
+     then "not reconciled since this run pinned it" else empty end);
+def stale($root; $pinAt): [opwhy, specwhy($root; $pinAt)];
+def resync_hint:
+  if failedop and (.teknoirPost.class // "platform") != "platform"
+  then "post re-syncs platform Applications only: Sync this one in the ArgoCD UI (or with the patch in OPERATE section 12)\(
+        if .teknoirPost.strict == true then ", then run up again" else "" end)"
+  else empty end;
+def why($root; $pinAt):
+  [ (if (.status.sync.status // "") != "Synced" or (.status.health.status // "") != "Healthy"
+     then "\(.status.sync.status // "Unknown")/\(.status.health.status // "Unknown")" else empty end),
+    opwhy,
+    (if failedop
+     then "last sync to \(oprev | revstr) \(.status.operationState.phase): \((.status.operationState.message // "no message") | .[0:200])"
+     else empty end),
+    resync_hint,
+    specwhy($root; $pinAt)
+  ] | join("; ");
+def resync_candidate($root; $pinAt; $rootapp):
+  failedop and (stale($root; $pinAt) | length) == 0
+  and (.metadata.name == $root
+       or ($rootapp != null and ($rootapp.status.sync.status // "") == "Synced"
+           and ($rootapp | stale($root; $pinAt) | length) == 0));
+'
+
+# jq: classify($root; $profiles) - which Applications post waits for (R2).
+#   platform   the root, or tracked by it (tracking-id "<root>:..." or, with
+#              apps in any namespace, "<ns>_<root>:..."): strict
+#   teamspace  an ownerReference of kind Profile: strict only when that
+#              Profile carries an ArgoCD tracking-id (declared in GitOps)
+#   other      anything else: reported only
+# $profiles: {"<name>": {"uid": "...", "tracked": true|false}}. The result is
+# stored on each item as .teknoirPost = {class, strict, profile}.
+# A Profile itself gets a pseudo-entry (profile_why, on the summary of
+# _release_profiles_summary): its Applications must exist before there is
+# anything to wait for. Not ready while profile-controller has not run for it
+# (no appliedconfig.lastRunStart) or is running (lastRunEnd before
+# lastRunStart), while it owns no Application, or while an Application of an
+# enabled chart plugin (profile-controller names it <profile>-<chart name>) is
+# missing. A plugin whose applyStatus is not Success is only noted
+# (profile_note): EMQX's fails until the EMQX pod answers and profile-controller
+# retries it with a backoff of up to ~17 min, which would fail up on timing.
+RELEASE_JQ_CLASSIFY='
+def tracked_by($app): ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | test("^([^:]*_)?" + $app + ":"));
+def classify($root; $profiles):
+  ([.metadata.ownerReferences[]? | select(.kind == "Profile")][0] // null) as $own
+  | if .metadata.name == $root or tracked_by($root) then {class: "platform", strict: true, profile: ""}
+    elif $own != null then
+      ($profiles[$own.name] // null) as $p
+      | {class: "teamspace", profile: $own.name,
+         strict: ($p != null and $p.tracked and (($own.uid // "") == "" or $own.uid == $p.uid))}
+    else {class: "other", strict: false, profile: ""} end;
+def profile_owned($apps):
+  .name as $n | .uid as $uid
+  | [$apps[] | select(any(.metadata.ownerReferences[]?; .kind == "Profile" and .name == $n
+                          and ((.uid // "") == "" or $uid == "" or .uid == $uid))) | .metadata.name];
+def profile_create_why($apps):
+  # the Applications profile-controller has not created yet (empty: all there,
+  # or it has not run at all)
+  . as $p
+  | ($p | profile_owned($apps)) as $owned
+  | ([$p.plugins[] | select(.enabled and .chart != "") | "\($p.name)-\(.chart)"] | unique) as $expected
+  | ($expected - $owned) as $missing
+  | if $p.lastRunStart == "" then empty
+    elif ($owned | length) == 0 and (($p.plugins | length) == 0 or ($expected | length) > 0)
+    then "no Applications yet\(if ($expected | length) > 0 then " (expected \($expected | length): \($expected | join(", ")))" else "" end)"
+    elif ($missing | length) > 0 then "Applications not created yet: \($missing | join(", "))"
+    else empty end;
+def profile_why($apps):
+  [ (if .lastRunStart == "" then "not reconciled by profile-controller yet"
+     elif (.lastRunEnd | epoch) < (.lastRunStart | epoch)
+     then "profile-controller run in progress (started \(.lastRunStart))"
+     else empty end),
+    profile_create_why($apps)
+  ] | join("; ");
+# being created: profile-controller has not run for it or not created all its
+# Applications yet (a run in progress alone is not creation)
+def profile_creating($apps): .lastRunStart == "" or ([profile_create_why($apps)] | length) > 0;
+def profile_note:
+  [.plugins[] | select(.enabled and .status != "Success") | "\(.kind) \(if .status == "" then "not applied" else .status end)"]
+  | if length > 0 then "plugin(s) not applied: \(join(", "))" else "" end;
+'
+
+# jq: resync_patch - the one merge patch that re-syncs an Application the way
+# ArgoCD's SetAppOperation and auto-sync do: the operation (revision it is at,
+# prune and syncOptions of its sync policy, its retry or ArgoCD's default 5)
+# plus status.operationState cleared in the same write, guarded by the
+# resourceVersion it was read at (a concurrent change makes it fail: 409).
+RELEASE_JQ_RESYNC='
+def resync_patch:
+  {metadata: {resourceVersion: .metadata.resourceVersion},
+   operation: {initiatedBy: {username: "teknoir-node"},
+               sync: ({prune: (.spec.syncPolicy.automated.prune // false),
+                       syncOptions: (.spec.syncPolicy.syncOptions // null)}
+                      + (if (.spec.sources // [] | length) > 0
+                         then {revisions: (.status.sync.revisions // null)}
+                         else {revision: (.status.sync.revision // null)} end)
+                      | with_entries(select(.value != null))),
+               retry: (.spec.syncPolicy.retry // {limit: 5})},
+   status: {operationState: null}};
 '
 
 # Filled by release_load_record.
@@ -217,6 +373,7 @@ release_request_refresh() {
 }
 
 release_status() {
+  local json
   release_load_record
   case "${REC_SOURCE}" in
     configmap)
@@ -226,18 +383,76 @@ release_status() {
     application) printf 'release:   no release record; root Application pins app-of-apps %s\n' "${REC_AOA}" ;;
     none) printf 'release:   nothing deployed yet\n' ;;
   esac
+  crd_established "${APP_CRD}" || return 0
+  json="$(_release_applications_json)"
+  # which Applications `up` waits for (R2), with how many are not ready
+  "${JQ}" -r --arg root "${ROOT_APP}" "${RELEASE_JQ_READY}"'
+    [.items[] | {k: (if .teknoirPost.class == "platform" then "platform"
+                     elif .teknoirPost.class == "teamspace" then "teamspace \(.teknoirPost.profile)"
+                     else "other" end),
+                 strict: .teknoirPost.strict, bad: (why($root; 0) != "")}]
+    | group_by([.k, .strict])[]
+    | "apps:      \(.[0].k): \(length) Application(s), \(map(select(.bad)) | length) not ready (\(
+        if .[0].strict then "up waits for them" else "reported only, never block up" end))"' <<<"${json}"
+  # the teamspaces' own state: has profile-controller created their Applications
+  "${JQ}" -r '
+    .teknoirProfiles[]?
+    | "profile:   \(.name) (\(if .strict then "declared in GitOps, up waits for it" else "not in GitOps, reported only" end)): \(
+        if .why == "" then "\(.apps) Application(s) created" else "not ready: \(.why)" end)\(
+        if .note != "" then "; \(.note) (reported only)" else "" end)"' <<<"${json}"
 }
 
 # ---------------------------------------------------------------------------
 # post
 # ---------------------------------------------------------------------------
+_release_profiles_summary() {
+  # _release_profiles_summary <profiles-list-json> - per Profile its name, uid,
+  # whether ArgoCD tracks it (declared in GitOps) and profile-controller's run
+  # state: run times and, per plugin, enabled, chart name and apply status.
+  # Never a plugin's configuration.
+  "${JQ}" -c '[.items[]? | {name: .metadata.name, uid: (.metadata.uid // ""),
+      tracked: ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") != ""),
+      lastRunStart: (.status.appliedconfig.lastRunStart // ""),
+      lastRunEnd: (.status.appliedconfig.lastRunEnd // ""),
+      plugins: [(.status.appliedconfig.plugins // {}) | to_entries[] | {kind: .key,
+        enabled: (.value.appliedConfig.settings.enabled == true),
+        chart: ((.value.appliedConfig.pluginConfig.name // "") | if type == "string" then . else "" end),
+        status: ((.value.applyStatus.status // "") | tostring)}]}]' <<<"$1"
+}
+
+_release_classify() {
+  # _release_classify <applications-list-json> <profiles-list-json> - the
+  # Application list with .teknoirPost = {class, strict, profile} on every item,
+  # plus .teknoirProfiles: one pseudo-entry per Profile {name, strict (declared
+  # in GitOps), apps (owned), why (not ready: blocks post when strict),
+  # creating (its Applications are not all created yet), note (plugin
+  # failures: reported only)}.
+  local profiles
+  profiles="$(_release_profiles_summary "$2")"
+  "${JQ}" -c --arg root "${ROOT_APP}" --argjson profiles "${profiles}" "${RELEASE_JQ_READY}${RELEASE_JQ_CLASSIFY}"'
+    ($profiles | map({key: .name, value: .}) | from_entries) as $pmap
+    | .items |= map(. + {teknoirPost: classify($root; $pmap)})
+    | .items as $apps
+    | .teknoirProfiles = [$profiles[] | {name, strict: .tracked, apps: (profile_owned($apps) | length),
+                                         why: profile_why($apps), creating: profile_creating($apps),
+                                         note: profile_note}]' <<<"$1"
+}
+
 _release_applications_json() {
-  kc -n "${RELEASE_NS}" get "${APP_CRD}" -o json || die "cannot list Applications"
+  # Every Application in RELEASE_NS, classified (_release_classify) against
+  # the Profiles (none while the Profile CRD is not installed).
+  local apps profiles='{"items":[]}'
+  apps="$(kc -n "${RELEASE_NS}" get "${APP_CRD}" -o json)" || die "cannot list Applications"
+  if crd_established "${PROFILE_CRD}"; then
+    profiles="$(kc get "${PROFILE_CRD}" -o json)" || die "cannot list Profiles"
+  fi
+  _release_classify "${apps}" "${profiles}"
 }
 
 post_application_table() {
-  # Name, sync, health, revision; plus, for every Application that is not
-  # ready (see RELEASE_JQ_READY), why and its last operation message.
+  # Name, sync, health, revision and class; plus, for every Application that
+  # is not ready (see RELEASE_JQ_READY), why and its last operation message.
+  # Classes marked * are reported only: they never make post wait or fail.
   local json
   if ! crd_established "${APP_CRD}"; then
     printf 'apps:      ArgoCD is not installed\n'
@@ -246,49 +461,155 @@ post_application_table() {
   json="$(_release_applications_json)"
   "${JQ}" -r '
     def rev: (.status.sync.revision // .spec.source.targetRevision // "-");
+    def cls: (if .teknoirPost.class == "platform" then "platform"
+              elif .teknoirPost.class == "teamspace" then "teamspace/\(.teknoirPost.profile)"
+              else "other" end) + (if .teknoirPost.strict then "" else "*" end);
     .items | sort_by(.metadata.name)[] |
-    [.metadata.name, (.status.sync.status // "Unknown"), (.status.health.status // "Unknown"), rev] | @tsv' <<<"${json}" \
-    | awk -F'\t' 'BEGIN {printf "%-26s %-10s %-12s %s\n", "APPLICATION", "SYNC", "HEALTH", "REVISION"}
-                  {printf "%-26s %-10s %-12s %s\n", $1, $2, $3, $4}'
+    [.metadata.name, (.status.sync.status // "Unknown"), (.status.health.status // "Unknown"), rev, cls] | @tsv' <<<"${json}" \
+    | awk -F'\t' 'BEGIN {printf "%-32s %-10s %-12s %-10s %s\n", "APPLICATION", "SYNC", "HEALTH", "REVISION", "CLASS"}
+                  {printf "%-32s %-10s %-12s %-10s %s\n", $1, $2, $3, $4, $5}'
   "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
-    .items[] | why($root; $pinAt) as $w | select($w != "") |
-    "  \(.metadata.name): \($w) | \((.status.operationState.phase // "no operation")) \((.status.operationState.message // (.status.conditions // [] | map(.message) | join("; ")) // "") | .[0:300])"' <<<"${json}"
+    if any(.items[]; .teknoirPost.strict | not) then "(* reported only: up never waits for these)" else empty end,
+    (.items[] | why($root; $pinAt) as $w | select($w != "") |
+    "  \(.metadata.name)\(if .teknoirPost.strict then "" else " [reported only]" end): \($w) | \((.status.operationState.phase // "no operation")) \((.status.operationState.message // (.status.conditions // [] | map(.message) | join("; ")) // "") | .[0:300])"),
+    (.teknoirProfiles[]? | select(.why != "") |
+    "  profile/\(.name)\(if .strict then "" else " [reported only]" end): \(.why)"),
+    (.teknoirProfiles[]? | select(.note != "") | "  profile/\(.name) [reported only]: \(.note)")' <<<"${json}"
 }
 
 _release_post_not_ready() {
-  # "name<TAB>reasons" of every Application that is not ready (one line when
-  # none exist yet).
+  # "name<TAB>reasons" of every strict Application (platform, or a teamspace
+  # declared in GitOps) that is not ready; one line while the root
+  # Application does not exist yet. Plus "profile/<name><TAB>reasons" for a
+  # Profile declared in GitOps whose Applications profile-controller has not
+  # created yet (profile_why).
   "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
-    if (.items | length) == 0 then "(no Applications yet)\twaiting for ArgoCD to create them" else
-    .items[] | why($root; $pinAt) as $w | select($w != "") | "\(.metadata.name)\t\($w)" end' <<<"$1"
+    (if any(.items[]; .metadata.name == $root) | not then "\($root)\tnot created yet (waiting for the release phase or ArgoCD)" else
+     .items[] | select(.teknoirPost.strict) | why($root; $pinAt) as $w | select($w != "") | "\(.metadata.name)\t\($w)" end),
+    (.teknoirProfiles[]? | select(.strict and .why != "") | "profile/\(.name)\t\(.why)")' <<<"$1"
+}
+
+_release_post_creating() {
+  # The teamspaces declared in GitOps that this run is creating, space
+  # separated (empty: none): a strict Profile whose Applications
+  # profile-controller has not all created yet (or not run for it at all), or
+  # a strict teamspace Application that is not ready and has never completed a
+  # sync (empty .status.history: ArgoCD adds an entry per successful sync).
+  "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
+    [ (.teknoirProfiles[]? | select(.strict and .creating) | .name),
+      (.items[] | select(.teknoirPost.strict and .teknoirPost.class == "teamspace")
+       | select((.status.history // []) | length == 0)
+       | select(why($root; $pinAt) != "") | .teknoirPost.profile)
+    ] | unique | join(" ")' <<<"$1"
+}
+
+_release_post_reported() {
+  # "name<TAB>class<TAB>reasons" of everything not ready that post only
+  # reports: Applications of a teamspace not declared in GitOps or with no
+  # known owner, such a teamspace's Profile, and any teamspace's failed
+  # plugins (profile_note).
+  "${JQ}" -r --arg root "${ROOT_APP}" "${RELEASE_JQ_READY}"'
+    (.items[] | select(.teknoirPost.strict | not) | why($root; 0) as $w | select($w != "")
+     | "\(.metadata.name)\t\(if .teknoirPost.class == "teamspace" then "teamspace \(.teknoirPost.profile), not declared in GitOps" else "no Teknoir owner" end)\t\($w)"),
+    (.teknoirProfiles[]? | select((.strict | not) and .why != "")
+     | "profile/\(.name)\tteamspace \(.name), not declared in GitOps\t\(.why)"),
+    (.teknoirProfiles[]? | select(.note != "")
+     | "profile/\(.name)\tteamspace \(.name), plugin status (profile-controller retries)\t\(.note)")' <<<"$1"
+}
+
+_release_resync_candidates() {
+  # Names of the platform Applications whose last sync of their current
+  # revision Failed/Errored and that have no operation pending (HYG-C3), and
+  # only while that status describes the spec they will keep: their own status
+  # is not stale and, for a child, the root is Synced and not stale either
+  # (resync_candidate). Right after a pin, a failure of the superseded
+  # revision is never re-synced; the new revision's auto-sync replaces it.
+  "${JQ}" -r --arg root "${ROOT_APP}" --argjson pinAt "${RELEASE_PIN_AT:-0}" "${RELEASE_JQ_READY}"'
+    ([.items[] | select(.metadata.name == $root)][0] // null) as $rootapp
+    | .items[] | select(.teknoirPost.class == "platform")
+    | select(resync_candidate($root; $pinAt; $rootapp)) | .metadata.name' <<<"$1"
+}
+
+_release_resync_patch() {
+  # _release_resync_patch <application-json> - the merge patch body (one line).
+  "${JQ}" -c "${RELEASE_JQ_RESYNC}"'resync_patch' <<<"$1"
+}
+
+post_resync_failed() {
+  # post_resync_failed <classified-applications-json> - re-sync each platform
+  # Application whose last sync of its current revision failed, at most once
+  # per run (RELEASE_RESYNCED): ArgoCD's auto-sync never retries a revision
+  # whose sync failed ("failed previous sync attempt"), so without this the
+  # Application stays that way until the next chart version. A 409 (it changed
+  # since it was read) is retried at the next poll.
+  local json="$1" name app body reason
+  while IFS= read -r name; do
+    [[ -n "${name}" && -z "${RELEASE_RESYNCED[${name}]:-}" ]] || continue
+    app="$("${JQ}" -c --arg n "${name}" '.items[] | select(.metadata.name == $n) | del(.teknoirPost)' <<<"${json}")"
+    reason="$("${JQ}" -r --arg root "${ROOT_APP}" "${RELEASE_JQ_READY}"'
+      "last sync to \(oprev | revstr) \(.status.operationState.phase)"' <<<"${app}")"
+    if dry_run; then
+      RELEASE_RESYNCED["${name}"]=1
+      changed "re-sync Application ${name} once (${reason}): one merge patch sets .operation and clears .status.operationState"
+      continue
+    fi
+    body="$(_release_resync_patch "${app}")"
+    if kc -n "${RELEASE_NS}" patch "${APP_CRD}" "${name}" --type merge -p "${body}" >/dev/null 2>&1; then
+      RELEASE_RESYNCED["${name}"]=1
+      changed "re-synced Application ${name} once (${reason}): .operation set and .status.operationState cleared in one merge patch"
+    else
+      warn "could not re-sync Application ${name} now (changed since it was read?); trying again at the next poll"
+    fi
+  done < <(_release_resync_candidates "${json}")
 }
 
 post_wait_applications() {
-  local timeout json bad names last_report=0 refreshed=0 deadline
+  # Waits up to --wait-timeout, else POST_WAIT_DEFAULT on an update and
+  # POST_WAIT_FIRST_INSTALL on a first install. An update that creates a
+  # teamspace declared in GitOps (r5: teknoir-default) gets the first-install
+  # wait too, counted from the start, as soon as a poll sees it being created
+  # (_release_post_creating): the root pin, the profile-controller sync, its
+  # reconcile and the first sync of every plugin chart (MongoDB's init
+  # included) all happen in this run, next to the platform's own restarts.
+  local timeout json bad names creating last_report=0 refreshed=0 deadline start explicit=0
   if ! crd_established "${APP_CRD}"; then
     dry_run && { log "[dry-run] ArgoCD is not installed yet: post would wait for the Applications"; return 0; }
     die "post: CRD ${APP_CRD} is not Established"
   fi
   timeout="${WAIT_TIMEOUT:-}"
-  if [[ -z "${timeout}" ]]; then
+  if [[ -n "${timeout}" ]]; then
+    explicit=1
+  else
     timeout="${POST_WAIT_DEFAULT}"
     if [[ "${REC_SOURCE}" == "none" || "${REC_MODE}" == "install" ]]; then
       timeout="${POST_WAIT_FIRST_INSTALL}"
     fi
   fi
-  deadline=$(( SECONDS + timeout ))
+  start=${SECONDS}
+  deadline=$(( start + timeout ))
   while :; do
     json="$(_release_applications_json)"
+    post_resync_failed "${json}"
     bad="$(_release_post_not_ready "${json}")"
     if [[ -z "${bad}" ]]; then
       post_application_table >&2
-      log "every Application is Synced/Healthy at its current spec"
+      log "every platform Application (and every teamspace declared in GitOps) is Synced/Healthy at its current spec"
+      post_report_unwaited "${json}"
       return 0
     fi
     names="$(cut -f1 <<<"${bad}" | tr '\n' ' ')"
+    if (( explicit == 0 && timeout < POST_WAIT_FIRST_INSTALL )); then
+      creating="$(_release_post_creating "${json}")"
+      if [[ -n "${creating}" ]]; then
+        timeout="${POST_WAIT_FIRST_INSTALL}"
+        deadline=$(( start + timeout ))
+        log "this run creates teamspace(s) declared in GitOps (${creating}): post waits up to ${timeout}s in all, as on a first install"
+      fi
+    fi
     if dry_run; then
       post_application_table >&2
       log "[dry-run] would wait up to ${timeout}s for: ${names}"
+      post_report_unwaited "${json}"
       return 0
     fi
     if (( refreshed == 0 )) && cut -f1 <<<"${bad}" | grep -qxF "${ROOT_APP}"; then
@@ -300,7 +621,8 @@ post_wait_applications() {
     fi
     if (( SECONDS >= deadline )); then
       post_application_table >&2
-      die "post: after ${timeout}s these Applications are not Synced/Healthy at this release: $(awk -F'\t' '{printf "%s (%s) ", $1, $2}' <<<"${bad}")"
+      post_report_unwaited "${json}"
+      die "post: after ${timeout}s these Applications are not Synced/Healthy at this release: $(awk -F'\t' '{printf "%s (%s) ", $1, $2}' <<<"${bad}")(running up again is safe: every phase skips what is done and post waits again)"
     fi
     if (( SECONDS - last_report >= 60 )); then
       log "waiting for Synced/Healthy ($(( deadline - SECONDS ))s left): ${names}"
@@ -308,6 +630,14 @@ post_wait_applications() {
     fi
     sleep "${POST_POLL}"
   done
+}
+
+post_report_unwaited() {
+  # One WARN for the not-ready Applications post does not wait for.
+  local reported
+  reported="$(_release_post_reported "$1")"
+  [[ -n "${reported}" ]] || return 0
+  warn "not ready, not waited for (never blocks up: teamspaces not declared in GitOps, Applications without a Teknoir owner, teamspace plugin failures): $(awk -F'\t' '{printf "%s [%s] (%s); ", $1, $2, $3}' <<<"${reported}")"
 }
 
 _release_mirror_ref() {
@@ -361,6 +691,96 @@ post_image_check() {
   (( missing == 0 )) || die "post: running images neither in Harbor nor in containerd:${missing_list}"
 }
 
+_release_kc_cfg_escape() {
+  # curl config quoting: backslash and double quote escaped
+  local v="${1//\\/\\\\}"
+  printf '%s' "${v//\"/\\\"}"
+}
+
+_release_kc_login() {
+  # _release_kc_login <user> <password> - RELEASE_KC_CODE: the HTTP status of
+  # a master-realm password-grant token request (client admin-cli) at
+  # https://auth.<domain>/auth, through the gateway on NODE_IP and with the
+  # platform CA when its public copy exists. The credentials reach curl in a
+  # config file on a pipe, never on argv; only the status code is kept. Not
+  # for $(...): call ensure_work_dir first, in the main shell.
+  local ca="" code url
+  local -a cacert=()
+  if in_cluster secret teknoir-root-ca-bundle "${RELEASE_NS}"; then
+    ca="$(umask 077 && mktemp "${WORK_DIR}/kc-ca.XXXXXX")" || die "cannot create a temp file"
+    secret_value "${RELEASE_NS}" teknoir-root-ca-bundle ca.crt > "${ca}"
+    cacert=(--cacert "${ca}")
+  fi
+  url="${RELEASE_KEYCLOAK_URL:-https://auth.${TEKNOIR_DOMAIN}/auth}"
+  # shellcheck disable=SC2086  # RELEASE_CURL_OPTS: extra curl flags (tests)
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -m 30 ${cacert[@]+"${cacert[@]}"} \
+      --resolve "auth.${TEKNOIR_DOMAIN}:443:${NODE_IP}" ${RELEASE_CURL_OPTS:-} \
+      -K <(printf 'data-urlencode = "grant_type=password"\ndata-urlencode = "client_id=admin-cli"\ndata-urlencode = "username=%s"\ndata-urlencode = "password=%s"\n' \
+             "$(_release_kc_cfg_escape "$1")" "$(_release_kc_cfg_escape "$2")") \
+      "${url}/realms/master/protocol/openid-connect/token" 2>/dev/null)" || code="${code:-000}"
+  [[ -z "${ca}" ]] || rm -f "${ca}"
+  RELEASE_KC_CODE="${code:-000}"
+}
+
+post_keycloak_admin_cleanup() {
+  # Key previous-password of Secret teknoir-auth/keycloak-admin (the master
+  # admin's password before the migration, see migrate) is only needed until
+  # the auth sync's admin check has rotated the admin to key password. Remove
+  # it once a master-realm login with key password works (HTTP 200); else keep
+  # it and warn. The removal is guarded by the resourceVersion that was read,
+  # so a password changed in between is never paired with a stale check.
+  local meta rv keys user="admin" pass=""
+  in_cluster secret "${RELEASE_KC_SECRET}" "${RELEASE_KC_NS}" || return 0
+  # resourceVersion and which keys exist; never a value
+  meta="$(kc -n "${RELEASE_KC_NS}" get secret "${RELEASE_KC_SECRET}" \
+    -o 'go-template={{ .metadata.resourceVersion }}:{{ with .data }}{{ if index . "username" }}u{{ end }}{{ if index . "password" }}p{{ end }}{{ if index . "previous-password" }}x{{ end }}{{ end }}')" \
+    || die "cannot read Secret ${RELEASE_KC_NS}/${RELEASE_KC_SECRET}"
+  if [[ ! "${meta}" =~ ^([0-9]+):([upx]*)$ ]]; then
+    warn "keycloak-admin: unexpected metadata of Secret ${RELEASE_KC_NS}/${RELEASE_KC_SECRET}; previous-password not checked"
+    return 0
+  fi
+  rv="${BASH_REMATCH[1]}" keys="${BASH_REMATCH[2]}"
+  [[ "${keys}" == *x* ]] || return 0
+  if [[ "${keys}" != *p* ]]; then
+    warn "keycloak-admin: Secret ${RELEASE_KC_NS}/${RELEASE_KC_SECRET} has previous-password but no password yet (the platform-secrets Job adds it): previous-password is kept"
+    return 0
+  fi
+  if dry_run; then
+    log "[dry-run] keycloak-admin: has previous-password; post would remove it once the master admin logs in with key password"
+    return 0
+  fi
+  if [[ "${keys}" == *u* ]]; then
+    user="$(secret_value "${RELEASE_KC_NS}" "${RELEASE_KC_SECRET}" username)"
+  fi
+  read_secret pass "${RELEASE_KC_NS}" "${RELEASE_KC_SECRET}" password
+  ensure_work_dir
+  _release_kc_login "${user}" "${pass}"
+  pass=""
+  case "${RELEASE_KC_CODE}" in
+    200)
+      if kc -n "${RELEASE_KC_NS}" patch secret "${RELEASE_KC_SECRET}" --type=json \
+           -p "[{\"op\":\"test\",\"path\":\"/metadata/resourceVersion\",\"value\":\"${rv}\"},{\"op\":\"remove\",\"path\":\"/data/previous-password\"}]" >/dev/null 2>&1; then
+        changed "removed key previous-password from Secret ${RELEASE_KC_NS}/${RELEASE_KC_SECRET} (the master admin logs in with key password)"
+      else
+        warn "keycloak-admin: could not remove previous-password from Secret ${RELEASE_KC_NS}/${RELEASE_KC_SECRET} (changed since it was read?); the next up tries again"
+      fi
+      ;;
+    400|401)
+      warn "keycloak-admin: the master admin does not log in with key password of Secret ${RELEASE_KC_NS}/${RELEASE_KC_SECRET} (HTTP ${RELEASE_KC_CODE}): previous-password is kept; the auth sync's admin check rotates the admin with it (see the keycloak-config Job log)"
+      ;;
+    *)
+      warn "keycloak-admin: cannot check the master admin login at Keycloak (HTTP ${RELEASE_KC_CODE}): previous-password is kept"
+      ;;
+  esac
+}
+
+post_argocd_initial_admin() {
+  # ArgoCD's first admin password stays readable in this Secret until the
+  # local admin is rotated (`teknoir-airgap rotate argocd-admin` deletes it).
+  in_cluster secret "${ARGOCD_INITIAL_ADMIN_SECRET}" "${RELEASE_NS}" || return 0
+  warn "Secret ${RELEASE_NS}/${ARGOCD_INITIAL_ADMIN_SECRET} still holds ArgoCD's initial admin password: run teknoir-airgap rotate argocd-admin (it rotates the local admin and deletes that Secret)"
+}
+
 post_prune_bundles() {
   # Keep the current payload and the previous one; remove older ones.
   local bundles current d keep_prev="" n=0
@@ -387,6 +807,8 @@ phase_post() {
   # release_load_record reflects what the release phase recorded.
   release_load_record
   post_wait_applications
+  post_keycloak_admin_cleanup
+  post_argocd_initial_admin
   post_image_check
   post_prune_bundles
 }
