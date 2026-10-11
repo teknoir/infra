@@ -131,13 +131,26 @@ url_host() { sed -E 's|^https?://([^/:?#]+).*|\1|' <<<"$1"; }
 url_origin() { sed -E 's|^(https?://[^/?#]+).*|\1|' <<<"$1"; }
 no_query() { sed -E 's|\?.*||' <<<"$1"; }
 
+# A browser asks for HTML. ArgoCD 3.x answers its single-page-app routes
+# (/applications) with "404 page not found" unless Accept names text/html.
+ACCEPT_HTML='Accept: text/html,application/xhtml+xml,*/*;q=0.8'
+
+abs_url() {
+  # abs_url <page-url> <url> — <url> itself, or, when it is a path ("/auth/..."
+  # as Keycloak's logout-confirm form has), resolved against the page's origin
+  case "$2" in
+    /*) printf '%s%s' "$(url_origin "$1")" "$2" ;;
+    *) printf '%s' "$2" ;;
+  esac
+}
+
 fetch() {
   # fetch <curl args...> — follow redirects; sets CODE and EFF (final URL)
   local out
   # HTTP/1.1: over HTTP/2 the gateway resets the stream after ext_authz's 302
   # (PROTOCOL_ERROR, curl exit 92; the same on staging and production), which
   # browsers tolerate and curl does not
-  out="$(curl -sS --http1.1 --cacert "${CACERT}" -c "${jar}" -b "${jar}" -L --max-redirs 20 \
+  out="$(curl -sS --http1.1 -H "${ACCEPT_HTML}" --cacert "${CACERT}" -c "${jar}" -b "${jar}" -L --max-redirs 20 \
            -o "${page}" -w '%{http_code} %{url_effective}' "$@")" || return 1
   CODE="${out%% *}" EFF="${out#* }"
 }
@@ -146,7 +159,7 @@ fetch1() {
   # fetch1 <curl args...> — one request, no redirect following; sets CODE and
   # LOC (the Location header, resolved: curl's redirect_url)
   local out
-  out="$(curl -sS --http1.1 --cacert "${CACERT}" -c "${jar}" -b "${jar}" \
+  out="$(curl -sS --http1.1 -H "${ACCEPT_HTML}" --cacert "${CACERT}" -c "${jar}" -b "${jar}" \
            -o "${page}" -w '%{http_code} %{redirect_url}' "$@")" || return 1
   CODE="${out%% *}" LOC="${out#* }"
   [[ "${LOC}" != "${CODE}" ]] || LOC=""
@@ -299,7 +312,7 @@ exit 1
 }
 
 logout() {
-local origin issuer end_session act code_v auth_host
+local origin issuer end_session act code_v auth_host page_url
 origin="$(url_origin "${URL}")"
 issuer="${ISSUER:-https://auth.${origin#*://}/auth/realms/teknoir}"
 auth_host="$(url_host "${issuer}")"
@@ -312,8 +325,9 @@ fetch1 "${origin}/oauth2/sign_out?rd=$(urlenc "${end_session}")" || { say "logou
 if has_session_cookie "${jar}"; then say "logout 1/5: /oauth2/sign_out left the oauth2-proxy session cookie in place"; exit 1; fi
 say "logout 1/5: /oauth2/sign_out -> 302 $(no_query "${LOC}"), session cookie cleared"
 
+page_url="${LOC}"
 fetch1 "${LOC}" || { say "logout: cannot reach $(no_query "${LOC}")"; exit 1; }
-act="$(form_action_matching 'logout-confirm')"
+act="$(abs_url "${page_url}" "$(form_action_matching 'logout-confirm')")"
 code_v="$(input_value session_code)"
 [[ "${CODE}" == 200 && -n "${act}" ]] \
   || { say "logout 2/5: the end-session endpoint answered HTTP ${CODE} without the logout confirmation form"; exit 1; }

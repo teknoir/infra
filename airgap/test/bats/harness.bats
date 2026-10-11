@@ -522,7 +522,7 @@ EOF
 
 @test "e2e.sh E11: a dry run on a healthy stand-in passes; each broken part fails exactly its check" {
   local world="${BATS_TEST_DIRNAME}/fixtures/e2e-world.bash" b
-  for b in "" appproject-cluster-kinds plugin-fail no-sidecar image-missing dns claim catalog-member; do
+  for b in "" gitops-plugins appproject-cluster-kinds plugin-fail no-sidecar image-missing dns claim catalog-member; do
     run bash -c "
       E2E_WORK='${BATS_TEST_TMPDIR}/w' E2E_CATALOG_POLL=0; source '${E2E}'; WORLD_BREAK='${b}'; source '${world}'
       mkdir -p \"\${HTTP_DIR}\"; set_admin Owner@Example.com; TL_POLL=0; CATALOG_TIMEOUT=1
@@ -1115,6 +1115,14 @@ EOF
   run status_accepted 401
   [ "${status}" -ne 0 ]
   [ "$(urlenc 'https://auth.x/a?b=c&d=e f')" = "https%3A%2F%2Fauth.x%2Fa%3Fb%3Dc%26d%3De%20f" ]
+}
+
+@test "kc-login.sh: abs_url resolves a path action against the page's origin; browsers' Accept: text/html" {
+  # shellcheck source=../vm/kc-login.sh
+  source "${KCLOGIN}"
+  [ "$(abs_url 'https://auth.x.y/auth/realms/t/protocol/openid-connect/logout?client_id=a' /auth/realms/t/logout-confirm)" = "https://auth.x.y/auth/realms/t/logout-confirm" ]
+  [ "$(abs_url 'https://auth.x.y/p' 'https://auth.x.y/q?a=b')" = "https://auth.x.y/q?a=b" ]
+  [[ "${ACCEPT_HTML}" == "Accept: text/html"* ]]
 }
 
 @test "kc-login.sh: the logout confirmation form and Keycloak's feedback text" {

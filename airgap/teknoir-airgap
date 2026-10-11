@@ -1877,7 +1877,7 @@ doctor_node() {
   else
     d_fail "could not read the node clock"
   fi
-  missing=$(node_user_sh 'for c in sudo tar sha256sum find awk sed cmp flock openssl update-ca-certificates curl systemctl; do command -v "$c" >/dev/null 2>&1 || printf "%s " "$c"; done; echo' </dev/null 2>/dev/null | tail -n 1) || missing="?"
+  missing=$(node_user_sh 'PATH="${PATH}:/usr/local/sbin:/usr/sbin:/sbin"; for c in sudo tar sha256sum find awk sed cmp flock openssl update-ca-certificates curl systemctl; do command -v "$c" >/dev/null 2>&1 || printf "%s " "$c"; done; echo' </dev/null 2>/dev/null | tail -n 1) || missing="?"
   if [ -z "${missing}" ]; then d_ok "the node has the tools the converge uses"
   else d_fail "missing on the node: ${missing}(install from the Debian installation medium, docs/HOST-SETUP.md)"; fi
   doctor_time "$(node_user_sh "${TIME_FACTS_SCRIPT}" "${NODE_IP}" </dev/null 2>/dev/null || true)"

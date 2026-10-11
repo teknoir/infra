@@ -367,8 +367,37 @@ fresh_vm() {
   (( ALLOW_DESTROY )) || { fail "${TL_CASE} re-creates the VM: pass --allow-destroy"; return 1; }
   tl_log "re-creating the VM (destroy + start)"
   "${VM}" destroy
+  rm -f "${STATE}/node-rebooted"
   "${VM}" start
   "${NETNS}" up
+}
+
+pull_failures() {
+  # pull_failures [kubectl get events args] — the number of image-pull failure
+  # events (ErrImagePull, ImagePullBackOff, Failed to pull, Back-off pulling)
+  # and, one line later, the pods that are waiting in a pull error right now
+  # are counted by pull_waiting. After a node reboot (E12 leaves the marker) the
+  # pods with imagePullPolicy Always (the :latest teamspace images) resolve their
+  # tag at harbor.<domain> while Harbor itself is still starting and get 503:
+  # a pod with such a "Failed to pull image ... 503" event is a transient boot
+  # race (retried by kubelet), not counted; pull_waiting must still be 0 once
+  # the platform is Ready.
+  local rebooted=false
+  [[ -e "${STATE}/node-rebooted" ]] && rebooted=true
+  vm_kc get events "$@" -o json 2>/dev/null | jq -r --argjson rebooted "${rebooted}" '
+    def pull: (.message // "") | test("ErrImagePull|ImagePullBackOff|Failed to pull|Back-off pulling");
+    def boot503: (.message // "") | test("Failed to pull image.*503 Service Unavailable");
+    ([.items[] | select(pull and boot503) | .involvedObject.name] | unique) as $transient
+    | [.items[] | select(pull) | select(($rebooted | not) or ((.involvedObject.name as $n | $transient | index($n)) | not))] | length' \
+    || echo "?"
+}
+
+pull_waiting() {
+  # pull_waiting [kubectl args] — pods with a container waiting in ErrImagePull/ImagePullBackOff now
+  vm_kc get pods "$@" -o json 2>/dev/null | jq -r '
+    [.items[] | select([((.status.containerStatuses // []) + (.status.initContainerStatuses // []))[]
+        | (.state.waiting.reason // "") | select(. == "ErrImagePull" or . == "ImagePullBackOff")] | length > 0)] | length' \
+    || echo "?"
 }
 
 bundle_dir() {
@@ -432,6 +461,19 @@ apps_healthy() {
   s="$(apps_state 2>/dev/null)" || return 1
   [[ -n "${s}" ]] && [[ -z "$(awk '$2 != "Synced" || $3 != "Healthy"' <<<"${s}")" ]]
 }
+platform_ready() {
+  # every non-Job pod Ready and the ingress answers (a reboot leaves the
+  # Applications' last Healthy status in place until ArgoCD looks again)
+  local unready code
+  unready="$(vm_kc get pods -A -o json 2>/dev/null | jq -r '[.items[]
+      | select(.status.phase != "Succeeded" and .status.phase != "Failed")
+      | select([(.metadata.ownerReferences // [])[].kind] | index("Job") | not)
+      | select(([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length) == 0)] | length' 2>/dev/null || echo ?)"
+  [[ "${unready}" == 0 ]] || return 1
+  code="$(lan_https "https://${DOMAIN}/teknoir-system/grafana/")"
+  [[ "${code}" =~ ^(200|302|401|403)$ ]]
+}
+
 wait_apps() {
   # wait_apps <timeout> — every Application Synced/Healthy; prints the table on failure
   if wait_until "$1" apps_healthy; then pass "every Application is Synced/Healthy"; return 0; fi
@@ -1157,8 +1199,8 @@ e3() {
   else fail "FORWARD DROP counters did not grow (${before} -> ${after})"; fi
   bad="$(images_missing)"
   assert_eq "every pod image is present in containerd (imported, or pulled through the harbor.${DOMAIN} mirror)" "" "${bad}"
-  assert_eq "no ErrImagePull/ImagePullBackOff events" 0 \
-    "$(vm_kc get events -A --no-headers 2>/dev/null | grep -cE 'ErrImagePull|ImagePullBackOff' || true)"
+  assert_eq "no ErrImagePull/ImagePullBackOff events (boot-time Harbor 503s after E12's reboot aside)" 0 "$(pull_failures -A)"
+  assert_eq "no pod is waiting in ErrImagePull/ImagePullBackOff" 0 "$(pull_waiting -A)"
   local mirrors
   mirrors="$(vmx sudo cat /etc/rancher/k3s/registries.yaml)"
   local r miss=""
@@ -1468,7 +1510,8 @@ for ns in $(k get ns -o jsonpath='{.items[*].metadata.name}'); do
     # address and settings (logged by design); only their credentials count
     stype="$(k -n "$ns" get secret "$s" -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}')"
     for key in $(k -n "$ns" get secret "$s" -o json | python3 -c 'import json,sys; print("\n".join((json.load(sys.stdin).get("data") or {}).keys()))'); do
-      case "$key" in *.crt|ca.pem|*_USER|*USERNAME|username|user|KEYCLOAK_REALM|KEYCLOAK_CLIENTID) continue ;; esac
+      # *Mtime: ArgoCD's admin.passwordMtime is a timestamp (when the password changed), logged by design
+      case "$key" in *.crt|ca.pem|*_USER|*USERNAME|username|user|KEYCLOAK_REALM|KEYCLOAK_CLIENTID|*Mtime) continue ;; esac
       case "$stype:$key" in repository:url|repository:type|repository:name|repository:project|repository:enableOCI|repository:insecure|repo-creds:url|repo-creds:type|repo-creds:enableOCI) continue ;; esac
       # probes: the longest line of the value (PEM markers dropped) and the
       # base64 of the whole value (how `get secret -o yaml` would print it)
@@ -1889,18 +1932,20 @@ e11_checks() {
   email="$(lower "${ADMIN_EMAIL}")" name="$(user_name "${ADMIN_EMAIL}")"
 
   # 1. the GitOps Profile (K3)
-  v="$(vm_kc get profiles.teknoir.org "${ts}" -o json 2>/dev/null | jq -r '[
+  # spec.plugins: the controller fills in and owns the live list (managed fields),
+  # so the GitOps declaration is "ArgoCD's field manager owns no f:plugins"
+  v="$(vm_kc get profiles.teknoir.org "${ts}" --show-managed-fields -o json 2>/dev/null | jq -r '[
         ((.metadata.annotations["argocd.argoproj.io/sync-options"] // "") | gsub("\\s"; "") | split(",")
           | (any(.[]; . == "Prune=false") and any(.[]; . == "Delete=false"))),
         ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") != ""),
         ((.spec.owner.name // "-") | ascii_downcase),
-        ((.spec.plugins // []) | length)] | map(tostring) | join(" ")' 2>/dev/null || true)"
+        ([.metadata.managedFields[]? | select(.manager == "argocd-controller") | .fieldsV1["f:spec"]["f:plugins"]? // empty] | length)] | map(tostring) | join(" ")' 2>/dev/null || true)"
   [[ -n "${v}" ]] || { fail "Profile ${ts} does not exist"; return 0; }
   read -r a b c d <<<"${v}"
   assert_eq "Profile ${ts} carries sync-options Prune=false,Delete=false" true "${a}"
   assert_eq "Profile ${ts} is declared in GitOps (ArgoCD tracking-id)" true "${b}"
   assert_eq "Profile ${ts} is owned by the first admin" "${email}" "${c}"
-  assert_eq "Profile ${ts} has no spec.plugins (the controller's defaults apply)" 0 "${d}"
+  assert_eq "Profile ${ts} declares no spec.plugins in GitOps (the controller's defaults apply)" 0 "${d}"
 
   # 2. its namespace
   v="$(vm_kc get namespace "${ts}" -o json 2>/dev/null | jq -r --arg ts "${ts}" '[
@@ -1966,8 +2011,8 @@ e11_checks() {
   assert_eq "every ${ts} pod is Ready and has the istio-proxy sidecar" "" "${bad}"
   if [[ -n "$(vm_kc -n "${ts}" get pods -o name 2>/dev/null || true)" ]]; then pass "${ts} has pods"; else fail "${ts} has no pods"; fi
   assert_eq "every ${ts} image is in containerd" "" "$(images_missing "${ts}" | tr '\n' ' ')"
-  assert_eq "no ErrImagePull/ImagePullBackOff events in ${ts}" 0 \
-    "$(vm_kc -n "${ts}" get events --no-headers 2>/dev/null | grep -cE 'ErrImagePull|ImagePullBackOff' || true)"
+  assert_eq "no ErrImagePull/ImagePullBackOff events in ${ts} (boot-time Harbor 503s after E12's reboot aside)" 0 "$(pull_failures -n "${ts}")"
+  assert_eq "no ${ts} pod is waiting in ErrImagePull/ImagePullBackOff" 0 "$(pull_waiting -n "${ts}")"
 
   # 8. names, TLS and the teamspace's web apps
   out="$(vm_kc -n default run "e2e-dns-$(date +%s)" --image="${E2E_DNS_IMAGE:-docker.io/library/busybox:1.36.1}" \
@@ -2058,6 +2103,7 @@ e12() {
   # a reboot: the clock comes back from the RTC that up wrote (a guest reboot
   # keeps QEMU and its RTC; a QEMU restart would reset the RTC to the rig host's clock)
   boot0="$(vmx cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+  mkdir -p "${STATE}"; : > "${STATE}/node-rebooted"
   vmx sudo systemctl reboot >/dev/null 2>&1 || true
   sleep 20
   "${VM}" start >/dev/null 2>&1 || true
@@ -2067,6 +2113,7 @@ e12() {
   else fail "after the reboot the node clock is $(skew_now) s off (want within 5 s)"; fi
   wait_until 600 vm_kc get --raw /readyz >/dev/null 2>&1 || fail "API not ready after the reboot"
   wait_apps 1800 || true
+  wait_until 1500 platform_ready || fail "the platform is not Ready (all pods, ingress) 1500 s after the reboot"
 
   # the node serves time to the LAN (chrony allow + local stratum 10)
   sntp="$(lan "${E2E_WORK}" python3 -I "${HERE}/sntp-query.py" "${NODE_IP}" 2>&1 | grep '^stratum=' | tail -n1 || true)"

@@ -14,13 +14,18 @@ WORLD_TS="teknoir-default"
 WORLD_OWNER="Owner@Example.com"
 
 world_profile() {
-  local st="Success"
+  local st="Success" argo_owns='"f:owner": {}'
   [[ "${WORLD_BREAK}" == plugin-fail ]] && st="Fail"
+  # the controller fills spec.plugins and owns it; ArgoCD's Apply owns only f:owner
+  [[ "${WORLD_BREAK}" == gitops-plugins ]] && argo_owns='"f:owner": {}, "f:plugins": {}'
   cat <<EOF
 {"metadata": {"name": "${WORLD_TS}", "annotations": {
    "argocd.argoproj.io/sync-options": "Prune=false, Delete=false",
-   "argocd.argoproj.io/tracking-id": "profile-controller:teknoir.org/Profile:/${WORLD_TS}"}},
- "spec": {"owner": {"kind": "User", "name": "${WORLD_OWNER}"}},
+   "argocd.argoproj.io/tracking-id": "profile-controller:teknoir.org/Profile:/${WORLD_TS}"},
+   "managedFields": [
+     {"manager": "argocd-controller", "operation": "Apply", "fieldsV1": {"f:spec": {${argo_owns}}}},
+     {"manager": "manager", "operation": "Update", "fieldsV1": {"f:spec": {"f:plugins": {}, "f:resourceQuotaSpec": {}}}}]},
+ "spec": {"owner": {"kind": "User", "name": "${WORLD_OWNER}"}, "plugins": [{"kind": "EMQX"}, {"kind": "Deadend"}]},
  "status": {"appliedconfig": {"plugins": {
    "EMQX": {"appliedConfig": {"settings": {"enabled": true}}, "applyStatus": {"status": "${st}"}},
    "Deadend": {"appliedConfig": {"settings": {"enabled": true}}, "applyStatus": {"status": "Success"}},
@@ -43,7 +48,7 @@ EOF
 vm_kc() {
   local a="$*" p
   case "${a}" in
-    "get profiles.teknoir.org ${WORLD_TS} -o json") world_profile ;;
+    "get profiles.teknoir.org ${WORLD_TS} -o json"|"get profiles.teknoir.org ${WORLD_TS} --show-managed-fields -o json") world_profile ;;
     "get profiles.teknoir.org ${WORLD_TS} -o jsonpath={.spec.owner.name}") printf '%s' "${WORLD_OWNER}" ;;
     "get namespace ${WORLD_TS} -o json")
       echo "{\"metadata\": {\"labels\": {\"istio-injection\": \"enabled\"}, \"annotations\": {\"owner\": \"owner@example.com\"},
@@ -71,6 +76,7 @@ vm_kc() {
     "-n ${WORLD_TS} get pods -o json"|"get pods -n ${WORLD_TS} -o json") world_pods ;;
     "-n ${WORLD_TS} get pods -o name") echo pod/emqx-0 ;;
     "-n ${WORLD_TS} get events --no-headers") : ;;
+    "get events -n ${WORLD_TS} -o json") echo '{"items": []}' ;;
     "-n default run "*"nslookup mqtt-${WORLD_TS}.${WORLD_DOMAIN}")
       printf 'Server:\t\t10.43.0.10\nAddress:\t10.43.0.10:53\n\nName:\tmqtt-%s.%s\n' "${WORLD_TS}" "${WORLD_DOMAIN}"
       [[ "${WORLD_BREAK}" == dns ]] || printf 'Address: 10.77.0.10\n' ;;
