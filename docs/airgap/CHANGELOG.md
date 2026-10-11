@@ -6,6 +6,17 @@ describe only the current procedure; past procedures, incidents and the
 reasons for the redesign are kept here. The git history of `infra` and
 `platform-applications-gitops` (branch `teknoir-local`) is the full archive.
 
+## 2026-10-11: profile plugin charts 0.0.101
+
+- **Profile plugin charts 0.0.101** are pinned in the bundle (pins for 0.0.99 and
+  0.0.100 stay for rollback bundles). EMQX 5 now serves the platform certificate
+  on the TLS listener 8883 (the EMQX 4 `EMQX_LISTENER__SSL__*` env names were
+  ignored by emqx 5.8.9, so it served the built-in self-signed "EMQ RootCA"), and
+  the max packet size uses `EMQX_MQTT__MAX_PACKET_SIZE=3MB`.
+- **backstage-api waits for Postgres** (gitops 926b0b4): an initContainer, so it no
+  longer starts before its database after a node reboot and stays unready.
+  Not yet VM-verified.
+
 ## 2026-10-11: live node decommissioned, the VM rig moves to the dev host
 
 - **Live teknoir-local node decommissioned.** `192.168.5.181`: k3s removed, data

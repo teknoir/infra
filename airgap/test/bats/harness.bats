@@ -106,7 +106,7 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
   # the host starts ssh/ping to the VM; the replies arrive on the bridge and hit INPUT -i tkvm0 -j DROP
   # unless an ESTABLISHED,RELATED accept sits in front of it (never NEW: the VM reaches no host service)
   grep -q 'INPUT 1 -i "${BR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT' "${VM}"
-  ! grep -q 'conntrack --ctstate [A-Z,]*NEW' "${VM}"
+  refute_grep -q 'conntrack --ctstate [A-Z,]*NEW' "${VM}"
   grep -q 'INPUT -i "${BR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do' "${VM}"
 }
 

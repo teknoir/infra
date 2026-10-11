@@ -430,7 +430,7 @@ debs_gate gate_fail "${TREE}/node/debs"
 strict_re='teknoir\.cloud|ghcr-token'
 config_url_re='(repoURL|url|host|hostname|server|endpoint|registry|repository|issuer)"?[[:space:]]*:[[:space:]]*[^[:space:]]*(github\.com|storage\.googleapis\.com)'
 benign_re='host:[[:space:]]*github\.com'
-# The teamspace plugin renders are the published plugin chart bytes (0.0.100), which
+# The teamspace plugin renders are the published plugin chart bytes (0.0.101), which
 # list imagePullSecrets ghcr-token and Google Cloud Storage settings: warned,
 # not fatal (accepted for r5; fixed in a later plugin chart release).
 for f in "${WORK}/renders/"*.yaml "${TREE}/node/oneshot/"*.yaml "${TREE}/node/templates/"*; do
