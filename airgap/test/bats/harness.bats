@@ -102,6 +102,14 @@ metrics-server-deployment metrics-server-service resource-reader rolebindings ru
   [ -z "${hits}" ] || { echo "${hits}"; return 1; }
 }
 
+@test "vm.sh: the host INPUT drop for the bridge still lets replies to the host's own connections in (vm.sh ssh)" {
+  # the host starts ssh/ping to the VM; the replies arrive on the bridge and hit INPUT -i tkvm0 -j DROP
+  # unless an ESTABLISHED,RELATED accept sits in front of it (never NEW: the VM reaches no host service)
+  grep -q 'INPUT 1 -i "${BR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT' "${VM}"
+  ! grep -q 'conntrack --ctstate [A-Z,]*NEW' "${VM}"
+  grep -q 'INPUT -i "${BR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do' "${VM}"
+}
+
 @test "vm.sh: VM state lives in VM_DIR, not in the repo" {
   VM_DIR="${BATS_TEST_TMPDIR}/vmdir" run "${VM}" key
   [ "${status}" -eq 0 ]

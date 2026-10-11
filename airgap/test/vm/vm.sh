@@ -115,9 +115,13 @@ net_up() {
   fi
   # The host is not part of the airgapped LAN: the VM may ping the bridge
   # address (routing tests, diagnostics) but reaches no host service.
+  # The replies to what the host itself starts (vm.sh ssh, ping) come back
+  # on the bridge and must pass: accept only ESTABLISHED,RELATED, never NEW.
   ipt -C INPUT -i "${BR}" -j DROP 2>/dev/null || ipt -I INPUT 1 -i "${BR}" -j DROP
   ipt -C INPUT -i "${BR}" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null \
     || ipt -I INPUT 1 -i "${BR}" -p icmp --icmp-type echo-request -j ACCEPT
+  ipt -C INPUT -i "${BR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null \
+    || ipt -I INPUT 1 -i "${BR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
   log "bridge ${BR} up; forwarding to/from it is dropped, the host answers ping only"
 }
 
@@ -127,6 +131,7 @@ net_down() {
   while ipt -D FORWARD -o "${BR}" -j DROP 2>/dev/null; do :; done
   while ipt -D INPUT -i "${BR}" -j DROP 2>/dev/null; do :; done
   while ipt -D INPUT -i "${BR}" -p icmp --icmp-type echo-request -j ACCEPT 2>/dev/null; do :; done
+  while ipt -D INPUT -i "${BR}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done
   if ip link show "${TAP}" >/dev/null 2>&1; then sudo ip link del "${TAP}"; fi
   if ip link show "${BR}" >/dev/null 2>&1; then sudo ip link del "${BR}"; fi
   log "bridge ${BR}, tap ${TAP} and their firewall rules removed"
