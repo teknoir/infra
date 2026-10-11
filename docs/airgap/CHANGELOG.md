@@ -8,34 +8,32 @@ reasons for the redesign are kept here. The git history of `infra` and
 
 ## r5 (app-of-apps 0.0.5)
 
-### Encrypted backups and the ArgoCD break-glass
+### Bundle: teamspace plugins, node packages, pinned images
 
-- **Backups encrypted on the node.** New optional site key
-  `BACKUP_AGE_RECIPIENTS` (age public keys). With it every node backup is also
-  encrypted to those keys in `/var/lib/teknoir-airgap/exports/<ts>.tar.age`, and
-  the node keeps the 3 newest encrypted backups but only the newest unencrypted
-  one (older ones are encrypted before they are removed). Before, the node kept
-  3 unencrypted sets, and old copies piled up in `/root`.
-- **`teknoir-airgap backup --out DIR` without a terminal.** With recipients the
-  node encrypts and the LAN host only copies (sha256-checked, 0600); no
-  passphrase, no plaintext export. `--name TS` copies an existing backup.
-  Without recipients the passphrase flow is unchanged.
-- **`rotate argocd-admin`.** A new ArgoCD local admin password in
-  `teknoir-system/argocd-admin-break-glass` (read by `credentials argocd-admin`,
-  included in backups); `argocd-initial-admin-secret` is deleted once the new
-  password logs in. `rotate argocd-admin --out FILE` writes it to a 0600 file.
-- **One-time clean-up runbook** (OPERATE.md, r5): encrypted backup first, then
-  the plaintext copies on the node and on vpro, the world-readable cloud-init
-  seed, finalize and rotations. The pre-migration set is streamed and verified
-  before the deployed payload's `--take`, which runs with `BACKUP_KEEP=99` so
-  that it prunes nothing; every stream fails on a failed `tar` (`pipefail`).
-  The node unit tests run these blocks against the deployed 0.0.4 payload.
-- vpro: `~/.config/teknoir/install-devtools.sh` installs `age` and `age-keygen`
-  v1.3.1 (sha256-pinned) for decryption.
-- **One recipient check.** The build, the node and the LAN tool check
-  `BACKUP_AGE_RECIPIENTS` with the same function; an age private key pasted
-  there (or anywhere in a site file, for the build) is refused as such and
-  never printed, so it reaches no log or build output.
+- **Teamspaces work offline.** The bundle carries the 9 teamspace plugin
+  charts profile-controller deploys by default (profile-plugin-* 0.0.99, the
+  published archives, pinned by sha256) and their ~20 images (~1.8 GiB). The
+  node pushes the charts to `harbor.<domain>/teknoir` with the other charts;
+  profile-controller reads them from there (its `PLUGIN_CHART_REPO`). Before,
+  a teamspace's Applications pointed at teknoir.github.io and stayed
+  `Unknown`.
+- **Time packages.** chrony and util-linux-extra (hwclock) ship as pinned
+  `.deb` files in `node/debs`; the node has no NTP egress and no hwclock
+  today.
+- **Pinned Teknoir images (G-09).** The build fails on a Teknoir image that is
+  not `<repo>:<immutable tag>@sha256:<linux/amd64 manifest>`, on a pinned
+  index, and on a digest in a one-shot tier; the teamspace plugin images on
+  `:latest` only warn (listed in `MANIFEST.yaml`). The node refuses a pin that
+  is not the bundle's manifest and verifies the pinned manifest in Harbor
+  after the push; the post check looks the pinned manifest up in Harbor and
+  containerd. `airgap/build/pin-images.sh` prints and verifies pins.
+- **Size.** A bundle is about 5.8 GB; the limit is 6.5 GiB. Use exFAT or ext4
+  media, or `make-bundle.sh --split` for FAT32.
+- **Rollback.** To roll back from r5, run `up --rollback` with the retained
+  0.0.4 bundle, not a rebuild. The rollback is not clean: 0.0.4 does not
+  prune r5's kept objects, so its post phase fails on `user-controller`, and
+  nobody has rehearsed it. OPERATE.md ("Rolling back from r5") explains how to
+  confirm it.
 
 ### Node time, RTC, teamspace DNS and site keys
 
@@ -86,32 +84,34 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
   cloud-image network layout of the live node, and has new sections on the
   fixed address and on name resolution for devices.
 
-### Bundle: teamspace plugins, node packages, pinned images
+### Encrypted backups and the ArgoCD break-glass
 
-- **Teamspaces work offline.** The bundle carries the 9 teamspace plugin
-  charts profile-controller deploys by default (profile-plugin-* 0.0.99, the
-  published archives, pinned by sha256) and their ~20 images (~1.8 GiB). The
-  node pushes the charts to `harbor.<domain>/teknoir` with the other charts;
-  profile-controller reads them from there (its `PLUGIN_CHART_REPO`). Before,
-  a teamspace's Applications pointed at teknoir.github.io and stayed
-  `Unknown`.
-- **Time packages.** chrony and util-linux-extra (hwclock) ship as pinned
-  `.deb` files in `node/debs`; the node has no NTP egress and no hwclock
-  today.
-- **Pinned Teknoir images (G-09).** The build fails on a Teknoir image that is
-  not `<repo>:<immutable tag>@sha256:<linux/amd64 manifest>`, on a pinned
-  index, and on a digest in a one-shot tier; the teamspace plugin images on
-  `:latest` only warn (listed in `MANIFEST.yaml`). The node refuses a pin that
-  is not the bundle's manifest and verifies the pinned manifest in Harbor
-  after the push; the post check looks the pinned manifest up in Harbor and
-  containerd. `airgap/build/pin-images.sh` prints and verifies pins.
-- **Size.** A bundle is about 5.8 GB; the limit is 6.5 GiB. Use exFAT or ext4
-  media, or `make-bundle.sh --split` for FAT32.
-- **Rollback.** To roll back from r5, run `up --rollback` with the retained
-  0.0.4 bundle, not a rebuild. The rollback is not clean: 0.0.4 does not
-  prune r5's kept objects, so its post phase fails on `user-controller`, and
-  nobody has rehearsed it. OPERATE.md ("Rolling back from r5") explains how to
-  confirm it.
+- **Backups encrypted on the node.** New optional site key
+  `BACKUP_AGE_RECIPIENTS` (age public keys). With it every node backup is also
+  encrypted to those keys in `/var/lib/teknoir-airgap/exports/<ts>.tar.age`, and
+  the node keeps the 3 newest encrypted backups but only the newest unencrypted
+  one (older ones are encrypted before they are removed). Before, the node kept
+  3 unencrypted sets, and old copies piled up in `/root`.
+- **`teknoir-airgap backup --out DIR` without a terminal.** With recipients the
+  node encrypts and the LAN host only copies (sha256-checked, 0600); no
+  passphrase, no plaintext export. `--name TS` copies an existing backup.
+  Without recipients the passphrase flow is unchanged.
+- **`rotate argocd-admin`.** A new ArgoCD local admin password in
+  `teknoir-system/argocd-admin-break-glass` (read by `credentials argocd-admin`,
+  included in backups); `argocd-initial-admin-secret` is deleted once the new
+  password logs in. `rotate argocd-admin --out FILE` writes it to a 0600 file.
+- **One-time clean-up runbook** (OPERATE.md, r5): encrypted backup first, then
+  the plaintext copies on the node and on vpro, the world-readable cloud-init
+  seed, finalize and rotations. The pre-migration set is streamed and verified
+  before the deployed payload's `--take`, which runs with `BACKUP_KEEP=99` so
+  that it prunes nothing; every stream fails on a failed `tar` (`pipefail`).
+  The node unit tests run these blocks against the deployed 0.0.4 payload.
+- vpro: `~/.config/teknoir/install-devtools.sh` installs `age` and `age-keygen`
+  v1.3.1 (sha256-pinned) for decryption.
+- **One recipient check.** The build, the node and the LAN tool check
+  `BACKUP_AGE_RECIPIENTS` with the same function; an age private key pasted
+  there (or anywhere in a site file, for the build) is refused as such and
+  never printed, so it reaches no log or build output.
 
 ### Post phase, failed syncs and migrate --finalize (infra)
 

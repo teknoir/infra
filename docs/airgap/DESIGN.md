@@ -46,6 +46,9 @@ Verified facts and agreed deviations that supersede the text below where they di
 
 ## r5 (app-of-apps 0.0.5)
 
+Changes of release r5 that supersede the text below where they differ. Each
+work package adds its own subsection.
+
 ### Bundle supply: teamspace plugins, node packages, pinned images
 
 - **Teamspaces are in scope.** profile-controller creates one ArgoCD Application per plugin and Profile at run time, so app-of-apps never renders them. The bundle therefore carries the published archives of the plugins the controller enables by default (`PROFILE_PLUGIN_CHARTS`: deadend, emqx, prometheus, jwks, fleet-metrics, grafana, mongodb, historian, observatory), byte for byte from teknoir.github.io/profile-plugins-helm, each pinned by sha256 (equal to the gh-pages index digest). Postgres and claims are disabled by default and are not carried; airgap Profiles must not enable them or set another version.
@@ -61,77 +64,6 @@ Verified facts and agreed deviations that supersede the text below where they di
   - 0.0.4's profile-controller (pre-K2, hard-coded teknoir.github.io; `plugin_utils.go` updates every `Application` it renders) tries to point the teamspace Applications back at github.io, where they would be `Unknown` offline. `profile-controller-argocd` should refuse that write and leave them on Harbor. Nobody has observed this yet.
   - Candidate fix: put `IgnoreExtraneous` on the Namespace `teknoir-user-credentials` and on the GitOps Profile template (gitops charts). For the Profile it matters for a rollback between two versions that both permit Profiles, for example r6 back to r5. After that, E4 with its rollback leg switched on shows whether A's post phase passes.
 - **Release branches.** `make-bundle.sh` accepts `r<N>[-name]` branches besides the env branch and `airgap-redesign*`, so the r5 bundle is built from the r5 integration branches before they are merged.
-
-## r5 (app-of-apps 0.0.5)
-
-Changes of release r5 that supersede the text below where they differ. Each
-package adds its own subsection.
-
-### Encrypted backups and the ArgoCD break-glass (WP-I-BACKUP: SEC-C8, SEC-C9, SEC-C12)
-
-- **Site key `BACKUP_AGE_RECIPIENTS`** (optional): space-separated age X25519
-  public keys, each `^age1[0-9a-z]{58}$`; public values in the committed site
-  file. One validator, `site_age_recipients_check VALUE [LABEL]`, checks it
-  everywhere: the build (`site_values_check`), the node (`load_site`, and
-  again in `lib/backup.sh` before a backup and for `backup --recipient`) and
-  the LAN tool (`site_load`, `backup`). The three runtimes share no sourced
-  code (the LAN tool is a self-contained bash 3.2 script), so the function is
-  the same text in `lib/common.sh`, `teknoir-airgap` and `build/lib-build.sh`,
-  and `airgap/test/unit/site-age-recipients-test.sh` fails when the copies
-  differ or a caller checks the format itself. It uses case patterns only
-  (bash 3.2, no locale-dependent ranges). A value holding `SECRET-KEY` (any
-  case, anywhere) is refused with "holds an age PRIVATE key
-  (AGE-SECRET-KEY-...) ... treat that identity as exposed" and nothing of the
-  value is printed; any other bad entry is shown with at most its first 8
-  characters (control and glob characters as `?`), so neither the run logs nor
-  the build output ever hold a key. The build's `site_check` also refuses an
-  age identity (`AGE-SECRET-KEY-1` and key characters; a comment that only
-  names the prefix passes) anywhere else in a site file, a comment included.
-  The message texts are WP-I-HOST's, so both packages' tests check one text.
-  Decision:
-  two recipients, the operator's key and an offline recovery key; no identity
-  ever goes onto the node or into a repo.
-- **Node backups** (I-12 superseded): with recipients, `backup_take` also writes
-  `exports/<ts>.tar.age` (0600; `tar` of `backups/<ts>` piped into
-  `age -r R1 -r R2 ...`; written as `.partial` and renamed). Retention:
-  `BACKUP_KEEP_PLAIN` (default 1) plaintext sets and `BACKUP_KEEP` (default 3)
-  encrypted exports; a plaintext set without an export is encrypted before it
-  is pruned (kept when that fails). An age failure fails the backup (and so
-  the converge) with the complete plaintext set in place and nothing pruned.
-  Without recipients the old keep-3 plaintext rotation stays, with a warning.
-  Recipients and the age binary are checked before k3s is stopped. One
-  plaintext set is a deliberate trade-off: the live datastore is unencrypted
-  anyway (D6), and it keeps a fast local rollback.
-- **Off-node copy**: `teknoir-airgap backup --out DIR [--name TS]` uses
-  `teknoir-node backup --recipient-site --take` (or `--name TS`) when the site
-  has recipients: no terminal, no passphrase, the node's export is copied with
-  a sha256 check into a 0600 file and stays on the node; no plaintext export
-  exists. `--name` of a set pruned to its export hands that export out as it
-  is. Without recipients the passphrase flow (`--export`, tty) is unchanged.
-- **`rotate argocd-admin`** (D10): `random_alnum 32`; `argocd account bcrypt`
-  (no `--password`: ArgoCD v3.5.1 reads it from a non-terminal stdin and
-  prints `Password: <hash>`) runs in `deploy/argo-argocd-server` (container
-  `server`) with the value on `kubectl exec -i` stdin, so it is in no argv (node
-  or container) and no log. Order: store in `argocd-admin-break-glass` (create or merge
-  patch, never apply: no last-applied annotation), merge-patch `argocd-secret`
-  `admin.password` and `admin.passwordMtime` (ends older admin sessions) from a
-  0600 file, then up to `ARGOCD_LOGIN_ATTEMPTS` (4) spaced logins on
-  `/api/v1/session` (ArgoCD locks a user for 5 minutes after 5 failures), and
-  only after a 200 delete `argocd-initial-admin-secret`. The LAN
-  `rotate argocd-admin --out FILE` reads the new value back with
-  `credentials argocd-admin`.
-- **Runbook**: OPERATE.md "r5 (app-of-apps 0.0.5)" orders the one-time clean-up:
-  verified encrypted backup first, then deleting plaintext copies (node, vpro,
-  cloud-init seed mode), then finalize and rotations. Step 2 runs on the
-  deployed 0.0.4 payload, whose `--take` keeps 3 sets and so would prune the
-  pre-migration set: that set is streamed (`bash -o pipefail` on the node) and
-  decrypted and checked (`sha256sum -c` in `/dev/shm`) first, and the take
-  runs with `BACKUP_KEEP=99`, which 0.0.4 reads from the environment. Every
-  stream lands as `.partial` and is renamed only on success; step 4 deletes
-  the vpro `.secrets` only when the decrypted archive equals them
-  (`diff -rq`). `airgap/test/node/run.sh` runs the step 2 and 4 blocks as
-  written against the 0.0.4 payload (`git archive 8610f8d`) and the real age,
-  including a tar that fails halfway and the plain `--take` that prunes.
 
 ### Node time, RTC, teamspace DNS and site keys (WP-I-HOST)
 
@@ -258,7 +190,179 @@ resolve (coredns-custom knew only the platform names).
   with a dead-man revert (TIME-T6). teknoir-local keeps its DHCP address,
   pinned by a UniFi reservation (HOST-SETUP "Fixed address").
 
-## r5 (app-of-apps 0.0.5)
+### Encrypted backups and the ArgoCD break-glass (WP-I-BACKUP: SEC-C8, SEC-C9, SEC-C12)
+
+- **Site key `BACKUP_AGE_RECIPIENTS`** (optional): space-separated age X25519
+  public keys, each `^age1[0-9a-z]{58}$`; public values in the committed site
+  file. One validator, `site_age_recipients_check VALUE [LABEL]`, checks it
+  everywhere: the build (`site_values_check`), the node (`load_site`, and
+  again in `lib/backup.sh` before a backup and for `backup --recipient`) and
+  the LAN tool (`site_load`, `backup`). The three runtimes share no sourced
+  code (the LAN tool is a self-contained bash 3.2 script), so the function is
+  the same text in `lib/common.sh`, `teknoir-airgap` and `build/lib-build.sh`,
+  and `airgap/test/unit/site-age-recipients-test.sh` fails when the copies
+  differ or a caller checks the format itself. It uses case patterns only
+  (bash 3.2, no locale-dependent ranges). A value holding `SECRET-KEY` (any
+  case, anywhere) is refused with "holds an age PRIVATE key
+  (AGE-SECRET-KEY-...) ... treat that identity as exposed" and nothing of the
+  value is printed; any other bad entry is shown with at most its first 8
+  characters (control and glob characters as `?`), so neither the run logs nor
+  the build output ever hold a key. The build's `site_check` also refuses an
+  age identity (`AGE-SECRET-KEY-1` and key characters; a comment that only
+  names the prefix passes) anywhere else in a site file, a comment included.
+  The message texts are WP-I-HOST's, so both packages' tests check one text.
+  Decision:
+  two recipients, the operator's key and an offline recovery key; no identity
+  ever goes onto the node or into a repo.
+- **Node backups** (I-12 superseded): with recipients, `backup_take` also writes
+  `exports/<ts>.tar.age` (0600; `tar` of `backups/<ts>` piped into
+  `age -r R1 -r R2 ...`; written as `.partial` and renamed). Retention:
+  `BACKUP_KEEP_PLAIN` (default 1) plaintext sets and `BACKUP_KEEP` (default 3)
+  encrypted exports; a plaintext set without an export is encrypted before it
+  is pruned (kept when that fails). An age failure fails the backup (and so
+  the converge) with the complete plaintext set in place and nothing pruned.
+  Without recipients the old keep-3 plaintext rotation stays, with a warning.
+  Recipients and the age binary are checked before k3s is stopped. One
+  plaintext set is a deliberate trade-off: the live datastore is unencrypted
+  anyway (D6), and it keeps a fast local rollback.
+- **Off-node copy**: `teknoir-airgap backup --out DIR [--name TS]` uses
+  `teknoir-node backup --recipient-site --take` (or `--name TS`) when the site
+  has recipients: no terminal, no passphrase, the node's export is copied with
+  a sha256 check into a 0600 file and stays on the node; no plaintext export
+  exists. `--name` of a set pruned to its export hands that export out as it
+  is. Without recipients the passphrase flow (`--export`, tty) is unchanged.
+- **`rotate argocd-admin`** (D10): `random_alnum 32`; `argocd account bcrypt`
+  (no `--password`: ArgoCD v3.5.1 reads it from a non-terminal stdin and
+  prints `Password: <hash>`) runs in `deploy/argo-argocd-server` (container
+  `server`) with the value on `kubectl exec -i` stdin, so it is in no argv (node
+  or container) and no log. Order: store in `argocd-admin-break-glass` (create or merge
+  patch, never apply: no last-applied annotation), merge-patch `argocd-secret`
+  `admin.password` and `admin.passwordMtime` (ends older admin sessions) from a
+  0600 file, then up to `ARGOCD_LOGIN_ATTEMPTS` (4) spaced logins on
+  `/api/v1/session` (ArgoCD locks a user for 5 minutes after 5 failures), and
+  only after a 200 delete `argocd-initial-admin-secret`. The LAN
+  `rotate argocd-admin --out FILE` reads the new value back with
+  `credentials argocd-admin`.
+- **Runbook**: OPERATE.md "r5 (app-of-apps 0.0.5)" orders the one-time clean-up:
+  verified encrypted backup first, then deleting plaintext copies (node, vpro,
+  cloud-init seed mode), then finalize and rotations. Step 2 runs on the
+  deployed 0.0.4 payload, whose `--take` keeps 3 sets and so would prune the
+  pre-migration set: that set is streamed (`bash -o pipefail` on the node) and
+  decrypted and checked (`sha256sum -c` in `/dev/shm`) first, and the take
+  runs with `BACKUP_KEEP=99`, which 0.0.4 reads from the environment. Every
+  stream lands as `.partial` and is renamed only on success; step 4 deletes
+  the vpro `.secrets` only when the decrypted archive equals them
+  (`diff -rq`). `airgap/test/node/run.sh` runs the step 2 and 4 blocks as
+  written against the 0.0.4 payload (`git archive 8610f8d`) and the real age,
+  including a tar that fails halfway and the plain `--take` that prunes.
+
+### Post phase classification, failed-sync re-sync, keycloak-admin clean-up, migrate --finalize (infra lib/release.sh, lib/migrate.sh)
+
+- **Which Applications post waits for (R2).** Platform: the root `app-of-apps`
+  and every Application whose `argocd.argoproj.io/tracking-id` starts with
+  `app-of-apps:` (or `<ns>_app-of-apps:`). Teamspace: an ownerReference of kind
+  `Profile`; strict only when that Profile itself carries an ArgoCD tracking-id
+  (declared in GitOps by the profile-controller chart, contract K3) and the
+  ownerReference uid matches. Platform and strict teamspace Applications must be
+  ready; all others (teamspaces created in Backstage, Applications with no
+  Teknoir owner) are listed in one WARN and never block. The root must exist.
+  `teknoir-node status` prints one `apps:` line per class; the table has a
+  CLASS column (`*` = reported only). The same rules gate `migrate --finalize`.
+- **A Profile declared in GitOps is itself waited for (TS-C6).** Its
+  Applications only exist once profile-controller has reconciled it, so without
+  this a Profile with none (profile-controller down, or Forbidden by its RBAC)
+  or only some would add nothing to wait for. Post adds a strict entry
+  `profile/<name>` that is not ready while `status.appliedconfig.lastRunStart`
+  is missing ("not reconciled by profile-controller yet"), while `lastRunEnd`
+  is missing or earlier ("run in progress"), while the Profile owns no
+  Application (owner uid checked), or while an enabled chart plugin's
+  Application is missing (profile-controller names it
+  `<profile>-<pluginConfig.name>`). A plugin whose `applyStatus.status` is not
+  `Success` is only reported: EMQX's fails until the EMQX pod answers its API,
+  and profile-controller retries with a backoff of up to ~17 min, which would
+  fail `up` on timing alone (E11 asserts every plugin `Success` on the VM).
+  Profiles not declared in GitOps get the same entry, reported only. Only
+  names, uids, run times and plugin kind/enabled/chart/status are read; never
+  a plugin's configuration. `status` prints one `profile:` line per Profile.
+- **The wait (TS-C6).** Without `--wait-timeout`, post waits
+  POST_WAIT_DEFAULT (1200 s) on an update and POST_WAIT_FIRST_INSTALL (2700 s)
+  on a first install. An update that creates a teamspace declared in GitOps
+  gets 2700 s too, counted from the start of the wait, as soon as one poll
+  sees it being created (`_release_post_creating`): a strict Profile that
+  profile-controller has not run for, or whose Applications are not all
+  created yet (a run in progress alone does not count), or a strict teamspace
+  Application that is not ready and has an empty `status.history` (ArgoCD adds
+  an entry per successful sync, so it has never synced). The r5 update creates
+  `teknoir-default` this way: the root pin, the profile-controller sync, its
+  reconcile and the first sync of 9 charts (MongoDB's init included) all fall
+  in one `up`, next to Keycloak, Harbor and Backstage restarts, which can take
+  longer than 20 min. An explicit `--wait-timeout` is never extended. The
+  timeout error says that re-running `up` is safe.
+- **Failed last sync (HYG-C3).** `why()` reports `last sync to <rev> <phase>:
+  <message>` when `.status.operationState.phase` is Failed or Error, its
+  revision (`syncResult.revision[s]`, else `operation.sync.revision[s]`) equals
+  `.status.sync.revision[s]`, and no `.operation` is pending; a pending
+  `.operation` is itself not ready ("requested, not started yet"), which closes
+  the window between the re-sync patch and the controller picking it up. Post
+  re-syncs each such *platform* Application, but only while that failure is
+  about the spec the Application keeps: its own status is not stale (no
+  operation pending or running, `comparedTo` equals the spec's source[s], an
+  exact chart pin equals `status.sync.revision`, the root reconciled since this
+  run's pin) and, for a child, the root is `Synced` with a status that is not
+  stale either. Right after a pin the old revision's failure is still in the
+  status (the root has not synced the new child spec yet, or ArgoCD has not
+  compared the child's new spec); re-syncing it would re-apply the superseded
+  chart, spend the once-per-run budget and, with the spec's retry, hold an
+  operation that blocks the new revision's auto-sync. The root's own failure
+  at its current pin makes the root the candidate. At most once per run
+  (RELEASE_RESYNCED) with one merge patch: `metadata.resourceVersion` (the
+  apiserver rejects a stale write with 409; retried at the next poll),
+  `.operation` = {initiatedBy teknoir-node, sync {revision[s] it is at,
+  prune = `spec.syncPolicy.automated.prune`, syncOptions from the spec}, retry =
+  `spec.syncPolicy.retry` or ArgoCD's default `{limit: 5}`}, and
+  `status.operationState: null`. That mirrors ArgoCD's SetAppOperation and
+  auto-sync. Setting `.operation` alone makes the controller merge the new
+  operation into the stale state (it writes operationState with a JSON merge
+  patch and the empty fields are omitempty) and fail at once (live, 05:40).
+  Dry-run records the re-sync as a would-change. Teamspace (and other)
+  Applications are never re-synced (R2). ArgoCD never retries a failed
+  revision either, so `why()` adds to such an Application's failed-sync reason
+  that post re-syncs platform Applications only and how to sync it (ArgoCD UI,
+  or the OPERATE section 12 patch). Otherwise a strict teamspace Application
+  whose first sync spent its retries would fail every `up` with no way out
+  named.
+- **keycloak-admin `previous-password` (SEC-C10).** After the wait, post reads
+  only the resourceVersion and the key names of `teknoir-auth/keycloak-admin`.
+  With `previous-password` and `password` present, it logs in to realm master
+  with `password` (admin-cli password grant, credentials in a curl config on a
+  pipe, through the gateway on NODE_IP with the platform CA). On 200 it removes
+  the key with a JSON patch whose first op tests the resourceVersion; on 400/401
+  or any other status it keeps it with a WARN. Dry-run does not log in. Post
+  also warns while `teknoir-system/argocd-initial-admin-secret` exists.
+- **`migrate --finalize [--i-know]` (SEC-C10).** Refuses unless: no Teknoir
+  K3s file or Addon is left (teknoir-argo included); every retired
+  `*.yaml|*.yml|*.json` keeps `<manifests>/<name>.skip`; the post phase's
+  strict Applications are ready; and `/var/lib/teknoir-airgap/exports` holds an
+  age file (`age-encryption.org/v1` header) whose backup stamp (UTC in its
+  name, else its mtime) is newer than the newest `manifests-retired/<UTC>` dir.
+  `--i-know` waives only the export check (an encrypted copy kept off the
+  node). It then shreds every retired file (symlinks are unlinked, never
+  followed), removes the directories and `manifests-retired`, and logs names
+  only. The `.skip` guards are never touched. New retirements are mode 0600.
+- **`migrate --argo` ownership check (HYG-C6).** An object of the detached file
+  is ArgoCD's when it carries the `argo` tracking-id or is a Synced entry of the
+  `argo` Application's `.status.resources` (mapped to `Kind.v1.` / `Kind.group`).
+  `argocd-tls-certs-cm` and objects labelled
+  `app.kubernetes.io/managed-by=teknoir-node` are logged as converge-owned; only
+  the rest is warned. The secrets phase now applies that label to
+  `argocd-tls-certs-cm` (one label-only server-side apply on the next `up`).
+- **Tests.** `airgap/test/unit/release-ready-test.sh` (classification, reasons,
+  candidates, patch body, wait loop with a stub controller, keycloak clean-up,
+  status lines), `airgap/test/unit/migrate-argo-untracked-test.sh`, k3d
+  `run.sh T10` (the real runner's post phase against stand-in Applications and
+  `stubs/fake-keycloak.py`) and `migrate-test.sh` (CRD adoption via status,
+  0600 retirements, every finalize refusal and the shred). VM: E1/E10/E15 assert
+  operationState Succeeded and a non-empty admission `caBundle` (WP-I-E2E).
 
 ### admin-user: one-time password handover, teamspace owner, catalog wait (SEC-C2, TS-C4, SIGN-C6)
 
@@ -280,10 +384,146 @@ The LAN tool passes `--teamspace` and `--reset-password` through; `--reset-passw
 
 Tests: `airgap/test/k3d/admin-user-test.sh` (stand-in controllers in K1-Secret and legacy modes, stand-in Profiles, a postgres catalog whose stand-in user provider trails every claim change, fake Keycloak with reset-password, and a kubectl wrapper that replaces the Secret or the legacy value right after admin-user read it, or changes the User right before a patch: resume, reset over a pending value, the delete preconditions, the sha256 guard and both conflict retries are covered, and so is an existing empty 0600 `--out` as node_mktemp creates it, filled by a handover and by `--reset-password` without a temp file left behind), `airgap/test/unit/admin-out-file-test.sh` (no cluster, run by run-static: the never-overwrite checks refuse only a non-empty `--out`, so a tightening to "exists" fails it), `airgap/test/bats/lan_entrypoint.bats` (admin-user flags through `--local` with a path-mapping sudo stub) and `airgap/test/lan/` (bash 3.2, real sshd).
 
-## r5 (app-of-apps 0.0.5)
+### VM e2e additions (test plan 3)
 
-Changes of release r5 that supersede the text below where they differ. Each
-package adds its own subsection.
+Each run uses a freshly created VM. The VM's Harbor keeps the first push of
+every version.
+
+- Fresh: `E1 E11 E12 E13 E14 E2 E3 E7 E8` with bundle B.
+- Upgrade: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto E2E_E4_ROLLBACK=1 e2e.sh --allow-destroy E1 E4`,
+  with A = aoa0.0.4.
+  - E1 installs A as a baseline. A bundle whose app-of-apps is below 0.0.5 is a baseline,
+    and the r5-only E1 checks below only warn there.
+  - E4 then asserts the release checks on B. It also asserts that r5 clears A's legacy
+    password field.
+  - `E2E_E4_APPS=auto` derives the expected changes from the two bundles' pins, plus the
+    teknoir-default plugin Applications.
+- Live rehearsal: E15.
+
+Rollback from r5 to a pre-r5 bundle is an open design gap. B's GitOps Profile
+teknoir-default and Namespace teknoir-user-credentials carry
+Prune=false,Delete=false but no `argocd.argoproj.io/compare-options: IgnoreExtraneous`.
+Once A no longer renders them, three things happen:
+- profile-controller and user-controller stay OutOfSync, because a skipped prune keeps an
+  Application OutOfSync;
+- A's profile-controller points the teknoir-default Applications back at github.io
+  (Unknown offline);
+- A's post waits for every Application.
+
+The plan's rollback, an r5-built 0.0.4 bundle, has the same problem: under R2 the kept,
+tracked Profile keeps its teamspace Applications strict.
+
+An untested rollback is not green:
+- `E2E_E4_ROLLBACK=1` (the release run) runs the leg. It asserts each part separately (up
+  exits 0; every Application except teknoir-default-* Synced/Healthy; profile-controller
+  and user-controller Synced; Profile and Namespace kept; release record A rollback;
+  revisions back), and it reports the teknoir-default Applications. Today it fails, by
+  name, on the parts above.
+- `E2E_E4_ROLLBACK=0` waives the leg on purpose, and the summary row says so.
+- Left at auto, E4 fails when the rollback would cross r5.
+
+The decision belongs to WP-G-CTRL, WP-I-RELEASE and WP-I-BUNDLE, before the live rollout.
+One option is `argocd.argoproj.io/compare-options: IgnoreExtraneous` on the GitOps Profile
+and the credentials Namespace; another is a documented rollback procedure.
+
+The first admin is the owner of the GitOps Profile teknoir-default, so E11 can
+check its grants.
+
+- E1 adds these checks:
+  - every platform Application (the root and what it tracks) has operationState
+    Succeeded;
+  - both monitoring-admission webhook configurations have a caBundle;
+  - every digest-pinned container's imageID ends in its digest;
+  - post logs "live image check: N pullable ..., 0 missing";
+  - `/oauth2/start` returns 302 to auth.<domain>;
+  - after admin-user, no `status.set_initial_password` and no temporary-password
+    Secret remain;
+  - the `--out` password signs in under `kc-login --forbid-profile-form`;
+  - Backstage resolves the session to `user:default/<name>` within 3 minutes of the
+    User's creation;
+  - backstage-api has restartCount 0.
+- E11 checks the default teamspace:
+  - the Profile has Prune=false,Delete=false and a tracking-id, its owner is the
+    admin, and it has no spec.plugins;
+  - the namespace has its label, owner annotation and ownerReference;
+  - namespaceAdmin and the user's RoleBinding both bind teknoir-admin;
+  - the User has the claim owner@teknoir-default;
+  - the policies, the TLS Secret (checked by name only) and the ConfigMaps exist;
+  - the AppProject's sourceRepos is harbor.<domain>/teknoir only, with no cluster
+    whitelist;
+  - the 9 plugin Applications come from Harbor at PLUGIN_CHART_VERSION with
+    RespectIgnoreDifferences=true, and are Synced/Healthy within 20 minutes;
+  - every enabled plugin reports Success;
+  - every pod is Ready with the sidecar, its images are local, and nothing failed
+    to pull;
+  - an in-pod nslookup of mqtt-teknoir-default resolves to NODE_IP;
+  - TLS works on 8883 and 2222;
+  - the teamspace's Grafana and Prometheus answer 200;
+  - the Backstage system and the user's group membership appear (PT1M polling).
+- E12 checks node time:
+  - the pinned .debs are installed, timesyncd is gone, chrony is active and
+    hwclock exists;
+  - at -20 s, a plain up gets within 2 s in 60 s and changes no package;
+  - at -400 s with the RTC also off, up exits 1 with the hint, and
+    `up --sync-clock` brings both clock and RTC within 2 s;
+  - after a guest reboot, the clock is within 5 s (QEMU keeps the RTC the guest
+    wrote);
+  - SNTP from the netns gets stratum 11 or lower and an offset within 2 s;
+  - doctor reports no FAIL for the node.
+- E13 checks access and credentials:
+  - a non-admin realm user (a User CR with role viewer) signs in with a forced
+    password change; after a reconcile its temporary-password Secret is gone (K1
+    case b);
+  - that user gets 403 on the teknoir-system monitoring UIs, no ArgoCD
+    Applications, and 403 from Harbor project creation (not a CSRF failure);
+  - the admin gets 200 and Grafana Admin by e-mail;
+  - platform-admin is disabled and its login is refused;
+  - the can-i matrix of rbac-k3d holds, and no "forbidden" appears in the
+    controller logs;
+  - keycloak-admin has no previous-password;
+  - the LAN backup without a tty decrypts with each test identity, sha256sum -c
+    passes, and one plaintext set remains;
+  - after `rotate argocd-admin`: the initial secret is gone, the old password
+    gets 401, the new one 200, and the SSO admin can still sync;
+  - after `rotate keycloak-db --i-know`, sign-in still works;
+  - Prometheus logs no "Error sending alerts" for 5 minutes.
+- E14 checks sign-in robustness:
+  - a garbage cookie gets 302 to `/oauth2/start` and two expiring Set-Cookies;
+  - CORS and XHR requests get 401 without Location;
+  - http gets 301 to https;
+  - a signed-in API call without a Backstage token gets the upstream 401/403;
+  - the logout chain ends at the login form.
+- E15 rehearses the live rollout:
+  - The setup is E10's old layout, migrate, up A, one admin login, migrate
+    --argo and M6.
+  - Then the live state is injected: Profile teknoir-demo on github.io, a stale
+    Failed monitoring operation with retryCount 5, and empty admission caBundles.
+  - The master-realm legacy clients are created through the master admin API,
+    because neither the old layout nor A creates them (the live node got them by
+    hand, old AIRGAP-BOOTSTRAP 8): teknoir, with the oauth2-proxy client's secret
+    and a service account holding master-realm manage-users; argocd; and harbor.
+    The teknoir service account lists master's users, which shows the severity.
+    Before B, all three exist and teknoir's secret gets a token on master, so the
+    check after B cannot pass on an empty realm.
+  - Then up B runs, and these must hold:
+    - post passes;
+    - teknoir-demo moves to Harbor (a warning only if it stays unhealthy);
+    - monitoring Succeeds with its caBundle;
+    - the legacy field is cleared with the credential's created_date unchanged
+      (read-only SQL);
+    - previous-password is gone;
+    - the master legacy clients are gone, and the old teknoir secret gets 401 on
+      master;
+    - admin-user grants owner@teknoir-default and owner@teknoir-demo and writes
+      no file;
+    - the E11, E13 and E14 checks pass.
+- E2, E4, E7, E8 and E10 are extended as described in the CHANGELOG.
+
+The e2e harness itself is tested without a VM (airgap/test/README.md):
+`kc_login.bats` uses a local HTTPS stand-in for oauth2-proxy and Keycloak, and
+`harness.bats` dry-runs E1, E4, E11, E12, all of E13, E15's injection and the whole
+E15 sequence against stub worlds. Each broken part of a world fails exactly its
+assertion.
 
 ### monitoring 0.0.5, argo 0.0.4, harbor 0.0.10 (WP-G-ACCESS: SEC-C5, HYG-C8)
 
@@ -1090,149 +1330,6 @@ Scenarios. Each asserts and prints a pass/fail summary.
      - Harbor is stable for 1 h with no new harbor-core ReplicaSet.
 - Host-setup doc check, manual and once: install Debian 13 from the offline ISO into a VM attached to tkvm0 using only HOST-SETUP.md, then E1 from the netns. This validates the installer path the cloud image skips.
 
-## r5 (app-of-apps 0.0.5)
-
-### VM e2e additions (test plan 3)
-
-Each run uses a freshly created VM. The VM's Harbor keeps the first push of
-every version.
-
-- Fresh: `E1 E11 E12 E13 E14 E2 E3 E7 E8` with bundle B.
-- Upgrade: `E2E_BUNDLE=<A> E2E_BUNDLE_B=<B> E2E_E4_APPS=auto E2E_E4_ROLLBACK=1 e2e.sh --allow-destroy E1 E4`,
-  with A = aoa0.0.4.
-  - E1 installs A as a baseline. A bundle whose app-of-apps is below 0.0.5 is a baseline,
-    and the r5-only E1 checks below only warn there.
-  - E4 then asserts the release checks on B. It also asserts that r5 clears A's legacy
-    password field.
-  - `E2E_E4_APPS=auto` derives the expected changes from the two bundles' pins, plus the
-    teknoir-default plugin Applications.
-- Live rehearsal: E15.
-
-Rollback from r5 to a pre-r5 bundle is an open design gap. B's GitOps Profile
-teknoir-default and Namespace teknoir-user-credentials carry
-Prune=false,Delete=false but no `argocd.argoproj.io/compare-options: IgnoreExtraneous`.
-Once A no longer renders them, three things happen:
-- profile-controller and user-controller stay OutOfSync, because a skipped prune keeps an
-  Application OutOfSync;
-- A's profile-controller points the teknoir-default Applications back at github.io
-  (Unknown offline);
-- A's post waits for every Application.
-
-The plan's rollback, an r5-built 0.0.4 bundle, has the same problem: under R2 the kept,
-tracked Profile keeps its teamspace Applications strict.
-
-An untested rollback is not green:
-- `E2E_E4_ROLLBACK=1` (the release run) runs the leg. It asserts each part separately (up
-  exits 0; every Application except teknoir-default-* Synced/Healthy; profile-controller
-  and user-controller Synced; Profile and Namespace kept; release record A rollback;
-  revisions back), and it reports the teknoir-default Applications. Today it fails, by
-  name, on the parts above.
-- `E2E_E4_ROLLBACK=0` waives the leg on purpose, and the summary row says so.
-- Left at auto, E4 fails when the rollback would cross r5.
-
-The decision belongs to WP-G-CTRL, WP-I-RELEASE and WP-I-BUNDLE, before the live rollout.
-One option is `argocd.argoproj.io/compare-options: IgnoreExtraneous` on the GitOps Profile
-and the credentials Namespace; another is a documented rollback procedure.
-
-The first admin is the owner of the GitOps Profile teknoir-default, so E11 can
-check its grants.
-
-- E1 adds these checks:
-  - every platform Application (the root and what it tracks) has operationState
-    Succeeded;
-  - both monitoring-admission webhook configurations have a caBundle;
-  - every digest-pinned container's imageID ends in its digest;
-  - post logs "live image check: N pullable ..., 0 missing";
-  - `/oauth2/start` returns 302 to auth.<domain>;
-  - after admin-user, no `status.set_initial_password` and no temporary-password
-    Secret remain;
-  - the `--out` password signs in under `kc-login --forbid-profile-form`;
-  - Backstage resolves the session to `user:default/<name>` within 3 minutes of the
-    User's creation;
-  - backstage-api has restartCount 0.
-- E11 checks the default teamspace:
-  - the Profile has Prune=false,Delete=false and a tracking-id, its owner is the
-    admin, and it has no spec.plugins;
-  - the namespace has its label, owner annotation and ownerReference;
-  - namespaceAdmin and the user's RoleBinding both bind teknoir-admin;
-  - the User has the claim owner@teknoir-default;
-  - the policies, the TLS Secret (checked by name only) and the ConfigMaps exist;
-  - the AppProject's sourceRepos is harbor.<domain>/teknoir only, with no cluster
-    whitelist;
-  - the 9 plugin Applications come from Harbor at PLUGIN_CHART_VERSION with
-    RespectIgnoreDifferences=true, and are Synced/Healthy within 20 minutes;
-  - every enabled plugin reports Success;
-  - every pod is Ready with the sidecar, its images are local, and nothing failed
-    to pull;
-  - an in-pod nslookup of mqtt-teknoir-default resolves to NODE_IP;
-  - TLS works on 8883 and 2222;
-  - the teamspace's Grafana and Prometheus answer 200;
-  - the Backstage system and the user's group membership appear (PT1M polling).
-- E12 checks node time:
-  - the pinned .debs are installed, timesyncd is gone, chrony is active and
-    hwclock exists;
-  - at -20 s, a plain up gets within 2 s in 60 s and changes no package;
-  - at -400 s with the RTC also off, up exits 1 with the hint, and
-    `up --sync-clock` brings both clock and RTC within 2 s;
-  - after a guest reboot, the clock is within 5 s (QEMU keeps the RTC the guest
-    wrote);
-  - SNTP from the netns gets stratum 11 or lower and an offset within 2 s;
-  - doctor reports no FAIL for the node.
-- E13 checks access and credentials:
-  - a non-admin realm user (a User CR with role viewer) signs in with a forced
-    password change; after a reconcile its temporary-password Secret is gone (K1
-    case b);
-  - that user gets 403 on the teknoir-system monitoring UIs, no ArgoCD
-    Applications, and 403 from Harbor project creation (not a CSRF failure);
-  - the admin gets 200 and Grafana Admin by e-mail;
-  - platform-admin is disabled and its login is refused;
-  - the can-i matrix of rbac-k3d holds, and no "forbidden" appears in the
-    controller logs;
-  - keycloak-admin has no previous-password;
-  - the LAN backup without a tty decrypts with each test identity, sha256sum -c
-    passes, and one plaintext set remains;
-  - after `rotate argocd-admin`: the initial secret is gone, the old password
-    gets 401, the new one 200, and the SSO admin can still sync;
-  - after `rotate keycloak-db --i-know`, sign-in still works;
-  - Prometheus logs no "Error sending alerts" for 5 minutes.
-- E14 checks sign-in robustness:
-  - a garbage cookie gets 302 to `/oauth2/start` and two expiring Set-Cookies;
-  - CORS and XHR requests get 401 without Location;
-  - http gets 301 to https;
-  - a signed-in API call without a Backstage token gets the upstream 401/403;
-  - the logout chain ends at the login form.
-- E15 rehearses the live rollout:
-  - The setup is E10's old layout, migrate, up A, one admin login, migrate
-    --argo and M6.
-  - Then the live state is injected: Profile teknoir-demo on github.io, a stale
-    Failed monitoring operation with retryCount 5, and empty admission caBundles.
-  - The master-realm legacy clients are created through the master admin API,
-    because neither the old layout nor A creates them (the live node got them by
-    hand, old AIRGAP-BOOTSTRAP 8): teknoir, with the oauth2-proxy client's secret
-    and a service account holding master-realm manage-users; argocd; and harbor.
-    The teknoir service account lists master's users, which shows the severity.
-    Before B, all three exist and teknoir's secret gets a token on master, so the
-    check after B cannot pass on an empty realm.
-  - Then up B runs, and these must hold:
-    - post passes;
-    - teknoir-demo moves to Harbor (a warning only if it stays unhealthy);
-    - monitoring Succeeds with its caBundle;
-    - the legacy field is cleared with the credential's created_date unchanged
-      (read-only SQL);
-    - previous-password is gone;
-    - the master legacy clients are gone, and the old teknoir secret gets 401 on
-      master;
-    - admin-user grants owner@teknoir-default and owner@teknoir-demo and writes
-      no file;
-    - the E11, E13 and E14 checks pass.
-- E2, E4, E7, E8 and E10 are extended as described in the CHANGELOG.
-
-The e2e harness itself is tested without a VM (airgap/test/README.md):
-`kc_login.bats` uses a local HTTPS stand-in for oauth2-proxy and Keycloak, and
-`harness.bats` dry-runs E1, E4, E11, E12, all of E13, E15's injection and the whole
-E15 sequence against stub worlds. Each broken part of a world fails exactly its
-assertion.
-
 ## Work items
 
 NOTE: G-05 is superseded by D2 (dedicated realm `teknoir`, not an adoption of master). G-04 must include the Backstage/user-controller secrets above. L-01 hygiene is folded into the migration (keycloak admin rotation happens via G-05/D2).
@@ -1534,116 +1631,3 @@ Follow migration_for_live_env M0-M6 with the new bundle: backup, migrate --dry-r
 - Node /opt/k3s/agent/images stale tarballs not in the current bundle: goharbor *_v2.15.2, valkey-photon, busybox_1.28/latest if unused, dex, redis 8.6.4 if unused (pruned by host phase)
 - Harbor robot$argocd and the ArgoCD repo-creds Secret using it, after the credential-less repository is live
 - vpro infra-teknoir-local/bundle/teknoir-airgap-bundle-0.1.0 and the plaintext .secrets/: move to an encrypted backup, then delete
-
-## r5 (app-of-apps 0.0.5)
-
-Design changes of release r5. Each subsection belongs to one work package; the
-plan and the facts behind it are in the r5 hardening plan.
-
-### Post phase classification, failed-sync re-sync, keycloak-admin clean-up, migrate --finalize (infra lib/release.sh, lib/migrate.sh)
-
-- **Which Applications post waits for (R2).** Platform: the root `app-of-apps`
-  and every Application whose `argocd.argoproj.io/tracking-id` starts with
-  `app-of-apps:` (or `<ns>_app-of-apps:`). Teamspace: an ownerReference of kind
-  `Profile`; strict only when that Profile itself carries an ArgoCD tracking-id
-  (declared in GitOps by the profile-controller chart, contract K3) and the
-  ownerReference uid matches. Platform and strict teamspace Applications must be
-  ready; all others (teamspaces created in Backstage, Applications with no
-  Teknoir owner) are listed in one WARN and never block. The root must exist.
-  `teknoir-node status` prints one `apps:` line per class; the table has a
-  CLASS column (`*` = reported only). The same rules gate `migrate --finalize`.
-- **A Profile declared in GitOps is itself waited for (TS-C6).** Its
-  Applications only exist once profile-controller has reconciled it, so without
-  this a Profile with none (profile-controller down, or Forbidden by its RBAC)
-  or only some would add nothing to wait for. Post adds a strict entry
-  `profile/<name>` that is not ready while `status.appliedconfig.lastRunStart`
-  is missing ("not reconciled by profile-controller yet"), while `lastRunEnd`
-  is missing or earlier ("run in progress"), while the Profile owns no
-  Application (owner uid checked), or while an enabled chart plugin's
-  Application is missing (profile-controller names it
-  `<profile>-<pluginConfig.name>`). A plugin whose `applyStatus.status` is not
-  `Success` is only reported: EMQX's fails until the EMQX pod answers its API,
-  and profile-controller retries with a backoff of up to ~17 min, which would
-  fail `up` on timing alone (E11 asserts every plugin `Success` on the VM).
-  Profiles not declared in GitOps get the same entry, reported only. Only
-  names, uids, run times and plugin kind/enabled/chart/status are read; never
-  a plugin's configuration. `status` prints one `profile:` line per Profile.
-- **The wait (TS-C6).** Without `--wait-timeout`, post waits
-  POST_WAIT_DEFAULT (1200 s) on an update and POST_WAIT_FIRST_INSTALL (2700 s)
-  on a first install. An update that creates a teamspace declared in GitOps
-  gets 2700 s too, counted from the start of the wait, as soon as one poll
-  sees it being created (`_release_post_creating`): a strict Profile that
-  profile-controller has not run for, or whose Applications are not all
-  created yet (a run in progress alone does not count), or a strict teamspace
-  Application that is not ready and has an empty `status.history` (ArgoCD adds
-  an entry per successful sync, so it has never synced). The r5 update creates
-  `teknoir-default` this way: the root pin, the profile-controller sync, its
-  reconcile and the first sync of 9 charts (MongoDB's init included) all fall
-  in one `up`, next to Keycloak, Harbor and Backstage restarts, which can take
-  longer than 20 min. An explicit `--wait-timeout` is never extended. The
-  timeout error says that re-running `up` is safe.
-- **Failed last sync (HYG-C3).** `why()` reports `last sync to <rev> <phase>:
-  <message>` when `.status.operationState.phase` is Failed or Error, its
-  revision (`syncResult.revision[s]`, else `operation.sync.revision[s]`) equals
-  `.status.sync.revision[s]`, and no `.operation` is pending; a pending
-  `.operation` is itself not ready ("requested, not started yet"), which closes
-  the window between the re-sync patch and the controller picking it up. Post
-  re-syncs each such *platform* Application, but only while that failure is
-  about the spec the Application keeps: its own status is not stale (no
-  operation pending or running, `comparedTo` equals the spec's source[s], an
-  exact chart pin equals `status.sync.revision`, the root reconciled since this
-  run's pin) and, for a child, the root is `Synced` with a status that is not
-  stale either. Right after a pin the old revision's failure is still in the
-  status (the root has not synced the new child spec yet, or ArgoCD has not
-  compared the child's new spec); re-syncing it would re-apply the superseded
-  chart, spend the once-per-run budget and, with the spec's retry, hold an
-  operation that blocks the new revision's auto-sync. The root's own failure
-  at its current pin makes the root the candidate. At most once per run
-  (RELEASE_RESYNCED) with one merge patch: `metadata.resourceVersion` (the
-  apiserver rejects a stale write with 409; retried at the next poll),
-  `.operation` = {initiatedBy teknoir-node, sync {revision[s] it is at,
-  prune = `spec.syncPolicy.automated.prune`, syncOptions from the spec}, retry =
-  `spec.syncPolicy.retry` or ArgoCD's default `{limit: 5}`}, and
-  `status.operationState: null`. That mirrors ArgoCD's SetAppOperation and
-  auto-sync. Setting `.operation` alone makes the controller merge the new
-  operation into the stale state (it writes operationState with a JSON merge
-  patch and the empty fields are omitempty) and fail at once (live, 05:40).
-  Dry-run records the re-sync as a would-change. Teamspace (and other)
-  Applications are never re-synced (R2). ArgoCD never retries a failed
-  revision either, so `why()` adds to such an Application's failed-sync reason
-  that post re-syncs platform Applications only and how to sync it (ArgoCD UI,
-  or the OPERATE section 12 patch). Otherwise a strict teamspace Application
-  whose first sync spent its retries would fail every `up` with no way out
-  named.
-- **keycloak-admin `previous-password` (SEC-C10).** After the wait, post reads
-  only the resourceVersion and the key names of `teknoir-auth/keycloak-admin`.
-  With `previous-password` and `password` present, it logs in to realm master
-  with `password` (admin-cli password grant, credentials in a curl config on a
-  pipe, through the gateway on NODE_IP with the platform CA). On 200 it removes
-  the key with a JSON patch whose first op tests the resourceVersion; on 400/401
-  or any other status it keeps it with a WARN. Dry-run does not log in. Post
-  also warns while `teknoir-system/argocd-initial-admin-secret` exists.
-- **`migrate --finalize [--i-know]` (SEC-C10).** Refuses unless: no Teknoir
-  K3s file or Addon is left (teknoir-argo included); every retired
-  `*.yaml|*.yml|*.json` keeps `<manifests>/<name>.skip`; the post phase's
-  strict Applications are ready; and `/var/lib/teknoir-airgap/exports` holds an
-  age file (`age-encryption.org/v1` header) whose backup stamp (UTC in its
-  name, else its mtime) is newer than the newest `manifests-retired/<UTC>` dir.
-  `--i-know` waives only the export check (an encrypted copy kept off the
-  node). It then shreds every retired file (symlinks are unlinked, never
-  followed), removes the directories and `manifests-retired`, and logs names
-  only. The `.skip` guards are never touched. New retirements are mode 0600.
-- **`migrate --argo` ownership check (HYG-C6).** An object of the detached file
-  is ArgoCD's when it carries the `argo` tracking-id or is a Synced entry of the
-  `argo` Application's `.status.resources` (mapped to `Kind.v1.` / `Kind.group`).
-  `argocd-tls-certs-cm` and objects labelled
-  `app.kubernetes.io/managed-by=teknoir-node` are logged as converge-owned; only
-  the rest is warned. The secrets phase now applies that label to
-  `argocd-tls-certs-cm` (one label-only server-side apply on the next `up`).
-- **Tests.** `airgap/test/unit/release-ready-test.sh` (classification, reasons,
-  candidates, patch body, wait loop with a stub controller, keycloak clean-up,
-  status lines), `airgap/test/unit/migrate-argo-untracked-test.sh`, k3d
-  `run.sh T10` (the real runner's post phase against stand-in Applications and
-  `stubs/fake-keycloak.py`) and `migrate-test.sh` (CRD adoption via status,
-  0600 retirements, every finalize refusal and the shred). VM: E1/E10/E15 assert
-  operationState Succeeded and a non-empty admission `caBundle` (WP-I-E2E).
