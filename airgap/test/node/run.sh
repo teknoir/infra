@@ -736,8 +736,16 @@ installs="$(since "${before}" '^apt-get install' | grep -v ' -s ' || true)"
 check "(a) fresh node: converge succeeds" [ "${RC}" == 0 ]
 check "(a) exactly one apt-get install, after the simulate" \
   bash -c "[ \$(grep -c . <<<'${installs}') = 1 ] && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get install' | head -1 | grep -q ' -s '"
-check "(a) the install is offline, with both absolute .deb paths" \
-  bash -c "grep -q -- '--no-download' <<<'${installs}' && grep -qF '${PAYLOAD}/debs/${DEB_CHRONY}' <<<'${installs}' && grep -qF '${PAYLOAD}/debs/${DEB_ULE}' <<<'${installs}' && grep -q 'DPkg::Lock::Timeout=300' <<<'${installs}'"
+check "(a) the install names both absolute .deb paths" \
+  bash -c "grep -qF '${PAYLOAD}/debs/${DEB_CHRONY}' <<<'${installs}' && grep -qF '${PAYLOAD}/debs/${DEB_ULE}' <<<'${installs}' && grep -q 'DPkg::Lock::Timeout=300' <<<'${installs}'"
+apt_calls="$(since "${before}" '^apt-get install')"
+APT_HIDE=' -o Dir::State::Lists=/[^ ]* -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= '
+check "(a) the simulate (--no-download) and the install hide the node's lists and binary caches (the .debs are apt's only origin)" \
+  bash -c "sed -n 1p <<<'${apt_calls}' | grep -q -- '^apt-get install -s --no-download${APT_HIDE}' && sed -n 2p <<<'${apt_calls}' | grep -q -- '^apt-get install -y${APT_HIDE}'"
+check "(a) the install runs without --no-download (with it apt 3.0 never resolves a local .deb's path)" \
+  bash -c "! grep -q -- '--no-download' <<<'${installs}'"
+check "(a) both saw an existing, empty lists dir in the run's scratch dir, removed at exit" \
+  bash -c "[ \"\$(cut -d' ' -f1 '${STUB_STATE}/apt-lists.log' | tr '\n' ' ')\" = 'empty empty ' ] && [ \"\$(cut -d' ' -f2 '${STUB_STATE}/apt-lists.log' | sort -u | grep -c .)\" = 1 ] && d=\"\$(head -1 '${STUB_STATE}/apt-lists.log' | cut -d' ' -f2)\" && [[ \"\${d}\" == */teknoir-node.*/apt-lists ]] && [ ! -e \"\${d}\" ]"
 check "(a) the change is recorded, with the timesyncd removal" \
   grep -qF 'changed: installed chrony 4.6.1-3+deb13u2, util-linux-extra 2.41.5-0+deb13u1 from the bundle (removed systemd-timesyncd)' "${T}/out"
 before="$(ncalls)"
@@ -765,10 +773,19 @@ tn converge --site test --only host
 unset STUB_APT_SIM_RC
 check "(d) a failing simulate (exit 100): WARN, no install, converge rc 0" \
   bash -c "[ ${RC} = 0 ] && grep -q 'WARN: host packages: apt cannot install .* offline (simulate exit 100' '${T}/out' && [ -z \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get install' | grep -v ' -s ' || true)\" ]"
+mkdir -p "${STUB_STATE}/dpkg"
+echo 257.13-1~deb13u1 > "${STUB_STATE}/dpkg/systemd-timesyncd"
+export STUB_APT_RC=100
+before="$(ncalls)"
+tn converge --site test --only host
+unset STUB_APT_RC
+check "(f) a failing install (exit 100) after apt removed systemd-timesyncd: the WARN says the node has no time service, converge rc 0" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: host packages: apt-get install of chrony 4.6.1-3+deb13u2, util-linux-extra 2.41.5-0+deb13u1 failed (.*); apt had already removed systemd-timesyncd, so the node has no time service until the packages are installed: the converge goes on without them' '${T}/out' && ! grep -q 'changed: installed chrony' '${T}/out'"
+rm -rf "${STUB_STATE}/dpkg"
 before="$(ncalls)"
 tn converge --site test --only host --dry-run
 check "(e) dry-run: the simulate is the only apt-get call" \
-  bash -c "[ ${RC} = 0 ] && [ \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -c '^apt-get')\" = 1 ] && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get' | grep -q '^apt-get install -s --no-download'"
+  bash -c "[ ${RC} = 0 ] && [ \"\$(tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -c '^apt-get')\" = 1 ] && tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep '^apt-get' | grep -q '^apt-get install -s --no-download -o Dir::State::Lists=/'"
 check "(e) dry-run reports the install it would do" grep -q 'would change: install chrony 4.6.1-3+deb13u2, util-linux-extra 2.41.5-0+deb13u1 from the bundle (removes systemd-timesyncd)' "${T}/out"
 check "(e) dry-run installs nothing" [ ! -d "${STUB_STATE}/dpkg" ]
 printf 'chrony %s amd64 %064d %s\n' 4.6.1-3+deb13u2 0 "${DEB_CHRONY}" > "${PAYLOAD}/debs/debs.lock"

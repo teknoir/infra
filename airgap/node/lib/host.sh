@@ -287,8 +287,20 @@ host_packages() {
   # that fails, is a WARN and the step is skipped. A node on another Debian
   # point release must not be blocked from a platform update; preflight keeps
   # checking the clock, and doctor shows the gap.
-  local lock="${NODE_ROOT}/debs/debs.lock" pkg ver sha file deb have sim rc=0 op what bad="" removed="" list
-  local -a debs=() names=()
+  #
+  # Both apt calls see an empty lists dir and no binary caches, so the local
+  # .debs are the only origin apt knows and nothing can be fetched. With the
+  # node's lists in view, a version that a repository also offers (the live
+  # node's lists, from its install, carry both pins) makes apt plan the fetch
+  # from that repository, which --no-download refuses: "E: Unable to fetch
+  # some archives", exit 100. The node's installed packages (the dpkg status)
+  # are still all in view. The install itself runs without --no-download:
+  # with it, apt 3.0 never runs the file method that resolves a local .deb's
+  # path and fails after its removals ("E: Internal Error, Pathname to install
+  # is not absolute"), leaving the node with neither systemd-timesyncd nor
+  # chrony (found by airgap/test/node/packages-test.sh).
+  local lock="${NODE_ROOT}/debs/debs.lock" pkg ver sha file deb have sim rc=0 op what bad="" removed="" gone="" list
+  local -a debs=() names=() apt_offline=()
   if [[ ! -f "${lock}" ]]; then
     log "host packages: this payload has no node/debs (nothing to install)"
     return 0
@@ -325,7 +337,10 @@ host_packages() {
     log "host packages: the bundle's node packages are installed ($(awk 'NF && $1 !~ /^#/ {printf "%s%s %s", s, $1, $2; s = ", "}' "${lock}"))"
     return 0
   fi
-  sim="$(LC_ALL=C apt-get install -s --no-download --no-install-recommends "${debs[@]}" 2>&1)" || rc=$?
+  ensure_work_dir
+  mkdir -p "${WORK_DIR}/apt-lists/partial"
+  apt_offline=(-o "Dir::State::Lists=${WORK_DIR}/apt-lists" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=)
+  sim="$(LC_ALL=C apt-get install -s --no-download "${apt_offline[@]}" --no-install-recommends "${debs[@]}" 2>&1)" || rc=$?
   if (( rc != 0 )); then
     warn "host packages: apt cannot install ${list} offline (simulate exit ${rc}: $(grep -E '^(E:|W:)' <<<"${sim}" | tail -n 3 | tr '\n' ' ')): skipped; the node keeps its clock tools as they are"
     return 0
@@ -354,10 +369,14 @@ host_packages() {
     return 0
   fi
   # DPkg::Lock::Timeout: unattended-upgrades and apt-daily may hold the lock
-  if ! run env DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 apt-get install -y --no-download \
+  if ! run env DEBIAN_FRONTEND=noninteractive UCF_FORCE_CONFFOLD=1 apt-get install -y "${apt_offline[@]}" \
        --no-install-recommends -o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold "${debs[@]}" >&2; then
     HOST_PACKAGES_PLANNED=0
-    warn "host packages: apt-get install of ${list} failed (see /var/log/apt/term.log; dpkg --audit): the converge goes on without them"
+    # apt removes before it installs: say so when the node lost its time client
+    for pkg in ${removed//,/ }; do
+      [[ -n "$(host_pkg_installed_version "${pkg}")" ]] || gone+="${gone:+, }${pkg}"
+    done
+    warn "host packages: apt-get install of ${list} failed (see /var/log/apt/term.log; dpkg --audit)${gone:+; apt had already removed ${gone}, so the node has no time service until the packages are installed}: the converge goes on without them"
     return 0
   fi
   changed "installed ${list} from the bundle${removed:+ (removed ${removed})}"

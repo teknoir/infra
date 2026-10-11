@@ -299,9 +299,11 @@ host_files() {
     if grep -qE "${MUTATING_RE}" <<<"${l}"; then echo "wrongly mutating: ${l}"; return 1; fi
   done
   # an apt-get simulation is not mutating; the install it plans is
-  printf '%s\n' "apt-get install -s --no-download --no-install-recommends /p/debs/chrony.deb" > "${STUB_LOG}"
+  # (the shapes host_packages runs: lists and binary caches hidden)
+  local hide="-o Dir::State::Lists=/dev/shm/teknoir-node.Ab12/apt-lists -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache="
+  printf '%s\n' "apt-get install -s --no-download ${hide} --no-install-recommends /p/debs/chrony.deb" > "${STUB_LOG}"
   [ -z "$(mutating_calls)" ]
-  printf '%s\n' "apt-get install -y --no-download /p/debs/chrony.deb" > "${STUB_LOG}"
+  printf '%s\n' "apt-get install -y ${hide} --no-install-recommends -o DPkg::Lock::Timeout=300 /p/debs/chrony.deb" > "${STUB_LOG}"
   [ -n "$(mutating_calls)" ]
 }
 
