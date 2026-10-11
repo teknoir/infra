@@ -216,7 +216,7 @@ stop() {
       kill "${pid}"
       # qemu holds the tap until it has exited: a start right after must not race it
       for _ in $(seq 1 20); do kill -0 "${pid}" 2>/dev/null || break; sleep 1; done
-      kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null || true
+      if kill -0 "${pid}" 2>/dev/null; then kill -9 "${pid}" 2>/dev/null || true; fi
     fi
   fi
   rm -f "${PIDF}"; log "stopped"
