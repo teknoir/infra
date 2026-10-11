@@ -13,21 +13,78 @@
 # E0 = resume `up` on the existing VM, a debug aid run only when named):
 #   E1  fresh bootstrap on a just-created VM: up, all Applications
 #       Synced/Healthy in 45 min, HTTPS to harbor/argocd/auth with the fetched
-#       CA; the first admin from `admin-user --email --out` (0600 file), then
-#       an oauth2-proxy login as that admin, setting the new password Keycloak
-#       demands for the temporary one                        [--allow-destroy]
+#       CA; every platform Application's last operation Succeeded; the
+#       monitoring admission webhooks have a caBundle; every digest-pinned
+#       container runs that digest; post logs "live image check: N pullable
+#       ... 0 missing"; /oauth2/start redirects to auth.<domain>. The first
+#       admin (the owner of Profile teknoir-default unless E2E_ADMIN_EMAIL)
+#       from `admin-user --email --out` (0600 file): the User keeps no
+#       status.set_initial_password and the temporary-password Secret is gone;
+#       an oauth2-proxy login as that admin sets the new password Keycloak
+#       demands and never sees the Update Profile form; Backstage resolves the
+#       session to user:default/<name> within 3 min of the User's creation;
+#       backstage-api never restarted. A bundle older than r5 (app-of-apps <
+#       E2E_R5_AOA: bundle A of the upgrade run) is a baseline: those r5-only
+#       checks (operations, caBundle, digests, the handover, the profile form,
+#       the Backstage identity, the restarts) only warn    [--allow-destroy]
+#   E11 default teamspace teknoir-default (GitOps Profile): Profile, namespace,
+#       RoleBindings, the owner claim, policies, Secrets, the AppProject
+#       (Harbor only, no cluster kinds) and its 9 plugin Applications from
+#       Harbor at PLUGIN_CHART_VERSION with RespectIgnoreDifferences, Synced/
+#       Healthy in 20 min; plugin status Success; pods Ready with the sidecar,
+#       images local; mqtt-teknoir-default.<domain> resolves to NODE_IP in a
+#       pod; TLS on 8883 and 2222; Grafana and Prometheus of the teamspace
+#       answer the owner; the Backstage catalog has the system and the user's
+#       teamspace group
+#   E12 node time: the bundled chrony and util-linux-extra at their pinned
+#       versions, systemd-timesyncd gone, chrony active, hwclock present; the
+#       node 20 s behind -> a plain up corrects it within 60 s, no package
+#       change; 400 s behind (RTC too) -> up refuses with the --sync-clock
+#       hint, up --sync-clock fixes clock and RTC; after a guest reboot the
+#       clock is within 5 s; SNTP from the LAN host: stratum <= 11, offset
+#       <= 2 s; doctor reports no FAIL for the node
+#   E13 access and credentials: a non-admin realm user (its temporary-password
+#       Secret deleted once it set its own password) gets 403 from the
+#       teknoir-system Grafana, Prometheus and Alertmanager, no ArgoCD
+#       Applications and 403 creating a Harbor project; the admin gets 200
+#       and is Grafana Admin by e-mail; platform-admin cannot sign in;
+#       controller RBAC (can-i matrix, no "forbidden" in their logs);
+#       keycloak-admin without previous-password; the LAN backup without a tty
+#       decrypts with each test age identity and verifies, one plaintext set
+#       left on the node; rotate argocd-admin (initial Secret gone, old
+#       password 401, new 200, SSO admin still role:admin); rotate keycloak-db
+#       --i-know and the admin still signs in; Prometheus sends its alerts
+#   E14 sign-in robustness: a garbage session cookie -> 302 /oauth2/start and
+#       expired cookies; XHR -> 401 without Location; http -> 301 https; a
+#       signed-in API call without a Backstage token gets Backstage's own
+#       401/403; the logout chain (oauth2-proxy sign_out -> Keycloak logout
+#       confirmation -> https://<domain>/ -> /oauth2/start -> login form)
 #   E2  idempotency: a second up reports 0 changes; pod UIDs, k3s start time,
-#       Secret resourceVersions unchanged; Harbor receives 0 blob uploads
+#       Secret resourceVersions unchanged (only user-controller's own deletion
+#       of a temporary-password Secret is allowed); Harbor receives 0 blob uploads; the
+#       teknoir-default Applications were not synced again and their Secrets
+#       kept their resourceVersions; profile-controller did not restart
 #   E3  no egress from the VM or the namespace (FORWARD DROP counters grow);
 #       every running image is in containerd; no ErrImagePull
-#   E4  update to bundle B changes only the bumped Applications and records B;
-#       bundle A is refused, accepted with --rollback, and then kept
+#   E4  update to bundle B changes only the bumped Applications and records B,
+#       every platform operation Succeeded, admission caBundle set, digests
+#       match, the admin still signs in (Keycloak data kept), Harbor healthy;
+#       bundle A is refused, accepted with --rollback, and then kept. From an
+#       r5 B to a pre-r5 A the rollback meets an open design gap (B's kept
+#       Profile and Namespace, A's post): E2E_E4_ROLLBACK=1 runs it and asserts
+#       each part; E2E_E4_ROLLBACK=0 waives it on purpose (noted in the
+#       summary row); left at auto, E4 fails, because an unrehearsed rollback
+#       is not green
 #   E5  interrupt up during payload sync, Harbor push and tarball import; each
 #       re-run completes with no manual repair
 #   E8  rotate oauth2-proxy-cookie: only that Secret changes, oauth2-proxy
-#       rolls, login still works
-#   E7  secrets hygiene: no Secret value in the LAN transcript or node logs;
-#       no PRIVATE KEY in the bundle tar; ~/.docker, ~/.config/helm unchanged
+#       rolls, the pre-rotation cookie gets 302 /oauth2/start (not 403), login
+#       still works
+#   E7  secrets hygiene: no Secret value in the LAN transcript or node logs,
+#       nor any value the LAN side holds (passwords from admin-user, kc-login
+#       and credentials, the test age identities); no age identity on the
+#       node; no PRIVATE KEY or age identity in the bundle tar; ~/.docker,
+#       ~/.config/helm unchanged
 #   E6  node rebuild: new host key -> up prints the ssh-keygen -R fix;
 #       --forget-host-key completes; optional restore check  [--allow-destroy]
 #   E10 migration rehearsal (OPERATE.md M3-M6): old-style install
@@ -35,33 +92,79 @@
 #       over: username + previous-password), up (the admin rotated to password;
 #       realm teknoir; admin-user + oauth2-proxy login), migrate --argo (no
 #       Teknoir K3s file or Addon left, argoproj CRDs protected, no old bundle
-#       copy), migrate again (robot repo-creds Secret and robot$argocd gone,
-#       app-of-apps still syncs), k3s restart (same inventory, Secrets keep
-#       their resourceVersion). Nothing lost but E2E_E10_EXPECTED_GONE, old
-#       secrets unchanged, CRDs Synced resources of their Applications (ArgoCD
-#       3.5 writes no tracking-id on CRDs), Harbor stable    [--allow-destroy]
+#       copy, no "no owner" warning), migrate again (robot repo-creds Secret
+#       and robot$argocd gone, app-of-apps still syncs), k3s restart (same
+#       inventory, Secrets keep their resourceVersion), an encrypted backup,
+#       then migrate --finalize (manifests-retired gone, .skip guards kept).
+#       Nothing lost but E2E_E10_EXPECTED_GONE, old secrets unchanged, CRDs
+#       Synced resources of their Applications (ArgoCD 3.5 writes no
+#       tracking-id on CRDs), Harbor stable                [--allow-destroy]
+#   E15 live rehearsal: E10's old layout, migrate, up with bundle A (the admin
+#       signs in once: legacy status.set_initial_password, no required
+#       actions), migrate --argo and M6 as on the live node; then the live
+#       state is injected: Profile teknoir-demo whose Applications point at
+#       github.io, a stale Failed monitoring operation with retryCount 5,
+#       empty admission caBundles, and realm master's legacy clients, which
+#       the live node got by hand (old AIRGAP-BOOTSTRAP 8) and neither the old
+#       layout nor A creates: teknoir (the oauth2-proxy client's secret, a
+#       service account with master-realm manage-users), argocd, harbor; the
+#       teknoir service account lists master's users (the severity); before
+#       B all 3 exist and teknoir's secret gets a master token
+#       (previous-password comes from the migration); then
+#       up with bundle B: post passes, teknoir-demo moves to Harbor
+#       (Synced/Healthy or a warning), monitoring syncs and gets its caBundle,
+#       the legacy field is cleared without a password change,
+#       previous-password and the master clients are gone (teknoir's secret
+#       gets 401 on master), admin-user grants owner on teknoir-default and
+#       teknoir-demo; then the E11, E13 and E14 checks      [--allow-destroy]
 #
 # Usage: airgap/test/vm/e2e.sh [--list] [--allow-destroy] [--stop-on-fail] [E...]
 # Environment:
 #   E2E_BUNDLE       bundle A: dist/teknoir-airgap-<id>.tar (+ .tar.sha256 next to it)
-#   E2E_BUNDLE_B     bundle B for E4 (a trivial controller + app-of-apps bump)
-#   E2E_E4_APPS      exactly the Applications B changes, e.g. "app-of-apps device-controller" (E4 needs it)
-#   E2E_OLD_SETUP    E10: command (run on vpro, VM_IP exported) that installs the
+#   E2E_BUNDLE_B     bundle B for E4 and E15 (E15: the release under test)
+#   E2E_E4_APPS      exactly the Applications B changes, e.g. "app-of-apps device-controller",
+#                    or auto: app-of-apps and the Applications whose chart pin differs
+#                    between A's and B's node/charts/pins.txt, plus the teknoir-default
+#                    plugin Applications when B's profile-controller adds that Profile
+#                    (E4 needs it)
+#   E2E_E4_ROLLBACK  E4 after the refused A: auto (default) rolls back to A unless B
+#                    is r5 and A predates it (then E4 fails and names the gap); 1
+#                    always (r5 -> pre-r5: each part of the expected state asserted;
+#                    the release run uses this); 0 never (a waiver, noted in the summary)
+#   E2E_E1_BASELINE  E1: auto (default) treats a bundle older than r5 as a baseline
+#                    (the r5-only checks warn); 1 always; 0 never (all strict)
+#   E2E_R5_AOA       the first app-of-apps version of r5 (default 0.0.5), read from
+#                    MANIFEST.yaml appOfAppsVersion or node/charts/pins.txt
+#   E2E_OLD_SETUP    E10, E15: command (run on vpro, VM_IP exported) that installs the
 #                    old (e9a3b7f) layout with dummy secrets on the fresh VM
 #                    (airgap/test/vm/old-setup.sh)
 #   E2E_E10_SECRETS  E10: ns/name of the Secrets that must stay unchanged
 #   E2E_E10_EXPECTED_GONE  E10: Kind/ns/name of the objects the migration removes
 #                    (default: the harbor-registry-htpasswd and argocd-harbor-repo Secrets)
 #   E2E_E10_STABLE_SECONDS  E10: how long Harbor must roll no new core ReplicaSet (3600)
+#   E2E_E15_DEMO_PROFILE  E15: Profile manifest for teknoir-demo (default: owner
+#                    = the admin, no spec.plugins: the controller's defaults)
 #   E2E_WORK         work dir (default ~/vmtest/e2e); LAN_HOME (default ~/vmtest/lanhome)
 #   E2E_UP_FLAGS     extra flags for every teknoir-airgap call
 #   E2E_ZERO_CHANGES_RE  regex that the E2 summary must match (default: "0 change|no change")
 #   E2E_LOGIN_URL    oauth2-proxy protected URL (default https://<domain>/teknoir-system/grafana/)
-#   E2E_ADMIN_EMAIL  E1: the first admin created with admin-user (default
+#   E2E_ADMIN_EMAIL  the first admin created with admin-user (default: the
+#                    owner of Profile teknoir-default once it exists (E1, E10,
+#                    E15; remembered in E2E_WORK/state/admin-email), else
 #                    e2e-admin@example.com)
 #   E2E_ADMIN_USER   Keycloak user for the login checks (default: E2E_ADMIN_EMAIL
 #                    in lower case, the username user-controller gives the
 #                    Keycloak user it creates for the User CR)
+#   E2E_NONADMIN_EMAIL  E13: the non-admin realm user (default e2e-viewer@example.com)
+#   E2E_TEAMSPACE    E11: the GitOps teamspace (default teknoir-default)
+#   E2E_CREDENTIALS_NS  namespace of the temporary-password Secrets
+#                    (default teknoir-user-credentials)
+#   E2E_DNS_IMAGE    E11: image with nslookup for the in-pod lookup, present on
+#                    the node (default docker.io/library/busybox:1.36.1)
+#   E2E_CATALOG_TIMEOUT  E1, E11: seconds to wait for the Backstage catalog (300)
+#   E2E_AGE          age binary for E13's decryption (default: age on PATH,
+#                    else the bundle's node/bin/age); the identities are
+#                    VM_DIR/age/*.key (vm.sh age-key)
 #   E2E_E6_RESTORE_CMD  E6: restore command run after the rebuild (OPERATE.md); unset = skip
 # Nothing here touches vpro's /etc/hosts, its default route, or the live env.
 set -euo pipefail
@@ -84,12 +187,29 @@ export LAN_SITE="${E2E_SITE:-${REPO}/airgap/site/vmtest.env}"
 SITE_FILE="${E2E_WORK}/site/vmtest.env"
 TRANSCRIPT="${E2E_WORK}/transcript.log"
 STATE="${E2E_WORK}/state"
-ALL=(E1 E2 E3 E4 E5 E8 E7 E6 E10)
+HTTP_DIR="${E2E_WORK}/http"
+ALL=(E1 E11 E12 E13 E14 E2 E3 E4 E5 E8 E7 E6 E10 E15)
 ALLOW_DESTROY=0 STOP_ON_FAIL=0
 HARBOR_NS="${E2E_HARBOR_NS:-teknoir-system}"
 HARBOR_REGISTRY="${E2E_HARBOR_REGISTRY:-harbor-registry}"
 ADMIN_EMAIL="${E2E_ADMIN_EMAIL:-e2e-admin@example.com}"
 ADMIN_USER="${E2E_ADMIN_USER:-$(printf '%s' "${ADMIN_EMAIL}" | tr '[:upper:]' '[:lower:]')}"
+ADMIN_JAR="${LAN_HOME}/e2e/admin.jar"
+NONADMIN_EMAIL="${E2E_NONADMIN_EMAIL:-e2e-viewer@example.com}"
+NONADMIN_JAR="${LAN_HOME}/e2e/nonadmin.jar"
+TEAMSPACE="${E2E_TEAMSPACE:-teknoir-default}"
+CRED_NS="${E2E_CREDENTIALS_NS:-teknoir-user-credentials}"
+CATALOG_TIMEOUT="${E2E_CATALOG_TIMEOUT:-300}"
+# the profile-controller's default plugins (TS-C6): one Application each, <teamspace>-<plugin>
+PLUGINS=(deadend emqx prometheus jwks fleet-metrics grafana mongodb historian observatory)
+ROOT_APP="app-of-apps"
+# the first app-of-apps version of release r5: an older bundle (E1's baseline
+# in the upgrade run, E4's rollback target) predates the r5 assertions
+R5_AOA="${E2E_R5_AOA:-0.0.5}"
+# set while E1 checks a pre-r5 baseline bundle: the r5-only assertions warn
+R5_SOFT=""
+NODE_STATE_DIR=/var/lib/teknoir-airgap
+AGE_ID_DIR="${VM_DIR:-${HOME}/vmtest}/age"
 ZERO_RE="${E2E_ZERO_CHANGES_RE:-(^|[^0-9])0 change|no change|nothing changed}"
 # shellcheck disable=SC1090
 DOMAIN="$(. "${LAN_SITE}"; printf '%s' "${TEKNOIR_DOMAIN}")"
@@ -213,9 +333,11 @@ cleanup() {
 
 prepare() {
   mkdir -p "${E2E_WORK}/bundles" "${E2E_WORK}/site" "${STATE}"
-  install -d -m 0700 "${LAN_HOME}" "${LAN_HOME}/e2e"
+  install -d -m 0700 "${LAN_HOME}" "${LAN_HOME}/e2e" "${HTTP_DIR}"
   install -m 0644 "${LAN_SITE}" "${SITE_FILE}"
   touch "${TRANSCRIPT}"
+  # the first admin chosen by an earlier E1/E10/E15 (the teknoir-default owner)
+  if [[ -z "${E2E_ADMIN_EMAIL:-}" && -s "${STATE}/admin-email" ]]; then set_admin "$(head -n1 "${STATE}/admin-email")"; fi
   start_agent
   local avail
   avail="$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)"
@@ -255,6 +377,34 @@ bundle_dir() {
 
 bundle_id() { basename "$1" | sed 's/^teknoir-airgap-//'; }
 
+bundle_aoa() {
+  # bundle_aoa <bundle-dir> — the app-of-apps version the bundle installs:
+  # MANIFEST.yaml appOfAppsVersion, else node/charts/pins.txt (as
+  # load_bundle_info reads it on the node); empty when neither says
+  local dir="$1" v=""
+  if [[ -f "${dir}/MANIFEST.yaml" ]]; then
+    v="$(awk '/^appOfAppsVersion:/ {
+        sub(/^appOfAppsVersion:[[:space:]]*/, ""); sub(/[[:space:]]+#.*$/, ""); gsub(/^["\047]|["\047]$/, ""); print; exit }' \
+      "${dir}/MANIFEST.yaml")"
+  fi
+  if [[ -z "${v}" && -f "${dir}/node/charts/pins.txt" ]]; then
+    v="$(awk '$1 == "app-of-apps" {print $2; exit}' "${dir}/node/charts/pins.txt")"
+  fi
+  printf '%s' "${v}"
+}
+version_lt() {
+  # version_lt <a> <b> — 0 when a sorts strictly before b (sort -V, as release.sh)
+  [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" == "$1" ]]
+}
+bundle_is_r5() {
+  # bundle_is_r5 <bundle-dir> — 0 when the bundle carries release r5
+  # (app-of-apps >= R5_AOA). A bundle without a version counts as r5, so its
+  # checks stay strict.
+  local v
+  v="$(bundle_aoa "$1")"
+  [[ -z "${v}" ]] || ! version_lt "${v}" "${R5_AOA}"
+}
+
 ca_file() { find "${LAN_HOME}/.teknoir-airgap" -name teknoir-root-ca.crt -print -quit 2>/dev/null; }
 
 lan_https() {
@@ -287,6 +437,18 @@ snap_pods() {
 }
 snap_secret_rvs() {
   vm_kc get secrets -A --no-headers -o custom-columns=NS:.metadata.namespace,NAME:.metadata.name,RV:.metadata.resourceVersion | sort
+}
+drop_cred_deletions() {
+  # drop_cred_deletions <before> <after> — snap_secret_rvs <before> without
+  # the CRED_NS Secrets that are gone in <after>: user-controller deletes a
+  # temporary-password Secret on its own requeue once the user has set a
+  # password (K1 case b), which is not a change `up` made. A Secret created
+  # or changed in CRED_NS still differs.
+  local now
+  now="$(awk -v ns="${CRED_NS}" '$1 == ns { print $2 }' <<<"$2" | tr '\n' ' ')"
+  awk -v ns="${CRED_NS}" -v now="${now}" '
+    BEGIN { n = split(now, a, " "); for (i = 1; i <= n; i++) keep[a[i]] = 1 }
+    !($1 == ns && !($2 in keep))' <<<"$1"
 }
 k3s_since() { vmx systemctl show k3s -p ActiveEnterTimestamp --value; }
 release_state() {
@@ -324,37 +486,556 @@ admin_pw_current() {
   else printf '%s' "${LAN_HOME}/e2e/admin.pw"; fi
 }
 
+LOGIN_OK=0
 login_check() {
-  # login_check <description> — scripted oauth2-proxy/Keycloak login from the netns
+  # login_check <description> [kc-login flags...] — a fresh scripted
+  # oauth2-proxy/Keycloak login as the admin from the netns; the session stays
+  # in ADMIN_JAR for later API calls. Sets LOGIN_OK; always returns 0.
+  local desc="$1"
+  shift
+  rm -f "${ADMIN_JAR}"
   if lan "${E2E_WORK}" "${KCLOGIN}" --cacert "$(ca_file)" --url "${LOGIN_URL}" --user "${ADMIN_USER}" \
-       --password-file "$(admin_pw_current)" --new-password-file "${LAN_HOME}/e2e/admin.new"; then
-    pass "$1"
+       --password-file "$(admin_pw_current)" --new-password-file "${LAN_HOME}/e2e/admin.new" \
+       --cookie-jar "${ADMIN_JAR}" "$@"; then
+    pass "${desc}"; LOGIN_OK=1
   else
-    fail "$1"
+    fail "${desc}"; LOGIN_OK=0
   fi
+}
+
+# ---------------------------------------------------------------------------
+# the first admin and other users
+# ---------------------------------------------------------------------------
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+user_name() { local e; e="$(lower "$1")"; printf '%s' "${e/@/-at-}"; }   # the User CR name admin-user gives an address
+set_admin() { ADMIN_EMAIL="$1"; ADMIN_USER="${E2E_ADMIN_USER:-$(lower "$1")}"; }
+
+reset_admin() {
+  # a fresh VM: forget the remembered admin and its password files
+  rm -f "${STATE}/admin-email" "${LAN_HOME}/e2e"/admin.* "${LAN_HOME}/e2e"/nonadmin.* "${LAN_HOME}/e2e"/*.pw
+  [[ -n "${E2E_ADMIN_EMAIL:-}" ]] || set_admin e2e-admin@example.com
+}
+
+adopt_owner() {
+  # adopt_owner <email> — make <email> the first admin (unless E2E_ADMIN_EMAIL
+  # is set) and remember it for later runs (STATE/admin-email)
+  [[ -z "${E2E_ADMIN_EMAIL:-}" && -n "$1" ]] || return 0
+  set_admin "$1"
+  printf '%s\n' "${ADMIN_EMAIL}" > "${STATE}/admin-email"
+  tl_log "first admin: ${ADMIN_EMAIL}, the owner of Profile ${TEAMSPACE}"
+}
+
+profile_owner() { vm_kc get profiles.teknoir.org "$1" -o jsonpath='{.spec.owner.name}' 2>/dev/null || true; }
+
+bundle_profile_owner() {
+  # bundle_profile_owner <bundle-dir> — the owner of Profile TEAMSPACE as the
+  # bundle's profile-controller chart renders it (before the Profile exists)
+  local dir="$1" helm tgz
+  helm="$(command -v helm || true)"
+  [[ -n "${helm}" ]] || helm="${dir}/node/bin/helm"
+  tgz="$(find "${dir}/node/charts" -maxdepth 1 -name 'profile-controller-*.tgz' -print -quit 2>/dev/null)"
+  [[ -x "${helm}" && -n "${tgz}" ]] || return 0
+  "${helm}" template e2e "${tgz}" -n teknoir-system 2>/dev/null | awk -v ts="${TEAMSPACE}" '
+    function flush() { if (prof && mine && o != "") found = o; prof = 0; mine = 0; inowner = 0; o = "" }
+    /^---/ { flush() }
+    /^kind: Profile$/ { prof = 1 }
+    /^  name: / && !inowner { v = $2; gsub(/"/, "", v); if (v == ts) mine = 1 }
+    /^  owner:/ { inowner = 1; next }
+    inowner && /^    name:/ { o = $2; inowner = 0 }
+    END { flush(); gsub(/"/, "", found); print found }' || true
+}
+
+user_reconciled() { [[ -n "$(vm_kc get users.teknoir.org "$1" -o jsonpath='{.status.computed_status}' 2>/dev/null || true)" ]]; }
+user_has_legacy_pw() {
+  # true while the User carries status.set_initial_password (its value never leaves the VM)
+  [[ "$(vm_kc get users.teknoir.org "$1" -o go-template='{{if .status}}{{if .status.set_initial_password}}yes{{end}}{{end}}' 2>/dev/null || true)" == yes ]]
+}
+user_claims() {
+  # user_claims <user> — the User's claim_set as "<name>@<namespace>", space-separated, sorted
+  vm_kc get users.teknoir.org "$1" -o jsonpath='{range .spec.claim_set[*]}{.name}@{.namespace}{"\n"}{end}' 2>/dev/null | sort | tr '\n' ' ' || true
+}
+k1_secret() {
+  # k1_secret <user> — the name of the user's temporary-password Secret when it exists (K1)
+  vm_kc -n "${CRED_NS}" get secret "user-initial-password-$1" --ignore-not-found -o name 2>/dev/null || true
+}
+k1_gone() {
+  # k1_gone <user> — 0 when the API server answers and the user's K1 Secret is absent
+  local v
+  v="$(vm_kc -n "${CRED_NS}" get secret "user-initial-password-$1" --ignore-not-found -o name 2>/dev/null)" || return 1
+  [[ -z "${v}" ]]
+}
+
+copy_initial_password() {
+  # copy_initial_password <user> <file> — the temporary password user-controller
+  # recorded (the K1 Secret, else the legacy status field) into <file>, 0600;
+  # the value goes from the VM's kubectl straight into the file, never printed
+  local u="$1" f="$2"
+  local b64
+  b64="$(vm_kc -n "${CRED_NS}" get secret "user-initial-password-${u}" -o jsonpath='{.data.password}' 2>/dev/null || true)"
+  ( umask 077
+    if [[ -n "${b64}" ]]; then
+      base64 -d <<<"${b64}" > "${f}" 2>/dev/null || : > "${f}"
+    else
+      vm_kc get users.teknoir.org "${u}" -o go-template='{{if .status}}{{with .status.set_initial_password}}{{.}}{{end}}{{end}}' > "${f}" 2>/dev/null || : > "${f}"
+    fi )
+  b64=""
+  [[ -s "${f}" ]]
+}
+
+pw_current() {
+  # pw_current <prefix> — <prefix>.new after a forced password change, else <prefix>.pw
+  if [[ -s "$1.new" ]]; then printf '%s' "$1.new"; else printf '%s' "$1.pw"; fi
+}
+
+kc_login() {
+  # kc_login <jar> <url> <user> <password-prefix> [kc-login flags...] — a fresh
+  # login from the netns (the jar is replaced); 0 when kc-login.sh reports ok
+  local jar="$1" url="$2" user="$3" pre="$4"
+  shift 4
+  rm -f "${jar}"
+  lan "${E2E_WORK}" "${KCLOGIN}" --cacert "$(ca_file)" --url "${url}" --user "${user}" \
+    --password-file "$(pw_current "${pre}")" --new-password-file "${pre}.new" --cookie-jar "${jar}" "$@"
+}
+
+sso_login() {
+  # sso_login <jar> <url> <session-cookie> — sign in to another client (ArgoCD,
+  # Harbor) with the Keycloak SSO session in <jar>, no form
+  lan "${E2E_WORK}" "${KCLOGIN}" --cacert "$(ca_file)" --cookie-jar "$1" --url "$2" --session-cookie "$3"
+}
+
+# ---------------------------------------------------------------------------
+# HTTP from the LAN netns (bodies and headers go to private files, never to
+# the terminal: they can carry cookies and tokens)
+# ---------------------------------------------------------------------------
+uri() { jq -rn --arg s "$1" '$s | @uri'; }
+
+lan_curl() {
+  # lan_curl <curl args...> — curl in the LAN netns with the fetched CA and
+  # HTTP/1.1 (kc-login.sh fetch: the gateway resets HTTP/2 streams after
+  # ext_authz's 302). Output goes to the transcript too: use -o/-D/-w.
+  lan "${E2E_WORK}" curl -sS --http1.1 -m 30 --cacert "$(ca_file)" "$@"
+}
+
+http_req() {
+  # http_req <header-file> <body-file> <curl args...> — one request, no
+  # redirect followed; prints the HTTP status (000 when none)
+  local h="$1" b="$2" out code
+  shift 2
+  ( umask 077; : > "${h}"; : > "${b}" )
+  out="$(lan_curl -D "${h}" -o "${b}" -w '\n%{http_code}' "$@" 2>/dev/null || true)"
+  code="$(tail -n1 <<<"${out}")"
+  [[ "${code}" =~ ^[0-9]{3}$ ]] || code=000
+  printf '%s' "${code}"
+}
+
+P_CODE="" P_LOC="" P_HDR="${HTTP_DIR}/probe.hdr" P_BODY="${HTTP_DIR}/probe.body"
+probe() {
+  # probe <curl args...> — one request without following redirects; sets
+  # P_CODE, P_LOC (the Location header) and the files P_HDR / P_BODY
+  P_CODE="$(http_req "${P_HDR}" "${P_BODY}" "$@")"
+  P_LOC="$(hdr_get "${P_HDR}" location)"
+}
+
+app_status() {
+  # app_status <jar> <url> — "<status> <final url>" of a GET following
+  # redirects with the jar's session (the jar is updated)
+  local out
+  out="$(lan_curl -L --max-redirs 10 -b "$1" -c "$1" -o /dev/null -w '\n%{http_code} %{url_effective}' "$2" 2>/dev/null || true)"
+  out="$(tail -n1 <<<"${out}")"
+  [[ "${out}" =~ ^[0-9]{3}\  ]] || out="000 $2"
+  printf '%s' "${out}"
+}
+
+hdr_get() {
+  # hdr_get <header-file> <name> — the value of the last such header (CR
+  # stripped), nothing when absent
+  awk -v n="$(lower "$2")" '
+    { sub(/\r$/, "") }
+    { i = index($0, ":"); if (i > 1 && tolower(substr($0, 1, i - 1)) == n) { v = substr($0, i + 1); sub(/^[ \t]+/, "", v); last = v } }
+    END { if (last != "") print last }' "$1" 2>/dev/null || true
+}
+
+expired_cookies() {
+  # expired_cookies <header-file> <cookie> — how many Set-Cookie headers clear
+  # <cookie>: an empty value with Max-Age=0 or an Expires in 1970
+  awk -v c="$2" '
+    { sub(/\r$/, "") }
+    tolower($0) ~ /^set-cookie:/ {
+      v = $0; sub(/^[^:]*:[ \t]*/, "", v); lv = tolower(v)
+      if ((index(v, c "=;") == 1 || v == c "=") && (lv ~ /max-age=0/ || lv ~ /expires=[^;]*1970/)) n++
+    }
+    END { print n + 0 }' "$1" 2>/dev/null || echo 0
+}
+
+oauth2_cookie() {
+  # the oauth2-proxy session cookie name (--cookie-name of its Deployment)
+  vm_kc -n teknoir-auth get deployments -o json 2>/dev/null | jq -r '
+    [.items[].spec.template.spec.containers[].args[]? | select(startswith("--cookie-name=")) | sub("^--cookie-name="; "")][0]
+    // "_oauth2_proxy"' 2>/dev/null || echo _oauth2_proxy
+}
+
+bs_token() {
+  # bs_token <jar> <auth-header-file> — Backstage's identity for the jar's
+  # oauth2-proxy session (GET /api/auth/istioVerifiedJWT/refresh as an XHR):
+  # prints the userEntityRef and writes "Authorization: Bearer <token>" to
+  # <auth-header-file> (0600; the token is never printed). 1 without a 200.
+  local body="${HTTP_DIR}/refresh.json" code ref
+  code="$(http_req "${HTTP_DIR}/refresh.hdr" "${body}" -b "$1" -c "$1" -H 'X-Requested-With: XMLHttpRequest' \
+            "https://${DOMAIN}/api/auth/istioVerifiedJWT/refresh")"
+  ref=""
+  if [[ "${code}" == 200 ]]; then
+    ref="$(jq -r '.backstageIdentity.identity.userEntityRef // empty' "${body}" 2>/dev/null || true)"
+    ( umask 077; jq -r '"Authorization: Bearer " + (.backstageIdentity.token // "")' "${body}" > "$2" 2>/dev/null || true )
+  fi
+  rm -f "${body}" "${HTTP_DIR}/refresh.hdr"
+  [[ -n "${ref}" ]] || return 1
+  printf '%s\n' "${ref}"
+}
+
+bs_entity() {
+  # bs_entity <jar> <auth-header-file> <kind/namespace/name> <out-file> — HTTP
+  # status of the Backstage catalog entity (its JSON in <out-file>)
+  http_req "${HTTP_DIR}/entity.hdr" "$4" -b "$1" -c "$1" -H @"$2" "https://${DOMAIN}/api/catalog/entities/by-name/$3"
+}
+
+# ---------------------------------------------------------------------------
+# reads on the VM (values stay there; only derived results are printed)
+# ---------------------------------------------------------------------------
+transcript_mark() { wc -c < "${TRANSCRIPT}" | tr -d ' '; }
+transcript_since() { tail -c +"$(( $1 + 1 ))" "${TRANSCRIPT}"; }
+
+node_teknoir() {
+  # node_teknoir <bundle-dir> <command> [args...] — that bundle's teknoir-node
+  # on the node as root with the node's copy of the site, for what the LAN
+  # tool does not expose (migrate --finalize); output to the transcript
+  local id rc
+  id="$(bundle_id "$1")"
+  shift
+  printf '\n$ [node] teknoir-node %s\n' "$*" >> "${TRANSCRIPT}"
+  set +e
+  vmx sudo "${NODE_STATE_DIR}/bundles/${id}/node/bin/teknoir-node" "$1" --site "${NODE_STATE_DIR}/site/vmtest.env" "${@:2}" 2>&1 | tee -a "${TRANSCRIPT}"
+  rc=${PIPESTATUS[0]}
+  set -e
+  return "${rc}"
+}
+
+kc_prelude() {
+  # the head of a VM root script that talks to Keycloak's admin API as the
+  # master admin of Secret teknoir-auth/keycloak-admin (credentials in files
+  # and curl config, never argv or output): kc_login, kc_get /admin-path
+  printf 'DOMAIN=%q NODE_IP=%q\n' "${DOMAIN}" "${NODE_IP}"
+  cat <<'EOF'
+set -eu
+k() { k3s kubectl "$@"; }
+d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
+chmod 700 "$d"
+k -n teknoir-system get secret teknoir-root-ca-bundle -o go-template='{{index .data "ca.crt" | base64decode}}' > "$d/ca"
+KC="https://auth.${DOMAIN}/auth"
+kc_curl() { curl -sS -m 20 --cacert "$d/ca" --resolve "auth.${DOMAIN}:443:${NODE_IP}" "$@"; }
+kc_login() {
+  k -n teknoir-auth get secret keycloak-admin -o go-template='{{index .data "username" | base64decode}}' > "$d/u"
+  k -n teknoir-auth get secret keycloak-admin -o go-template='{{index .data "password" | base64decode}}' > "$d/p"
+  kc_curl -o "$d/tok.json" --data-urlencode grant_type=password --data-urlencode client_id=admin-cli \
+    --data-urlencode "username@$d/u" --data-urlencode "password@$d/p" "$KC/realms/master/protocol/openid-connect/token"
+  rm -f "$d/p"
+  python3 - "$d/tok.json" "$d/hdr" <<'PY'
+import json, os, sys
+t = json.load(open(sys.argv[1]))["access_token"]
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, ('header = "Authorization: Bearer %s"\n' % t).encode())
+os.close(fd)
+PY
+  rm -f "$d/tok.json"
+}
+kc_get() { kc_curl -K "$d/hdr" "$KC/admin$1"; }
+EOF
+}
+kc_vm() { { kc_prelude; cat; } | vm_root; }
+
+kc_user_state() {
+  # kc_user_state <realm> <username> — "enabled=<bool> actions=<n>" of a
+  # Keycloak user, "absent" when there is none
+  {
+    printf 'R=%q U=%q\n' "$1" "$2"
+    cat <<'EOF'
+# vm-script: kc_user_state
+kc_login
+kc_get "/realms/$R/users?username=$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))' "$U")&exact=true" > "$d/users.json"
+python3 - "$d/users.json" "$U" <<'PY'
+import json, sys
+us = [u for u in json.load(open(sys.argv[1])) if u.get("username", "").lower() == sys.argv[2].lower()]
+print("absent" if not us else "enabled=%s actions=%d" % (str(us[0].get("enabled")).lower(), len(us[0].get("requiredActions") or [])))
+PY
+EOF
+  } | kc_vm 2>/dev/null || echo unknown
+}
+
+kc_master_clients() {
+  # "<clients> <code>": how many of the legacy clients teknoir, argocd and
+  # harbor realm master still has, and the HTTP status of a
+  # client_credentials grant on master with the teknoir client's secret
+  # (Secret keycloak-client-secrets; 401 once the client is gone)
+  kc_vm 2>/dev/null <<'EOF' || echo "unknown unknown"
+# vm-script: kc_master_clients
+kc_login
+n=0
+for c in teknoir argocd harbor; do
+  kc_get "/realms/master/clients?clientId=$c" > "$d/c.json"
+  n=$((n + $(python3 -c 'import json, sys; print(len(json.load(open(sys.argv[1]))))' "$d/c.json")))
+done
+k -n teknoir-auth get secret keycloak-client-secrets -o go-template='{{index .data "teknoir" | base64decode}}' > "$d/cs"
+c="$(kc_curl -o /dev/null -w '%{http_code}' --data-urlencode grant_type=client_credentials --data-urlencode client_id=teknoir \
+       --data-urlencode "client_secret@$d/cs" "$KC/realms/master/protocol/openid-connect/token" 2>/dev/null)" || c="${c:-000}"
+echo "$n $c"
+EOF
+}
+
+kc_pw_created() {
+  # kc_pw_created <username> — created_date of the user's password credential
+  # in realm teknoir, read with a read-only SQL session in keycloak-db-0
+  {
+    printf 'U=%q\n' "$1"
+    cat <<'EOF'
+# vm-script: kc_pw_created
+k3s kubectl -n teknoir-auth exec -i keycloak-db-0 -c postgres -- \
+  env PGOPTIONS='-c default_transaction_read_only=on' U="$U" \
+  sh -c 'psql -U "$POSTGRES_USER" -d "${POSTGRES_DB:-keycloak}" -tAq -v ON_ERROR_STOP=1 -v u="$U" -f -' <<'SQL'
+SELECT c.created_date FROM credential c
+  JOIN user_entity u ON u.id = c.user_id JOIN realm r ON r.id = u.realm_id
+ WHERE r.name = 'teknoir' AND lower(u.username) = lower(:'u') AND c.type = 'password';
+SQL
+EOF
+  } | vm_root 2>/dev/null | tr -d ' \r' | grep -E '^[0-9]+$' | head -n1 || true
+}
+
+platform_ops_not_succeeded() {
+  # platform Applications (ROOT_APP and the Applications it tracks, R2) whose
+  # last operation did not succeed, as name=phase
+  vm_kc -n teknoir-system get applications.argoproj.io -o json 2>/dev/null | jq -r --arg r "${ROOT_APP}" '
+    .items[] | select(.metadata.name == $r or ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") | startswith($r + ":")))
+    | select((.status.operationState.phase // "none") != "Succeeded") | "\(.metadata.name)=\(.status.operationState.phase // "none")"' \
+    | sort | tr '\n' ' ' || true
+}
+
+admission_ca() {
+  # "<configurations> <webhooks without caBundle>" of the monitoring admission
+  # webhook configurations (validating + mutating)
+  { vm_kc get validatingwebhookconfigurations -o json; vm_kc get mutatingwebhookconfigurations -o json; } 2>/dev/null | jq -rs '
+    [.[].items[] | select(.metadata.name | test("^monitoring.*admission$"))] as $c
+    | "\($c | length) \([$c[] | .metadata.name as $n | .webhooks[]? | select((.clientConfig.caBundle // "") == "") | "\($n)/\(.name)"] | join(","))"' \
+    2>/dev/null || echo "0 unknown"
+}
+
+digest_mismatches() {
+  # containers whose spec image is pinned by digest but whose running imageID
+  # is not that digest (running and completed pods)
+  vm_kc get pods -A -o json 2>/dev/null | jq -r '
+    .items[] | select(.status.phase == "Running" or .status.phase == "Succeeded") | . as $p
+    | [(.status.containerStatuses // [])[], (.status.initContainerStatuses // [])[]] as $ss
+    | [(.spec.containers // [])[], (.spec.initContainers // [])[]][] | select(.image | contains("@sha256:")) | . as $c
+    | ($c.image | sub("^.*@"; "")) as $dig
+    | ([$ss[] | select(.name == $c.name) | .imageID][0] // "") as $id
+    | select($id | endswith($dig) | not)
+    | "\($p.metadata.namespace)/\($p.metadata.name):\($c.name) imageID=\($id)"' | sort | tr '\n' ' ' || true
+}
+
+pod_states() {
+  # pod_states <ns> <deployment> — "<uid> <restarts>" of the Deployment's pods
+  local sel
+  sel="$(vm_kc -n "$1" get deployment "$2" -o json 2>/dev/null | jq -r '.spec.selector.matchLabels // {} | to_entries | map("\(.key)=\(.value)") | join(",")' || true)"
+  [[ -n "${sel}" ]] || { echo absent; return 0; }
+  vm_kc -n "$1" get pods -l "${sel}" -o json 2>/dev/null | jq -r '
+    .items[] | select(.metadata.deletionTimestamp == null)
+    | "\(.metadata.uid) \([(.status.containerStatuses // [])[].restartCount] | add // 0)"' | sort || true
+}
+
+images_missing() {
+  # images_missing [namespace] — pod images (all namespaces, or one) that
+  # containerd does not have (imported, or pulled through the Harbor mirror)
+  local images ns_args=(-A)
+  [[ -z "${1:-}" ]] || ns_args=(-n "$1")
+  images="$(vmx sudo k3s crictl images -o json | jq -r '.images[] | (.repoTags[]?, .repoDigests[]?)' | sort -u || true)"
+  vm_kc get pods "${ns_args[@]}" -o json | jq -r '.items[].spec | (.containers + (.initContainers // []))[].image' | sort -u |
+    while read -r img; do
+      grep -qxF -f <(image_names "${img}"; printf '%s\n' "${img}") <<<"${images}" || echo "${img}"
+    done
+}
+
+image_check_ok() {
+  # image_check_ok <text> — post's line "live image check: N pullable ..., 0 missing"
+  grep -qE 'live image check: [0-9]+ pullable.*(^|[^0-9])0 missing' <<<"$1"
+}
+
+can_i() {
+  # can_i <namespace/serviceaccount> <kubectl auth can-i args...> — yes or no
+  local sa="$1"
+  shift
+  vm_kc auth can-i "$@" --as="system:serviceaccount:${sa%%/*}:${sa#*/}" </dev/null 2>/dev/null | tail -n1 || true
+}
+controller_sa() {
+  # controller_sa <deployment> — "teknoir-system/<its service account>"
+  local sa
+  sa="$(vm_kc -n teknoir-system get deployment "$1" -o jsonpath='{.spec.template.spec.serviceAccountName}' 2>/dev/null || true)"
+  printf 'teknoir-system/%s' "${sa:-$1}"
+}
+
+skew_now() {
+  # the node clock minus this host's, in seconds (3 decimals); the ssh round
+  # trip is halved out
+  local a n b
+  a="$(date +%s.%N)"; n="$(vmx date +%s.%N 2>/dev/null || echo 0)"; b="$(date +%s.%N)"
+  awk -v a="${a}" -v b="${b}" -v n="${n}" 'BEGIN { printf "%.3f\n", n - (a + b) / 2 }'
+}
+abs_le() { awk -v v="$1" -v m="$2" 'BEGIN { if (v < 0) v = -v; exit !(v <= m) }'; }
+skew_within() { abs_le "$(skew_now)" "$1"; }
+rtc_offset() {
+  # the node's RTC minus its system clock, whole seconds ("none" without an RTC)
+  vm_root 2>/dev/null <<'EOF' || echo none
+f=/sys/class/rtc/rtc0/since_epoch
+if [ -r "$f" ]; then echo $(( $(cat "$f") - $(date +%s) )); else echo none; fi
+EOF
+}
+dpkg_state() {
+  # every package with version and status, and the dpkg log length: equal
+  # before and after an up that changed no package
+  # shellcheck disable=SC2016  # dpkg-query's own ${...} fields, for the VM's sh
+  vmx sudo sh -c 'dpkg-query -W -f "\${Package} \${Version} \${db:Status-Abbrev}\n" | sha256sum | cut -c1-16; wc -l < /var/log/dpkg.log' 2>/dev/null | tr '\n' ' ' || true
+}
+
+age_bin() {
+  # age_bin <bundle-dir> — the age binary to decrypt with
+  local a="${E2E_AGE:-$(command -v age || true)}"
+  [[ -n "${a}" ]] || a="$1/node/bin/age"
+  [[ -x "${a}" ]] && printf '%s' "${a}"
+}
+
+lan_secret_patterns() {
+  # the secret values the LAN side holds, one per line, for E7: passwords from
+  # admin-user, kc-login and credentials, and the test age identities
+  local f
+  # (a value file may lack its final newline: kc-login.sh writes none)
+  for f in "${LAN_HOME}"/e2e/*.pw "${LAN_HOME}"/e2e/*.new; do
+    [[ -s "${f}" ]] && printf '%s\n' "$(head -n1 "${f}")"
+  done
+  for f in "${AGE_ID_DIR}"/*.key; do
+    [[ -s "${f}" ]] && grep -h '^AGE-SECRET-KEY-' "${f}"
+  done
+  return 0
 }
 
 # ---------------------------------------------------------------------------
 # E1
 # ---------------------------------------------------------------------------
+url_host() { sed -E 's|^https?://([^/:?#]+).*|\1|' <<<"$1"; }
+
+e1_baseline() {
+  # e1_baseline <bundle-dir> — 0 when E1 installs a pre-r5 baseline (bundle A
+  # of the upgrade run): E2E_E1_BASELINE=1, or auto (the default) and the
+  # bundle's app-of-apps is older than R5_AOA. E2E_E1_BASELINE=0 keeps every
+  # check strict.
+  case "${E2E_E1_BASELINE:-auto}" in
+    1) return 0 ;;
+    0) return 1 ;;
+    auto) ! bundle_is_r5 "$1" ;;
+    *) tl_die "E2E_E1_BASELINE must be auto, 0 or 1 (got ${E2E_E1_BASELINE})" ;;
+  esac
+}
+
+r5_eq() {
+  # r5_eq <msg> <want> <got> — assert_eq for an assertion that only release r5
+  # satisfies; on a pre-r5 baseline (R5_SOFT set) a mismatch is a warning
+  if [[ -z "${R5_SOFT}" || "$2" == "$3" ]]; then assert_eq "$@"; return 0; fi
+  tl_warn "${R5_SOFT}, not asserted: $1: want [$2] got [$3]"
+}
+r5_fail() {
+  # r5_fail <msg> — fail, or on a pre-r5 baseline (R5_SOFT) a warning
+  if [[ -z "${R5_SOFT}" ]]; then fail "$*"; else tl_warn "${R5_SOFT}, not asserted: $*"; fi
+}
+
+platform_checks() {
+  # platform_checks <output of up> — release-level assertions shared by E1, E4
+  # and E15 (after wait_apps). The operation, caBundle and digest checks are
+  # r5's (HYG, K5): on E1's pre-r5 baseline they only warn.
+  local out="$1" v
+  if image_check_ok "${out}"; then pass "post: live image check reports N pullable, 0 missing"
+  else fail "post did not report 'live image check: N pullable ..., 0 missing'"; fi
+  r5_eq "every platform Application's last operation Succeeded" "" "$(platform_ops_not_succeeded)"
+  v="$(admission_ca)"
+  r5_eq "the monitoring admission webhook configurations exist (validating, mutating)" 2 "${v%% *}"
+  r5_eq "every monitoring admission webhook has a caBundle" "" "${v#* }"
+  r5_eq "every digest-pinned container runs that digest (imageID)" "" "$(digest_mismatches)"
+}
+
+oauth2_start_check() {
+  probe "https://${DOMAIN}/oauth2/start?rd=%2F"
+  if [[ "${P_CODE}" == 302 && "$(url_host "${P_LOC}")" == "auth.${DOMAIN}" ]]; then
+    pass "/oauth2/start redirects to auth.${DOMAIN} (the /oauth2 route precedes the catch-all)"
+  else
+    fail "/oauth2/start: HTTP ${P_CODE} to ${P_LOC%%\?*}, want 302 to auth.${DOMAIN}"
+  fi
+}
+
+backstage_identity_check() {
+  # backstage_identity_check <user> — with the admin's session, Backstage
+  # resolves the sign-in to user:default/<user> within 3 min of the User's
+  # creation (PT1M user ingestion; admin-user waited for the catalog)
+  local name="$1" created deadline ref="" hdr="${HTTP_DIR}/bs.auth"
+  created="$(vm_kc get users.teknoir.org "${name}" -o jsonpath='{.metadata.creationTimestamp}' 2>/dev/null || true)"
+  deadline=$(( $(date -d "${created:-now}" +%s 2>/dev/null || date +%s) + 180 ))
+  while :; do
+    ref="$(bs_token "${ADMIN_JAR}" "${hdr}" || true)"
+    [[ "${ref}" == "user:default/${name}" ]] && break
+    (( $(date +%s) < deadline )) || break
+    sleep 10
+  done
+  rm -f "${hdr}"
+  r5_eq "Backstage signs ${ADMIN_USER} in as user:default/${name} within 3 min of the User's creation" "user:default/${name}" "${ref}"
+}
+
 e1() {
   tl_case E1 "fresh bootstrap from the extracted tar in the LAN netns"
   [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
   fresh_vm || return 0
-  rm -rf "${LAN_HOME:?}/.teknoir-airgap" "${LAN_HOME}/e2e"/admin.*
-  local dir
+  rm -rf "${LAN_HOME:?}/.teknoir-airgap"
+  reset_admin
+  local dir aoa
   dir="$(bundle_dir "${E2E_BUNDLE}")"
+  aoa="$(bundle_aoa "${dir}")"
+  R5_SOFT=""
+  if e1_baseline "${dir}"; then
+    # the upgrade run's bundle A (E1, then E4 to B): A predates r5, so the
+    # r5-only assertions (the K1 handover, no Update Profile form, the
+    # Backstage identity without a restart, operations, caBundle, digest pins)
+    # only warn here; E4 asserts the release-level ones after the update to B
+    if [[ "${E2E_E1_BASELINE:-auto}" == 1 ]]; then R5_SOFT="baseline (E2E_E1_BASELINE=1, app-of-apps ${aoa:-unknown})"
+    else R5_SOFT="baseline app-of-apps ${aoa} < ${R5_AOA}"; fi
+    tl_log "the bundle predates r5 (${R5_SOFT}; E2E_E1_BASELINE=${E2E_E1_BASELINE:-auto}): the r5-only checks warn"
+  fi
+  e1_body "${dir}"
+  R5_SOFT=""
+}
+
+e1_body() {
+  local dir="$1" mark out
   dotdirs > "${STATE}/dotdirs.before"
+  mark="$(transcript_mark)"
   if up_in "${dir}"; then pass "teknoir-airgap up exits 0 on a fresh node"; else fail "teknoir-airgap up failed"; return 0; fi
+  out="$(transcript_since "${mark}")"
   wait_apps 2700 || true
   if [[ -n "$(ca_file)" ]]; then pass "the CA certificate was fetched to ${LAN_HOME}/.teknoir-airgap/<site>/"; else fail "no teknoir-root-ca.crt under ${LAN_HOME}/.teknoir-airgap"; return 0; fi
   assert_eq "https://harbor.${DOMAIN}/api/v2.0/health with the CA" 200 "$(lan_https "https://harbor.${DOMAIN}/api/v2.0/health")"
   assert_eq "https://argocd.${DOMAIN} with the CA" 200 "$(lan_https "https://argocd.${DOMAIN}/")"
   assert_eq "Keycloak master realm discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/auth/realms/master/.well-known/openid-configuration")"
   assert_eq "Keycloak realm teknoir discovery with the CA (D2)" 200 "$(lan_https "https://auth.${DOMAIN}/auth/realms/teknoir/.well-known/openid-configuration")"
+  platform_checks "${out}"
+  oauth2_start_check
   # the first platform admin (DESIGN C.5): a superadmin User CR, its Keycloak
-  # user (realm teknoir, group admin) and a temporary password in a 0600 file
-  local pw="${LAN_HOME}/e2e/admin.pw" mode
+  # user (realm teknoir, group admin) and a temporary password in a 0600 file;
+  # by default the owner of the GitOps Profile, so E11 can check its grants
+  adopt_owner "$(profile_owner "${TEAMSPACE}")"
+  local pw="${LAN_HOME}/e2e/admin.pw" mode name bs0 bs1
+  name="$(user_name "${ADMIN_EMAIL}")"
+  bs0="$(pod_states teknoir-system backstage-api)"
   if tk "${dir}" admin-user --email "${ADMIN_EMAIL}" --out "${pw}"; then
     mode="$(stat -c %a "${pw}" 2>/dev/null || echo missing)"
     assert_eq "admin-user --out writes the temporary password to a 0600 file" 600 "${mode}"
@@ -362,7 +1043,23 @@ e1() {
     fail "teknoir-airgap admin-user --email ${ADMIN_EMAIL} --out failed"; return 0
   fi
   [[ -s "${pw}" ]] || { fail "admin-user wrote no temporary password to ${pw}"; return 0; }
-  login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} (the forced change of the temporary password handled)"
+  if user_has_legacy_pw "${name}"; then r5_fail "User ${name} still carries status.set_initial_password after admin-user"
+  else pass "User ${name} carries no status.set_initial_password"; fi
+  r5_eq "the temporary-password Secret ${CRED_NS}/user-initial-password-${name} is gone after the handover" "" "$(k1_secret "${name}")"
+  # r5 drops VERIFY_PROFILE (K6): the login must not meet the Update Profile
+  # form. A pre-r5 realm still shows it to a user without a last name, so the
+  # baseline login answers it (kc-login.sh does unless --forbid-profile-form).
+  local form=(--forbid-profile-form) how="no Update Profile form"
+  if [[ -n "${R5_SOFT}" ]]; then
+    form=() how="the Update Profile form answered (${R5_SOFT})"
+    tl_warn "${R5_SOFT}, not asserted: the login may meet the Update Profile form (VERIFY_PROFILE)"
+  fi
+  login_check "oauth2-proxy login as ${ADMIN_USER} at ${LOGIN_URL} with the --out password (the forced change handled, ${how})" \
+    "${form[@]}"
+  if (( LOGIN_OK )); then backstage_identity_check "${name}"; else r5_fail "Backstage identity not checked: no session"; fi
+  bs1="$(pod_states teknoir-system backstage-api)"
+  r5_eq "admin-user restarted no backstage-api pod" "${bs0}" "${bs1}"
+  r5_eq "backstage-api never restarted (restartCount 0 since its first start)" "" "$(awk '$2 != 0 || $1 == "absent"' <<<"${bs1}")"
 }
 
 # ---------------------------------------------------------------------------
@@ -385,9 +1082,10 @@ e2() {
   tl_case E2 "idempotency: a second up changes nothing"
   [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
   ensure_vm
-  local dir pods secrets since t0 out rc puts
+  local dir pods secrets since t0 out rc puts ts_ops ts_secrets pc
   dir="$(bundle_dir "${E2E_BUNDLE}")"
   pods="$(snap_pods)" secrets="$(snap_secret_rvs)" since="$(k3s_since)"
+  ts_ops="$(teamspace_ops)" ts_secrets="$(teamspace_secret_rvs)" pc="$(pod_states teknoir-system profile-controller)"
   t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   set +e; out="$(up_in "${dir}")"; rc=$?; set -e
   assert_eq "the second up exits 0" 0 "${rc}"
@@ -395,9 +1093,29 @@ e2() {
   else fail "the summary does not match /${ZERO_RE}/:"; tail -15 <<<"${out}" >&2; fi
   assert_eq "pod UIDs unchanged" "${pods}" "$(snap_pods)"
   assert_eq "k3s ActiveEnterTimestamp unchanged (no restart)" "${since}" "$(k3s_since)"
-  assert_eq "Secret resourceVersions unchanged" "${secrets}" "$(snap_secret_rvs)"
+  local secrets1 kept
+  secrets1="$(snap_secret_rvs)"
+  kept="$(drop_cred_deletions "${secrets}" "${secrets1}")"
+  [[ "${kept}" == "${secrets}" ]] || tl_log "user-controller deleted temporary-password Secrets during the run (K1, not up's doing): $(added_lines "${kept}" "${secrets}" | awk '{print $2}' | tr '\n' ' ')"
+  assert_eq "Secret resourceVersions unchanged (only user-controller's K1 deletions in ${CRED_NS} allowed)" "${kept}" "${secrets1}"
   puts="$(harbor_blob_puts_since "${t0}")"
   assert_eq "Harbor received 0 blob uploads" 0 "${puts}"
+  if [[ -n "${ts_ops}" ]]; then
+    assert_eq "the ${TEAMSPACE} Applications were not synced again (operationState.finishedAt)" "${ts_ops}" "$(teamspace_ops)"
+  else
+    fail "no ${TEAMSPACE}-* Application to compare"
+  fi
+  assert_eq "the ${TEAMSPACE} Secrets kept their resourceVersions (no credential regenerated)" "${ts_secrets}" "$(teamspace_secret_rvs)"
+  assert_eq "profile-controller did not restart (pod UID, restartCount)" "${pc}" "$(pod_states teknoir-system profile-controller)"
+}
+
+teamspace_ops() {
+  # "<app> <finishedAt>" of the teamspace's Applications
+  vm_kc -n teknoir-system get applications.argoproj.io -o json 2>/dev/null | jq -r --arg p "${TEAMSPACE}-" '
+    .items[] | select(.metadata.name | startswith($p)) | "\(.metadata.name) \(.status.operationState.finishedAt // "none")"' | sort || true
+}
+teamspace_secret_rvs() {
+  vm_kc -n "${TEAMSPACE}" get secrets --no-headers -o custom-columns=NAME:.metadata.name,RV:.metadata.resourceVersion 2>/dev/null | sort || true
 }
 
 # ---------------------------------------------------------------------------
@@ -410,7 +1128,7 @@ forward_drops() {
 e3() {
   tl_case E3 "no egress from the VM or the LAN namespace; all images local"
   ensure_vm
-  local before after images bad
+  local before after bad
   before="$(forward_drops)"
   assert_not_cmd "VM: https://registry-1.docker.io/v2/ is unreachable" vmx curl -sS -m 5 -o /dev/null https://registry-1.docker.io/v2/
   assert_not_cmd "VM: github.com does not resolve" vmx getent hosts github.com
@@ -426,11 +1144,7 @@ e3() {
   after="$(forward_drops)"
   if (( after > before )); then pass "vpro FORWARD DROP counters for tkvm0 grew (${before} -> ${after})"
   else fail "FORWARD DROP counters did not grow (${before} -> ${after})"; fi
-  images="$(vmx sudo k3s crictl images -o json | jq -r '.images[] | (.repoTags[]?, .repoDigests[]?)' | sort -u)"
-  bad="$(vm_kc get pods -A -o json | jq -r '.items[].spec | (.containers + (.initContainers // []))[].image' | sort -u |
-         while read -r img; do
-           grep -qxF -f <(image_names "${img}"; printf '%s\n' "${img}") <<<"${images}" || echo "${img}"
-         done)"
+  bad="$(images_missing)"
   assert_eq "every pod image is present in containerd (imported, or pulled through the harbor.${DOMAIN} mirror)" "" "${bad}"
   assert_eq "no ErrImagePull/ImagePullBackOff events" 0 \
     "$(vm_kc get events -A --no-headers 2>/dev/null | grep -cE 'ErrImagePull|ImagePullBackOff' || true)"
@@ -447,33 +1161,167 @@ e3() {
 e4() {
   tl_case E4 "update to bundle B, refusal of A, rollback to A"
   [[ -n "${E2E_BUNDLE:-}" && -n "${E2E_BUNDLE_B:-}" ]] || { skip_case "E2E_BUNDLE and E2E_BUNDLE_B required"; return 0; }
-  [[ -n "${E2E_E4_APPS:-}" ]] || { skip_case "E2E_E4_APPS required: the Applications bundle B changes, e.g. \"app-of-apps device-controller\""; return 0; }
+  [[ -n "${E2E_E4_APPS:-}" ]] || { skip_case "E2E_E4_APPS required: the Applications bundle B changes (\"app-of-apps device-controller\", or auto)"; return 0; }
   ensure_vm
-  local a b ida idb before after changed want out rc
+  local a b ida idb before after changed want out rc mark kept name
   a="$(bundle_dir "${E2E_BUNDLE}")" b="$(bundle_dir "${E2E_BUNDLE_B}")"
   ida="$(bundle_id "${a}")" idb="$(bundle_id "${b}")"
-  want="$(tr ' ' '\n' <<<"${E2E_E4_APPS}" | grep . | sort -u | tr '\n' ' ')"
   wait_until 1800 apps_healthy || true
   before="$(app_revs)"
+  if [[ "${E2E_E4_APPS}" == auto ]]; then
+    want="$(e4_expected_apps "${a}" "${b}" "$(awk '{print $1}' <<<"${before}")")"
+    tl_log "E2E_E4_APPS=auto: B should change ${want:-nothing}"
+  else
+    want="$(tr ' ' '\n' <<<"${E2E_E4_APPS}" | grep . | sort -u | tr '\n' ' ')"
+  fi
+  mark="$(transcript_mark)"
   if up_in "${b}"; then pass "up with bundle B exits 0"; else fail "up with bundle B failed"; return 0; fi
+  out="$(transcript_since "${mark}")"
   wait_apps 1800 || true
   after="$(app_revs)"
   changed="$(added_lines "${before}" "${after}" | awk '{print $1}' | sort -u | tr '\n' ' ')"
   assert_eq "the Applications bundle B changed are exactly E2E_E4_APPS" "${want}" "${changed}"
   assert_eq "the release record is bundle B, mode update" "${idb} update" "$(release_state)"
+  platform_checks "${out}"
+  assert_eq "https://harbor.${DOMAIN}/api/v2.0/health after the update" 200 "$(lan_https "https://harbor.${DOMAIN}/api/v2.0/health")"
+  # an admin made on a pre-r5 A kept the legacy status.set_initial_password
+  # (E1 only warned); r5's user-controller clears it without a password change
+  name="$(user_name "${ADMIN_EMAIL}")"
+  if bundle_is_r5 "${b}" && user_reconciled "${name}"; then
+    if wait_until 300 not_legacy "${name}"; then pass "after B: User ${name} carries no status.set_initial_password"
+    else fail "after B: User ${name} still carries status.set_initial_password"; fi
+  fi
+  if [[ -s "$(admin_pw_current)" ]]; then
+    login_check "the admin still signs in after the update (Keycloak database kept)"
+  else
+    tl_warn "no admin password file (run E1 first): the sign-in after the update is not checked"
+  fi
   set +e; out="$(up_in "${a}")"; rc=$?; set -e
   if (( rc != 0 )) && grep -qi rollback <<<"${out}"; then pass "up with the older bundle A is refused (and mentions --rollback)"
   else fail "up with the older bundle A was not refused (rc=${rc})"; fi
   assert_eq "the refused run left the release record at B" "${idb} update" "$(release_state)"
   assert_eq "the refused run left every Application at B" "${after}" "$(app_revs)"
+  case "$(e4_rollback_mode "${a}" "${b}")" in
+    off)
+      # an explicit waiver: the summary row says so
+      tl_warn "E2E_E4_ROLLBACK=0: the rollback to A is waived, not rehearsed"
+      TL_CASE_DESC+=" (rollback leg waived: E2E_E4_ROLLBACK=0)"
+      return 0 ;;
+    gap)
+      # an untested rollback is not green: run it (1) or waive it on purpose (0)
+      tl_warn "the rollback to A would cross r5: ${E4_ROLLBACK_GAP}"
+      fail "the rollback from the r5 B to the pre-r5 A is not rehearsed: set E2E_E4_ROLLBACK=1 to run it (each part asserted) or E2E_E4_ROLLBACK=0 to waive it on purpose"
+      return 0 ;;
+    cross) e4_rollback_cross "${a}" "${ida}" "${before}"; return 0 ;;
+  esac
   if up_in "${a}" --rollback; then pass "up --rollback with A exits 0"; else fail "up --rollback with A failed"; return 0; fi
   wait_apps 1800 || true
   assert_eq "the release record is bundle A, mode rollback" "${ida} rollback" "$(release_state)"
-  assert_eq "every Application is back at its revision before B" "${before}" "$(app_revs)"
+  # Applications B added and A does not render stay when their owner keeps
+  # them (a GitOps Profile is Prune=false,Delete=false): reported, not compared
+  kept="$(added_lines "$(awk '{print $1}' <<<"${before}")" "$(app_revs | awk '{print $1}')" | tr '\n' ' ')"
+  [[ -z "${kept// /}" ]] || tl_log "Applications added by B and kept after the rollback: ${kept}"
+  assert_eq "every Application is back at its revision before B" "${before}" "$(app_revs_known "${before}")"
   if up_in "${a}"; then pass "a plain up with A after the rollback exits 0"; else fail "plain up with A after the rollback failed"; fi
   wait_apps 900 || true
   assert_eq "a plain up with A keeps A in rollback mode (no roll-forward)" "${ida} rollback" "$(release_state)"
-  assert_eq "a plain up with A leaves every Application at A" "${before}" "$(app_revs)"
+  assert_eq "a plain up with A leaves every Application at A" "${before}" "$(app_revs_known "${before}")"
+}
+
+# A rollback from r5 to a pre-r5 bundle meets state that A neither renders nor
+# prunes. Until the rollback design settles it (WP-G-CTRL, WP-I-RELEASE,
+# WP-I-BUNDLE), that leg fails E4 unless it is run (E2E_E4_ROLLBACK=1, each
+# part asserted) or waived on purpose (E2E_E4_ROLLBACK=0).
+E4_ROLLBACK_GAP="B (r5) adds the GitOps Profile ${TEAMSPACE} and the Namespace ${CRED_NS}, both Prune=false,Delete=false \
+without IgnoreExtraneous, so after a rollback to a pre-r5 A the profile-controller and user-controller Applications stay \
+OutOfSync (pruning skipped); A's profile-controller points the ${TEAMSPACE}-* Applications back at github.io (Unknown \
+offline), and A's post waits for every Application to be Synced/Healthy. Open rollback-design gap."
+
+e4_rollback_mode() {
+  # e4_rollback_mode <dir A> <dir B> — what E4 does after the refused A:
+  #   off    E2E_E4_ROLLBACK=0: waived (the summary row says so)
+  #   gap    auto (the default) and B is r5 while A predates it: not run, and
+  #          E4 fails (an untested rollback is not green)
+  #   cross  E2E_E4_ROLLBACK=1 and that same r5 -> pre-r5 rollback: run, and
+  #          assert the state the rollback design must reach
+  #   run    otherwise: the plain rollback (A and B on the same side of r5)
+  local crosses=0
+  if bundle_is_r5 "$2" && ! bundle_is_r5 "$1"; then crosses=1; fi
+  case "${E2E_E4_ROLLBACK:-auto}" in
+    0) echo off ;;
+    1) if (( crosses )); then echo cross; else echo run; fi ;;
+    auto) if (( crosses )); then echo gap; else echo run; fi ;;
+    *) tl_die "E2E_E4_ROLLBACK must be auto, 0 or 1 (got ${E2E_E4_ROLLBACK})" ;;
+  esac
+}
+
+app_sync() {
+  # app_sync <application> — "<sync>/<health>" ("absent" when it does not exist)
+  local s
+  s="$(vm_kc -n teknoir-system get applications.argoproj.io "$1" -o jsonpath='{.status.sync.status}/{.status.health.status}' 2>/dev/null || true)"
+  printf '%s' "${s:-absent}"
+}
+ts_apps_report() {
+  # ts_apps_report <teamspace> — "<app>=<sync>/<health>@<repoURL>" of its Applications
+  vm_kc -n teknoir-system get applications.argoproj.io -o json 2>/dev/null | jq -r --arg p "$1-" '
+    .items[] | select(.metadata.name | startswith($p))
+    | "\(.metadata.name)=\(.status.sync.status // "none")/\(.status.health.status // "none")@\(.spec.source.repoURL // "")"' \
+    | sort | tr '\n' ' ' || true
+}
+
+e4_rollback_cross() {
+  # e4_rollback_cross <dir A> <bundle id A> <app_revs before B> — the r5 ->
+  # pre-r5 rollback (E2E_E4_ROLLBACK=1): every step is asserted and nothing
+  # stops at the first failure, so the run names which part of the gap is open
+  local a="$1" ida="$2" before="$3" rc app
+  tl_log "rollback across r5 (E2E_E4_ROLLBACK=1); known gap: ${E4_ROLLBACK_GAP}"
+  set +e; up_in "${a}" --rollback; rc=$?; set -e
+  if (( rc == 0 )); then pass "up --rollback with the pre-r5 A exits 0"
+  else fail "up --rollback with the pre-r5 A failed (rc=${rc}); the Application states follow"; fi
+  if wait_until 1800 apps_healthy_except "${TEAMSPACE}-"; then pass "every Application but ${TEAMSPACE}-* is Synced/Healthy after the rollback"
+  else fail "after the rollback, not Synced/Healthy: $(apps_unhealthy_except "${TEAMSPACE}-")"; fi
+  for app in profile-controller user-controller; do
+    assert_eq "${app} is Synced/Healthy after the rollback (its kept r5 object is ignored, not pending a prune)" \
+      Synced/Healthy "$(app_sync "${app}")"
+  done
+  if vm_kc get profiles.teknoir.org "${TEAMSPACE}" -o name >/dev/null 2>&1; then pass "Profile ${TEAMSPACE} is kept (a rollback deletes no teamspace)"
+  else fail "Profile ${TEAMSPACE} is gone after the rollback"; fi
+  if vm_kc get namespace "${CRED_NS}" -o name >/dev/null 2>&1; then pass "Namespace ${CRED_NS} is kept (Prune=false,Delete=false)"
+  else fail "Namespace ${CRED_NS} is gone after the rollback"; fi
+  tl_log "the ${TEAMSPACE} Applications after the rollback: $(ts_apps_report "${TEAMSPACE}")"
+  assert_eq "the release record is bundle A, mode rollback" "${ida} rollback" "$(release_state)"
+  assert_eq "every Application is back at its revision before B" "${before}" "$(app_revs_known "${before}")"
+  (( rc == 0 )) || return 0
+  if up_in "${a}"; then pass "a plain up with A after the rollback exits 0"; else fail "plain up with A after the rollback failed"; fi
+  assert_eq "a plain up with A keeps A in rollback mode (no roll-forward)" "${ida} rollback" "$(release_state)"
+}
+
+bundle_pins() {
+  # bundle_pins <bundle-dir> — "<chart> <version>" lines of node/charts/pins.txt
+  [[ -f "$1/node/charts/pins.txt" ]] && awk 'NF >= 2 && $1 !~ /^#/ {print $1, $2}' "$1/node/charts/pins.txt"
+  return 0
+}
+e4_expected_apps() {
+  # e4_expected_apps <dir A> <dir B> <Application names before B> — what B
+  # should change (E2E_E4_APPS=auto): ROOT_APP and every existing Application
+  # whose chart pin differs between A and B (an Application is named after its
+  # chart), plus the plugin Applications of the GitOps Profile when B adds it
+  local names="$3" p
+  {
+    awk -v root="${ROOT_APP}" -v names="$(tr '\n' ' ' <<<"${names}")" '
+      BEGIN { n = split(names, x, " "); for (i = 1; i <= n; i++) known[x[i]] = 1 }
+      FNR == NR { va[$1] = $2; next }
+      ($1 == root || $1 in known) && va[$1] != $2 { print $1 }' <(bundle_pins "$1") <(bundle_pins "$2")
+    if [[ -n "$(bundle_profile_owner "$2")" ]] && ! grep -q "^${TEAMSPACE}-" <<<"${names}"; then
+      for p in "${PLUGINS[@]}"; do echo "${TEAMSPACE}-${p}"; done
+    fi
+  } | sort -u | tr '\n' ' '
+}
+
+app_revs_known() {
+  # app_revs_known <earlier app_revs> — app_revs of the Applications listed in <earlier> only
+  app_revs | awk -v names="$(awk '{print $1}' <<<"$1" | tr '\n' ' ')" '
+    BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) w[a[i]] = 1 } $1 in w'
 }
 
 # ---------------------------------------------------------------------------
@@ -577,16 +1425,30 @@ e6() {
 e7() {
   tl_case E7 "secrets hygiene: no Secret value in the transcript or node logs; no private key in the tar"
   ensure_vm
-  local res
+  local res lanpat="${HTTP_DIR}/lan-secrets.pat" idpat="${HTTP_DIR}/age-ids.pat" n
+  # values the LAN side holds: the passwords (the VM's own credentials) are
+  # scanned on the VM like the Secrets; the test age identities never go to
+  # the VM, so they are scanned here, and the node is searched for any age
+  # identity by its format
+  ( umask 077
+    lan_secret_patterns | grep -v '^AGE-SECRET-KEY-' | awk 'length > 13' > "${lanpat}" || true
+    lan_secret_patterns | grep '^AGE-SECRET-KEY-' > "${idpat}" || true )
+  if [[ -s "${idpat}" ]]; then
+    n="$(grep -acFf "${idpat}" "${TRANSCRIPT}" || true)"
+    assert_eq "no test age identity in the LAN transcript" 0 "${n:-0}"
+  fi
+  rm -f "${idpat}"
+  vm_upload /tmp/e2e-lan-secrets.pat < "${lanpat}"
+  rm -f "${lanpat}"
   vm_upload /tmp/e2e-transcript.log < "${TRANSCRIPT}"
   # The scan runs on the VM: values are read and compared there, never printed.
   res="$(vm_root <<'EOF'
 set -eu
-T=/tmp/e2e-transcript.log
+T=/tmp/e2e-transcript.log L=/tmp/e2e-lan-secrets.pat
 k() { k3s kubectl "$@"; }
 files="$T $(ls /var/log/teknoir-airgap/*.log 2>/dev/null | tr '\n' ' ')"
 checked=0 leaks=0
-pat="$(mktemp)" val="$(mktemp)"; trap 'rm -f "$pat" "$val" "$T"' EXIT; chmod 600 "$pat" "$val"
+pat="$(mktemp)" val="$(mktemp)"; trap 'rm -f "$pat" "$val" "$T" "$L"' EXIT; chmod 600 "$pat" "$val"
 for ns in $(k get ns -o jsonpath='{.items[*].metadata.name}'); do
   case "$ns" in teknoir-*|cert-manager|istio-system) ;; *) continue ;; esac
   for s in $(k -n "$ns" get secrets -o jsonpath='{range .items[?(@.type!="kubernetes.io/service-account-token")]}{.metadata.name}{"\n"}{end}'); do
@@ -611,12 +1473,27 @@ for ns in $(k get ns -o jsonpath='{.items[*].metadata.name}'); do
   done
 done
 echo "checked=$checked leaks=$leaks"
+lan_checked=0 lan_leaks=0
+if [ -s "$L" ]; then
+  lan_checked=$(grep -c . "$L")
+  # shellcheck disable=SC2086  # $files is a list
+  lan_leaks=$(cat $files 2>/dev/null | grep -acFf "$L" || true)
+fi
+echo "lan_checked=$lan_checked lan_leaks=${lan_leaks:-0}"
+age_ids=$(grep -rlsaE --exclude-dir=bundles 'AGE-SECRET-KEY-1[02-9ACDEFGHJKLMNPQRSTUVWXYZ]{58}' \
+  /var/lib/teknoir-airgap /var/log/teknoir-airgap /root /home /etc 2>/dev/null | wc -l)
+echo "age_ids=$age_ids"
 EOF
 )"
   printf '%s\n' "${res}" >&2
   if grep -q '^checked=[1-9]' <<<"${res}"; then pass "scanned $(sed -n 's/^checked=\([0-9]*\).*/\1/p' <<<"${res}") Secret values on the VM"
   else fail "no Secret values were scanned"; fi
-  assert_eq "no Secret value appears in the LAN transcript or the node logs" 0 "$(sed -n 's/.*leaks=\([0-9]*\)$/\1/p' <<<"${res}")"
+  assert_eq "no Secret value appears in the LAN transcript or the node logs" 0 "$(sed -n 's/^checked=[0-9]* leaks=\([0-9]*\)$/\1/p' <<<"${res}")"
+  tl_log "LAN-side values scanned: $(sed -n 's/^lan_checked=\([0-9]*\).*/\1/p' <<<"${res}") (admin-user, kc-login, credentials, non-admin passwords)"
+  assert_eq "no value the LAN side holds (passwords from admin-user, kc-login, credentials) in the transcript or the node logs" 0 \
+    "$(sed -n 's/^lan_checked=[0-9]* lan_leaks=\([0-9]*\)$/\1/p' <<<"${res}")"
+  assert_eq "no age identity on the node (/var/lib/teknoir-airgap but bundles, logs, /root, /home, /etc)" 0 \
+    "$(sed -n 's/^age_ids=\([0-9]*\)$/\1/p' <<<"${res}")"
   # The build gate's own checks, repeated on the shipped bundle: no PEM private
   # key header in any plain file (the bare phrase is legitimate in binaries:
   # Go's crypto code), no "PRIVATE KEY" at all in the plain-text config.
@@ -628,6 +1505,9 @@ EOF
     assert_eq "no PEM private key header in a plain file of $(basename "${t}")" "" \
       "$(find "${d}" -type f ! -path '*/node/images/*/blobs/*' ! -path '*/node/bootstrap-images/*' ! -name 'k3s-airgap-images-*' -print0 \
          | xargs -0 -r grep -laE -- '-----BEGIN ([A-Z0-9]+ )*PRIVATE KEY-----' | sed "s|^${d}/||" | tr '\n' ' ' || true)"
+    assert_eq "no age identity in a plain file of $(basename "${t}")" "" \
+      "$(find "${d}" -type f ! -path '*/node/images/*/blobs/*' ! -path '*/node/bootstrap-images/*' ! -name 'k3s-airgap-images-*' -print0 \
+         | xargs -0 -r grep -laE -- 'AGE-SECRET-KEY-1[02-9ACDEFGHJKLMNPQRSTUVWXYZ]{58}' | sed "s|^${d}/||" | tr '\n' ' ' || true)"
     assert_eq "no 'PRIVATE KEY' in the plain-text config of $(basename "${t}")" "" \
       "$(find "${d}/node/oneshot" "${d}/node/templates" "${d}/site" "${d}/node/site" "${d}/node/charts/pins.txt" "${d}/node/images/images.lock" -type f -print0 2>/dev/null \
          | xargs -0 -r grep -la 'PRIVATE KEY' | sed "s|^${d}/||" | tr '\n' ' ' || true)"
@@ -646,8 +1526,12 @@ e8() {
   tl_case E8 "rotate oauth2-proxy-cookie: only that Secret changes; oauth2-proxy rolls; login works"
   [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
   ensure_vm
-  local dir before after changed pods_before pods_after
+  local dir before after changed pods_before pods_after old_jar="${LAN_HOME}/e2e/pre-rotation.jar"
   dir="$(bundle_dir "${E2E_BUNDLE}")"
+  # a session from before the rotation, to replay afterwards
+  login_check "a session before the rotation"
+  rm -f "${old_jar}"
+  if (( LOGIN_OK )); then ( umask 077; cp "${ADMIN_JAR}" "${old_jar}" ); fi
   before="$(snap_secret_rvs)"
   pods_before="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
   if tk "${dir}" rotate oauth2-proxy-cookie; then pass "rotate oauth2-proxy-cookie exits 0"; else fail "rotate failed"; return 0; fi
@@ -657,6 +1541,16 @@ e8() {
   assert_eq "only teknoir-auth/oauth2-proxy-secret changed" "teknoir-auth/oauth2-proxy-secret " "${changed}"
   pods_after="$(vm_kc -n teknoir-auth get pods -l "${E2E_OAUTH2_PROXY_SELECTOR:-app=oauth2-proxy}" -o jsonpath='{.items[*].metadata.uid}')"
   if [[ -n "${pods_after}" && "${pods_after}" != "${pods_before}" ]]; then pass "oauth2-proxy pods were replaced"; else fail "oauth2-proxy did not roll"; fi
+  if [[ -s "${old_jar}" ]]; then
+    # the old cookie no longer decrypts: ext_authz denies, and the gateway
+    # turns the denial into a login redirect instead of a bare 403 (SIGN-C2)
+    probe -b "${old_jar}" "https://${DOMAIN}/"
+    if [[ "${P_CODE}" == 302 && "${P_LOC}" == *"/oauth2/start"* ]]; then pass "the pre-rotation cookie gets 302 to /oauth2/start (not 403)"
+    else fail "the pre-rotation cookie got HTTP ${P_CODE} to ${P_LOC%%\?*}, want 302 to /oauth2/start"; fi
+    rm -f "${old_jar}" "${P_HDR}" "${P_BODY}"
+  else
+    fail "no pre-rotation session to replay"
+  fi
   login_check "login still works after the cookie-secret rotation"
 }
 
@@ -812,15 +1706,34 @@ argoproj_crds_unprotected() {
                    | .metadata.name] | join(" ") end'
 }
 
+skip_guards() { vmx sudo ls /opt/k3s/server/manifests | grep -E '\.skip$' | tr '\n' ' ' || true; }
+retired_exists() { vmx sudo test -e /opt/k3s/server/manifests-retired; }
+
+e10_finalize() {
+  # e10_finalize <bundle-dir> — a backup on the node (with the site's age
+  # recipients it leaves an encrypted export newer than the migration), then
+  # `teknoir-node migrate --finalize`: the retired K3s files are gone, the
+  # .skip guards stay
+  local dir="$1" skips0
+  skips0="$(skip_guards)"
+  if retired_exists; then pass "manifests-retired exists before the finalize"; else fail "no manifests-retired to finalize"; fi
+  if node_teknoir "${dir}" backup >/dev/null; then pass "a node backup (encrypted export) before the finalize"
+  else fail "the node backup before the finalize failed"; fi
+  if node_teknoir "${dir}" migrate --finalize; then pass "migrate --finalize exits 0"; else fail "migrate --finalize failed"; return 0; fi
+  if retired_exists; then fail "manifests-retired still exists after the finalize"; else pass "manifests-retired is gone"; fi
+  assert_eq "the .skip guards are untouched by the finalize" "${skips0}" "$(skip_guards)"
+}
+
 e10() {
   tl_case E10 "migration rehearsal: old layout -> migrate -> up -> migrate --argo -> migrate (M6) -> k3s restart"
   [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
   [[ -n "${E2E_OLD_SETUP:-}" ]] || { skip_case "E2E_OLD_SETUP (old-tooling install command) not set"; return 0; }
   (( ALLOW_DESTROY )) || { skip_case "re-creates the VM: pass --allow-destroy"; return 0; }
   fresh_vm || return 0
-  rm -rf "${LAN_HOME:?}/.teknoir-airgap" "${LAN_HOME}/e2e"/admin.*
+  rm -rf "${LAN_HOME:?}/.teknoir-airgap"
+  reset_admin
   if VM_IP="${NODE_IP}" bash -c "${E2E_OLD_SETUP}"; then pass "old-style install completed"; else fail "E2E_OLD_SETUP failed"; return 0; fi
-  local dir inv0 hashes0 inv1 inv2 rvs1 gone lost unexpected g codes t0 st skips pw="${LAN_HOME}/e2e/admin.pw" mode
+  local dir inv0 hashes0 inv1 inv2 rvs1 gone lost unexpected g codes t0 st skips pw="${LAN_HOME}/e2e/admin.pw" mode mark
   dir="$(bundle_dir "${E2E_BUNDLE}")"
 
   # --- baseline and M3 -------------------------------------------------------
@@ -845,6 +1758,7 @@ e10() {
   assert_eq "the master admin logs in with keycloak-admin password" 200 "${codes%% *}"
   assert_eq "the master admin no longer logs in with previous-password (rotated)" 401 "${codes##* }"
   assert_eq "Keycloak realm teknoir discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/auth/realms/teknoir/.well-known/openid-configuration")"
+  adopt_owner "$(profile_owner "${TEAMSPACE}")"
   if tk "${dir}" admin-user --email "${ADMIN_EMAIL}" --out "${pw}"; then
     mode="$(stat -c %a "${pw}" 2>/dev/null || echo missing)"
     assert_eq "admin-user --out writes the temporary password to a 0600 file" 600 "${mode}"
@@ -859,7 +1773,12 @@ e10() {
 
   # --- M4b: migrate --argo ------------------------------------------------------
   if tk "${dir}" migrate --argo --dry-run; then pass "migrate --argo --dry-run exits 0"; else fail "migrate --argo --dry-run failed"; fi
+  mark="$(transcript_mark)"
   if tk "${dir}" migrate --argo; then pass "migrate --argo exits 0"; else fail "migrate --argo failed"; return 0; fi
+  # the untracked check counts Synced status.resources (CRDs) and the
+  # converge-owned objects as owned (HYG-C6)
+  assert_eq "migrate --argo warns about no object without an owner" "" \
+    "$(transcript_since "${mark}" | grep -i 'no owner' | tr '\n' ' ' || true)"
   assert_eq "no Teknoir Addon is left" "" "$(teknoir_addons)"
   assert_eq "no Teknoir K3s file is left in /opt/k3s/server/manifests" "" "$(teknoir_k3s_files)"
   skips="$(vmx sudo ls /opt/k3s/server/manifests | grep -E '^teknoir-(argo|app-of-apps)\.yaml\.skip$' | tr '\n' ' ' || true)"
@@ -892,6 +1811,9 @@ e10() {
   assert_eq "no Teknoir K3s file re-appeared after the restart" "" "$(teknoir_k3s_files)"
   assert_eq "the platform Secrets kept their resourceVersion over the restart" "${rvs1}" "$(e10_secret_rvs)"
 
+  # --- finalize: an encrypted export newer than the migration, then the retired files go
+  e10_finalize "${dir}"
+
   # --- whole run: nothing lost but the expected, Secrets adopted, CRDs, Harbor -----
   gone="$(e10_gone_lines)"
   lost="$(LC_ALL=C comm -23 <(printf '%s\n' "${inv0}") <(printf '%s\n' "${inv2}"))"
@@ -922,6 +1844,824 @@ e10() {
 }
 
 # ---------------------------------------------------------------------------
+# E11
+# ---------------------------------------------------------------------------
+ts_apps_unhealthy() {
+  # ts_apps_unhealthy [teamspace] — its plugin Applications that are missing
+  # or not Synced/Healthy
+  local ts="${1:-${TEAMSPACE}}" st p out=""
+  st="$(vm_kc -n teknoir-system get applications.argoproj.io --no-headers \
+          -o custom-columns=N:.metadata.name,S:.status.sync.status,H:.status.health.status 2>/dev/null || true)"
+  for p in "${PLUGINS[@]}"; do
+    awk -v n="${ts}-${p}" '$1 == n && $2 == "Synced" && $3 == "Healthy" { ok = 1 } END { exit !ok }' <<<"${st}" || out+="${ts}-${p} "
+  done
+  printf '%s' "${out}"
+}
+ts_apps_healthy() { [[ -z "$(ts_apps_unhealthy "$@")" ]]; }
+rolebinding_exists() { vm_kc -n "$1" get rolebinding "$2" -o name >/dev/null 2>&1; }
+rolebinding_ref() {
+  # rolebinding_ref <ns> <name> — "<roleRef kind>/<name> <kind>/<subject>,..." (subjects in lower case)
+  vm_kc -n "$1" get rolebinding "$2" -o json 2>/dev/null | jq -r '
+    "\(.roleRef.kind)/\(.roleRef.name) " + ([.subjects[]? | "\(.kind)/\(.name | ascii_downcase)"] | join(","))' || true
+}
+
+e11() {
+  tl_case E11 "default teamspace ${TEAMSPACE}: Profile, namespace, grants, plugins from Harbor, DNS, TLS, Backstage"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  [[ -n "$(ca_file)" ]] || { fail "no CA certificate under ${LAN_HOME}/.teknoir-airgap (run E1 first)"; return 0; }
+  e11_checks
+}
+
+e11_checks() {
+  local ts="${TEAMSPACE}" email name v a b c d x repo ver p bad out hdr="${HTTP_DIR}/bs.auth" deadline ok
+  email="$(lower "${ADMIN_EMAIL}")" name="$(user_name "${ADMIN_EMAIL}")"
+
+  # 1. the GitOps Profile (K3)
+  v="$(vm_kc get profiles.teknoir.org "${ts}" -o json 2>/dev/null | jq -r '[
+        ((.metadata.annotations["argocd.argoproj.io/sync-options"] // "") | gsub("\\s"; "") | split(",")
+          | (any(.[]; . == "Prune=false") and any(.[]; . == "Delete=false"))),
+        ((.metadata.annotations["argocd.argoproj.io/tracking-id"] // "") != ""),
+        ((.spec.owner.name // "-") | ascii_downcase),
+        ((.spec.plugins // []) | length)] | map(tostring) | join(" ")' 2>/dev/null || true)"
+  [[ -n "${v}" ]] || { fail "Profile ${ts} does not exist"; return 0; }
+  read -r a b c d <<<"${v}"
+  assert_eq "Profile ${ts} carries sync-options Prune=false,Delete=false" true "${a}"
+  assert_eq "Profile ${ts} is declared in GitOps (ArgoCD tracking-id)" true "${b}"
+  assert_eq "Profile ${ts} is owned by the first admin" "${email}" "${c}"
+  assert_eq "Profile ${ts} has no spec.plugins (the controller's defaults apply)" 0 "${d}"
+
+  # 2. its namespace
+  v="$(vm_kc get namespace "${ts}" -o json 2>/dev/null | jq -r --arg ts "${ts}" '[
+        (.metadata.labels["istio-injection"] // "-"),
+        ((.metadata.annotations.owner // "-") | ascii_downcase),
+        ([(.metadata.ownerReferences // [])[] | select(.kind == "Profile" and .name == $ts)] | length)] | map(tostring) | join(" ")' || true)"
+  read -r a b c <<<"${v}"
+  assert_eq "namespace ${ts}: label istio-injection=enabled" enabled "${a}"
+  assert_eq "namespace ${ts}: annotation owner is the admin" "${email}" "${b}"
+  assert_eq "namespace ${ts}: ownerReference to Profile ${ts}" 1 "${c}"
+
+  # 3. grants: the Profile's namespaceAdmin, then admin-user's owner claim
+  v="$(rolebinding_ref "${ts}" namespaceAdmin)"
+  assert_eq "RoleBinding ${ts}/namespaceAdmin binds ClusterRole teknoir-admin" "ClusterRole/teknoir-admin" "${v%% *}"
+  if [[ ",${v#* }," == *",User/${email},"* ]]; then pass "RoleBinding ${ts}/namespaceAdmin has subject User ${email}"
+  else fail "RoleBinding ${ts}/namespaceAdmin subjects [${v#* }] lack User ${email}"; fi
+  if [[ " $(user_claims "${name}") " == *" owner@${ts} "* ]]; then pass "User ${name} holds claim owner@${ts} (admin-user)"
+  else fail "User ${name} lacks claim owner@${ts}: [$(user_claims "${name}")]"; fi
+  if wait_until 300 rolebinding_exists "${ts}" "user-${name}-teknoir-role-binding"; then
+    v="$(rolebinding_ref "${ts}" "user-${name}-teknoir-role-binding")"
+    assert_eq "RoleBinding ${ts}/user-${name}-teknoir-role-binding (user-controller) binds teknoir-admin" "ClusterRole/teknoir-admin" "${v%% *}"
+  else
+    fail "user-controller created no RoleBinding ${ts}/user-${name}-teknoir-role-binding within 300 s"
+  fi
+
+  # 4. what the controller puts into the namespace (Secrets by name only)
+  for x in authorizationpolicies.security.istio.io/ns-owner-access-istio authorizationpolicies.security.istio.io/whitelist-namespaces \
+           secret/domain-wildcard-tls configmap/org-config configmap/user-alerting-rules; do
+    if vm_kc -n "${ts}" get "${x}" -o name >/dev/null 2>&1; then pass "${ts}: ${x%%.*} ${x#*/} exists"
+    else fail "${ts}: ${x%%.*} ${x#*/} is missing"; fi
+  done
+
+  # 5. the AppProject and the 9 plugin Applications, from Harbor (K2)
+  repo="$(vm_kc -n teknoir-system get configmap profile-controller-config -o jsonpath='{.data.PLUGIN_CHART_REPO}' 2>/dev/null || true)"
+  ver="$(vm_kc -n teknoir-system get configmap profile-controller-config -o jsonpath='{.data.PLUGIN_CHART_VERSION}' 2>/dev/null || true)"
+  assert_eq "profile-controller-config: PLUGIN_CHART_REPO is Harbor's project teknoir" "harbor.${DOMAIN}/teknoir" "${repo}"
+  if [[ -n "${ver}" ]]; then pass "profile-controller-config: PLUGIN_CHART_VERSION ${ver}"; else fail "profile-controller-config has no PLUGIN_CHART_VERSION"; fi
+  v="$(vm_kc -n teknoir-system get appprojects.argoproj.io "${ts}" -o json 2>/dev/null | jq -r '
+        "\((.spec.sourceRepos // []) | join(",")) \((.spec.clusterResourceWhitelist // []) | length)"' || true)"
+  assert_eq "AppProject teknoir-system/${ts}: sourceRepos harbor.${DOMAIN}/teknoir only, no cluster-scoped kinds" "harbor.${DOMAIN}/teknoir 0" "${v}"
+  for p in "${PLUGINS[@]}"; do
+    v="$(vm_kc -n teknoir-system get applications.argoproj.io "${ts}-${p}" -o json 2>/dev/null | jq -r '[
+          (.spec.source.repoURL // "-"), (.spec.source.targetRevision // "-"), (.spec.project // "-"),
+          ((.spec.syncPolicy.syncOptions // []) | any(.[]; . == "RespectIgnoreDifferences=true") | tostring)] | join(" ")' || true)"
+    assert_eq "Application ${ts}-${p}: chart from Harbor at ${ver:-?}, project ${ts}, RespectIgnoreDifferences=true" \
+      "harbor.${DOMAIN}/teknoir ${ver} ${ts} true" "${v}"
+  done
+  if wait_until 1200 ts_apps_healthy "${ts}"; then pass "the 9 ${ts} plugin Applications are Synced/Healthy"
+  else fail "${ts} plugin Applications not Synced/Healthy within 20 min: $(ts_apps_unhealthy "${ts}")"; fi
+
+  # 6. the controller applied every enabled plugin (EMQX: its MQTT user exists)
+  bad="$(vm_kc get profiles.teknoir.org "${ts}" -o json 2>/dev/null | jq -r '
+        (.status.appliedconfig.plugins // {}) | to_entries[] | select(.value.appliedConfig.settings.enabled == true)
+        | select((.value.applyStatus.status // "") != "Success") | "\(.key)=\(.value.applyStatus.status // "none")"' | tr '\n' ' ' || true)"
+  assert_eq "Profile ${ts}: every enabled plugin applied with status Success" "" "${bad}"
+
+  # 7. pods Ready with the Istio sidecar, images local, no pull errors
+  bad="$(vm_kc -n "${ts}" get pods -o json 2>/dev/null | jq -r '
+        .items[] | select(.status.phase != "Succeeded")
+        | select(([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length) == 0
+                 or ([(.spec.containers // [])[].name, (.spec.initContainers // [])[].name] | index("istio-proxy") | not))
+        | .metadata.name' | tr '\n' ' ' || true)"
+  assert_eq "every ${ts} pod is Ready and has the istio-proxy sidecar" "" "${bad}"
+  if [[ -n "$(vm_kc -n "${ts}" get pods -o name 2>/dev/null || true)" ]]; then pass "${ts} has pods"; else fail "${ts} has no pods"; fi
+  assert_eq "every ${ts} image is in containerd" "" "$(images_missing "${ts}" | tr '\n' ' ')"
+  assert_eq "no ErrImagePull/ImagePullBackOff events in ${ts}" 0 \
+    "$(vm_kc -n "${ts}" get events --no-headers 2>/dev/null | grep -cE 'ErrImagePull|ImagePullBackOff' || true)"
+
+  # 8. names, TLS and the teamspace's web apps
+  out="$(vm_kc -n default run "e2e-dns-$(date +%s)" --image="${E2E_DNS_IMAGE:-docker.io/library/busybox:1.36.1}" \
+           --image-pull-policy=IfNotPresent --restart=Never --rm -i --quiet --command -- nslookup "mqtt-${ts}.${DOMAIN}" 2>&1 || true)"
+  if grep -qE "^Address:?[[:space:]]+${NODE_IP//./\\.}\$" <<<"${out}"; then pass "in a pod, mqtt-${ts}.${DOMAIN} resolves to NODE_IP ${NODE_IP} (CoreDNS)"
+  else fail "in a pod, mqtt-${ts}.${DOMAIN} does not resolve to ${NODE_IP}: $(tr '\n' ' ' <<<"${out}" | cut -c1-200)"; fi
+  for x in "8883 mqtt-${ts}" "2222 deadend-${ts}"; do
+    out="$(lan "${E2E_WORK}" openssl s_client -connect "${NODE_IP}:${x%% *}" -servername "${x#* }.${DOMAIN}" -CAfile "$(ca_file)" \
+             -verify_return_error -brief </dev/null 2>&1 || true)"
+    if grep -q 'Verification: OK' <<<"${out}"; then pass "TLS handshake with ${x#* }.${DOMAIN} on ${NODE_IP}:${x%% *}, verified with the platform CA"
+    else fail "no verified TLS handshake with ${x#* }.${DOMAIN} on ${NODE_IP}:${x%% *}"; fi
+  done
+  login_check "the admin signs in for the ${ts} web apps and the catalog"
+  for x in grafana prometheus; do
+    v="$(app_status "${ADMIN_JAR}" "https://${DOMAIN}/${ts}/${x}/")"
+    if [[ "${v%% *}" == 200 && "$(url_host "${v#* }")" == "${DOMAIN}" ]]; then pass "https://${DOMAIN}/${ts}/${x}/ answers the owner with 200"
+    else fail "https://${DOMAIN}/${ts}/${x}/: HTTP ${v%% *} at ${v#* }"; fi
+  done
+
+  # 9. the Backstage catalog (PT1M user and profile ingestion: poll, no refresh call)
+  deadline=$(( SECONDS + CATALOG_TIMEOUT )) ok=0
+  while (( SECONDS < deadline )); do
+    if bs_token "${ADMIN_JAR}" "${hdr}" >/dev/null \
+       && [[ "$(bs_entity "${ADMIN_JAR}" "${hdr}" "system/${ts}/${ts}" "${HTTP_DIR}/entity.json")" == 200 ]] \
+       && [[ "$(bs_entity "${ADMIN_JAR}" "${hdr}" "user/${ts}/${name}" "${HTTP_DIR}/entity.json")" == 200 ]] \
+       && jq -e --arg g "group:${ts}/${ts}" '(.spec.memberOf // []) | index($g)' "${HTTP_DIR}/entity.json" >/dev/null 2>&1; then
+      ok=1; break
+    fi
+    sleep "${E2E_CATALOG_POLL:-15}"
+  done
+  rm -f "${hdr}" "${HTTP_DIR}/entity.json" "${HTTP_DIR}/entity.hdr"
+  if (( ok )); then pass "Backstage has system ${ts}/${ts}, and user ${ts}/${name} is a member of group:${ts}/${ts}"
+  else fail "Backstage has no system ${ts}/${ts} or user ${ts}/${name} in group:${ts}/${ts} within ${CATALOG_TIMEOUT} s"; fi
+}
+
+# ---------------------------------------------------------------------------
+# E12
+# ---------------------------------------------------------------------------
+e12() {
+  tl_case E12 "node time: bundled chrony, skew correction, --sync-clock, RTC, reboot, SNTP, doctor"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  local dir lock want got st s0 s1 out rc rtc boot0 boot1 sntp stratum offset v
+  local -a pkgs=()
+  dir="$(bundle_dir "${E2E_BUNDLE}")"
+
+  # the bundled packages (TIME-T1/T2)
+  lock="${dir}/node/debs/debs.lock"
+  if [[ -s "${lock}" ]]; then
+    want="$(awk 'NF >= 2 { print $1, $2 }' "${lock}" | sort)"
+    read -r -a pkgs <<<"$(awk '{ print $1 }' <<<"${want}" | tr '\n' ' ')"
+    # shellcheck disable=SC2016  # dpkg-query's own ${...} fields
+    got="$(vmx dpkg-query -W -f '${Package} ${Version}\n' "${pkgs[@]}" 2>/dev/null | sort || true)"
+    assert_eq "the bundled packages are installed at their pinned versions (node/debs/debs.lock)" "${want}" "${got}"
+  else
+    fail "the bundle has no node/debs/debs.lock"
+  fi
+  # shellcheck disable=SC2016
+  st="$(vmx dpkg-query -W -f '${db:Status-Abbrev}' systemd-timesyncd 2>/dev/null || true)"
+  if [[ "${st}" == ii* ]]; then fail "systemd-timesyncd is still installed (${st})"; else pass "systemd-timesyncd is gone (dpkg: ${st:-unknown package})"; fi
+  assert_eq "chrony is active" active "$(vmx systemctl is-active chrony 2>/dev/null || true)"
+  if [[ -n "$(vmx sudo sh -c 'command -v hwclock' 2>/dev/null || true)" ]]; then pass "hwclock is installed"; else fail "hwclock is not installed on the node"; fi
+
+  # 20 s behind: a plain up corrects it (TIME-T3), and installs nothing again
+  s0="$(dpkg_state)"
+  vmx sudo date -u -s "@$(( $(date +%s) - 20 ))" >/dev/null 2>&1 || true
+  tl_log "node clock set 20 s back: skew $(skew_now) s"
+  if up_in "${dir}"; then pass "up with the node 20 s behind exits 0"; else fail "up with the node 20 s behind failed"; fi
+  if wait_until 60 skew_within 2; then pass "the node clock is within 2 s of the LAN host within 60 s of up ($(skew_now) s)"
+  else fail "the node clock is $(skew_now) s off 60 s after up (want within 2 s)"; fi
+  s1="$(dpkg_state)"
+  assert_eq "a second up changed no package (dpkg status and log)" "${s0}" "${s1}"
+
+  # 400 s behind, the RTC too (a node that booted with a bad RTC)
+  vmx sudo date -u -s "@$(( $(date +%s) - 400 ))" >/dev/null 2>&1 || true
+  vmx sudo hwclock --systohc --utc >/dev/null 2>&1 || true
+  tl_log "node clock and RTC set 400 s back: skew $(skew_now) s, RTC offset $(rtc_offset) s"
+  set +e; out="$(up_in "${dir}")"; rc=$?; set -e
+  if (( rc == 1 )) && grep -q -- '--sync-clock' <<<"${out}"; then pass "up with the node 400 s behind exits 1 with the --sync-clock hint"
+  else fail "up with the node 400 s behind: exit ${rc}, want 1 with the --sync-clock hint"; fi
+  if up_in "${dir}" --sync-clock; then pass "up --sync-clock exits 0"; else fail "up --sync-clock failed"; fi
+  if wait_until 60 skew_within 2; then pass "the node clock is within 2 s after up --sync-clock ($(skew_now) s)"
+  else fail "the node clock is $(skew_now) s off after up --sync-clock"; fi
+  rtc="$(rtc_offset)"
+  if [[ "${rtc}" =~ ^-?[0-9]+$ ]] && abs_le "${rtc}" 2; then pass "|RTC - system| <= 2 s after up --sync-clock (${rtc} s)"
+  else fail "RTC offset ${rtc} s after up --sync-clock (want within 2 s)"; fi
+
+  # a reboot: the clock comes back from the RTC that up wrote (a guest reboot
+  # keeps QEMU and its RTC; a QEMU restart would reset the RTC to vpro's clock)
+  boot0="$(vmx cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+  vmx sudo systemctl reboot >/dev/null 2>&1 || true
+  sleep 20
+  "${VM}" start >/dev/null 2>&1 || true
+  boot1="$(vmx cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+  if [[ -n "${boot1}" && "${boot1}" != "${boot0}" ]]; then pass "the node rebooted (new boot id)"; else fail "the node did not reboot"; fi
+  if skew_within 5; then pass "after the reboot the node clock is within 5 s of the LAN host ($(skew_now) s)"
+  else fail "after the reboot the node clock is $(skew_now) s off (want within 5 s)"; fi
+  wait_until 600 vm_kc get --raw /readyz >/dev/null 2>&1 || fail "API not ready after the reboot"
+  wait_apps 1800 || true
+
+  # the node serves time to the LAN (chrony allow + local stratum 10)
+  sntp="$(lan "${E2E_WORK}" python3 -I "${HERE}/sntp-query.py" "${NODE_IP}" 2>&1 | grep '^stratum=' | tail -n1 || true)"
+  stratum="$(sed -n 's/^stratum=\([0-9]*\).*/\1/p' <<<"${sntp}")"
+  offset="$(sed -n 's/.* offset=\([-0-9.]*\).*/\1/p' <<<"${sntp}")"
+  if [[ -n "${stratum}" ]] && (( stratum <= 11 )) && abs_le "${offset:-99}" 2; then pass "SNTP from the LAN host to ${NODE_IP}:123: ${sntp}"
+  else fail "SNTP from the LAN host to ${NODE_IP}:123: [${sntp:-no answer}] (want stratum <= 11, |offset| <= 2 s)"; fi
+
+  # doctor: the node's checks (RTC, chrony, time source, lease) report no FAIL;
+  # the LAN host's own checks run in the netns, whose OS does not trust the
+  # platform CA by design (reported, not asserted)
+  out="$(tk "${dir}" doctor 2>&1 | sed 's/\x1b\[[0-9;]*m//g' || true)"
+  v="$(sed -n '/^Node /,$p' <<<"${out}" | grep -E '^[[:space:]]*FAIL' || true)"
+  assert_eq "doctor reports no FAIL for the node" "" "${v}"
+  v="$(sed -n '1,/^Node /p' <<<"${out}" | grep -E '^[[:space:]]*FAIL' | tr '\n' ' ' || true)"
+  [[ -z "${v}" ]] || tl_warn "doctor FAIL lines for the LAN netns (not asserted): ${v}"
+}
+
+# ---------------------------------------------------------------------------
+# E13
+# ---------------------------------------------------------------------------
+NA_OK=0
+nonadmin_setup() {
+  # nonadmin_setup — the non-admin realm user: a User CR (role viewer, not in
+  # Keycloak group admin), its temporary password copied to nonadmin.pw, a
+  # first login (forced password change) with the session in NONADMIN_JAR,
+  # then the K1 cleanup: the Secret goes once the user has set their own
+  # password. Sets NA_OK.
+  local name pre="${LAN_HOME}/e2e/nonadmin" email
+  NA_OK=0
+  email="$(lower "${NONADMIN_EMAIL}")" name="$(user_name "${NONADMIN_EMAIL}")"
+  if ! vm_kc get users.teknoir.org "${name}" -o name >/dev/null 2>&1; then
+    rm -f "${pre}.pw" "${pre}.new"
+    if jq -n --arg n "${name}" --arg e "${email}" '{apiVersion: "teknoir.org/v1", kind: "User", metadata: {name: $n},
+         spec: {email: $e, email_verified: true, enabled: true, display_name: "E2E Viewer", claims_v0: {role: "viewer"}, plugins: []}}' \
+         | vm_kc create -f - >/dev/null; then
+      pass "created the non-admin User ${name} (role viewer, not in Keycloak group admin)"
+    else
+      fail "cannot create the non-admin User ${name}"; return 0
+    fi
+  fi
+  wait_until 300 user_reconciled "${name}" || { fail "user-controller did not create ${email} in Keycloak within 300 s"; return 0; }
+  if [[ ! -s "$(pw_current "${pre}")" ]]; then
+    wait_until 60 copy_initial_password "${name}" "${pre}.pw" \
+      || { fail "no temporary password recorded for ${name} (Secret ${CRED_NS}/user-initial-password-${name})"; return 0; }
+  fi
+  if kc_login "${NONADMIN_JAR}" "https://${DOMAIN}/" "${email}" "${pre}" --forbid-profile-form; then
+    pass "the non-admin realm user signs in (forced password change, no Update Profile form)"; NA_OK=1
+  else
+    fail "the non-admin realm user cannot sign in"; return 0
+  fi
+  # K1 (SEC-C1 case b): with UPDATE_PASSWORD gone, the next reconcile deletes
+  # the temporary-password Secret. user-controller requeues such a User only
+  # hourly, so a changed annotation starts that reconcile now (the controller
+  # watches Users without a predicate). This also keeps the deletion out of
+  # E2's no-change window.
+  vm_kc annotate users.teknoir.org "${name}" "e2e.teknoir.org/poke=$(date +%s)" --overwrite >/dev/null 2>&1 \
+    || tl_warn "cannot annotate User ${name}: waiting for user-controller's own requeue"
+  if wait_until 300 k1_gone "${name}"; then
+    pass "the non-admin's temporary-password Secret ${CRED_NS}/user-initial-password-${name} is deleted once the user set their own password"
+  else
+    fail "Secret ${CRED_NS}/user-initial-password-${name} still exists 300 s after the user set their own password"
+  fi
+}
+
+argocd_login_url() { printf 'https://argocd.%s/auth/login?return_url=%s' "${DOMAIN}" "$(uri "https://argocd.${DOMAIN}/applications")"; }
+
+argocd_apps_count() {
+  # argocd_apps_count <jar> — "<status> <number of Applications ArgoCD lists>"
+  local code n
+  code="$(http_req "${HTTP_DIR}/argo.hdr" "${HTTP_DIR}/argo.json" -b "$1" -c "$1" "https://argocd.${DOMAIN}/api/v1/applications")"
+  n="$(jq -r '(.items // []) | length' "${HTTP_DIR}/argo.json" 2>/dev/null || echo "?")"
+  rm -f "${HTTP_DIR}/argo.hdr" "${HTTP_DIR}/argo.json"
+  printf '%s %s' "${code}" "${n}"
+}
+
+argocd_session_vm() {
+  # argocd_session_vm <root-only file on the VM> — HTTP status of POST
+  # /api/v1/session as admin with that password (read and sent on the VM)
+  {
+    printf 'DOMAIN=%q NODE_IP=%q F=%q\n' "${DOMAIN}" "${NODE_IP}" "$1"
+    cat <<'EOF'
+# vm-script: argocd_session_vm
+set -eu
+d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
+chmod 700 "$d"
+k3s kubectl -n teknoir-system get secret teknoir-root-ca-bundle -o go-template='{{index .data "ca.crt" | base64decode}}' > "$d/ca"
+python3 - "$F" "$d/body" <<'PY'
+import json, os, sys
+p = open(sys.argv[1]).read().rstrip("\n")
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, json.dumps({"username": "admin", "password": p}).encode())
+os.close(fd)
+PY
+curl -sS -o /dev/null -w '%{http_code}' -m 20 --cacert "$d/ca" --resolve "argocd.${DOMAIN}:443:${NODE_IP}" \
+  -H 'Content-Type: application/json' --data-binary @"$d/body" "https://argocd.${DOMAIN}/api/v1/session" || echo 000
+EOF
+  } | vm_root 2>/dev/null | tail -c 3
+}
+
+e13() {
+  tl_case E13 "access and credentials: non-admin, admin, platform-admin, controller RBAC, backup, rotations"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  [[ -n "$(ca_file)" ]] || { fail "no CA certificate under ${LAN_HOME}/.teknoir-airgap (run E1 first)"; return 0; }
+  e13_checks "$(bundle_dir "${E2E_BUNDLE}")"
+}
+
+e13_checks() {
+  local dir="$1" t0 start u url v code n who want line proj csrf pa="${LAN_HOME}/e2e/platform-admin" out waited
+  local -a args=()
+  t0="$(date -u +%Y-%m-%dT%H:%M:%SZ)" start="${SECONDS}"
+  login_check "the admin signs in"
+  nonadmin_setup
+
+  # Grafana, Prometheus and Alertmanager of teknoir-system: group admin only (SEC-C5)
+  for u in grafana prometheus alertmanager; do
+    url="https://${DOMAIN}/teknoir-system/${u}/"
+    if (( NA_OK )); then
+      v="$(app_status "${NONADMIN_JAR}" "${url}")"
+      if [[ "${v%% *}" == 403 && "$(url_host "${v#* }")" == "${DOMAIN}" ]]; then pass "non-admin: ${url} is forbidden (403)"
+      else fail "non-admin: ${url}: HTTP ${v%% *} at ${v#* }, want 403"; fi
+    fi
+    if (( LOGIN_OK )); then
+      v="$(app_status "${ADMIN_JAR}" "${url}")"
+      if [[ "${v%% *}" == 200 && "$(url_host "${v#* }")" == "${DOMAIN}" ]]; then pass "admin: ${url} answers 200"
+      else fail "admin: ${url}: HTTP ${v%% *} at ${v#* }, want 200"; fi
+    fi
+  done
+  if (( LOGIN_OK )); then
+    code="$(http_req "${HTTP_DIR}/g.hdr" "${HTTP_DIR}/g.json" -b "${ADMIN_JAR}" -c "${ADMIN_JAR}" "https://${DOMAIN}/teknoir-system/grafana/api/user")"
+    v="$(jq -r '"\(.login // "-") \(.email // "-")"' "${HTTP_DIR}/g.json" 2>/dev/null || echo "- -")"
+    assert_eq "Grafana /api/user: the admin is known by e-mail through the JWT (not anonymous)" "200 ${ADMIN_USER} ${ADMIN_USER}" "${code} $(lower "${v}")"
+    code="$(http_req "${HTTP_DIR}/g.hdr" "${HTTP_DIR}/g.json" -b "${ADMIN_JAR}" -c "${ADMIN_JAR}" "https://${DOMAIN}/teknoir-system/grafana/api/user/orgs")"
+    v="$(jq -r '[.[]? | .role] | join(",")' "${HTTP_DIR}/g.json" 2>/dev/null || true)"
+    if [[ "${code}" == 200 && ",${v}," == *",Admin,"* ]]; then pass "Grafana: the admin's org role is Admin"; else fail "Grafana org roles of the admin: HTTP ${code} [${v}], want Admin"; fi
+    rm -f "${HTTP_DIR}/g.hdr" "${HTTP_DIR}/g.json"
+  fi
+
+  # ArgoCD: no default role for non-admins; group admin is role:admin
+  if (( NA_OK )); then
+    if sso_login "${NONADMIN_JAR}" "$(argocd_login_url)" argocd.token; then
+      assert_eq "non-admin: ArgoCD /api/v1/applications lists no Application" "200 0" "$(argocd_apps_count "${NONADMIN_JAR}")"
+    else
+      fail "non-admin: ArgoCD SSO sign-in failed"
+    fi
+  fi
+  proj="$(vm_kc -n teknoir-system get applications.argoproj.io "${ROOT_APP}" -o jsonpath='{.spec.project}' 2>/dev/null || true)"
+  if (( LOGIN_OK )) && sso_login "${ADMIN_JAR}" "$(argocd_login_url)" argocd.token; then
+    v="$(argocd_apps_count "${ADMIN_JAR}")"
+    if [[ "${v%% *}" == 200 && "${v#* }" =~ ^[1-9][0-9]*$ ]]; then pass "admin: ArgoCD lists ${v#* } Applications"; else fail "admin: ArgoCD Applications: ${v}"; fi
+  else
+    fail "admin: ArgoCD SSO sign-in failed"
+  fi
+
+  # Harbor: project creation is admin-only
+  if (( NA_OK )); then
+    if sso_login "${NONADMIN_JAR}" "https://harbor.${DOMAIN}/c/oidc/login?redirect_url=%2Fharbor%2Fprojects" sid; then
+      code="$(http_req "${HTTP_DIR}/h.hdr" "${HTTP_DIR}/h.json" -b "${NONADMIN_JAR}" -c "${NONADMIN_JAR}" "https://harbor.${DOMAIN}/api/v2.0/users/current")"
+      v="$(jq -r '.username // "-"' "${HTTP_DIR}/h.json" 2>/dev/null || echo -)"
+      assert_eq "non-admin: Harbor knows the OIDC user (GET /api/v2.0/users/current)" "200 $(lower "${NONADMIN_EMAIL}")" "${code} $(lower "${v}")"
+      csrf="$(hdr_get "${HTTP_DIR}/h.hdr" x-harbor-csrf-token)"
+      ( umask 077
+        printf 'X-Harbor-CSRF-Token: %s\n' "${csrf}" > "${HTTP_DIR}/csrf.hdr"
+        printf '{"project_name":"e2e-nonadmin-probe","metadata":{"public":"false"}}' > "${HTTP_DIR}/project.json" )
+      code="$(http_req "${HTTP_DIR}/h.hdr" "${HTTP_DIR}/h.json" -b "${NONADMIN_JAR}" -c "${NONADMIN_JAR}" -H @"${HTTP_DIR}/csrf.hdr" \
+                -H 'Content-Type: application/json' --data-binary @"${HTTP_DIR}/project.json" "https://harbor.${DOMAIN}/api/v2.0/projects")"
+      v="$(jq -r '[.errors[]?.message] | join(";")' "${HTTP_DIR}/h.json" 2>/dev/null || true)"
+      if [[ "${code}" == 403 && "$(lower "${v}")" != *csrf* ]]; then pass "non-admin: Harbor refuses POST /api/v2.0/projects (403, project_creation_restriction adminonly)"
+      else fail "non-admin: Harbor POST /api/v2.0/projects: HTTP ${code} [${v}], want 403 (not a CSRF failure)"; fi
+      rm -f "${HTTP_DIR}/h.hdr" "${HTTP_DIR}/h.json" "${HTTP_DIR}/csrf.hdr" "${HTTP_DIR}/project.json"
+    else
+      fail "non-admin: Harbor OIDC sign-in failed"
+    fi
+  fi
+
+  # the retired platform-admin login (D1): disabled in the realm import
+  v="$(kc_user_state teknoir platform-admin)"
+  assert_eq "Keycloak user platform-admin (realm teknoir) is disabled" false "$(sed -n 's/^enabled=\([a-z]*\).*/\1/p' <<<"${v}")"
+  rm -f "${pa}.pw" "${pa}.new"
+  if tk "${dir}" credentials platform-admin --out "${pa}.pw" >/dev/null 2>&1 && [[ -s "${pa}.pw" ]]; then
+    set +e; out="$(kc_login "${HTTP_DIR}/platform-admin.jar" "${LOGIN_URL}" platform-admin "${pa}" 2>&1)"; v=$?; set -e
+    if (( v != 0 )) && grep -qi 'disabled' <<<"${out}"; then pass "a platform-admin sign-in is refused (account disabled)"
+    else fail "a platform-admin sign-in was not refused as disabled (exit ${v})"; fi
+    rm -f "${HTTP_DIR}/platform-admin.jar"
+  else
+    tl_warn "credentials platform-admin gave no password: only the Keycloak state of platform-admin is checked"
+  fi
+
+  # controller RBAC (SEC-C6/C7): the can-i matrix of tests/rbac-k3d.sh
+  local uc pc
+  uc="$(controller_sa user-controller)" pc="$(controller_sa profile-controller)"
+  while IFS='|' read -r who want line; do
+    [[ -n "${who}" ]] || continue
+    read -r -a args <<<"${line}"
+    assert_eq "auth can-i ${line} as ${who#*/}" "${want}" "$(can_i "${who}" "${args[@]}")"
+  done <<EOF
+${uc}|no|* *
+${uc}|yes|create rolebindings --all-namespaces
+${uc}|yes|bind clusterroles/teknoir-admin
+${uc}|no|bind clusterroles/cluster-admin
+${uc}|no|bind clusterroles/admin
+${uc}|no|get secrets -n teknoir-auth
+${uc}|no|create clusterrolebindings
+${uc}|no|create pods --subresource=exec -n teknoir-auth
+${pc}|no|* *
+${pc}|yes|create rolebindings -n ${TEAMSPACE}
+${pc}|no|create clusterrolebindings
+${pc}|no|bind clusterroles/cluster-admin
+${pc}|no|create pods --subresource=exec -n ${TEAMSPACE}
+EOF
+  for u in user-controller profile-controller; do
+    n="$(vm_kc -n teknoir-system logs "deployment/${u}" --tail=-1 2>/dev/null | grep -ci 'forbidden' || true)"
+    assert_eq "no 'forbidden' in the ${u} log" 0 "${n:-0}"
+  done
+
+  # post removed the migration's previous-password (SEC-C10)
+  assert_eq "Secret keycloak-admin has no previous-password (username and password only)" "password username" "$(secret_keys teknoir-auth keycloak-admin)"
+
+  e13_backup "${dir}"
+  e13_argocd_admin "${dir}" "${proj}"
+
+  # D8 rehearsal: a new Keycloak database password, then sign-ins still work
+  if tk "${dir}" rotate keycloak-db --i-know; then pass "rotate keycloak-db --i-know exits 0"; else fail "rotate keycloak-db --i-know failed"; fi
+  if wait_until 900 apps_healthy_except teknoir-demo-; then pass "every Application (but teknoir-demo-*) is Synced/Healthy after the rotation"
+  else fail "Applications not Synced/Healthy after rotate keycloak-db: $(apps_unhealthy_except teknoir-demo-)"; fi
+  login_check "the admin signs in after rotate keycloak-db"
+
+  # Prometheus reaches Alertmanager (alertmanager-allow-prometheus)
+  waited=$(( SECONDS - start ))
+  if (( waited < 300 )); then tl_log "waiting $(( 300 - waited )) s to cover 5 min of Prometheus logs"; sleep $(( 300 - waited )); fi
+  n="$(vm_kc -n teknoir-system logs -l app.kubernetes.io/name=prometheus -c prometheus --since-time="${t0}" --tail=-1 2>/dev/null \
+        | grep -c 'Error sending alert' || true)"
+  assert_eq "Prometheus logged no 'Error sending alerts' since ${t0} (5 min or more)" 0 "${n:-0}"
+}
+
+e13_backup() {
+  # the LAN backup without a terminal: encrypted to the site's recipients,
+  # each test identity decrypts it, sha256sum -c passes, one plaintext set left
+  local dir="$1" outdir="${LAN_HOME}/e2e/backup" site ids age f idf list tmp sums n
+  site="${SITE_FILE}"
+  [[ -f "${dir}/site/vmtest.env" ]] && site="${dir}/site/vmtest.env"
+  if ids="$("${VM}" age-key --check "${site}" 2>"${HTTP_DIR}/age-key.err")"; then
+    pass "the site's BACKUP_AGE_RECIPIENTS are the test identities in ${AGE_ID_DIR}"
+  else
+    fail "test age identities: $(tail -n1 "${HTTP_DIR}/age-key.err" | sed 's/\x1b\[[0-9;]*m//g')"; return 0
+  fi
+  age="$(age_bin "${dir}")" || { fail "no age binary (E2E_AGE, PATH or ${dir}/node/bin/age)"; return 0; }
+  rm -rf "${outdir}"
+  if tk "${dir}" backup --out "${outdir}"; then pass "backup --out without a terminal (recipients from the site)"
+  else fail "backup --out without a terminal failed"; return 0; fi
+  f="$(find "${outdir}" -maxdepth 1 -type f -name '*.tar.age' 2>/dev/null | sort | tail -n1)"
+  [[ -n "${f}" ]] || { fail "no *.tar.age in ${outdir}"; return 0; }
+  assert_eq "the LAN backup file is mode 0600" 600 "$(stat -c %a "${f}")"
+  while read -r _ idf; do
+    [[ -f "${idf}" ]] || continue
+    list="$("${age}" -d -i "${idf}" "${f}" </dev/null 2>/dev/null | tar -t 2>/dev/null || true)"
+    if grep -qE '(^|/)BACKUP\.info$' <<<"${list}" && grep -qE '(^|/)SHA256SUMS$' <<<"${list}"; then
+      pass "$(basename "${idf}") decrypts the backup (BACKUP.info and SHA256SUMS listed)"
+    else
+      fail "$(basename "${idf}") does not decrypt the backup to a listing with BACKUP.info and SHA256SUMS"
+    fi
+  done <<<"${ids}"
+  tmp="$(mktemp -d "${E2E_WORK}/backup-check.XXXXXX")"
+  chmod 700 "${tmp}"
+  idf="$(awk 'NR == 1 { print $2 }' <<<"${ids}")"
+  if "${age}" -d -i "${idf}" "${f}" 2>/dev/null | tar -C "${tmp}" -x 2>/dev/null; then
+    sums="$(find "${tmp}" -name SHA256SUMS -printf '%h\n' | head -n1)"
+    if [[ -n "${sums}" ]] && ( cd "${sums}" && sha256sum -c --quiet SHA256SUMS >/dev/null 2>&1 ); then pass "sha256sum -c of the decrypted backup passes"
+    else fail "sha256sum -c of the decrypted backup fails"; fi
+  else
+    fail "decrypting and extracting the backup failed"
+  fi
+  rm -rf "${tmp}"
+  n="$(vmx sudo find "${NODE_STATE_DIR}/backups" -mindepth 1 -maxdepth 1 -type d -name '2*Z' 2>/dev/null | grep -c . || true)"
+  assert_eq "one plaintext backup set is left on the node" 1 "${n:-0}"
+}
+
+e13_argocd_admin() {
+  # rotate argocd-admin (SEC-C9): the initial Secret goes, the old password
+  # stops working, the new one (credentials argocd-admin) works, and the SSO
+  # admin keeps role:admin
+  local dir="$1" proj="$2" saved code pw="${LAN_HOME}/e2e/argocd-admin.pw" body="${HTTP_DIR}/session.json"
+  saved="$(vm_root 2>/dev/null <<'EOF' || echo unknown
+# vm-script: argocd_old_password
+set -eu
+f=/root/e2e-argocd-old.pw
+rm -f "$f"
+if k3s kubectl -n teknoir-system get secret argocd-initial-admin-secret >/dev/null 2>&1; then
+  ( umask 077; k3s kubectl -n teknoir-system get secret argocd-initial-admin-secret -o go-template='{{index .data "password" | base64decode}}' > "$f" )
+  echo saved
+else
+  echo absent
+fi
+EOF
+)"
+  if tk "${dir}" rotate argocd-admin; then pass "rotate argocd-admin exits 0"; else fail "rotate argocd-admin failed"; return 0; fi
+  assert_eq "argocd-initial-admin-secret is gone after the rotation" "" \
+    "$(vm_kc -n teknoir-system get secret argocd-initial-admin-secret --ignore-not-found -o name 2>/dev/null || true)"
+  if [[ "${saved}" == saved ]]; then
+    assert_eq "the old ArgoCD admin password is refused (POST /api/v1/session)" 401 "$(argocd_session_vm /root/e2e-argocd-old.pw)"
+  else
+    tl_warn "argocd-initial-admin-secret was gone before the rotation (${saved}): the old password is not checked"
+  fi
+  vmx sudo rm -f /root/e2e-argocd-old.pw >/dev/null 2>&1 || true
+  rm -f "${pw}"
+  if tk "${dir}" credentials argocd-admin --out "${pw}" && [[ -s "${pw}" ]]; then
+    assert_eq "credentials argocd-admin --out writes a 0600 file" 600 "$(stat -c %a "${pw}" 2>/dev/null || echo missing)"
+    ( umask 077; jq -n --rawfile p "${pw}" '{username: "admin", password: ($p | rtrimstr("\n"))}' > "${body}" )
+    code="$(http_req "${HTTP_DIR}/session.hdr" "${HTTP_DIR}/session.out" -H 'Content-Type: application/json' \
+              --data-binary @"${body}" "https://argocd.${DOMAIN}/api/v1/session")"
+    rm -f "${body}" "${HTTP_DIR}/session.hdr" "${HTTP_DIR}/session.out"
+    assert_eq "the rotated ArgoCD admin password signs in (POST /api/v1/session)" 200 "${code}"
+  else
+    fail "credentials argocd-admin --out failed"
+  fi
+  if (( LOGIN_OK )) && sso_login "${ADMIN_JAR}" "$(argocd_login_url)" argocd.token; then
+    code="$(http_req "${HTTP_DIR}/cani.hdr" "${HTTP_DIR}/cani.json" -b "${ADMIN_JAR}" -c "${ADMIN_JAR}" \
+              "https://argocd.${DOMAIN}/api/v1/account/can-i/applications/sync/${proj:-default}/${ROOT_APP}")"
+    assert_eq "the SSO admin may still sync ${ROOT_APP} (role:admin)" "200 yes" "${code} $(jq -r '.value // "-"' "${HTTP_DIR}/cani.json" 2>/dev/null || echo -)"
+    rm -f "${HTTP_DIR}/cani.hdr" "${HTTP_DIR}/cani.json"
+  else
+    fail "the SSO admin cannot sign in to ArgoCD after the rotation"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# E14
+# ---------------------------------------------------------------------------
+e14() {
+  tl_case E14 "sign-in robustness: garbage cookie, XHR 401, http->https, upstream 401/403 passthrough, logout chain"
+  [[ -n "${E2E_BUNDLE:-}" ]] || { skip_case "E2E_BUNDLE not set"; return 0; }
+  ensure_vm
+  [[ -n "$(ca_file)" ]] || { fail "no CA certificate under ${LAN_HOME}/.teknoir-airgap (run E1 first)"; return 0; }
+  e14_checks
+}
+
+http_to_https_check() {
+  # plain HTTP is a bare redirect to https: ext_authz and the Lua run on :443 only
+  probe "http://${DOMAIN}/"
+  if [[ "${P_CODE}" == 301 && "${P_LOC}" == "https://${DOMAIN}"* && "${P_LOC}" != *oauth2* ]]; then pass "http://${DOMAIN}/ gets 301 to https, not to the login"
+  else fail "http://${DOMAIN}/: HTTP ${P_CODE} to ${P_LOC:-nowhere}, want 301 to https://${DOMAIN} (no oauth2)"; fi
+}
+
+e14_checks() {
+  local cookie n
+  cookie="$(oauth2_cookie)"
+  probe -H "Cookie: ${cookie}=garbage" "https://${DOMAIN}/"
+  if [[ "${P_CODE}" == 302 && "${P_LOC}" == "https://${DOMAIN}/oauth2/start?rd="* ]]; then pass "a garbage session cookie gets 302 to /oauth2/start"
+  else fail "a garbage session cookie got HTTP ${P_CODE} to ${P_LOC%%\?*}, want 302 to https://${DOMAIN}/oauth2/start"; fi
+  n="$(expired_cookies "${P_HDR}" "${cookie}")"
+  if (( n >= 2 )); then pass "the redirect clears ${cookie} (${n} expiring Set-Cookie headers)"
+  else fail "the redirect has ${n} expiring Set-Cookie headers for ${cookie}, want 2"; fi
+  probe -H "Cookie: ${cookie}=garbage" -H 'Sec-Fetch-Mode: cors' "https://${DOMAIN}/api/catalog/entities"
+  assert_eq "a fetch (Sec-Fetch-Mode: cors) without a valid session gets 401 without Location" "401 -" "${P_CODE} ${P_LOC:--}"
+  probe -H 'X-Requested-With: XMLHttpRequest' "https://${DOMAIN}/"
+  assert_eq "an XHR (X-Requested-With) without a session gets 401 without Location" "401 -" "${P_CODE} ${P_LOC:--}"
+  http_to_https_check
+  login_check "a fresh admin session for the passthrough and logout checks"
+  if (( LOGIN_OK )); then
+    probe -b "${ADMIN_JAR}" -c "${ADMIN_JAR}" "https://${DOMAIN}/api/catalog/entities"
+    if [[ "${P_CODE}" =~ ^40[13]$ && "${P_LOC}" != *"/oauth2/"* ]]; then pass "signed in, /api/catalog/entities without a Backstage token gets Backstage's own ${P_CODE} (no login loop)"
+    else fail "signed in, /api/catalog/entities without a Backstage token: HTTP ${P_CODE} to ${P_LOC:-nowhere}, want 401/403 without a login redirect"; fi
+    if lan "${E2E_WORK}" "${KCLOGIN}" --logout --cacert "$(ca_file)" --url "https://${DOMAIN}/" --cookie-jar "${ADMIN_JAR}"; then
+      pass "logout: sign_out -> Keycloak confirmation -> https://${DOMAIN}/ -> /oauth2/start -> login form"
+    else
+      fail "the logout chain failed (see the kc-login lines above)"
+    fi
+  fi
+  rm -f "${P_HDR}" "${P_BODY}"
+}
+
+# ---------------------------------------------------------------------------
+# E15
+# ---------------------------------------------------------------------------
+apps_unhealthy_except() {
+  # apps_unhealthy_except <name prefix> — Applications not Synced/Healthy,
+  # leaving out those whose name starts with <prefix>
+  apps_state 2>/dev/null | awk -v p="$1" '($2 != "Synced" || $3 != "Healthy") && index($1, p) != 1 { print $1 "=" $2 "/" $3 }' | tr '\n' ' ' || true
+}
+apps_healthy_except() { [[ -z "$(apps_unhealthy_except "$1")" ]]; }
+demo_apps() { vm_kc -n teknoir-system get applications.argoproj.io -o name 2>/dev/null | grep -c '/teknoir-demo-' || true; }
+demo_apps_exist() { (( $(demo_apps) >= ${#PLUGINS[@]} )); }
+demo_repos() {
+  vm_kc -n teknoir-system get applications.argoproj.io -o json 2>/dev/null | jq -r '
+    [.items[] | select(.metadata.name | startswith("teknoir-demo-")) | .spec.source.repoURL] | unique | join(" ")' || true
+}
+not_legacy() { ! user_has_legacy_pw "$1"; }
+demo_on_harbor() { [[ "$(demo_repos)" == "harbor.${DOMAIN}/teknoir" ]]; }
+master_clients_gone() { [[ "$(kc_master_clients)" == "0 401" ]]; }
+
+e15_master_clients() {
+  # e15_master_clients — realm master's legacy clients as the live node has
+  # them (made by hand per the old AIRGAP-BOOTSTRAP 8; neither old-setup.sh nor
+  # bundle A creates them), through the master admin API:
+  #   teknoir  confidential, the secret of realm teknoir's teknoir client
+  #            (keycloak-client-secrets/teknoir, also the oauth2-proxy
+  #            client secret), a service account holding master-realm
+  #            manage-users, query-users and view-users
+  #   argocd   confidential, keycloak-client-secrets/argocd
+  #   harbor   confidential, service account and direct grants, a secret of
+  #            its own
+  # Then the severity: teknoir's client_credentials token lists realm
+  # master's users. Prints "seed <client> <status>", "grant <status> <roles>"
+  # and "sa-users <status>"; secrets and tokens stay in a 0700 dir on the VM.
+  kc_vm 2>/dev/null <<'EOF' || true
+# vm-script: e15_master_clients
+kc_login
+for c in teknoir argocd; do
+  k -n teknoir-auth get secret keycloak-client-secrets -o go-template="{{index .data \"$c\" | base64decode}}" > "${d:?}/s_$c"
+done
+( umask 077; head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > "${d:?}/s_harbor" )
+python3 - "$d" "$DOMAIN" <<'PY'
+import json, os, sys
+d, dom = sys.argv[1], sys.argv[2]
+extra = {
+    "teknoir": {"serviceAccountsEnabled": True, "redirectUris": ["https://%s/oauth2/callback" % dom]},
+    "argocd": {"redirectUris": ["https://argocd.%s/auth/callback" % dom]},
+    "harbor": {"serviceAccountsEnabled": True, "directAccessGrantsEnabled": True,
+               "redirectUris": ["https://harbor.%s/c/oidc/callback" % dom]},
+}
+for c, x in extra.items():
+    body = {"clientId": c, "enabled": True, "publicClient": False, "standardFlowEnabled": True,
+            "secret": open(os.path.join(d, "s_" + c)).read()}
+    body.update(x)
+    fd = os.open(os.path.join(d, c + ".json"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.write(fd, json.dumps(body).encode())
+    os.close(fd)
+PY
+rm -f "${d:?}/s_argocd" "${d:?}/s_harbor"
+for c in teknoir argocd harbor; do
+  code="$(kc_curl -K "$d/hdr" -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+            --data-binary @"$d/$c.json" "$KC/admin/realms/master/clients")" || code=000
+  rm -f "${d:?}/${c:?}.json"
+  echo "seed $c $code"
+done
+first_id() {
+  python3 -c 'import json, sys
+v = json.load(open(sys.argv[1]))
+v = v[0] if isinstance(v, list) and v else v
+print(v.get("id", "") if isinstance(v, dict) else "")' "$1" 2>/dev/null || true
+}
+kc_get "/realms/master/clients?clientId=teknoir" > "$d/c.json"; cid="$(first_id "$d/c.json")"
+kc_get "/realms/master/clients?clientId=master-realm" > "$d/c.json"; mr="$(first_id "$d/c.json")"
+code=000 n=0
+if [ -n "$cid" ] && [ -n "$mr" ]; then
+  kc_get "/realms/master/clients/$cid/service-account-user" > "$d/c.json"; sa="$(first_id "$d/c.json")"
+  kc_get "/realms/master/clients/$mr/roles" > "$d/roles.json"
+  n="$(python3 - "$d/roles.json" "$d/grant.json" <<'PY'
+import json, sys
+want = {"manage-users", "query-users", "view-users"}
+roles = [r for r in json.load(open(sys.argv[1])) if r.get("name") in want]
+open(sys.argv[2], "w").write(json.dumps(roles))
+print(len(roles))
+PY
+)" || n=0
+  if [ -n "$sa" ]; then
+    code="$(kc_curl -K "$d/hdr" -o /dev/null -w '%{http_code}' -H 'Content-Type: application/json' \
+              --data-binary @"$d/grant.json" "$KC/admin/realms/master/users/$sa/role-mappings/clients/$mr")" || code=000
+  fi
+fi
+echo "grant $code $n"
+code="$(kc_curl -o "$d/sa.json" -w '%{http_code}' --data-urlencode grant_type=client_credentials --data-urlencode client_id=teknoir \
+          --data-urlencode "client_secret@$d/s_teknoir" "$KC/realms/master/protocol/openid-connect/token")" || code=000
+rm -f "${d:?}/s_teknoir"
+u=000
+if [ "$code" = 200 ]; then
+  python3 - "$d/sa.json" "$d/sahdr" <<'PY'
+import json, os, sys
+t = json.load(open(sys.argv[1]))["access_token"]
+fd = os.open(sys.argv[2], os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, ('header = "Authorization: Bearer %s"\n' % t).encode())
+os.close(fd)
+PY
+  u="$(kc_curl -K "$d/sahdr" -o /dev/null -w '%{http_code}' "$KC/admin/realms/master/users?max=1")" || u=000
+fi
+rm -f "${d:?}/sa.json" "${d:?}/sahdr"
+echo "sa-users $u"
+EOF
+}
+
+e15_inject() {
+  # the live teknoir-local state that A left and B must converge
+  local rev now patch kind cfg n ops bad="" out
+  if [[ -n "${E2E_E15_DEMO_PROFILE:-}" ]]; then
+    if vm_kc apply -f - < "${E2E_E15_DEMO_PROFILE}" >/dev/null; then pass "Profile teknoir-demo from ${E2E_E15_DEMO_PROFILE}"; else fail "cannot apply ${E2E_E15_DEMO_PROFILE}"; fi
+  elif jq -n --arg o "$(lower "${ADMIN_EMAIL}")" \
+         '{apiVersion: "teknoir.org/v1", kind: "Profile", metadata: {name: "teknoir-demo"}, spec: {owner: {kind: "User", name: $o}}}' \
+       | vm_kc create -f - >/dev/null; then
+    pass "Profile teknoir-demo created as Backstage did (owner ${ADMIN_EMAIL}, not in GitOps)"
+  else
+    fail "cannot create Profile teknoir-demo"
+  fi
+  if wait_until 600 demo_apps_exist; then pass "A's profile-controller created the teknoir-demo Applications ($(demo_repos))"
+  else fail "only $(demo_apps) teknoir-demo Applications after 600 s"; fi
+  rev="$(vm_kc -n teknoir-system get applications.argoproj.io monitoring -o jsonpath='{.status.sync.revision}' 2>/dev/null || true)"
+  now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  patch="$(jq -cn --arg r "${rev}" --arg t "${now}" '{status: {operationState: {
+      phase: "Failed", message: "one or more objects failed to apply, reason: e2e injected the live teknoir-local state",
+      retryCount: 5, startedAt: $t, finishedAt: $t,
+      operation: {sync: {revision: $r}, retry: {limit: 5}, initiatedBy: {automated: true}},
+      syncResult: {revision: $r}}}}')"
+  if vm_kc -n teknoir-system patch applications.argoproj.io monitoring --type=merge -p "${patch}" >/dev/null; then
+    pass "monitoring carries a stale Failed operation for its current revision (retryCount 5)"
+  else
+    fail "cannot inject the Failed monitoring operation"
+  fi
+  for kind in validatingwebhookconfigurations mutatingwebhookconfigurations; do
+    for cfg in $(vm_kc get "${kind}" -o name 2>/dev/null | grep -E '/monitoring.*admission$' || true); do
+      n="$(vm_kc get "${cfg}" -o json 2>/dev/null | jq '.webhooks | length' || echo 0)"
+      ops="$(jq -cn --argjson n "${n:-0}" '[range(0; $n) | {op: "add", path: "/webhooks/\(.)/clientConfig/caBundle", value: ""}]')"
+      vm_kc patch "${cfg}" --type=json -p "${ops}" >/dev/null 2>&1 || bad+="${cfg%%.*}/${cfg##*/} "
+    done
+  done
+  n="$(admission_ca)"
+  if [[ -z "${bad}" && -n "${n#* }" ]]; then pass "the monitoring admission webhooks have an empty caBundle (${n#* })"
+  else fail "could not empty the admission caBundles (patch refused: ${bad:-none}; configurations and empty webhooks: ${n})"; fi
+  out="$(e15_master_clients)"
+  assert_eq "realm master gets the legacy clients teknoir, argocd and harbor, as the live node has them" \
+    "teknoir=201 argocd=201 harbor=201" "$(awk '$1 == "seed" { printf "%s%s=%s", s, $2, $3; s = " " }' <<<"${out}")"
+  assert_eq "the teknoir client's service account holds master-realm manage-users, query-users and view-users" \
+    "204 3" "$(awk '$1 == "grant" { print $2, $3 }' <<<"${out}")"
+  assert_eq "the severity: teknoir's client_credentials token (the oauth2-proxy secret) lists realm master's users" \
+    200 "$(awk '$1 == "sa-users" { print $2 }' <<<"${out}")"
+}
+
+e15() {
+  tl_case E15 "live rehearsal: old layout -> migrate -> up A -> the live state -> up B"
+  [[ -n "${E2E_BUNDLE:-}" && -n "${E2E_BUNDLE_B:-}" ]] || { skip_case "E2E_BUNDLE (A) and E2E_BUNDLE_B (B) required"; return 0; }
+  [[ -n "${E2E_OLD_SETUP:-}" ]] || { skip_case "E2E_OLD_SETUP (old-tooling install command) not set"; return 0; }
+  (( ALLOW_DESTROY )) || { skip_case "re-creates the VM: pass --allow-destroy"; return 0; }
+  local a b owner pw="${LAN_HOME}/e2e/admin.pw" rerun="${LAN_HOME}/e2e/admin-rerun.pw" name mark out v created0 created1 claims
+  a="$(bundle_dir "${E2E_BUNDLE}")" b="$(bundle_dir "${E2E_BUNDLE_B}")"
+  fresh_vm || return 0
+  rm -rf "${LAN_HOME:?}/.teknoir-airgap"
+  reset_admin
+  # as on the live node, the admin is the owner B's GitOps Profile names
+  owner="$(bundle_profile_owner "${b}")"
+  if [[ -n "${owner}" ]]; then adopt_owner "${owner}"; else tl_warn "cannot read the ${TEAMSPACE} owner from bundle B; the admin is ${ADMIN_EMAIL}"; fi
+  name="$(user_name "${ADMIN_EMAIL}")"
+
+  # --- 1. the live history with bundle A ------------------------------------------
+  if VM_IP="${NODE_IP}" bash -c "${E2E_OLD_SETUP}"; then pass "old-style install completed"; else fail "E2E_OLD_SETUP failed"; return 0; fi
+  if tk "${a}" migrate; then pass "migrate (A) exits 0"; else fail "migrate (A) failed"; return 0; fi
+  if up_in "${a}" --force-images; then pass "up --force-images with bundle A exits 0"; else fail "up with bundle A failed"; return 0; fi
+  wait_apps 2700 || true
+  if tk "${a}" admin-user --email "${ADMIN_EMAIL}" --out "${pw}" && [[ -s "${pw}" ]]; then pass "admin-user (A) wrote the temporary password"
+  else fail "admin-user (A) failed"; return 0; fi
+  login_check "the admin signs in once on A (forced password change)"
+  (( LOGIN_OK )) || return 0
+  if tk "${a}" migrate --argo; then pass "migrate --argo (A) exits 0"; else fail "migrate --argo (A) failed"; fi
+  if tk "${a}" migrate; then pass "migrate again (A, M6) exits 0"; else fail "migrate (A, M6) failed"; fi
+
+  # --- 2. the live state -------------------------------------------------------------
+  e15_inject
+  if user_has_legacy_pw "${name}"; then pass "before B: User ${name} carries the legacy status.set_initial_password"
+  else fail "before B: User ${name} carries no legacy status.set_initial_password"; fi
+  assert_eq "before B: Keycloak user ${ADMIN_USER} is enabled with no required action" "enabled=true actions=0" "$(kc_user_state teknoir "${ADMIN_USER}")"
+  created0="$(kc_pw_created "${ADMIN_USER}")"
+  if [[ -n "${created0}" ]]; then pass "before B: the password credential's created_date is read (read-only SQL)"; else fail "cannot read the password credential's created_date"; fi
+  assert_eq "before B: Secret keycloak-admin still has previous-password" "password previous-password username" "$(secret_keys teknoir-auth keycloak-admin)"
+  # all three, and teknoir's shared secret gets a master token: so the
+  # deletion after B is not met by an empty realm
+  assert_eq "before B: realm master has the 3 legacy clients, and teknoir's secret gets a token there (client_credentials)" \
+    "3 200" "$(kc_master_clients)"
+
+  # --- 3. up with B ---------------------------------------------------------------------
+  mark="$(transcript_mark)"
+  if up_in "${b}"; then pass "up with bundle B exits 0 (post passes)"; else fail "up with bundle B failed"; return 0; fi
+  out="$(transcript_since "${mark}")"
+  if wait_until 2700 apps_healthy_except teknoir-demo-; then pass "every Application but teknoir-demo-* is Synced/Healthy"
+  else fail "Applications not Synced/Healthy: $(apps_unhealthy_except teknoir-demo-)"; fi
+  platform_checks "${out}"
+
+  # --- 4. what B converged ----------------------------------------------------------------
+  wait_until 600 demo_on_harbor || true
+  assert_eq "every teknoir-demo Application points at Harbor" "harbor.${DOMAIN}/teknoir" "$(demo_repos)"
+  if wait_until 1200 ts_apps_healthy teknoir-demo; then pass "the teknoir-demo Applications are Synced/Healthy"
+  else tl_warn "teknoir-demo Applications not Synced/Healthy (a Backstage-made teamspace: warning only): $(ts_apps_unhealthy teknoir-demo)"; fi
+  assert_eq "monitoring's operation Succeeded" Succeeded \
+    "$(vm_kc -n teknoir-system get applications.argoproj.io monitoring -o jsonpath='{.status.operationState.phase}' 2>/dev/null || true)"
+  if wait_until 300 not_legacy "${name}"; then pass "user-controller cleared the legacy status.set_initial_password"
+  else fail "User ${name} still carries status.set_initial_password"; fi
+  assert_eq "no temporary-password Secret for ${name} (the user had no pending UPDATE_PASSWORD)" "" "$(k1_secret "${name}")"
+  created1="$(kc_pw_created "${ADMIN_USER}")"
+  assert_eq "the admin's Keycloak password was not changed (credential created_date)" "${created0}" "${created1}"
+  assert_eq "Keycloak user ${ADMIN_USER} still has no required action" "enabled=true actions=0" "$(kc_user_state teknoir "${ADMIN_USER}")"
+  assert_eq "post removed previous-password from Secret keycloak-admin" "password username" "$(secret_keys teknoir-auth keycloak-admin)"
+  if wait_until 600 master_clients_gone; then pass "the master-realm legacy clients are deleted; the old teknoir secret gets 401 on master"
+  else fail "master-realm legacy clients after B: $(kc_master_clients) (want 0 clients, HTTP 401)"; fi
+  rm -f "${rerun}"
+  if tk "${b}" admin-user --email "${ADMIN_EMAIL}" --out "${rerun}"; then pass "admin-user (B) re-run exits 0"; else fail "admin-user (B) re-run failed"; fi
+  if [[ -e "${rerun}" ]]; then fail "admin-user (B) wrote ${rerun} although the password was handed out before"; else pass "admin-user (B) wrote no password file (already handed out)"; fi
+  claims="$(user_claims "${name}")"
+  for v in "owner@${TEAMSPACE}" owner@teknoir-demo; do
+    if [[ " ${claims} " == *" ${v} "* ]]; then pass "admin-user granted ${v}"; else fail "User ${name} lacks ${v}: [${claims}]"; fi
+  done
+  login_check "the admin still signs in with the password set on A" --forbid-profile-form
+
+  # --- 5. then the release checks on the migrated node --------------------------------------
+  e11_checks
+  e13_checks "${b}"
+  e14_checks
+}
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 main() {
@@ -942,7 +2682,9 @@ main() {
     shift
   done
   (( ${#run[@]} )) || run=("${ALL[@]}")
-  need sudo ip curl jq tar sha256sum ssh ssh-agent ssh-add setsid iptables stat
+  [[ "${E2E_E1_BASELINE:-auto}" =~ ^(auto|0|1)$ ]] || tl_die "E2E_E1_BASELINE must be auto, 0 or 1"
+  [[ "${E2E_E4_ROLLBACK:-auto}" =~ ^(auto|0|1)$ ]] || tl_die "E2E_E4_ROLLBACK must be auto, 0 or 1"
+  need sudo ip curl jq tar sha256sum ssh ssh-agent ssh-add setsid iptables stat python3 openssl awk
   trap cleanup EXIT
   prepare
   local s

@@ -183,6 +183,51 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
   default 240 s); backstage chart 0.0.84 runs the user and profile providers
   every minute. Sign out and in again after `admin-user` has finished.
 
+### VM end-to-end test
+
+The VM test (`airgap/test/vm/e2e.sh`) covers the r5 changes before they reach the
+live node.
+
+- **New scenarios.** E11 checks the default teamspace `teknoir-default`. E12 checks
+  node time: the bundled chrony, skew correction, `up --sync-clock`, the RTC, a
+  reboot, SNTP from the LAN and `doctor`. E13 checks access and credentials: a
+  non-admin realm user against Grafana, Prometheus, Alertmanager, ArgoCD and Harbor;
+  the disabled platform-admin; controller RBAC; the encrypted LAN backup; and
+  `rotate argocd-admin` and `keycloak-db`. E14 checks sign-in robustness: a garbage
+  cookie, XHR 401, http to https, upstream 401/403 passthrough and the logout
+  chain. E15 rehearses the live rollout: the old layout, bundle A, the injected
+  live state, then bundle B. The injected state includes the master-realm legacy
+  clients that the live node got by hand; before B they must exist and answer,
+  so their deletion is really rehearsed.
+- E13 also checks that the non-admin's temporary-password Secret is deleted after
+  its first sign-in. A reconcile is started with an annotation, so the deletion
+  does not fall into E2's no-change window. E2 tolerates only such K1 deletions
+  in teknoir-user-credentials.
+- **Extended scenarios.**
+  - E1: every platform operation Succeeded, the admission caBundle, the digest
+    pins, post's image check, `/oauth2/start`, the one-time password handover, no
+    Update Profile form, Backstage identity within 3 minutes, no backstage-api
+    restart.
+  - E2: teknoir-default is not synced again, its Secrets keep their
+    resourceVersions, and profile-controller does not restart.
+  - E1 with a pre-r5 bundle (app-of-apps below 0.0.5, the upgrade run's A) is a
+    baseline: the r5-only checks warn instead of failing (`E2E_E1_BASELINE`).
+  - E4: the same release checks after the update, and A's legacy password field
+    cleared. `E2E_E4_APPS=auto` derives the expected Applications from the pins.
+    The rollback from r5 to a pre-r5 A meets an open design gap (DESIGN.md).
+    `E2E_E4_ROLLBACK=1` runs it and asserts each part; `=0` waives it on purpose.
+    Left at auto, E4 fails, because a rollback that was not rehearsed is not
+    green.
+  - E7: the passwords the LAN side holds and the test age identities appear in no
+    log.
+  - E8: the pre-rotation cookie gets a login redirect.
+  - E10: no "no owner" warning, then `migrate --finalize`.
+- The first admin of a VM run is the owner of Profile teknoir-default.
+- `kc-login.sh` gains the options `--cookie-jar`, `--forbid-profile-form`,
+  `--session-cookie`, `--accept-status` and `--logout`.
+- `vmtest.env` has two test age recipients. Their identities stay on vpro
+  (`vm.sh age-key`). The VM network stays static.
+
 ## 2026-10: redesign (app-of-apps 0.0.4)
 
 One build command, one LAN-host command, and the same command for the first
