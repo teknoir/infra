@@ -14,7 +14,6 @@ OAUTH2_REDIS_SECRET_MANIFEST_PATH=manifest-oauth2-proxy-redis-secret.yaml
 GCR_SECRET_MANIFEST_PATH=manifest-gcr-json-key-secret.yaml
 GHCR_SECRET_MANIFEST_PATH=manifest-ghcr-token-secret.yaml
 HARBOR_SECRET_MANIFEST_PATH=manifest-harbor-secret.yaml
-BACKSTAGE_KEYCLOAK_MANIFEST_PATH=manifest-backstage-keycloak-secret.yaml
 BACKSTAGE_SECRETS_MANIFEST_PATH=manifest-backstage-secrets.yaml
 ARGOCD_KEYCLOAK_MANIFEST_PATH=manifest-argocd-keycloak-secret.yaml
 TEKNOIR_GITHUB_MANIFEST_PATH=manifest-teknoir-github-secret.yaml
@@ -30,7 +29,6 @@ for manifest in \
   "${GCR_SECRET_MANIFEST_PATH}" \
   "${GHCR_SECRET_MANIFEST_PATH}" \
   "${HARBOR_SECRET_MANIFEST_PATH}" \
-  "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}" \
   "${BACKSTAGE_SECRETS_MANIFEST_PATH}" \
   "${ARGOCD_KEYCLOAK_MANIFEST_PATH}" \
   "${TEKNOIR_GITHUB_MANIFEST_PATH}"; do
@@ -91,12 +89,6 @@ if [ -f "${HARBOR_SECRET_MANIFEST_PATH}" ]; then
   ssh anders@r415 \
     "sudo tee /opt/k3s/server/manifests/teknoir-harbor-secret.yaml >/dev/null" \
     < "${HARBOR_SECRET_MANIFEST_PATH}"
-fi
-
-if [ -f "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}" ]; then
-  ssh anders@r415 \
-    "sudo tee /opt/k3s/server/manifests/teknoir-backstage-keycloak-secrets.yaml >/dev/null" \
-    < "${BACKSTAGE_KEYCLOAK_MANIFEST_PATH}"
 fi
 
 if [ -f "${BACKSTAGE_SECRETS_MANIFEST_PATH}" ]; then
