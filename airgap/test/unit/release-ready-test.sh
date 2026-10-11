@@ -144,6 +144,12 @@ run_lib() {
         case "${a}" in
           *" get crd "*) echo True ;;
           *" get applications.argoproj.io -o json "*)
+            # a loaded node: the first API_FAILS calls time out
+            if [[ -s "${W}/api-fails" ]] && (( $(cat "${W}/api-fails") > 0 )); then
+              echo $(( $(cat "${W}/api-fails") - 1 )) > "${W}/api-fails"
+              echo "error: net/http: TLS handshake timeout" >&2
+              return 1
+            fi
             # the controller stand-in consumes a pending operation first
             case "${CTRL}" in
               fail) jq -c ".items |= map(if .operation then .status.operationState = {phase: \"Failed\", message: \"failed again\", syncResult: {revision: .status.sync.revision}} | del(.operation) else . end)" "${W}/apps.json" > "${W}/apps.tmp" && mv "${W}/apps.tmp" "${W}/apps.json" ;;
@@ -372,6 +378,17 @@ check "a teamspace Application with a failed op is never re-synced by post" bash
 check "... and the error says how to retry it" \
   grep -qF 'teknoir-default-grafana (last sync to 0.0.99 Failed: one or more synchronization tasks completed unsuccessfully (retried 5 times).; post re-syncs platform Applications only: Sync this one in the ArgoCD UI' "${WORK}/out"
 check "the timeout error says re-running up is safe" grep -qF '(running up again is safe: every phase skips what is done and post waits again)' "${WORK}/out"
+
+# a loaded node: the API server times out on the first calls; post polls again and passes
+cp "${WORK}/apps.json.orig2" "${WORK}/apps.json"; : > "${WORK}/patches.log"; echo 3 > "${WORK}/api-fails"
+CTRL=succeed run_lib 'WAIT_TIMEOUT=20; REC_SOURCE=configmap; post_wait_applications'
+check "API timeouts on the Application list: post polls again and passes" grep -q '^rc=0$' "${WORK}/out"
+check "... and warns once per missed poll" eq 3 "$(grep -c 'WARN: the Kubernetes API did not answer the Application list' "${WORK}/out")"
+echo 1000 > "${WORK}/api-fails"
+CTRL=succeed run_lib 'WAIT_TIMEOUT=2; REC_SOURCE=configmap; post_wait_applications'
+check "an API that never answers: post fails at the deadline, saying so" \
+  grep -qE 'ERROR: post: the Kubernetes API did not answer for the Application list within 2s \(running up again is safe' "${WORK}/out"
+: > "${WORK}/api-fails"
 
 echo "# 4b. the wait: an update that creates a teamspace declared in GitOps waits as long as a first install"
 cp "${WORK}/profiles.json" "${WORK}/profiles.json.orig"

@@ -588,7 +588,18 @@ post_wait_applications() {
   start=${SECONDS}
   deadline=$(( start + timeout ))
   while :; do
-    json="$(_release_applications_json)"
+    # A loaded node (first install: images are being pushed and unpacked) can
+    # leave the API server unanswered for a while ("TLS handshake timeout"):
+    # that is a reason to poll again, not to fail the run. The deadline still
+    # applies.
+    if ! json="$(_release_applications_json 2>/dev/null)"; then
+      if (( SECONDS >= deadline )); then
+        die "post: the Kubernetes API did not answer for the Application list within ${timeout}s (running up again is safe: every phase skips what is done and post waits again)"
+      fi
+      warn "the Kubernetes API did not answer the Application list ($(( deadline - SECONDS ))s left); polling again"
+      sleep "${POST_POLL}"
+      continue
+    fi
     post_resync_failed "${json}"
     bad="$(_release_post_not_ready "${json}")"
     if [[ -z "${bad}" ]]; then
