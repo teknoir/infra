@@ -2500,6 +2500,14 @@ e14_checks() {
     probe -b "${ADMIN_JAR}" -c "${ADMIN_JAR}" "https://${DOMAIN}/api/catalog/entities"
     if [[ "${P_CODE}" =~ ^40[13]$ && "${P_LOC}" != *"/oauth2/"* ]]; then pass "signed in, /api/catalog/entities without a Backstage token gets Backstage's own ${P_CODE} (no login loop)"
     else fail "signed in, /api/catalog/entities without a Backstage token: HTTP ${P_CODE} to ${P_LOC:-nowhere}, want 401/403 without a login redirect"; fi
+    # the Log out button's URL is built from teknoir.auth.* of the frontend config; the image's
+    # runtime injection never reaches the loader (r5 stage 14), so the chart adds it to index.html
+    probe -b "${ADMIN_JAR}" -c "${ADMIN_JAR}" "https://${DOMAIN}/home"
+    if [[ "${P_CODE}" == 200 ]] && grep -Fq "window.__APP_CONFIG__={\"teknoir\":{\"auth\":{\"issuer\":\"https://auth.${DOMAIN}/auth/realms/teknoir\"" "${P_BODY}"; then
+      pass "the served index.html carries teknoir.auth.issuer (realm teknoir), so the UI's Log out ends the oauth2-proxy and realm sessions"
+    else
+      fail "the served index.html (HTTP ${P_CODE}) carries no window.__APP_CONFIG__ with teknoir.auth.issuer: the UI's Log out would go to realm master"
+    fi
     if lan "${E2E_WORK}" "${KCLOGIN}" --logout --cacert "$(ca_file)" --url "https://${DOMAIN}/" --cookie-jar "${ADMIN_JAR}"; then
       pass "logout: sign_out -> Keycloak confirmation -> https://${DOMAIN}/ -> /oauth2/start -> login form"
     else

@@ -12,7 +12,8 @@ e.g. with curl --resolve or a .curlrc):
                    navigate, or X-Requested-With) gets 401 (the r5 gateway
                    Lua). Signed in: /teknoir-system/* is 403 unless the user
                    is in group admin, /api/catalog/* is 401 without a bearer
-                   token (Backstage), anything else 200.
+                   token (Backstage), /home carries window.__APP_CONFIG__ with
+                   teknoir.auth.issuer, anything else 200.
   auth.<domain>    Keycloak realm teknoir under /auth: the login form
                    (kc-form-login), the required actions UPDATE_PASSWORD
                    (kc-passwd-update-form) and UPDATE_PROFILE
@@ -153,6 +154,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(403, "RBAC: access denied", ctype="text/plain")
         if path.startswith("/api/catalog/") and not (self.headers.get("Authorization") or "").startswith("Bearer "):
             return self.send(401, '{"error":{"name":"AuthenticationError"}}', ctype="application/json")
+        if path == "/home":
+            # Backstage's index.html with the runtime config the chart adds (E14)
+            cfg = json.dumps({"teknoir": {"auth": {"issuer": AUTH_URL + REALM, "clientId": "teknoir"}}}, separators=(",", ":"))
+            return self.send(200, "<html><head><script data-teknoir-runtime-config>window.__APP_CONFIG__=" + cfg
+                             + ";</script></head><body>app /home</body></html>")
         return self.send(200, page(f"app {path}"))
 
     # -- Keycloak --------------------------------------------------------------

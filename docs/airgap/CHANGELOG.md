@@ -28,6 +28,15 @@ reasons for the redesign are kept here. The git history of `infra` and
   Deployment in istio-system watches istiod's `pilot_jwks_resolver_network_fetch_*`
   counters and deletes the istiod pod once (proxies keep their configuration meanwhile)
   when a fetch failed and every `jwksUri` answers again.
+- **Backstage "Log out" ended the wrong session** (gitops backstage chart, 4002b06). The
+  frontend image's runtime config injection (`APP_CONFIG_teknoir_auth_*`) never reached the
+  UI: the Backstage config loader ignores it whenever `index.html` has a
+  `backstage.io/config` script tag, which the image always does. The Log out button
+  therefore used the pre-r5 URL (Keycloak realm `master`, no oauth2-proxy `sign_out`): the
+  user stayed signed in. Found by the browser check of the VM install (E14 tests the
+  logout chain by URL, not the button). A chart script (ConfigMap `backstage-frontend-inject`,
+  run by nginx after the image's own script) adds `teknoir.*` to `index.html` as
+  `window.__APP_CONFIG__`; E14 now checks the served page for it.
 
 ## 2026-10-11: live node decommissioned, the VM rig moves to the dev host
 

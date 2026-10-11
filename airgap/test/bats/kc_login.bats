@@ -159,6 +159,6 @@ no_password_in() {
     e14_checks
     echo \"FAILED=\${TL_NFAIL} PASSED=\${TL_NPASS}\""
   [ "${status}" -eq 0 ]
-  [[ "${output}" == *"FAILED=0 PASSED=7"* ]] || { echo "${output}"; return 1; }
+  [[ "${output}" == *"FAILED=0 PASSED=8"* ]] || { echo "${output}"; return 1; }
   no_password_in "${output}"
 }
