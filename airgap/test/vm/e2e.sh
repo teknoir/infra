@@ -539,6 +539,16 @@ admin_pw_current() {
   else printf '%s' "${LAN_HOME}/e2e/admin.pw"; fi
 }
 
+sign_in_works() {
+  # a scripted sign-in as the admin, silent: true when it succeeds. The jar is
+  # a scratch one, ADMIN_JAR stays for login_check.
+  local jar="${LAN_HOME}/e2e/probe.jar"
+  rm -f "${jar}"
+  lan "${E2E_WORK}" "${KCLOGIN}" --cacert "$(ca_file)" --url "${LOGIN_URL}" --user "${ADMIN_USER}" \
+    --password-file "$(admin_pw_current)" --new-password-file "${LAN_HOME}/e2e/admin.new" \
+    --cookie-jar "${jar}" >/dev/null 2>&1
+}
+
 LOGIN_OK=0
 login_check() {
   # login_check <description> [kc-login flags...] — a fresh scripted
@@ -2114,6 +2124,15 @@ e12() {
   wait_until 600 vm_kc get --raw /readyz >/dev/null 2>&1 || fail "API not ready after the reboot"
   wait_apps 1800 || true
   wait_until 1500 platform_ready || fail "the platform is not Ready (all pods, ingress) 1500 s after the reboot"
+  # Pods Ready is not "sign-in works": istiod fetches the Keycloak JWKS (the
+  # RequestAuthentication jwksUri) while Keycloak is still down at boot, serves
+  # a JWKS that rejects every token ("JWKS fetch failed ... using public-only
+  # JWKS", 401 at the gateway) and retries about every 30 s. Wait for a real
+  # sign-in (bounded; a sign-in that never works still fails) before the next
+  # case signs in.
+  if [[ -n "${ADMIN_USER:-}" && -s "$(admin_pw_current)" ]]; then
+    wait_until 300 sign_in_works || fail "no scripted sign-in works 300 s after the platform is Ready (istiod JWKS cache?)"
+  fi
 
   # the node serves time to the LAN (chrony allow + local stratum 10)
   sntp="$(lan "${E2E_WORK}" python3 -I "${HERE}/sntp-query.py" "${NODE_IP}" 2>&1 | grep '^stratum=' | tail -n1 || true)"
