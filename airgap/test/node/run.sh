@@ -4,7 +4,8 @@
 # timedatectl and date-set (DATE_BIN), in a sandbox (TEKNOIR_HOST_ROOT): no
 # root, no cluster, nothing outside a temp dir is touched, and the test
 # host's clock and packages are never changed (the stubs shadow the real
-# tools; CHRONYC, HWCLOCK and DATE_BIN point at stubs or at absent paths).
+# tools; CHRONYC, HWCLOCK and DATE_BIN point at stubs or at absent paths; a
+# sysctl stub applies the managed inotify file to a fake <root>/proc).
 #
 # Covers: template rendering (coredns-custom golden: the live hosts block
 # plus the wildcard template for teamspace names), payload
@@ -17,8 +18,10 @@
 # runner interface (teknoir-airgap up's exact converge argv, --operator, the
 # break-glass flags reaching the oneshot and harbor phases as ONESHOT_REAPPLY
 # and HARBOR_FORCE_IMAGES, --reapply checked against oneshot/TIERS), the
-# preflight refusal of an unmigrated cluster (live Teknoir K3s files), r5 time
-# (offline install of node/debs behind apt's simulate guard; chrony drop-in
+# preflight refusal of an unmigrated cluster (live Teknoir K3s files), the
+# managed inotify limits (sysctl.d file applied once, also when only the
+# running values are lower, nothing on a right node, nothing in dry-run), r5
+# time (offline install of node/debs behind apt's simulate guard; chrony drop-in
 # goldens and restart only on change; one LAN-time sample per up while chrony
 # has only its local/manual reference, none with a selected source; manual
 # samples under 12 h old dropped first, so chrony fits no clock rate across
@@ -316,6 +319,71 @@ check "k3s dotfiles are left alone" [ -e "${ROOT}/opt/k3s/agent/images/.cache.js
 check "missing image re-imported without a restart" \
   bash -c "tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q 'images import' && ! tail -n +$(( before + 1 )) '${STUB_CALLS}' | grep -q '^systemctl restart k3s'"
 
+echo "# host phase: inotify limits (istio-proxy aborts at Debian's 128 instances)"
+INO_WANT='# Managed by teknoir-node (host phase); every up rewrites it.
+# Envoy (istio-proxy) aborts with Debian'"'"'s default of 128 inotify instances.
+fs.inotify.max_user_instances=1024
+fs.inotify.max_user_watches=524288'
+ino_proc() { mkdir -p "${ROOT}/proc/sys/fs/inotify"; echo "$1" > "${ROOT}/proc/sys/fs/inotify/max_user_instances"; echo "$2" > "${ROOT}/proc/sys/fs/inotify/max_user_watches"; }
+ino_sysctl_calls() { calls_since "$1" | grep -c '^sysctl --system$' || true; }
+new_sandbox ino
+ino_proc 128 65536
+before="$(ncalls)"
+tn converge --site test --only host
+check "inotify, fresh node: converge succeeds" [ "${RC}" == 0 ]
+check "inotify, fresh node: /etc/sysctl.d/teknoir.inotify.conf has the managed content" \
+  [ "$(cat "${ROOT}/etc/sysctl.d/teknoir.inotify.conf")" == "${INO_WANT}" ]
+check "inotify, fresh node: file is 0644" [ "$(stat -c %a "${ROOT}/etc/sysctl.d/teknoir.inotify.conf")" == 644 ]
+check "inotify, fresh node: sysctl --system ran once" [ "$(ino_sysctl_calls "${before}")" == 1 ]
+check "inotify, fresh node: the running values follow (stub sysctl)" \
+  [ "$(cat "${ROOT}/proc/sys/fs/inotify/max_user_instances")" == 1024 -a "$(cat "${ROOT}/proc/sys/fs/inotify/max_user_watches")" == 524288 ]
+check "inotify, fresh node: sysctl runs before k3s is installed" \
+  bash -c "grep -n -m1 '^sysctl --system' '${STUB_CALLS}' | cut -d: -f1 > '${T}/n1'; grep -n -m1 '^install.sh' '${STUB_CALLS}' | cut -d: -f1 > '${T}/n2'; [ \$(cat '${T}/n1') -lt \$(cat '${T}/n2') ]"
+
+before="$(ncalls)"
+tn converge --site test --only host
+check "inotify, re-run: no sysctl call" [ "$(ino_sysctl_calls "${before}")" == 0 ]
+check "inotify, re-run: 0 changes" grep -q 'summary: 0 changes' "${T}/out"
+
+printf 'fs.inotify.max_user_instances=1024\n' > "${ROOT}/etc/sysctl.d/teknoir.inotify.conf"
+ino_proc 1024 65536
+before="$(ncalls)"
+tn converge --site test --only host
+check "inotify, live-style file (instances only): rewritten to the full content" \
+  [ "$(cat "${ROOT}/etc/sysctl.d/teknoir.inotify.conf")" == "${INO_WANT}" ]
+check "inotify, live-style file: applied with sysctl --system" [ "$(ino_sysctl_calls "${before}")" == 1 ]
+
+ino_proc 128 65536
+before="$(ncalls)"
+tn converge --site test --only host
+check "inotify, file right but running values lower: applied without a reboot" [ "$(ino_sysctl_calls "${before}")" == 1 ]
+check "inotify, file right but running values lower: the file is not rewritten" bash -c "! grep -q 'wrote .*teknoir.inotify.conf' '${T}/out'"
+
+ino_proc 4096 1048576
+before="$(ncalls)"
+tn converge --site test --only host
+check "inotify, running values already high and file matching: no sysctl call" [ "$(ino_sysctl_calls "${before}")" == 0 ]
+
+ino_proc 128 65536
+before="$(ncalls)"
+STUB_SYSCTL_NOAPPLY=1 tn converge --site test --only host
+check "inotify, an overriding sysctl.d file: rc 0 with a WARN" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: inotify max_user_instances max_user_watches still below' '${T}/out'"
+STUB_SYSCTL_FAIL=1 tn converge --site test --only host
+check "inotify, sysctl --system failing: rc 0 with a WARN" \
+  bash -c "[ ${RC} = 0 ] && grep -q 'WARN: sysctl --system failed' '${T}/out'"
+
+new_sandbox inodry
+ino_proc 128 65536
+before="$(ncalls)"
+KMODE=refused tn converge --site test --dry-run --only host
+check "inotify, dry-run: no file written" [ ! -e "${ROOT}/etc/sysctl.d/teknoir.inotify.conf" ]
+check "inotify, dry-run: no sysctl call" [ "$(ino_sysctl_calls "${before}")" == 0 ]
+check "inotify, dry-run: reports the write and the apply" \
+  bash -c "grep -q 'would change: write ${ROOT}/etc/sysctl.d/teknoir.inotify.conf' '${T}/out' && grep -q 'would change: apply the inotify limits' '${T}/out'"
+check "inotify, dry-run: running values untouched" [ "$(cat "${ROOT}/proc/sys/fs/inotify/max_user_instances")" == 128 ]
+
+echo "# host phase: an existing install keeps encryption off"
 echo "# host phase: an existing install keeps encryption off"
 new_sandbox 2
 mkdir -p "${ROOT}/opt/k3s/server/db" "${ROOT}/etc/rancher/k3s" "${ROOT}/usr/local/bin" "${ROOT}/etc/systemd/system"

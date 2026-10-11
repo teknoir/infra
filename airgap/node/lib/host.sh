@@ -17,6 +17,12 @@
 # corrects with a LAN-host sample (or from TIME_SOURCE); the RTC is written
 # when it is more than CLOCK_OK_SKEW seconds off, so a reboot starts right.
 #
+# Inotify limits (r5): Debian keeps fs.inotify.max_user_instances=128, and with
+# the teamspace pods' istio-proxy sidecars Envoy aborts ("inotify_fd_ >= 0 ...
+# Consider increasing fs.inotify.max_user_instances"). The host phase manages
+# /etc/sysctl.d/teknoir.inotify.conf (the name of the hand-made file on the
+# live node, which it adopts) before k3s starts, and applies it without reboot.
+#
 # k3s subcommands that take --data-dir get it explicitly (secrets-encrypt,
 # etcd-snapshot, ...); ctr/kubectl/crictl find it through config.yaml.
 # Role: only "server" is implemented (D11); "agent" is refused in preflight.
@@ -34,6 +40,10 @@ K3S_CA_FILE="${HOST_ROOT}/etc/rancher/k3s/teknoir-root-ca.crt"
 OS_CA_FILE="${HOST_ROOT}/usr/local/share/ca-certificates/teknoir-root-ca.crt"
 K3S_UNIT_FILE="${HOST_ROOT}/etc/systemd/system/k3s.service"
 HOSTS_FILE="${HOST_ROOT}/etc/hosts"
+SYSCTL_INOTIFY_CONF="${HOST_ROOT}/etc/sysctl.d/teknoir.inotify.conf"
+INOTIFY_PROC_DIR="${HOST_ROOT}/proc/sys/fs/inotify"
+# the limits teknoir-node manages (name value), in file order
+INOTIFY_LIMITS=("max_user_instances 1024" "max_user_watches 524288")
 CHRONY_CONF_DIR="${HOST_ROOT}/etc/chrony/conf.d"
 CHRONY_CONF="${CHRONY_CONF_DIR}/teknoir-airgap.conf"
 RESTART_STAMP="${STATE_DIR}/restart.stamp"
@@ -239,6 +249,68 @@ host_hosts_block() {
   # Rewrite in place (keeps the inode: /etc/hosts may be a bind mount).
   cat "${want}" > "${HOSTS_FILE}" || die "cannot write ${HOSTS_FILE}"
   changed "managed block in ${HOSTS_FILE}: ${NODE_IP} $(teknoir_fqdns)"
+}
+
+host_sysctl_bin() {
+  # host_sysctl_bin - sysctl: $SYSCTL, else on PATH, else in sbin (the
+  # converge PATH may lack it). Empty when the node has none.
+  local c
+  for c in "${SYSCTL:-}" "$(command -v sysctl 2>/dev/null || true)" /usr/sbin/sysctl /sbin/sysctl; do
+    if [[ -n "${c}" && -x "${c}" ]]; then printf '%s' "${c}"; return 0; fi
+  done
+  return 0
+}
+
+host_inotify_lower() {
+  # host_inotify_lower - names of the managed limits whose running value is
+  # below the wanted one. An unreadable value counts as fine.
+  local entry name want have
+  for entry in "${INOTIFY_LIMITS[@]}"; do
+    read -r name want <<<"${entry}"
+    have="$(cat "${INOTIFY_PROC_DIR}/${name}" 2>/dev/null)" || continue
+    [[ "${have}" =~ ^[0-9]+$ ]] || continue
+    (( have >= want )) || printf '%s ' "${name}"
+  done
+}
+
+host_sysctl_inotify() {
+  # Manage the inotify limits (see the header) and apply them with
+  # `sysctl --system` when the file changed or a running value is lower than
+  # the file's. Nothing is written or run on a node that is already right.
+  ensure_work_dir
+  local conf="${WORK_DIR}/teknoir.inotify.conf" entry name want lower sysctl_bin
+  {
+    printf '# Managed by teknoir-node (host phase); every up rewrites it.\n'
+    printf '# Envoy (istio-proxy) aborts with Debian'"'"'s default of 128 inotify instances.\n'
+    for entry in "${INOTIFY_LIMITS[@]}"; do
+      read -r name want <<<"${entry}"
+      printf 'fs.inotify.%s=%s\n' "${name}" "${want}"
+    done
+  } > "${conf}"
+  ensure_dir "$(dirname "${SYSCTL_INOTIFY_CONF}")" 0755
+  install_file "${conf}" "${SYSCTL_INOTIFY_CONF}" 0644 "fs.inotify limits for istio-proxy"
+  lower="$(host_inotify_lower)"
+  if (( ! FILE_CHANGED )) && [[ -z "${lower}" ]]; then
+    log "inotify limits: ${SYSCTL_INOTIFY_CONF#"${HOST_ROOT}"} in place and applied"
+    return 0
+  fi
+  if dry_run; then
+    changed "apply the inotify limits with sysctl --system${lower:+ (running ${lower% } below the wanted value)}"
+    return 0
+  fi
+  sysctl_bin="$(host_sysctl_bin)"
+  if [[ -z "${sysctl_bin}" ]]; then
+    warn "sysctl not found: the inotify limits apply at the next boot (istio-proxy may abort until then)"
+    return 0
+  fi
+  if ! "${sysctl_bin}" --system >/dev/null; then
+    warn "sysctl --system failed: the inotify limits may not be applied until the next boot"
+    return 0
+  fi
+  changed "applied the inotify limits (sysctl --system)"
+  lower="$(host_inotify_lower)"
+  [[ -z "${lower}" ]] || warn "inotify ${lower% } still below ${SYSCTL_INOTIFY_CONF#"${HOST_ROOT}"} after sysctl --system: another /etc/sysctl.d file sets it later"
+  return 0
 }
 
 host_ipv4_network() {
@@ -1125,6 +1197,7 @@ phase_host() {
   HOST_RESOLV_CHANGED=0
   K3S_JUST_STARTED=0
   host_check_k3s_payload
+  host_sysctl_inotify
   host_node_files
   host_hosts_block
   host_packages

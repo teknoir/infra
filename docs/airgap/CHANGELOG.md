@@ -84,6 +84,13 @@ written (93 s behind), so a reboot would have started the node outside `up`'s
   cloud-image network layout of the live node, and has new sections on the
   fixed address and on name resolution for devices.
 
+- **Inotify limits (found in the VM e2e).** On a fresh node the teamspace pods'
+  istio-proxy aborted (`inotify_fd_ >= 0`) because Debian keeps
+  `fs.inotify.max_user_instances=128`. The host phase now manages
+  `/etc/sysctl.d/teknoir.inotify.conf` (1024 instances, 524288 watches; the
+  live node's hand-made file of that name is adopted) before k3s starts, and
+  runs `sysctl --system` when the file changed or a running value is lower.
+
 ### Encrypted backups and the ArgoCD break-glass
 
 - **Backups encrypted on the node.** New optional site key

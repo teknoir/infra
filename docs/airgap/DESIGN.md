@@ -147,6 +147,14 @@ resolve (coredns-custom knew only the platform names).
   (`hwclock --systohc --utc`) when it is more than 2 s off the system clock;
   never when `/etc/adjtime` says the RTC keeps local time. A routine sample is
   not a recorded change, so an unchanged second `up` still reports 0 changes.
+- **Inotify limits.** `host_sysctl_inotify` (first step of the host phase,
+  before k3s is installed or restarted) writes
+  `/etc/sysctl.d/teknoir.inotify.conf` with `fs.inotify.max_user_instances=1024`
+  and `max_user_watches=524288` (Debian's 128 instances make istio-proxy's
+  Envoy abort). It runs `sysctl --system` (`$SYSCTL`, else PATH, else
+  `/usr/sbin`) only when the file changed or a value in `/proc/sys/fs/inotify`
+  is lower than the file's, so a reboot-free node converges and a right node
+  makes no call; a failing `sysctl` is a WARN, dry-run only reports.
 - **Indirection.** `CHRONYC`, `HWCLOCK` and `DATE_BIN` (the date that sets the
   clock) can be overridden, so the sandbox tests run against stubs and never
   touch the test host's clock or packages.

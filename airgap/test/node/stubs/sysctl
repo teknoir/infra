@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Stub sysctl: records the call; --system applies the sandbox's
+# <host root>/etc/sysctl.d/teknoir.inotify.conf to its fake
+# <host root>/proc/sys/fs/inotify/* (STUB_SYSCTL_FAIL=1: exits 1;
+# STUB_SYSCTL_NOAPPLY=1: succeeds but sets nothing, as an overriding file would).
+printf 'sysctl %s\n' "$*" >> "${STUB_CALLS:?}"
+[[ "${STUB_SYSCTL_FAIL:-0}" != 1 ]] || exit 1
+if [[ "$*" == "--system" && "${STUB_SYSCTL_NOAPPLY:-0}" != 1 ]]; then
+  conf="${TEKNOIR_HOST_ROOT:?}/etc/sysctl.d/teknoir.inotify.conf"
+  if [[ -f "${conf}" ]]; then
+    while IFS='=' read -r k v; do
+      [[ "${k}" == fs.inotify.* ]] || continue
+      mkdir -p "${TEKNOIR_HOST_ROOT}/proc/sys/fs/inotify"
+      printf '%s\n' "${v}" > "${TEKNOIR_HOST_ROOT}/proc/sys/fs/inotify/${k#fs.inotify.}"
+    done < "${conf}"
+  fi
+fi
+exit 0

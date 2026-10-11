@@ -223,6 +223,16 @@ LAN's DNS server (teknoir-local: a local DNS record on the UniFi gateway), or
 an `/etc/hosts` entry per name. `./teknoir-airgap trust` only covers the
 platform names on a LAN host.
 
+## Inotify limits
+
+Debian's `fs.inotify.max_user_instances=128` is too low for the teamspace
+pods: Envoy (istio-proxy) aborts with `inotify_fd_ >= 0 ... Consider increasing
+fs.inotify.max_user_instances`. There is nothing to set by hand: the host phase
+of `./teknoir-airgap up` writes `/etc/sysctl.d/teknoir.inotify.conf`
+(`max_user_instances=1024`, `max_user_watches=524288`) and applies it with
+`sysctl --system`, without a reboot. A hand-made file of that name (the old
+`HOST-SETUP` step 6) is rewritten to the managed content.
+
 ## More nodes
 
 This release runs a single node. The node converge keeps a server/agent role so
