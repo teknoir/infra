@@ -211,7 +211,13 @@ stop() {
   if running; then
     ssh_vm 'sudo poweroff' 2>/dev/null || true
     local _; for _ in $(seq 1 30); do running || break; sleep 2; done
-    if running; then kill "$(cat "${PIDF}")"; fi
+    if running; then
+      local pid; pid="$(cat "${PIDF}")"
+      kill "${pid}"
+      # qemu holds the tap until it has exited: a start right after must not race it
+      for _ in $(seq 1 20); do kill -0 "${pid}" 2>/dev/null || break; sleep 1; done
+      kill -0 "${pid}" 2>/dev/null && kill -9 "${pid}" 2>/dev/null || true
+    fi
   fi
   rm -f "${PIDF}"; log "stopped"
 }
