@@ -98,9 +98,12 @@ Commands:
                            stream a backup encrypted to age public keys; --take: a new
                            backup, --name TS: that one (default: the latest)
   migrate [...]            one-time K3s file detach of the live env (lib/migrate.sh)
-  admin-user --email ADDR --out FILE
-                           create the first platform admin (a superadmin User; its
-                           temporary password goes to FILE, 0600) (lib/admin.sh)
+  admin-user --email ADDR --out FILE [--teamspace NAME] [--reset-password]
+                           create or complete a platform admin (a superadmin User,
+                           Keycloak group admin, owner of the teamspaces it owns);
+                           its temporary password goes once to FILE (0600, never
+                           overwritten); --reset-password sets a new one
+                           (lib/admin.sh)
   help
 
 Options:

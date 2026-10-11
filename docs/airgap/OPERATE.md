@@ -270,6 +270,26 @@ Verification checklist:
 - [ ] `./teknoir-airgap doctor` reports no `FAIL`.
 - [ ] The browser checks from section 3 pass.
 
+### r5 (app-of-apps 0.0.5)
+
+#### admin-user once after the update
+
+After the `up` with the r5 bundle, run `admin-user` once for each existing
+admin, with a new file name:
+
+```sh
+./teknoir-airgap admin-user --email anders.aslund@teknoir.ai --out ~/teknoir-admin-r5.txt
+```
+
+It makes the address owner of `teknoir-default` (and of any other teamspace
+whose Profile names it as owner, for example `teknoir-demo`), waits until
+Backstage's catalog lists the user as a member of those teamspaces (up to about
+a minute after the claim is added), and warns that no temporary password is on
+record: that password was used long ago, and no file is written. When it has
+finished, sign out of Backstage and in again; a session started before then
+does not have the new teamspaces. Do not add `--reset-password`: it would
+replace a working password.
+
 ## 5. Rollback
 
 To go back to an older release, run `up` from the older bundle (extracted from
@@ -428,11 +448,21 @@ This:
   e-mail verified;
 - lets user-controller create the Keycloak user in realm `teknoir` with a
   temporary password, and puts it in the group `admin`;
-- restarts Backstage's backend once, so its catalog knows the user right away
-  (it otherwise reads users every 30 minutes);
-- writes the temporary password to the `--out` file (mode 0600). On the node it
-  exists only for a moment, in a root-only file under
-  `/var/lib/teknoir-airgap/tmp`, which `teknoir-airgap` copies and deletes.
+- hands the temporary password over once: it writes it to the `--out` file
+  (mode 0600) and then deletes it from the cluster. user-controller keeps it in
+  the Secret `teknoir-user-credentials/user-initial-password-<name>` for at most
+  72 hours (an older user-controller kept it in the User's status). On the node
+  the password exists only for a moment, in a root-only file under
+  `/var/lib/teknoir-airgap/tmp`, which `teknoir-airgap` copies and deletes;
+- makes the user owner (ClaimSet `owner`) of every teamspace whose Profile
+  names this address as its owner, such as `teknoir-default` for the platform
+  owner, and waits until user-controller has granted it (RoleBinding
+  `user-<name>-teknoir-role-binding` in the teamspace);
+- waits until Backstage's catalog lists the user (`user:default/<name>`) as a
+  member of each of those teamspaces (`group:<teamspace>/<teamspace>` in its
+  `memberOf`). Backstage takes the user's teamspaces from that catalog entry at
+  sign-in, and its user provider adds a new owner claim only on its next run
+  (every minute). Backstage is not restarted.
 
 The address is used in lower case. It may contain letters, digits, `.` and `-`
 around one `@`, with `.` and `-` only between letters or digits; `_` and `+` are
@@ -440,23 +470,43 @@ refused. The user name (the address with `@` replaced by `-at-`) must be a valid
 Kubernetes and Backstage entity name of at most 63 characters, so the address
 can have at most 60.
 
-Re-running `admin-user` for the same address is safe: it leaves the User as it
-is and writes the temporary password user-controller recorded again (useless
-once that user has changed it). If the Keycloak user existed before
-user-controller saw it, there is no temporary password: the command says so and
-writes no file; set a password in Keycloak (realm `teknoir`, Users).
+`admin-user` never overwrites a file: give an `--out` file that does not exist
+yet (an empty one is fine). The file is written only when there is a temporary
+password to hand over.
+
+Re-running `admin-user` for the same address is safe. It changes nothing but
+missing owner claims (for example on a teamspace created for the address
+later) and waits for the catalog again. The temporary password is handed out
+only once: a re-run says `no temporary password of ... is on record` and
+writes no file. If the run stops after the password was handed over (for
+example while it waits for the catalog), the LAN tool still saves the file;
+run it again with another `--out` file name. `--teamspace NAME` limits the
+owner grant to that teamspace, and fails when it does not exist or belongs to
+another address.
+
+A lost password file before the first sign-in, or a forgotten password: issue a
+new temporary password:
+
+```sh
+./teknoir-airgap admin-user --email anders.aslund@teknoir.ai --reset-password --out ~/teknoir-admin-new.txt
+```
+
+It sets a new temporary password through the Keycloak admin API and writes it
+to the new file (`--out` is required). The user's current password stops
+working at once, and Keycloak asks for a new one at the next sign-in. Never run
+it for an admin whose password works; a plain re-run is the safe command.
 
 Sign in:
 
 1. Open `https://teknoir.airgapped/`. You are sent to the Keycloak sign-in page of
    realm `teknoir`.
 2. Sign in with the e-mail address and the temporary password from the file.
-3. Keycloak asks for a new password, and possibly for first and last name.
-4. Backstage opens. Delete the password file.
+3. Keycloak asks for a new password.
+4. Backstage opens, with your first teamspace as the current one. Delete the
+   password file.
 
-What does not work yet: the new user has no teamspace, and creating teamspaces
-is not available on the airgapped platform in this release (the per-teamspace
-charts are not mirrored yet).
+Backstage reads a user's teamspaces at sign-in: after `admin-user` added an
+owner claim for a user who was already signed in, sign out and in again.
 
 ## 10. Backup and restore
 
@@ -872,9 +922,17 @@ is not an ArgoCD admin (not in the Keycloak group `admin`), and the gateway turn
 ArgoCD's `403` into a redirect the UI cannot follow. Add the user to the group
 (or use `./teknoir-airgap admin-user`), then sign out and in again.
 
-**Backstage says "user not found in catalog".** The catalog reads User objects
-every 30 minutes; `admin-user` restarts Backstage's backend once so a new user can
-sign in right away. Run it again, or wait.
+**Backstage says "user not found in catalog", or shows no teamspace.**
+Backstage's user provider reads the User objects every minute (backstage chart
+0.0.84; every 30 minutes before), and `admin-user` waits until the catalog lists
+the user as a member of its teamspaces. Sign out and in again after
+`admin-user` has finished: the session keeps the teamspaces it got at sign-in.
+When the wait times out, the message says whether the catalog does not list
+the user at all or lists it without a teamspace; check the provider's log:
+`kubectl --context teknoir-local -n teknoir-system logs deploy/backstage-api | grep -i -e user-provider -e claimset`.
+A warning `Claimset 'group:<teamspace>/owner' ... not found` means Backstage
+does not know the teamspace's ClaimSet `owner` yet. Restarting Backstage does
+not help: its scheduler keeps the next run time.
 
 ## 13. Who owns what
 
@@ -1205,7 +1263,7 @@ from a bundle copied there), `--forget-host-key`, `--host-key FINGERPRINT`.
 | `./teknoir-airgap kubeconfig` | Write the kubeconfig (`--context NAME`, `--kubeconfig FILE`) |
 | `./teknoir-airgap trust` | `/etc/hosts` block and CA trust on this LAN host (`--print`) |
 | `./teknoir-airgap credentials NAME --out FILE` | One credential into a 0600 file |
-| `./teknoir-airgap admin-user --email ADDRESS --out FILE` | A named admin; temporary password into a 0600 file |
+| `./teknoir-airgap admin-user --email ADDRESS --out FILE` | A named admin, owner of its teamspaces; the temporary password once into a new 0600 file (`--teamspace NAME`, `--reset-password`) |
 | `./teknoir-airgap backup --out DIR` | Encrypted node backup copied to this host (`--name TS`: an existing one) |
 | `./teknoir-airgap rotate NAME` | Replace one generated secret (`--i-know`; `--out FILE` for `argocd-admin`) |
 | `./teknoir-airgap migrate` | One-time move off the legacy k3s files (`--dry-run`, `--argo`, `--undo NAME`, `--keycloak-admin-password-file FILE`) |

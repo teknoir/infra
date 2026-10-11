@@ -23,11 +23,13 @@
 #               [--force-images] [ARGS given after --]
 #   status      --site FILE --lan-time EPOCH
 #   credentials NAME --site FILE           value on stdout (a pipe, never a tty)
-#   admin-user  --email ADDR --out FILE --site FILE
+#   admin-user  --email ADDR --out FILE --site FILE [--teamspace NAME]
+#               [--reset-password]
 #               the temporary password goes to FILE: a fresh root-only file
 #               in /var/lib/teknoir-airgap/tmp (0700) that teknoir-airgap then
-#               copies to the LAN host and deletes. The runner's stdout is its
-#               log here, never data.
+#               copies to the LAN host and deletes, also when the runner fails
+#               after it wrote the file. The runner's stdout is its log here,
+#               never data.
 #   backup      --recipient-site (--take | --name TS) --site FILE
 #               (the site sets BACKUP_AGE_RECIPIENTS; no tty) a new or the
 #               named backup, encrypted to those age public keys into
@@ -108,9 +110,12 @@ Commands:
   credentials NAME      Write one platform credential (for example
                         platform-admin) to the --out file, mode 0600. Never
                         prints it.
-  admin-user            Create a platform admin (Keycloak user and Backstage
-                        User) for --email; the temporary password goes to the
-                        --out file, mode 0600.
+  admin-user            Create or complete a platform admin for --email
+                        (Keycloak user in group admin, Backstage User, owner of
+                        the teamspaces the address owns) and wait until
+                        Backstage knows it. The temporary password goes once
+                        to the --out file, mode 0600; --reset-password sets a
+                        new one.
   backup                Take a backup on the node and copy it into the --out
                         directory, encrypted with age: to the site's
                         BACKUP_AGE_RECIPIENTS public keys (no terminal needed),
@@ -160,13 +165,21 @@ Options for trust:
 
 Options for credentials, admin-user and backup:
   --out FILE|DIR        Where to write: a file for credentials and admin-user, a
-                        directory for backup. Required.
+                        directory for backup. Required. admin-user never
+                        overwrites a file: give a new (or empty) one; it is
+                        written only when there is a password to hand over.
   --name TS             backup: copy the existing node backup TS (a UTC
                         timestamp such as 20261009T051050Z) instead of taking
                         a new one.
   --email ADDRESS       admin-user: the new admin's e-mail address (the login),
                         used in lower case: letters, digits, '.' and '-'
                         around one '@' (no '_' or '+').
+  --teamspace NAME      admin-user: grant owner only on this teamspace, which
+                        must exist and belong to --email (default: every
+                        teamspace the address owns).
+  --reset-password      admin-user: set a new temporary password in Keycloak
+                        (the current password stops working) and write it to
+                        --out. Needs --out.
 
 Options for rotate:
   --i-know              Confirm a rotation with side effects (Harbor secretKey,
@@ -1062,6 +1075,8 @@ OPT_UNDO=
 OPT_ARGO=0
 OPT_KC_PW_FILE=
 OPT_NAME=
+OPT_TEAMSPACE=
+OPT_RESET_PW=0
 
 # Options a command accepts (beyond the global ones).
 allowed() {
@@ -1071,6 +1086,7 @@ allowed() {
     trust:--print) return 0 ;;
     credentials:--out|admin-user:--out|admin-user:--email|backup:--out) return 0 ;;
     backup:--name) return 0 ;;
+    admin-user:--teamspace|admin-user:--reset-password) return 0 ;;
     rotate:--i-know|rotate:--out) return 0 ;;
     migrate:--dry-run|migrate:--undo|migrate:--argo|migrate:--keycloak-admin-password-file) return 0 ;;
   esac
@@ -1087,7 +1103,7 @@ parse_args() {
     esac
     case "${a}" in
       -h|--help) usage; exit 0 ;;
-      --site|--node|--host-key|--reapply|--context|--kubeconfig|--out|--email|--undo|--keycloak-admin-password-file|--name)
+      --site|--node|--host-key|--reapply|--context|--kubeconfig|--out|--email|--teamspace|--undo|--keycloak-admin-password-file|--name)
         if [ -z "${v}" ]; then
           [ $# -ge 2 ] || usage_error "${a} needs a value"
           v=$2; shift
@@ -1101,6 +1117,7 @@ parse_args() {
           --kubeconfig) OPT_KUBECONFIG=${v} ;;
           --out) OPT_OUT=${v} ;;
           --email) OPT_EMAIL=${v} ;;
+          --teamspace) OPT_TEAMSPACE=${v} ;;
           --undo) OPT_UNDO=${v} ;;
           --keycloak-admin-password-file) OPT_KC_PW_FILE=${v} ;;
           --name) OPT_NAME=${v} ;;
@@ -1113,6 +1130,7 @@ parse_args() {
       --print) OPT_PRINT=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
       --i-know) OPT_I_KNOW=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
       --argo) OPT_ARGO=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
+      --reset-password) OPT_RESET_PW=1; PARSED_OPTS="${PARSED_OPTS} ${a}" ;;
       --) shift; while [ $# -gt 0 ]; do PASS[${#PASS[@]}]=$1; shift; done; PARSED_OPTS="${PARSED_OPTS} --"; break ;;
       -*) usage_error "unknown option ${a}" ;;
       *)
@@ -1541,33 +1559,72 @@ email_check() {
 }
 
 cmd_admin_user() {
-  local email rc=0
-  [ "$(npos)" -eq 0 ] || usage_error "admin-user takes no arguments besides --email and --out"
+  local email rc=0 saved=0
+  [ "$(npos)" -eq 0 ] || usage_error "admin-user takes no arguments besides its options (--email, --out, --teamspace, --reset-password)"
   [ -n "${OPT_EMAIL}" ] || usage_error "admin-user needs --email ADDRESS"
+  if [ "${OPT_RESET_PW}" = 1 ] && [ -z "${OPT_OUT}" ]; then
+    usage_error "--reset-password needs --out FILE: the new temporary password goes only there"
+  fi
   email=$(printf '%s' "${OPT_EMAIL}" | tr '[:upper:]' '[:lower:]')
   email_check "${email}"
+  if [ -n "${OPT_TEAMSPACE}" ]; then
+    printf '%s\n' "${OPT_TEAMSPACE}" | grep -Eq '^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$' \
+      || usage_error "--teamspace ${OPT_TEAMSPACE}: not a teamspace name (lower-case letters, digits and '-', at most 63 characters)"
+  fi
   common_open
   out_file_prepare "${OPT_OUT}"
+  # Never overwrite: the password is handed out only once, so a file that
+  # already holds something (an earlier password, anything else) stays.
+  [ ! -L "${OUT_ABS}" ] || die "--out ${OUT_ABS} is a symlink; give a plain file name"
+  if [ -s "${OUT_ABS}" ]; then
+    die "--out ${OUT_ABS} exists and is not empty; admin-user never overwrites a file: give a new file name (it is written only when there is a temporary password to hand over)"
+  fi
   LOCAL_TMP=$(mktemp "$(dirname "${OUT_ABS}")/.teknoir-airgap.XXXXXX") || die "cannot create a file next to ${OUT_ABS}"
   chmod 600 "${LOCAL_TMP}"
   node_prepare
   # The runner writes the password into a root-only file on the node (its
   # stdout is its log); this side copies that file and deletes it.
   REMOTE_TMP=$(node_mktemp admin-user) || exit 1
-  log "setting up admin ${email} on the node (teknoir-node admin-user waits for user-controller and Keycloak)"
-  run_runner tty admin-user --email "${email}" --out "${REMOTE_TMP}" --site "${REMOTE_SITE}" >&2 || rc=$?
-  [ "${rc}" -eq 0 ] || die "teknoir-node admin-user failed on the node (exit ${rc}); fix the cause it reports and run the command again (it resumes)"
-  node_sh pipe 'cat "$1" && rm -f "$1"' "${REMOTE_TMP}" </dev/null >"${LOCAL_TMP}" 2>"${TMPD}/fetch.err" \
-    || { sed 's/^/  node: /' "${TMPD}/fetch.err" >&2; die "could not copy the temporary password from the node; run the command again"; }
+  set -- --email "${email}" --out "${REMOTE_TMP}" --site "${REMOTE_SITE}"
+  if [ -n "${OPT_TEAMSPACE}" ]; then set -- "$@" --teamspace "${OPT_TEAMSPACE}"; fi
+  if [ "${OPT_RESET_PW}" = 1 ]; then set -- "$@" --reset-password; fi
+  log "setting up admin ${email} on the node (teknoir-node admin-user waits for user-controller, Keycloak and the Backstage catalog)"
+  run_runner tty admin-user "$@" >&2 || rc=$?
+  # Fetched even after a failure: the runner hands the password over (and
+  # deletes it from the cluster) before its last steps, so this file may be
+  # the only copy. A missing file is no password (a refused reset removes it).
+  if ! node_sh pipe '[ ! -e "$1" ] || { cat "$1" && rm -f "$1"; }' "${REMOTE_TMP}" </dev/null >"${LOCAL_TMP}" 2>"${TMPD}/fetch.err"; then
+    sed 's/^/  node: /' "${TMPD}/fetch.err" >&2
+    die "could not copy the file teknoir-node admin-user wrote on the node (it may hold the temporary password, which is then no longer on record there); run the command again with --reset-password and a new --out file"
+  fi
   REMOTE_TMP=
-  if [ ! -s "${LOCAL_TMP}" ]; then
-    warn "the node recorded no temporary password for ${email} (see its message above); ${OUT_ABS} was not written"
+  if [ -s "${LOCAL_TMP}" ]; then
+    if [ -s "${OUT_ABS}" ] || [ -L "${OUT_ABS}" ]; then
+      saved=${LOCAL_TMP}
+      LOCAL_TMP=   # kept: it is the only copy
+      die "${OUT_ABS} appeared meanwhile and is not overwritten; the temporary password of ${email} is in ${saved} (mode 0600)"
+    fi
+    mv -f "${LOCAL_TMP}" "${OUT_ABS}"
+    LOCAL_TMP=
+    saved=1
+  fi
+  if [ "${rc}" -ne 0 ]; then
+    if [ "${saved}" = 1 ]; then
+      die "teknoir-node admin-user failed on the node (exit ${rc}) after it handed out the temporary password, which is in ${OUT_ABS} (mode 0600); fix the cause it reports and run the command again with another --out file (it resumes)"
+    fi
+    die "teknoir-node admin-user failed on the node (exit ${rc}); fix the cause it reports and run the command again (it resumes)"
+  fi
+  if [ "${saved}" = 0 ]; then
+    log "admin user ${email} is set up"
+    warn "the node recorded no temporary password for ${email} (see its message above); ${OUT_ABS} was not written. A new one: ./${PROG} admin-user --email ${email} --reset-password --out NEW-FILE"
     return 0
   fi
-  mv -f "${LOCAL_TMP}" "${OUT_ABS}"
-  LOCAL_TMP=
-  log "admin user ${email} is set up; its temporary password is in ${OUT_ABS} (mode 0600)"
-  log "sign in at https://${TEKNOIR_DOMAIN}/ ; Keycloak asks for a new password at the first login"
+  if [ "${OPT_RESET_PW}" = 1 ]; then
+    log "the new temporary password of ${email} is in ${OUT_ABS} (mode 0600); the previous password no longer works"
+  else
+    log "admin user ${email} is set up; its temporary password is in ${OUT_ABS} (mode 0600)"
+  fi
+  log "sign in at https://${TEKNOIR_DOMAIN}/ ; Keycloak asks for a new password at the first sign-in. Delete the file afterwards"
 }
 
 # backup_recipients_count: BACKUP_RECIPIENTS_N = the number of age public keys

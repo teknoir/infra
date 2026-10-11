@@ -1,16 +1,22 @@
 """TEST STUB: the Keycloak endpoints lib/admin.sh uses (never shipped).
 
-  python3 -I fake-keycloak.py <port> <admin-username-file> <admin-password-file> <request-log>
+  python3 -I fake-keycloak.py <port> <admin-username-file> <admin-password-file> <request-log> [<record-dir>]
 
   POST /realms/master/protocol/openid-connect/token   (grant_type=password, client_id=admin-cli)
   GET  /admin/realms/<realm>/users?username=U&exact=true
   GET  /admin/realms/<realm>/groups?search=admin&exact=true
   GET  /admin/realms/<realm>/users/<id>/groups
   PUT  /admin/realms/<realm>/users/<id>/groups/<group-id>
+  PUT  /admin/realms/<realm>/users/<id>/reset-password  ({type, value, temporary})
 Test controls: POST /test/user?username=U (what user-controller does),
-GET /test/state. The request log gets "METHOD PATH" lines only.
+POST /test/fail-reset?code=N (the next reset-password answers N),
+GET /test/state (users, members, and the resets without their values).
+The request log gets "METHOD PATH" lines only. A reset-password value goes
+only to <record-dir>/reset-<user-id>.txt (mode 0600, value plus a newline),
+so a test can compare it with admin-user's --out file.
 """
 import json
+import os
 import secrets
 import sys
 import threading
@@ -23,9 +29,10 @@ with open(sys.argv[2], encoding="utf-8") as f:
 with open(sys.argv[3], encoding="utf-8") as f:
     ADMIN_PASSWORD = f.read()
 LOG = sys.argv[4]
+RECORD_DIR = sys.argv[5] if len(sys.argv) > 5 else None
 LOCK = threading.Lock()
 STATE = {"tokens": [], "users": {}, "groups": {"g-admin": {"id": "g-admin", "name": "admin", "path": "/admin"}},
-         "members": {}}
+         "members": {}, "resets": [], "fail_reset": None}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -63,6 +70,9 @@ class Handler(BaseHTTPRequestHandler):
                 uid = "u-" + secrets.token_hex(4)
                 STATE["users"][uid] = {"id": uid, "username": q["username"][0].lower()}
                 return self.reply(201, {})
+            if parts == ["test", "fail-reset"]:
+                STATE["fail_reset"] = int(q["code"][0])
+                return self.reply(201, {})
             if parts == ["realms", "master", "protocol", "openid-connect", "token"]:
                 n = int(self.headers.get("Content-Length") or 0)
                 form = parse_qs(self.rfile.read(n).decode())
@@ -79,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
         parts, q = self.parts()
         with LOCK:
             if parts == ["test", "state"]:
-                return self.reply(200, {k: v for k, v in STATE.items() if k != "tokens"})
+                return self.reply(200, {k: v for k, v in STATE.items() if k not in ("tokens", "fail_reset")})
             if not self.bearer_ok():
                 return None
             if len(parts) == 4 and parts[:2] == ["admin", "realms"] and parts[3] == "users":
@@ -94,9 +104,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self):
         self.record()
         parts, _ = self.parts()
+        n = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(n) if n else b""
         with LOCK:
             if not self.bearer_ok():
                 return None
+            if len(parts) == 6 and parts[3] == "users" and parts[5] == "reset-password" and parts[4] in STATE["users"]:
+                if STATE["fail_reset"] is not None:
+                    code, STATE["fail_reset"] = STATE["fail_reset"], None
+                    return self.reply(code, {"error": "test failure"})
+                try:
+                    body = json.loads(raw)
+                except ValueError:
+                    return self.reply(400, {"error": "invalid json"})
+                if (self.headers.get("Content-Type") or "").split(";")[0] != "application/json" \
+                        or body.get("type") != "password" or not isinstance(body.get("value"), str) or not body["value"]:
+                    return self.reply(400, {"error": "invalid credential representation"})
+                STATE["resets"].append({"user": parts[4], "type": body["type"], "temporary": body.get("temporary"),
+                                        "length": len(body["value"])})
+                if RECORD_DIR:
+                    path = os.path.join(RECORD_DIR, f"reset-{parts[4]}.txt")
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(body["value"] + "\n")
+                return self.reply(204)
             if len(parts) == 7 and parts[3] == "users" and parts[5] == "groups" and parts[4] in STATE["users"]:
                 members = STATE["members"].setdefault(parts[4], [])
                 if parts[6] not in members:

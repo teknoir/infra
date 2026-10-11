@@ -28,6 +28,10 @@ expect_rc 2 "admin-user with '+' in the address" "${T}" admin-user --email a+b@e
 expect_rc 2 "admin-user with '_' in the address (the node refuses it)" "${T}" admin-user --email a_b@example.com --out /tmp/x
 expect_out "no '_' or '+'" "explains the address rule"
 expect_rc 2 "admin-user with '..' in the address" "${T}" admin-user --email a..b@example.com --out /tmp/x
+expect_rc 2 "admin-user --reset-password without --out" "${T}" admin-user --email a@example.com --reset-password
+expect_out "needs --out FILE" "explains that --reset-password needs --out"
+expect_rc 2 "admin-user --teamspace with an invalid name" "${T}" admin-user --email a@example.com --teamspace Bad_Name --out /tmp/x
+expect_rc 2 "--reset-password on another command" "${T}" credentials platform-admin --reset-password --out /tmp/x
 expect_rc 2 "admin-user with a leading '-'" "${T}" admin-user --email -a@example.com --out /tmp/x
 expect_rc 2 "admin-user without a top-level domain" "${T}" admin-user --email a@example --out /tmp/x
 expect_rc 2 "admin-user with an address whose User name exceeds 63 characters" "${T}" admin-user --email "$(printf 'a%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50)@example.com" --out /tmp/x

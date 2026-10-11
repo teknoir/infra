@@ -3,7 +3,8 @@
 # and answers like the real one (airgap/node/bin/teknoir-node): stdout is the
 # log (sent to stderr) except for credentials and backup; secrets on stdout
 # only when stdout is a pipe; admin-user needs --out FILE and writes the
-# temporary password only there; backup --export needs a terminal.
+# temporary password only there (the new one with --reset-password) and
+# echoes the flags it got; backup --export needs a terminal.
 log=/var/log/teknoir-airgap-fake-runner.log
 printf '%s uid=%s %s\n' "$(date -u +%H:%M:%S)" "$(id -u)" "$*" >>"$log"
 [ "$(id -u)" = 0 ] || { echo "fake teknoir-node: not root" >&2; exit 1; }
@@ -30,10 +31,11 @@ case $cmd in
     printf 's3cr3t-%s-value\n' "$1" ;;
   admin-user)
     # like lib/admin.sh; special addresses: fail@ fails after creating the
-    # User, existing@ has no temporary password (the node only warns)
-    email='' out=''
+    # User, existing@ has no temporary password (the node only warns), late@
+    # fails after the handover (a catalog timeout)
+    email='' out='' reset=0 ts=''
     while [ $# -gt 0 ]; do
-      case $1 in --email) email=$2; shift ;; --out) out=$2; shift ;; esac
+      case $1 in --email) email=$2; shift ;; --out) out=$2; shift ;; --teamspace) ts=$2; shift ;; --reset-password) reset=1 ;; esac
       shift
     done
     [ -n "$email" ] || { echo "admin-user: --email is required" >&2; exit 1; }
@@ -45,14 +47,17 @@ case $cmd in
     echo "creating User ${email%@*}-at-${email#*@} (superadmin)"
     case $email in
       fail@*) echo "admin-user: timed out waiting for user-controller" >&2; exit 1 ;;
-      existing@*) echo "WARN: User records no temporary password: set one in Keycloak" >&2; exit 0 ;;
+      existing@*) echo "WARN: no temporary password of $email is on record: use --reset-password" >&2; exit 0 ;;
     esac
+    echo "fake admin-user flags:${ts:+ --teamspace $ts}$( [ "$reset" = 1 ] && printf ' --reset-password' )"
+    if [ -s "$out" ]; then echo "admin-user: $out exists and is not empty" >&2; exit 1; fi
     t=$(mktemp "$(dirname "$out")/.teknoir-admin-user.XXXXXX") || exit 1
     chmod 600 "$t"
-    printf 's3cr3t-temporary-password\n' >"$t"
+    if [ "$reset" = 1 ]; then printf 's3cr3t-reset-password\n' >"$t"; else printf 's3cr3t-temporary-password\n' >"$t"; fi
     if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then chown "$SUDO_USER:" "$t"; fi
     mv -f "$t" "$out"
-    echo "temporary password of $email written to $out (mode 0600, not shown)" ;;
+    echo "temporary password of $email written to $out (mode 0600, not shown)"
+    case $email in late@*) echo "admin-user: timed out waiting until the Backstage catalog lists the user" >&2; exit 1 ;; esac ;;
   backup)
     b=/var/lib/teknoir-airgap/backups e=/var/lib/teknoir-airgap/exports
     if [ -n "$stream" ]; then
