@@ -596,7 +596,7 @@ JSON
   E2E_E1_BASELINE=1
   e1_baseline "${d}/m5"
   unset E2E_E1_BASELINE
-  # E4 after the refused A: r5 B -> pre-r5 A is the open rollback gap
+  # E4 after the refused A: r5 B -> pre-r5 A crosses r5 (the leg must be run or waived)
   [ "$(e4_rollback_mode "${d}/m4" "${d}/m5")" = gap ]
   [ "$(E2E_E4_ROLLBACK=1 e4_rollback_mode "${d}/m4" "${d}/m5")" = cross ]
   [ "$(E2E_E4_ROLLBACK=0 e4_rollback_mode "${d}/m4" "${d}/m5")" = off ]

@@ -70,8 +70,8 @@
 #       every platform operation Succeeded, admission caBundle set, digests
 #       match, the admin still signs in (Keycloak data kept), Harbor healthy;
 #       bundle A is refused, accepted with --rollback, and then kept. From an
-#       r5 B to a pre-r5 A the rollback meets an open design gap (B's kept
-#       Profile and Namespace, A's post): E2E_E4_ROLLBACK=1 runs it and asserts
+#       r5 B to a pre-r5 A the rollback meets B's kept Profile and Namespace (A's
+#       post waits for them; the Namespace is IgnoreExtraneous): E2E_E4_ROLLBACK=1 runs it and asserts
 #       each part; E2E_E4_ROLLBACK=0 waives it on purpose (noted in the
 #       summary row); left at auto, E4 fails, because an unrehearsed rollback
 #       is not green
@@ -1297,13 +1297,14 @@ e4() {
 }
 
 # A rollback from r5 to a pre-r5 bundle meets state that A neither renders nor
-# prunes. Until the rollback design settles it (WP-G-CTRL, WP-I-RELEASE,
-# WP-I-BUNDLE), that leg fails E4 unless it is run (E2E_E4_ROLLBACK=1, each
-# part asserted) or waived on purpose (E2E_E4_ROLLBACK=0).
-E4_ROLLBACK_GAP="B (r5) adds the GitOps Profile ${TEAMSPACE} and the Namespace ${CRED_NS}, both Prune=false,Delete=false \
-without IgnoreExtraneous, so after a rollback to a pre-r5 A the profile-controller and user-controller Applications stay \
-OutOfSync (pruning skipped); A's profile-controller points the ${TEAMSPACE}-* Applications back at github.io (Unknown \
-offline), and A's post waits for every Application to be Synced/Healthy. Open rollback-design gap."
+# prunes: B's Profile and the credentials Namespace (Prune=false,Delete=false).
+# The Namespace is IgnoreExtraneous (user-controller 0.0.85), so A's
+# user-controller stays Synced and A's post passes; without it that leg fails.
+# The leg must be run (E2E_E4_ROLLBACK=1, each part asserted) or waived on
+# purpose (E2E_E4_ROLLBACK=0); an unrehearsed rollback is not green.
+E4_ROLLBACK_GAP="B (r5) adds the GitOps Profile ${TEAMSPACE} and the Namespace ${CRED_NS}, both Prune=false,Delete=false, \
+which a pre-r5 A neither renders nor prunes. The Namespace must be IgnoreExtraneous, or A's user-controller Application stays \
+OutOfSync and A's post fails after 1200 s. Rehearse it (E2E_E4_ROLLBACK=1) or waive it on purpose (E2E_E4_ROLLBACK=0)."
 
 e4_rollback_mode() {
   # e4_rollback_mode <dir A> <dir B> — what E4 does after the refused A:

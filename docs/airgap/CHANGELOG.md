@@ -380,10 +380,12 @@ live node.
     baseline: the r5-only checks warn instead of failing (`E2E_E1_BASELINE`).
   - E4: the same release checks after the update, and A's legacy password field
     cleared. `E2E_E4_APPS=auto` derives the expected Applications from the pins.
-    The rollback from r5 to a pre-r5 A meets an open design gap (DESIGN.md).
-    `E2E_E4_ROLLBACK=1` runs it and asserts each part; `=0` waives it on purpose.
-    Left at auto, E4 fails, because a rollback that was not rehearsed is not
-    green.
+    The rollback from r5 to a pre-r5 A is rehearsed (`E2E_E4_ROLLBACK=1` asserts
+    each part; `=0` waives it on purpose; left at auto, E4 fails, because a
+    rollback that was not rehearsed is not green). It needs the credentials
+    Namespace to be `IgnoreExtraneous` (user-controller 0.0.85, gitops 0f95ead):
+    without it A's user-controller Application stays OutOfSync and `up --rollback`
+    fails its post phase (DESIGN.md).
   - E7: the passwords the LAN side holds and the test age identities appear in no
     log.
   - E8: the pre-rotation cookie gets a login redirect.

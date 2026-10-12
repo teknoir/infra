@@ -1198,10 +1198,8 @@ dev host (`airgap/test/README.md`; there is no live node to try it on), each run
 - fresh install: E1, E11, E12, E13, E14, E2, E3, E7 and E8;
 - update from the deployed bundle: E1 with the deployed bundle as a baseline,
   then E4 to the new one with the rollback leg (`E2E_E4_ROLLBACK=1`;
-  `airgap/test/README.md` has the command). A rollback to the pre-r5 bundle is an
-  open design gap (DESIGN.md, r5), and E4 stays red on it until the gap is
-  settled. Do not count on `up --rollback` to app-of-apps 0.0.4 converging before
-  then;
+  `airgap/test/README.md` has the command). The rollback to the pre-r5 bundle is
+  part of that run (DESIGN.md, r5);
 - legacy-layout rehearsal: E15. It reproduces the history and state of the former
   live node (decommissioned 2026-10-11), the layout customer installs may still
   have, then runs `up` with the new bundle.
@@ -1750,30 +1748,30 @@ Keycloak". Harbor's is the local `admin` (`harbor-admin`) at
   ./teknoir-airgap up --rollback
   ```
 
-- Expect this `up --rollback` to exit non-zero once its post phase has waited
-  1200 s. Nobody has rehearsed this rollback: the VM test E4 does not run the
-  rollback from r5 to a pre-r5 bundle by default (an open design gap, see
-  DESIGN.md, r5). The release phase rolls the platform back to 0.0.4 and
-  records it. Then 0.0.4's post phase waits for every Application in
-  teknoir-system to be `Synced`/`Healthy`, and it finds r5 objects that 0.0.4
-  neither renders nor prunes:
+- This rollback is rehearsed: the VM test E4 (`E2E_E4_ROLLBACK=1`) runs it from
+  the r5 bundle to the pre-r5 bundle and `up --rollback` exits 0. The release phase
+  rolls the platform back to 0.0.4 and records it. 0.0.4's post phase then waits
+  for every Application in teknoir-system to be `Synced`/`Healthy`. r5 left objects
+  that 0.0.4 neither renders nor prunes, and they do not hold it up:
   - Namespace `teknoir-user-credentials` (user-controller 0.0.85,
     `Prune=false,Delete=false`) is kept. 0.0.4's AppProject permits
-    Namespaces, so ArgoCD keeps the `user-controller` Application `OutOfSync`
-    (pruning skipped). This alone makes the post phase fail.
+    Namespaces, so ArgoCD would keep the `user-controller` Application
+    `OutOfSync` (pruning skipped). The Namespace carries
+    `argocd.argoproj.io/compare-options: IgnoreExtraneous`, which ArgoCD reads from
+    the live object, so the Application stays `Synced`. If an r5 build without
+    that option ever reaches you (gitops before 0f95ead), `up --rollback` exits
+    non-zero after the 1200 s post wait, with `user-controller` `OutOfSync`.
   - Profile `teknoir-default` and its namespace are kept (profile-controller
     0.0.84, `Prune=false,Delete=false`). 0.0.4's AppProject does not permit
-    `teknoir.org/Profile`, so ArgoCD should leave the Profile out of the
-    comparison and not report `profile-controller` as `OutOfSync`. If it does
-    report it, treat it like the Namespace above.
+    `teknoir.org/Profile`, so ArgoCD leaves the Profile out of the comparison
+    and `profile-controller` stays `Synced`.
   - The teamspace Applications (`teknoir-default-*`, and `teknoir-demo-*` if
-    that teamspace exists): 0.0.4's profile-controller has no
-    `PLUGIN_CHART_REPO`, so it tries to point them back at
-    `https://teknoir.github.io/profile-plugins-helm`. There they would be
-    `Unknown`, because the node is offline. r5's admission policy
-    `profile-controller-argocd` (next point) should refuse that change. The
-    Applications then stay on Harbor, and the profile-controller log shows the
-    refused updates.
+    that teamspace exists) stay on Harbor and `Synced`/`Healthy`: the Profile keeps
+    the plugin settings the r5 controller wrote, so 0.0.4's profile-controller
+    (which has no `PLUGIN_CHART_REPO`) does not point them back at
+    `https://teknoir.github.io/profile-plugins-helm`, where they would be
+    `Unknown` offline. r5's admission policy `profile-controller-argocd` would
+    refuse such a change anyway.
   - The admission policies and their bindings
     (`profile-controller-teamspaces`, `profile-controller-argocd`,
     `user-controller-teamspace-access`) are also kept, as are the Role and
@@ -1786,11 +1784,12 @@ Keycloak". Harbor's is the local `admin` (`harbor-admin`) at
      `release:   app-of-apps 0.0.4, bundle teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af (rollback)`,
      and the first `history:` line is that rollback. The release phase writes
      this record before the post phase runs.
-  2. The same command prints the Application table. Every Application except
-     the ones above is `Synced`/`Healthy` at the version that the 0.0.4
-     bundle pins (its `node/charts/pins.txt`).
-  3. An `OutOfSync` controller Application must be waiting only for its kept
-     object. This command lists what is out of sync:
+  2. The same command prints the Application table. Every Application is
+     `Synced`/`Healthy` at the version that the 0.0.4 bundle pins (its
+     `node/charts/pins.txt`); the teamspace Applications keep the plugin chart
+     version of r5.
+  3. If an Application is `OutOfSync`, it must be waiting only for a kept object.
+     This command lists what is out of sync:
 
      ```sh
      kubectl --context teknoir-local -n teknoir-system get application user-controller \

@@ -169,15 +169,14 @@ plus 2048 MiB (`vm.sh ram-check`); do not run the k3d suites at the same time.
     - `E2E_E4_APPS=auto` expects app-of-apps, each Application whose chart pin differs
       between A and B, and the nine teknoir-default plugin Applications that B's GitOps
       Profile adds.
-    - The rollback from r5 B to the pre-r5 A meets an open design gap:
-      - after the rollback, B's Profile teknoir-default and Namespace
-        teknoir-user-credentials remain (Prune=false,Delete=false, without
-        IgnoreExtraneous), so profile-controller and user-controller stay OutOfSync;
-      - A's profile-controller points the teknoir-default Applications back at github.io;
-      - A's post waits for every Application.
+    - The rollback from r5 B to the pre-r5 A leaves B's Profile teknoir-default and
+      Namespace teknoir-user-credentials behind (Prune=false,Delete=false; A neither
+      renders nor prunes them). The Namespace is IgnoreExtraneous, so A's
+      user-controller Application stays Synced; A's post then passes. Without that
+      option the leg fails on user-controller OutOfSync.
 
       `E2E_E4_ROLLBACK=1` (the release run) runs the rollback and asserts each part of the
-      expected state, so E4 stays red until the rollback design settles the gap.
+      expected state.
       `E2E_E4_ROLLBACK=0` waives the leg on purpose; the summary row then says
       "rollback leg waived". Left at auto, E4 fails and names the gap, because a rollback
       that was not rehearsed is not green.

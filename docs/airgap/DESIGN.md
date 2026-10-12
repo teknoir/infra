@@ -286,11 +286,11 @@ work package adds its own subsection.
 - **G-09 in force** for platform renders (see G-09 below); teamspace renders only warn (R3).
 - **Size**: `BUNDLE_MAX_BYTES` 6.5 GiB (about 5.8 GiB measured); USB media must be exFAT/ext4 or use `--split`.
 - **Rollback from r5** is `up --rollback` with the retained bundle A (app-of-apps 0.0.4, `teknoir-airgap-teknoir-local-aoa0.0.4-20261009-i8610f8d-ga8fe7af.tar`, built by the pre-r5 infra 8610f8d), kept on the USB medium next to the r5 bundle. This replaces the original r5 plan, which had the r5 build make an app-of-apps 0.0.4 bundle. The r5 build cannot rebuild 0.0.4 as a clean bundle, for two reasons. First, its profile-controller predates K2: the plugin supply gate fails unless `PROFILE_PLUGIN_CHARTS=""`, which means no teamspaces offline. Second, it has 8 Teknoir images without a G-09 pin: the build fails unless `ALLOW_MUTABLE_TEKNOIR_TAGS=1`, which makes the bundle `-mutable`. Such a rebuild, with both settings committed on a release branch, is the one documented exception to "a `-mutable` bundle never goes live". It is allowed only when bundle A is lost, and only with `--rollback` to an app-of-apps version that was already live. It pairs r5 node code with 0.0.4 charts (untested) and re-resolves the floating tags on the build day (BUILD.md "Rollback bundles").
-- **The rollback from r5 to 0.0.4 is not clean, and it is not rehearsed.** E4 does not run the rollback from r5 to a pre-r5 bundle by default. A's post phase (infra 8610f8d, `RELEASE_JQ_READY`) waits for every Application in teknoir-system. It finds r5 objects that 0.0.4 neither renders nor prunes. The analysis below follows ArgoCD 3.5's comparison (`controller/state.go`): live objects that the AppProject does not permit are dropped before the diff, and an extraneous object counts as `OutOfSync` unless it carries `argocd.argoproj.io/compare-options: IgnoreExtraneous`.
-  - The Namespace `teknoir-user-credentials` (user-controller 0.0.85, `Prune=false,Delete=false`) is kept. 0.0.4's AppProject whitelists core Namespaces, so the `user-controller` Application stays `OutOfSync`, and `up --rollback` exits non-zero after the 1200 s wait. The release record is already written by then, so the platform rollback itself has happened. OPERATE.md "Rolling back from r5" explains how to confirm it.
-  - The Profile `teknoir-default` (`Prune=false,Delete=false`) is kept, but 0.0.4's whitelist has no `teknoir.org/Profile`, so ArgoCD drops it from the comparison. The same goes for the admission policies and their bindings, which are not in 0.0.4's whitelist either, and for the Role and RoleBinding in `teknoir-user-credentials`, which is not a 0.0.4 destination. None of these objects is pruned. The policies keep constraining the 0.0.4 controllers, which run under the same ServiceAccounts.
-  - 0.0.4's profile-controller (pre-K2, hard-coded teknoir.github.io; `plugin_utils.go` updates every `Application` it renders) tries to point the teamspace Applications back at github.io, where they would be `Unknown` offline. `profile-controller-argocd` should refuse that write and leave them on Harbor. Nobody has observed this yet.
-  - Candidate fix: put `IgnoreExtraneous` on the Namespace `teknoir-user-credentials` and on the GitOps Profile template (gitops charts). For the Profile it matters for a rollback between two versions that both permit Profiles, for example r6 back to r5. After that, E4 with its rollback leg switched on shows whether A's post phase passes.
+- **The rollback from r5 to 0.0.4 is rehearsed (E4, 2026-10-12) and works once the credentials Namespace is `IgnoreExtraneous`.** A's post phase (infra 8610f8d, `RELEASE_JQ_READY`) waits for every Application in teknoir-system, and it finds r5 objects that 0.0.4 neither renders nor prunes. The analysis follows ArgoCD 3.5's comparison (`controller/state.go`): live objects that the AppProject does not permit are dropped before the diff, and an extraneous object counts as `OutOfSync` unless it carries `argocd.argoproj.io/compare-options: IgnoreExtraneous`. E4 with `E2E_E4_ROLLBACK=1` showed, on the VM:
+  - The Namespace `teknoir-user-credentials` (user-controller 0.0.85, `Prune=false,Delete=false`) is kept. 0.0.4's AppProject whitelists core Namespaces, so without the option the `user-controller` Application stayed `OutOfSync` (`requiresPruning`) and `up --rollback` exited non-zero after the 1200 s wait (first run, gitops 4002b06). Since gitops 0f95ead the Namespace carries `IgnoreExtraneous` (the option is read from the live object, so it holds after 0.0.4's chart took over): the rollback exits 0, every Application is `Synced`/`Healthy`, the release record is A (rollback), a plain `up` with A stays in rollback mode.
+  - The Profile `teknoir-default` (`Prune=false,Delete=false`) is kept, but 0.0.4's whitelist has no `teknoir.org/Profile`, so ArgoCD drops it from the comparison: `profile-controller` stays `Synced`/`Healthy` (observed). The same goes for the admission policies and their bindings, and for the Role and RoleBinding in `teknoir-user-credentials`. None of these objects is pruned. The policies keep constraining the 0.0.4 controllers, which run under the same ServiceAccounts.
+  - The teamspace Applications `teknoir-default-*` stayed on Harbor (`harbor.<domain>/teknoir`, 0.0.101) and `Synced`/`Healthy` after the rollback (observed). 0.0.4's profile-controller is pre-K2, but the Profile keeps the plugin settings the r5 controller wrote, so it does not repoint them at github.io.
+  - Not done: `IgnoreExtraneous` on the GitOps Profile template. It would matter only for a rollback between two versions that both permit Profiles (r6 back to r5); decide it with r6.
 - **Release branches.** `make-bundle.sh` accepts `r<N>[-name]` branches besides the env branch and `airgap-redesign*`, so the r5 bundle is built from the r5 integration branches before they are merged.
 
 ### Node time, RTC, teamspace DNS and site keys (WP-I-HOST)
@@ -636,31 +636,20 @@ every version.
     teknoir-default plugin Applications.
 - Live rehearsal: E15.
 
-Rollback from r5 to a pre-r5 bundle is an open design gap. B's GitOps Profile
-teknoir-default and Namespace teknoir-user-credentials carry
-Prune=false,Delete=false but no `argocd.argoproj.io/compare-options: IgnoreExtraneous`.
-Once A no longer renders them, three things happen:
-- profile-controller and user-controller stay OutOfSync, because a skipped prune keeps an
-  Application OutOfSync;
-- A's profile-controller points the teknoir-default Applications back at github.io
-  (Unknown offline);
-- A's post waits for every Application.
+Rollback from r5 to a pre-r5 bundle is rehearsed by E4. B's Profile teknoir-default and
+Namespace teknoir-user-credentials carry Prune=false,Delete=false, so a pre-r5 A neither
+renders nor prunes them. The Namespace also carries
+`argocd.argoproj.io/compare-options: IgnoreExtraneous`, so the older user-controller
+Application stays Synced; the Profile is outside A's AppProject and is not compared. A's
+post waits for every Application and passes.
 
-The plan's rollback, an r5-built 0.0.4 bundle, has the same problem: under R2 the kept,
-tracked Profile keeps its teamspace Applications strict.
-
-An untested rollback is not green:
-- `E2E_E4_ROLLBACK=1` (the release run) runs the leg. It asserts each part separately (up
-  exits 0; every Application except teknoir-default-* Synced/Healthy; profile-controller
-  and user-controller Synced; Profile and Namespace kept; release record A rollback;
-  revisions back), and it reports the teknoir-default Applications. Today it fails, by
-  name, on the parts above.
+`E2E_E4_ROLLBACK=1` (the release run) runs the leg and asserts each part separately (up
+exits 0; every Application except teknoir-default-* Synced/Healthy; profile-controller
+and user-controller Synced; Profile and Namespace kept; release record A rollback;
+revisions back; a plain up keeps A in rollback mode), and it reports the teknoir-default
+Applications.
 - `E2E_E4_ROLLBACK=0` waives the leg on purpose, and the summary row says so.
-- Left at auto, E4 fails when the rollback would cross r5.
-
-The decision belongs to WP-G-CTRL, WP-I-RELEASE and WP-I-BUNDLE, before the live rollout.
-One option is `argocd.argoproj.io/compare-options: IgnoreExtraneous` on the GitOps Profile
-and the credentials Namespace; another is a documented rollback procedure.
+- Left at auto, E4 fails when the rollback would cross r5: an untested rollback is not green.
 
 The first admin is the owner of the GitOps Profile teknoir-default, so E11 can
 check its grants.
