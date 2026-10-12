@@ -537,6 +537,35 @@ EOF
   done
 }
 
+@test "e2e.sh: pull_failures counts permanent pull causes and pull events of pods that are not Ready, not recovered transients" {
+  # shellcheck source=../vm/e2e.sh
+  source "${E2E}"
+  local d="${BATS_TEST_TMPDIR}"
+  cat > "${d}/events.json" <<'JSON'
+{"items":[
+ {"involvedObject":{"name":"ok-pod"},"reason":"BackOff","message":"Back-off pulling image \"x:latest\""},
+ {"involvedObject":{"name":"ok-pod"},"reason":"Failed","message":"Failed to pull image \"x:latest\": Head https://h/v2/x: dial tcp 10.0.0.1:443: connect: connection refused"},
+ {"involvedObject":{"name":"gone-pod"},"reason":"BackOff","message":"Back-off pulling image \"y:latest\""},
+ {"involvedObject":{"name":"stuck-pod"},"reason":"BackOff","message":"Back-off pulling image \"z:latest\""},
+ {"involvedObject":{"name":"ok-pod"},"reason":"Failed","message":"Failed to pull image \"w:1\": rpc error: manifest unknown"},
+ {"involvedObject":{"name":"ok-pod"},"reason":"Pulled","message":"Successfully pulled image"}
+]}
+JSON
+  cat > "${d}/pods.json" <<'JSON'
+{"items":[
+ {"metadata":{"name":"ok-pod"},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}]}},
+ {"metadata":{"name":"stuck-pod"},"status":{"phase":"Pending","conditions":[{"type":"Ready","status":"False"}]}}
+]}
+JSON
+  vm_kc() { if [[ "$2" == events ]]; then cat "${d}/events.json"; else cat "${d}/pods.json"; fi; }
+  # the recovered transients (ok-pod refused/backoff, gone-pod) are not counted; the
+  # permanent cause (manifest unknown) and the pod that is still not Ready are
+  [ "$(pull_failures -A)" = 2 ]
+  # only the recovered transients left: nothing counts
+  printf '{"items":[{"involvedObject":{"name":"ok-pod"},"reason":"BackOff","message":"Back-off pulling image x"},{"involvedObject":{"name":"gone-pod"},"reason":"BackOff","message":"Back-off pulling image y"}]}' > "${d}/events.json"
+  [ "$(pull_failures -A)" = 0 ]
+}
+
 @test "e2e.sh: the bundle's app-of-apps version decides E1's baseline and E4's rollback leg" {
   # shellcheck source=../vm/e2e.sh
   source "${E2E}"

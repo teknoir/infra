@@ -375,21 +375,25 @@ fresh_vm() {
 pull_failures() {
   # pull_failures [kubectl get events args] — the number of image-pull failure
   # events (ErrImagePull, ImagePullBackOff, Failed to pull, Back-off pulling)
-  # and, one line later, the pods that are waiting in a pull error right now
-  # are counted by pull_waiting. After a node reboot (E12 leaves the marker) the
-  # pods with imagePullPolicy Always (the :latest teamspace images) resolve their
-  # tag at harbor.<domain> while Harbor itself is still starting (503) or the
-  # node's own IP is not configured yet (network is unreachable) and fail: a
-  # pod with such a "Failed to pull image ..." event is a transient boot race
-  # (retried by kubelet), not counted; pull_waiting must still be 0 once the
-  # platform is Ready.
-  local rebooted=false
-  [[ -e "${STATE}/node-rebooted" ]] && rebooted=true
-  vm_kc get events "$@" -o json 2>/dev/null | jq -r --argjson rebooted "${rebooted}" '
+  # that matter. The pods with imagePullPolicy Always (the :latest teamspace
+  # images) resolve their tag at harbor.<domain>, so while the platform
+  # converges or after a node reboot (E12) kubelet sometimes meets Harbor or
+  # the gateway starting ("503", "connection refused", "network is
+  # unreachable", timeouts) and retries until the pull works: such a transient
+  # is not a defect when the pod is Ready afterwards. Counted: an event with a
+  # permanent cause (manifest unknown, not found, unauthorized, denied, no such
+  # host) whatever the pod does, and any pull event of a pod that is not Ready
+  # now (a pod that is gone, replaced by a rollout, counts as recovered).
+  # pull_waiting counts the pods waiting in a pull error right now.
+  vm_kc get events "$@" -o json 2>/dev/null | jq -r --slurpfile pods <(vm_kc get pods "$@" -o json 2>/dev/null || echo '{"items":[]}') '
     def pull: (.message // "") | test("ErrImagePull|ImagePullBackOff|Failed to pull|Back-off pulling");
-    def boot503: (.message // "") | test("Failed to pull image.*(503 Service Unavailable|network is unreachable|connection refused|no route to host|i/o timeout|EOF)");
-    ([.items[] | select(pull and boot503) | .involvedObject.name] | unique) as $transient
-    | [.items[] | select(pull) | select(($rebooted | not) or ((.involvedObject.name as $n | $transient | index($n)) | not))] | length' \
+    def permanent: (.message // "") | test("manifest unknown|not found|unauthorized|denied|no such host|name unknown|invalid reference");
+    ($pods[0].items // []
+      | map(select(([.status.conditions[]? | select(.type == "Ready" and .status == "True")] | length) > 0 or .status.phase == "Succeeded")
+            | .metadata.name)) as $ready
+    | [.items[] | select(pull)
+        | select(permanent or ((.involvedObject.name as $n | $ready | index($n)) | not))
+        | select(permanent or (.involvedObject.name as $n | ($pods[0].items // []) | map(.metadata.name) | index($n)))] | length' \
     || echo "?"
 }
 
@@ -1210,7 +1214,7 @@ e3() {
   else fail "FORWARD DROP counters did not grow (${before} -> ${after})"; fi
   bad="$(images_missing)"
   assert_eq "every pod image is present in containerd (imported, or pulled through the harbor.${DOMAIN} mirror)" "" "${bad}"
-  assert_eq "no ErrImagePull/ImagePullBackOff events (boot-time Harbor 503s after E12's reboot aside)" 0 "$(pull_failures -A)"
+  assert_eq "no ErrImagePull/ImagePullBackOff events (a transient Harbor or gateway error that recovered is not counted)" 0 "$(pull_failures -A)"
   assert_eq "no pod is waiting in ErrImagePull/ImagePullBackOff" 0 "$(pull_waiting -A)"
   local mirrors
   mirrors="$(vmx sudo cat /etc/rancher/k3s/registries.yaml)"
@@ -2022,7 +2026,7 @@ e11_checks() {
   assert_eq "every ${ts} pod is Ready and has the istio-proxy sidecar" "" "${bad}"
   if [[ -n "$(vm_kc -n "${ts}" get pods -o name 2>/dev/null || true)" ]]; then pass "${ts} has pods"; else fail "${ts} has no pods"; fi
   assert_eq "every ${ts} image is in containerd" "" "$(images_missing "${ts}" | tr '\n' ' ')"
-  assert_eq "no ErrImagePull/ImagePullBackOff events in ${ts} (boot-time Harbor 503s after E12's reboot aside)" 0 "$(pull_failures -n "${ts}")"
+  assert_eq "no ErrImagePull/ImagePullBackOff events in ${ts} (a transient Harbor or gateway error that recovered is not counted)" 0 "$(pull_failures -n "${ts}")"
   assert_eq "no ${ts} pod is waiting in ErrImagePull/ImagePullBackOff" 0 "$(pull_waiting -n "${ts}")"
 
   # 8. names, TLS and the teamspace's web apps
