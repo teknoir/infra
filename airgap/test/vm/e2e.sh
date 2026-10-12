@@ -1717,7 +1717,40 @@ echo "${out}"
 EOF
   } | vm_root
 }
-kc_admin_rotated() { [[ "$(kc_admin_codes 2>/dev/null)" == "200 401" ]]; }
+# r5's post removes key previous-password once the master admin logs in with
+# key password (SEC-C10): after the rotation the codes are "200 none"; a release
+# without that removal (a pre-r5 bundle) leaves the key and gives "200 401"
+kc_admin_rotated() { local c; c="$(kc_admin_codes 2>/dev/null)"; [[ "${c}" == "200 401" || "${c}" == "200 none" ]]; }
+
+e10_save_prev_pw() {
+  # keep the migration's previous-password (the admin's old password) in a root
+  # 0600 file on the VM, so that its rotation can still be proved after post
+  # removed the key from the Secret; the value never leaves the VM
+  vm_root <<'EOF'
+set -eu
+umask 077
+k3s kubectl -n teknoir-auth get secret keycloak-admin -o go-template='{{index .data "previous-password" | base64decode}}' > /root/.e10-previous-password
+test -s /root/.e10-previous-password
+EOF
+}
+e10_prev_pw_code() {
+  # HTTP status of a master-realm token request as the keycloak-admin user with
+  # the saved old password (401 once the rotation worked); the file is removed
+  {
+    printf 'DOMAIN=%q NODE_IP=%q\n' "${DOMAIN}" "${NODE_IP}"
+    cat <<'EOF'
+set -eu
+d="$(mktemp -d)"; trap 'rm -rf "$d" /root/.e10-previous-password' EXIT
+chmod 700 "$d"
+k3s kubectl -n teknoir-system get secret teknoir-root-ca-bundle -o go-template='{{index .data "ca.crt" | base64decode}}' > "$d/ca"
+k3s kubectl -n teknoir-auth get secret keycloak-admin -o go-template='{{index .data "username" | base64decode}}' > "$d/u"
+curl -sS -o /dev/null -w '%{http_code}' -m 20 --cacert "$d/ca" --resolve "auth.${DOMAIN}:443:${NODE_IP}" \
+  --data-urlencode grant_type=password --data-urlencode client_id=admin-cli \
+  --data-urlencode "username@$d/u" --data-urlencode "password@/root/.e10-previous-password" \
+  "https://auth.${DOMAIN}/auth/realms/master/protocol/openid-connect/token" 2>/dev/null || echo 000
+EOF
+  } | vm_root
+}
 
 robot_argocd_state() {
   # "<http status> <number of robot$argocd accounts>" from the Harbor API as
@@ -1820,13 +1853,15 @@ e10() {
   # --- M4: up, the Keycloak admin rotation, realm teknoir, the first admin ------
   # --force-images as in OPERATE M4: the old tooling mirrored mutable tags
   # (postgres:17-alpine) that have moved upstream since
+  if e10_save_prev_pw; then pass "the migration's previous-password is kept on the VM (root, 0600) to prove the rotation"; else fail "cannot save previous-password"; return 0; fi
   if up_in "${dir}" --force-images; then pass "up --force-images after migrate exits 0"; else fail "up after migrate failed"; return 0; fi
   wait_apps 2700 || true
-  assert_eq "up added password to Secret keycloak-admin" "password previous-password username" "$(secret_keys teknoir-auth keycloak-admin)"
   wait_until 900 kc_admin_rotated || true
   codes="$(kc_admin_codes)"
   assert_eq "the master admin logs in with keycloak-admin password" 200 "${codes%% *}"
-  assert_eq "the master admin no longer logs in with previous-password (rotated)" 401 "${codes##* }"
+  # r5's post removes previous-password once password works (SEC-C10)
+  assert_eq "post removed previous-password from Secret keycloak-admin (username and password remain)" "password username" "$(secret_keys teknoir-auth keycloak-admin)"
+  assert_eq "the master admin no longer logs in with the old password (rotated)" 401 "$(e10_prev_pw_code)"
   assert_eq "Keycloak realm teknoir discovery with the CA" 200 "$(lan_https "https://auth.${DOMAIN}/auth/realms/teknoir/.well-known/openid-configuration")"
   adopt_owner "$(profile_owner "${TEAMSPACE}")"
   if tk "${dir}" admin-user --email "${ADMIN_EMAIL}" --out "${pw}"; then

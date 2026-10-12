@@ -472,7 +472,7 @@ EOF
   vmx() { :; }
   local f out
   for f in "kc_user_state teknoir platform-admin" kc_master_clients e15_master_clients "kc_pw_created a@b.c" \
-           "argocd_session_vm /root/x" rtc_offset kc_admin_codes robot_argocd_state e10_secret_hashes; do
+           "argocd_session_vm /root/x" rtc_offset kc_admin_codes e10_save_prev_pw e10_prev_pw_code robot_argocd_state e10_secret_hashes; do
     out="$(${f} 2>&1 || true)"
     [[ "${out}" != *SYNTAX-ERROR* ]] || { echo "${f}: ${out}"; return 1; }
   done
