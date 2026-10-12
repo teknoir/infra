@@ -790,7 +790,7 @@ EOF
       E2E_WORK='${BATS_TEST_TMPDIR}/w-${mode}' E2E_BUNDLE=x; source '${E2E}'; TL_POLL=0; MODE='${mode}'; W='${BATS_TEST_TMPDIR}/w-${mode}'
       mkdir -p \"\${W}\"; echo 1 > \"\${W}/boot\"; : > \"\${W}/ups\"
       bundle_dir() { echo '${b}'; }
-      ensure_vm() { :; }; wait_apps() { pass 'apps'; }
+      ensure_vm() { :; }; wait_apps() { pass 'apps'; }; platform_ready() { :; }
       VM=\"\${W}/vm.sh\"; printf '#!/bin/sh\nexit 0\n' > \"\${VM}\"; chmod +x \"\${VM}\"
       vmx() {
         case \"\$*\" in
