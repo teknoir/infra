@@ -1138,7 +1138,7 @@ e0() {
   ensure_vm
   local dir rc
   dir="$(bundle_dir "${E2E_BUNDLE}")"
-  set +e; up_in "${dir}"; rc=$?; set -e
+  up_in "${dir}" && rc=0 || rc=$?   # not set +e: lan() re-enables errexit, so a failing up would end the run
   assert_eq "up exits 0" 0 "${rc}"
 }
 
@@ -1339,7 +1339,7 @@ e4_rollback_cross() {
   # stops at the first failure, so the run names which part of the gap is open
   local a="$1" ida="$2" before="$3" rc app
   tl_log "rollback across r5 (E2E_E4_ROLLBACK=1); known gap: ${E4_ROLLBACK_GAP}"
-  set +e; up_in "${a}" --rollback; rc=$?; set -e
+  up_in "${a}" --rollback && rc=0 || rc=$?   # not set +e: lan() re-enables errexit, so a failing rollback would end the run with no summary
   if (( rc == 0 )); then pass "up --rollback with the pre-r5 A exits 0"
   else fail "up --rollback with the pre-r5 A failed (rc=${rc}); the Application states follow"; fi
   if wait_until 1800 apps_healthy_except "${TEAMSPACE}-"; then pass "every Application but ${TEAMSPACE}-* is Synced/Healthy after the rollback"

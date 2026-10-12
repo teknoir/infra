@@ -54,7 +54,8 @@ up_in() {
         { cat "${W}/revs.A"; grep '^teknoir-default-' "${W}/revs.B"; } > "${W}/revs"; echo "A rollback" > "${W}/record"
       else
         cat "${W}/revs.A" > "${W}/revs"
-        echo "post: Applications not Synced/Healthy after 1200 s"; return 1
+        # the real up_in goes through lan(), which re-enables errexit before it returns a failure
+        echo "post: Applications not Synced/Healthy after 1200 s"; set -e; return 1
       fi ;;
     "${W}/A")
       if [[ "$(cat "${W}/record" 2>/dev/null)" == "A rollback" ]]; then return 0; fi
