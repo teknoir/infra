@@ -35,6 +35,15 @@ Before deploying the infra chart, ensure the following secrets are generated:
     ./scripts/gen-oauth2-proxy-redis-secret.sh
     ```
 
+7.  **STUNner TURN Secret** (WireGuard / ZTNA, `teknoir-cloud` only, needed when `ztna.enabled` is set in
+    `platform-applications-gitops`). This one is applied straight to the cluster, from a pipe, and prints nothing
+    secret; it needs an explicit context and is idempotent:
+    ```sh
+    ./scripts/gen-stunner-auth-secret.sh --context <kubectl-context>
+    ```
+    It creates `stunner-system/stunner-auth-secret` (`type: ephemeral`, `secret: <48 random bytes>`) and, if missing,
+    the namespace with `istio-injection=disabled`. Rotating the secret resets every WireGuard tunnel.
+
 ### Deploying Secrets
 
 Once generated, you can deploy them using `kubectl apply` on the generated manifest files (e.g., `manifest-harbor-secret.yaml`).

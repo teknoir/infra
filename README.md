@@ -23,6 +23,17 @@ Secrets are managed manually. Generate them before deploying:
 ...
 ```
 
+#### STUNner TURN secret (WireGuard / ZTNA, staging)
+
+`./scripts/gen-stunner-auth-secret.sh --context <context>` creates `stunner-system/stunner-auth-secret`
+(`type: ephemeral`, `secret: <48 random bytes>`), the TURN-REST shared secret of the STUNner gateway in
+`platform-applications-gitops` (`charts/stunner`, enabled with `ztna.enabled` on `teknoir-cloud`). Unlike the
+scripts above it applies the Secret straight to the cluster and prints nothing secret. It needs an explicit
+`--context` (never the current one), is idempotent (an existing Secret is left alone), creates the namespace with
+`istio-injection=disabled` if missing, and refuses a production-looking context without `--allow-production`.
+Rotating the secret (delete it, re-run the script) resets every WireGuard tunnel. Test:
+`scripts/tests/gen-stunner-auth-secret-test.sh` (throwaway local apiserver, needs envtest).
+
 ### 2. Deploy
 
 ```sh
