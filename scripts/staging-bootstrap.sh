@@ -99,7 +99,7 @@ fi
 
 # 3. ArgoCD + root app-of-apps ---------------------------------------------------------
 STAGING_HOST=$HOST scripts/deploy-argo.sh
-log "waiting for the Application CRD"
-until k get crd applications.argoproj.io >/dev/null 2>&1; do sleep 5; done
+log "waiting for the ArgoCD CRDs"
+until k get crd applications.argoproj.io appprojects.argoproj.io >/dev/null 2>&1; do sleep 5; done
 k apply -f teknoir-cloud-app-of-apps.yaml >/dev/null
 log "app-of-apps applied; ArgoCD now installs the platform from platform-applications-gitops@teknoir-cloud"
