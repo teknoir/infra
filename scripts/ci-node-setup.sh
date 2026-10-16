@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 # ci-node-setup.sh: host setup for the on-cluster CI (platform-applications-gitops charts/ci).
 #
-#   ci-node-setup.sh server [--restart]   on the k3s server (r415)
+#   ci-node-setup.sh server [--restart] [--agent-ip IP]...
+#                                          on the k3s server (r415, now vpro); --agent-ip opens ufw
+#                                          for an agent node: flannel VXLAN (8472/udp) and the
+#                                          kubelet (10250/tcp) from it, and the pod/service CIDRs
 #   ci-node-setup.sh agent  --server-ip IP --node-ip IP [--token-file FILE]
-#                                          on a dedicated CI build node (vpro)
+#                          [--keep-docker] [--no-grow-root] [--label K=V]... [--taint K=V:EFFECT]...
+#                                          on a dedicated CI build node (vpro), or a shared host
+#                                          such as the dev host (virtual devices + CI tests):
+#     --keep-docker   leave Docker enabled (the host uses it; k3s has its own containerd anyway)
+#     --no-grow-root  do not extend the root LV over the free space of its VG
+#     --label/--taint replace the default label teknoir.org/ci-builder=true and taint
+#                     teknoir.org/ci=true:NoSchedule (give each flag once per value)
 #
 # Idempotent: every step checks first and only changes what differs. Run as root.
 #
@@ -33,12 +42,18 @@ die() { printf 'ci-node-setup: ERROR: %s\n' "$*" >&2; exit 1; }
 
 role=${1:-}; shift || true
 restart=false server_ip='' node_ip='' token_file=/etc/rancher/k3s/agent-token
+keep_docker=false grow_root=true labels=() taints=() agent_ips=()
 while [ $# -gt 0 ]; do
 	case $1 in
 	--restart) restart=true ;;
 	--server-ip) server_ip=$2; shift ;;
 	--node-ip) node_ip=$2; shift ;;
 	--token-file) token_file=$2; shift ;;
+	--keep-docker) keep_docker=true ;;
+	--agent-ip) agent_ips+=("$2"); shift ;;
+	--no-grow-root) grow_root=false ;;
+	--label) labels+=("$2"); shift ;;
+	--taint) taints+=("$2"); shift ;;
 	*) die "unknown argument $1" ;;
 	esac
 	shift
@@ -91,6 +106,17 @@ server)
 	binfmt
 	journald 200M
 	install -d -m 0711 /srv/buildkit
+	if [ ${#agent_ips[@]} -gt 0 ] && command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
+		for ip in "${agent_ips[@]}"; do
+			ufw allow proto udp from "$ip" to any port 8472 comment 'k3s flannel vxlan' >/dev/null
+			ufw allow proto tcp from "$ip" to any port 10250 comment 'k3s kubelet' >/dev/null
+		done
+		for c in "${CLUSTER_CIDRS[@]}"; do
+			ufw allow from "$c" comment k3s >/dev/null
+			ufw route allow from "$c" >/dev/null; ufw route allow to "$c" >/dev/null
+		done
+		log "ufw: agents ${agent_ips[*]} and the cluster CIDRs allowed"
+	fi
 	if [ -n "$(kubelet_gc "$data_dir/agent/etc/kubelet.conf.d")" ]; then
 		if $restart; then
 			systemctl restart k3s && log "k3s restarted (kubelet GC settings applied)"
@@ -105,11 +131,13 @@ agent)
 	binfmt
 	journald 500M
 	install -d -m 0711 /var/lib/buildkit
-	if systemctl is-enabled -q docker.service 2>/dev/null; then
+	[ ${#labels[@]} -gt 0 ] || labels=(teknoir.org/ci-builder=true)
+	[ ${#taints[@]} -gt 0 ] || taints=(teknoir.org/ci=true:NoSchedule)
+	if ! $keep_docker && systemctl is-enabled -q docker.service 2>/dev/null; then
 		systemctl disable docker.service docker.socket containerd.service >/dev/null 2>&1 || true
 		log "docker disabled at boot"
 	fi
-	if command -v lvs >/dev/null && vg=$(vgs --noheadings -o vg_name 2>/dev/null | head -n1 | tr -d ' ') && [ -n "$vg" ]; then
+	if $grow_root && command -v lvs >/dev/null && vg=$(vgs --noheadings -o vg_name 2>/dev/null | head -n1 | tr -d ' ') && [ -n "$vg" ]; then
 		free=$(vgs --noheadings --units b -o vg_free "$vg" | tr -dc 0-9)
 		root_lv=$(findmnt -n -o SOURCE /)
 		if [ "${free:-0}" -gt 1073741824 ]; then lvextend -r -l +100%FREE "$root_lv" >/dev/null && log "root LV extended"; fi
@@ -125,9 +153,9 @@ agent)
 		token-file: ${token_file}
 		node-ip: ${node_ip}
 		node-label:
-		  - teknoir.org/ci-builder=true
+		$(printf '  - %s\n' "${labels[@]}")
 		node-taint:
-		  - teknoir.org/ci=true:NoSchedule
+		$(printf '  - %s\n' "${taints[@]}")
 		kubelet-arg:
 		  - container-log-max-size=10Mi
 		  - container-log-max-files=3
@@ -141,6 +169,6 @@ agent)
 		systemctl restart k3s-agent && log "k3s-agent restarted (kubelet GC settings applied)"
 	fi
 	;;
-*) die "usage: $0 server [--restart] | agent --server-ip IP --node-ip IP [--token-file FILE]" ;;
+*) die "usage: $0 server [--restart] [--agent-ip IP]... | agent --server-ip IP --node-ip IP [--token-file FILE] [--keep-docker] [--no-grow-root] [--label K=V]... [--taint K=V:EFFECT]..." ;;
 esac
 log "done ($role)"
