@@ -115,6 +115,9 @@ server)
 			ufw allow from "$c" comment k3s >/dev/null
 			ufw route allow from "$c" >/dev/null; ufw route allow to "$c" >/dev/null
 		done
+		# `ufw allow` alone left the new rules out of the live chains on vpro (2026-10-16:
+		# flannel VXLAN from the agent was dropped); a reload loads them.
+		ufw reload >/dev/null
 		log "ufw: agents ${agent_ips[*]} and the cluster CIDRs allowed"
 	fi
 	if [ -n "$(kubelet_gc "$data_dir/agent/etc/kubelet.conf.d")" ]; then
@@ -145,6 +148,7 @@ agent)
 	if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
 		for src in "$server_ip" "${CLUSTER_CIDRS[@]}"; do ufw allow from "$src" comment k3s >/dev/null; done
 		for c in "${CLUSTER_CIDRS[@]}"; do ufw route allow from "$c" >/dev/null; ufw route allow to "$c" >/dev/null; done
+		ufw reload >/dev/null
 		log "ufw: k3s server and cluster CIDRs allowed"
 	fi
 	write_if_changed /etc/rancher/k3s/config.yaml 0600 <<-EOF >/dev/null
