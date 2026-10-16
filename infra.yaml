@@ -717,15 +717,6 @@ spec:
       tls:
         mode: SIMPLE
         credentialName: "teknoir-cloud-wildcard-tls"
-    - port:
-        name: tls-ssh
-        number: 2222
-        protocol: TLS
-      hosts:
-        - "teknoir.cloud"
-        - "*.teknoir.cloud"
-      tls:
-        mode: PASSTHROUGH
 ---
 # Source: infra/charts/auth/templates/keycloakx.yaml
 apiVersion: helm.cattle.io/v1
@@ -883,10 +874,6 @@ spec:
         port: 16021
         protocol: TCP
         targetPort: 15021
-      - name: tls-ssh
-        port: 2222
-        protocol: TCP
-        targetPort: 2222
       - name: https-mqtt
         port: 8084
         protocol: TCP
