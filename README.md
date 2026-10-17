@@ -46,12 +46,25 @@ Staging (`teknoir-cloud`) does not follow the branch: ArgoCD follows one release
 `platform-applications-gitops` (tag `staging-YYYYMMDD.N`). The root is therefore a template,
 `teknoir-cloud-app-of-apps.yaml.tmpl`, and a plain `kubectl apply -f` of it is no longer the way (the
 placeholders `__STAGING_RELEASE_SHA__` / `__STAGING_RELEASE__` would be applied as is).
-`scripts/staging-root.sh` fills them, from the live root's `teknoir.org/release` annotation if there is one,
-otherwise from the newest GitHub Release of `platform-applications-gitops` that is verified (not a prerelease)
-and not marked rolled back, checked against `git ls-remote --tags`. It prints by default and applies only with
-`--apply`. A fresh host is brought up with `scripts/staging-bootstrap.sh`, which calls it. Moving a running
-staging to another release is `scripts/staging-release` in `platform-applications-gitops`, not this script.
-Design: `plans/staging-releases.md` in the workspace.
+`scripts/staging-root.sh` fills them. It prints by default and applies only with `--apply --context <ctx>`.
+
+- The release comes from the live root's `teknoir.org/release` annotation if there is one, otherwise from the newest
+  GitHub Release of `platform-applications-gitops` that is verified (not a draft or prerelease) and not marked by
+  `scripts/staging-release`: title starting `[rolled back]` or body line `Rolled-Back: true`, title starting
+  `[not applied]` or body line `Not-Applied: true` (nothing else counts). Or you name it: `--release staging-YYYYMMDD.N --sha <40-hex>`.
+- A release from GitHub or from `--release/--sha` is verified the same way: the tag exists and peels to the SHA
+  (`--untagged` allows a missing tag for the time before the first release), the SHA is on the first-parent history of
+  `teknoir-cloud` (blobless fetch), and its `charts/app-of-apps/values.yaml` has the `release:` key.
+- `--apply` is for a fresh cluster. A live root already at the resolved release is left alone (no-op), a live root at
+  another release is refused (that is `scripts/staging-release`), and a live branch-following root (no annotation, the
+  state before the cutover) is refused with a pointer to `scripts/staging-release --bootstrap` in `platform-applications-gitops`.
+- `--check` does everything `--apply` would check, applies nothing and prints `<release> <sha>`.
+- The contexts `*eks*`, `*online*`, `*prod*` and `*r415*` are refused.
+
+A fresh host is brought up with `scripts/staging-bootstrap.sh`, which resolves and verifies the release first
+(`staging-root.sh --check`), before any namespace, Secret or ArgoCD change, and passes it to `--apply` in step 3.
+Design: `plans/staging-releases.md` in the workspace. Tests: `scripts/tests/staging-root-test.sh`
+(`K3D_CONTEXT=k3d-teknoir-dev` adds a re-apply under the release guard in a scratch namespace).
 
 ### 3. Important manual steps
 
