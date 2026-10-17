@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # staging-bootstrap.sh: bring up staging (teknoir-cloud) on a fresh single-node k3s server.
 #
-#   scripts/staging-bootstrap.sh --context vpro [--host anders@192.168.2.19]
+#   scripts/staging-bootstrap.sh --context vpro [--host anders@192.168.2.19] [--release TAG --sha SHA]
 #
 # Everything random is generated in-cluster by GitOps (platform-secrets), and Keycloak is
 # configured by GitOps (charts/auth realm file), so this script only does what GitOps
@@ -14,16 +14,18 @@
 #        cert-manager/godaddy-api-key-prod                   GODADDY_API_KEY + GODADDY_API_SECRET (DNS-01)
 #        teknoir-system/backstage-github-app-secret          BACKSTAGE_GITHUB_APP_FILE (+ BACKSTAGE_GCP_SA_FILE)
 #      An existing Secret is left alone unless FORCE=1;
-#   3. ArgoCD (scripts/deploy-argo.sh) and the root app-of-apps.
+#   3. ArgoCD (scripts/deploy-argo.sh) and the root app-of-apps, rendered for a RELEASE by scripts/staging-root.sh
+#      (optional --release staging-YYYYMMDD.N --sha <40-hex> to name one explicitly, e.g. before the first release).
 # Idempotent: rerun it after providing a missing credential.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CONTEXT='' HOST=anders@192.168.2.19
+CONTEXT='' HOST=anders@192.168.2.19 ROOT_ARGS=()
 while [ $# -gt 0 ]; do
 	case $1 in
 	--context) CONTEXT=$2; shift ;;
 	--host) HOST=$2; shift ;;
+	--release | --sha) ROOT_ARGS+=("$1" "$2"); shift ;; # explicit release for scripts/staging-root.sh
 	*) echo "unknown argument $1" >&2; exit 2 ;;
 	esac
 	shift
@@ -101,5 +103,7 @@ fi
 STAGING_HOST=$HOST scripts/deploy-argo.sh
 log "waiting for the ArgoCD CRDs"
 until k get crd applications.argoproj.io appprojects.argoproj.io >/dev/null 2>&1; do sleep 5; done
-k apply -f teknoir-cloud-app-of-apps.yaml >/dev/null
-log "app-of-apps applied; ArgoCD now installs the platform from platform-applications-gitops@teknoir-cloud"
+# Staging follows a released commit, not the branch: staging-root.sh fills teknoir-cloud-app-of-apps.yaml.tmpl
+# from the live root annotation, else the newest verified GitHub Release (see plans/staging-releases.md).
+scripts/staging-root.sh --context "$CONTEXT" --apply ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"}
+log "app-of-apps applied; ArgoCD now installs the platform from the released platform-applications-gitops commit"

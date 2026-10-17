@@ -38,8 +38,20 @@ Rotating the secret (delete it, re-run the script) resets every WireGuard tunnel
 
 ```sh
 ./scripts/deploy-argo.sh
-kubectl apply -f teknoir-cloud-app-of-apps.yaml
+./scripts/staging-root.sh --context <context>            # print the root Application for the current release
+./scripts/staging-root.sh --context <context> --apply    # apply it
 ```
+
+Staging (`teknoir-cloud`) does not follow the branch: ArgoCD follows one released commit of
+`platform-applications-gitops` (tag `staging-YYYYMMDD.N`). The root is therefore a template,
+`teknoir-cloud-app-of-apps.yaml.tmpl`, and a plain `kubectl apply -f` of it is no longer the way (the
+placeholders `__STAGING_RELEASE_SHA__` / `__STAGING_RELEASE__` would be applied as is).
+`scripts/staging-root.sh` fills them, from the live root's `teknoir.org/release` annotation if there is one,
+otherwise from the newest GitHub Release of `platform-applications-gitops` that is verified (not a prerelease)
+and not marked rolled back, checked against `git ls-remote --tags`. It prints by default and applies only with
+`--apply`. A fresh host is brought up with `scripts/staging-bootstrap.sh`, which calls it. Moving a running
+staging to another release is `scripts/staging-release` in `platform-applications-gitops`, not this script.
+Design: `plans/staging-releases.md` in the workspace.
 
 ### 3. Important manual steps
 
