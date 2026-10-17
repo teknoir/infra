@@ -1,0 +1,22 @@
+# The spec of the live staging root Application (vpro, kubectl get application app-of-apps, 2026-10-17, branch-following,
+# before the cutover), trimmed to metadata.name/namespace and spec. staging-root-test.sh compares the rendered template
+# against it: the template changes targetRevision, helm.parameters and the release annotation, nothing else.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: teknoir-system
+spec:
+  destination:
+    namespace: teknoir-system
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    path: charts/app-of-apps
+    repoURL: https://github.com/teknoir/platform-applications-gitops
+    targetRevision: teknoir-cloud
+  syncPolicy:
+    automated:
+      enabled: true
+      prune: true
+      selfHeal: true

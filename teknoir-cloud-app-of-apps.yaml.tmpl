@@ -1,0 +1,56 @@
+# TEMPLATE of the staging (teknoir-cloud) root Application. Do not `kubectl apply` this file directly:
+# staging follows one released commit, not a branch. scripts/staging-root.sh resolves the release
+# (live root annotation, else the newest verified GitHub Release of platform-applications-gitops) and fills
+#   __STAGING_RELEASE_SHA__  full 40-hex commit SHA of the release (targetRevision and helm parameter `release`)
+#   __STAGING_RELEASE__      release tag name, staging-YYYYMMDD.N (helm parameter `releaseName`, annotation)
+# Day to day the root is changed only by gitops scripts/staging-release, never from this file.
+# See plans/staging-releases.md (design) and README.md.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: teknoir-system
+spec:
+  sourceRepos:
+    - '*'
+  sourceNamespaces: []
+  destinations:
+    - namespace: 'teknoir-system'
+      server: 'https://kubernetes.default.svc'
+  clusterResourceWhitelist:
+    - group: 'argoproj.io'
+      kind: 'AppProject'
+    - group: 'argoproj.io'
+      kind: 'Application'
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: teknoir-system
+  annotations:
+    teknoir.org/release: "__STAGING_RELEASE__"
+spec:
+  destination:
+    namespace: teknoir-system
+    server: https://kubernetes.default.svc
+  source:
+    path: charts/app-of-apps
+    repoURL: https://github.com/teknoir/platform-applications-gitops
+    targetRevision: "__STAGING_RELEASE_SHA__"
+    helm:
+      parameters:
+        - name: release
+          value: "__STAGING_RELEASE_SHA__"
+          forceString: true
+        - name: releaseName
+          value: "__STAGING_RELEASE__"
+          forceString: true
+  project: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      enabled: true
