@@ -31,6 +31,10 @@
 #                                 pull secret, can pull them too. Fine on staging; on a cluster with
 #                                 customer teamspaces use a robot without ghcr (plans/new-cluster-
 #                                 requirements.md section 10).
+#                                 NOTE: a pod's own upstream imagePullSecret (docker.io, ghcr.io,
+#                                 nvcr.io) is sent to the mirror too (kubelet never sets the
+#                                 credential's server address): Harbor rejects it and the pull
+#                                 bypasses the cache (plans/harbor-proxy-staging.md).
 #   An agent restarts k3s-agent when the file changed. The server restarts k3s only with --restart
 #   (the API is down for about a minute; pods keep running, KillMode=process); otherwise it logs
 #   that the change applies at the next restart.
