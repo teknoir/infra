@@ -1,18 +1,34 @@
 #!/usr/bin/env bash
 # ci-node-setup.sh: host setup for the on-cluster CI (platform-applications-gitops charts/ci).
 #
-#   ci-node-setup.sh server [--restart] [--agent-ip IP]...
+#   ci-node-setup.sh server [--restart] [--agent-ip IP]... [REGISTRY OPTIONS]
 #                                          on the k3s server (r415, now vpro); --agent-ip opens ufw
 #                                          for an agent node: flannel VXLAN (8472/udp) and the
 #                                          kubelet (10250/tcp) from it, and the pod/service CIDRs
 #   ci-node-setup.sh agent  --server-ip IP --node-ip IP [--token-file FILE]
 #                          [--keep-docker] [--no-grow-root] [--label K=V]... [--taint K=V:EFFECT]...
+#                          [REGISTRY OPTIONS]
 #                                          on a dedicated CI build node (vpro), or a shared host
 #                                          such as the dev host (virtual devices + CI tests):
 #     --keep-docker   leave Docker enabled (the host uses it; k3s has its own containerd anyway)
 #     --no-grow-root  do not extend the root LV over the free space of its VG
 #     --label/--taint replace the default label teknoir.org/ci-builder=true and taint
 #                     teknoir.org/ci=true:NoSchedule (give each flag once per value)
+#
+# REGISTRY OPTIONS (plans/harbor-proxy-staging.md): pull images through the Harbor proxy-cache
+# projects, with the upstream registry as the fallback (k3s always tries its default endpoint last):
+#   --registry-mirror HOST|none   write /etc/rancher/k3s/registries.yaml (mode 0600, first line
+#                                 `# managed by ci-node-setup.sh`) mirroring docker.io, ghcr.io,
+#                                 gcr.io, quay.io, registry.k8s.io and nvcr.io to HOST's projects
+#                                 dockerhub/ ghcr/ gcr/ quay/ k8s/ nvcr/. `none` removes a managed
+#                                 file (rollback). A registries.yaml without the marker is never
+#                                 overwritten or removed. Without the option the file is left alone.
+#   --registry-auth-file FILE     required with HOST: one line `username:password` (the robot
+#                                 $nodes of Harbor, Secret teknoir-system/harbor-nodes-pull), mode
+#                                 0600 and owned by root. The password is never printed.
+#   An agent restarts k3s-agent when the file changed. The server restarts k3s only with --restart
+#   (the API is down for about a minute; pods keep running, KillMode=process); otherwise it logs
+#   that the change applies at the next restart.
 #
 # Idempotent: every step checks first and only changes what differs. Run as root.
 #
@@ -33,8 +49,12 @@
 #       ssh r415 sudo cat /opt/k3s/server/node-token | ssh <node> sudo install -m 0600 /dev/stdin /etc/rancher/k3s/agent-token
 set -euo pipefail
 
+# shellcheck source=lib/registries.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/registries.sh"
+
 K3S_VERSION=${K3S_VERSION:-v1.34.5+k3s1}
 CLUSTER_CIDRS=(10.42.0.0/16 10.43.0.0/16)
+REGISTRIES_FILE=${REGISTRIES_FILE:-/etc/rancher/k3s/registries.yaml}
 
 log() { printf 'ci-node-setup: %s\n' "$*"; }
 die() { printf 'ci-node-setup: ERROR: %s\n' "$*" >&2; exit 1; }
@@ -43,6 +63,7 @@ die() { printf 'ci-node-setup: ERROR: %s\n' "$*" >&2; exit 1; }
 role=${1:-}; shift || true
 restart=false server_ip='' node_ip='' token_file=/etc/rancher/k3s/agent-token
 keep_docker=false grow_root=true labels=() taints=() agent_ips=()
+registry_mirror='' registry_auth_file=''
 while [ $# -gt 0 ]; do
 	case $1 in
 	--restart) restart=true ;;
@@ -54,10 +75,21 @@ while [ $# -gt 0 ]; do
 	--no-grow-root) grow_root=false ;;
 	--label) labels+=("$2"); shift ;;
 	--taint) taints+=("$2"); shift ;;
+	--registry-mirror) registry_mirror=$2; shift ;;
+	--registry-auth-file) registry_auth_file=$2; shift ;;
 	*) die "unknown argument $1" ;;
 	esac
 	shift
 done
+if [ -n "$registry_mirror" ] && [ "$registry_mirror" != none ]; then
+	registries_valid_host "$registry_mirror" || die "invalid --registry-mirror '$registry_mirror' (a host name, or none)"
+	[ -n "$registry_auth_file" ] || die "--registry-mirror $registry_mirror needs --registry-auth-file (the proxy projects are private)"
+elif [ -n "$registry_auth_file" ] && [ -z "$registry_mirror" ]; then
+	die "--registry-auth-file needs --registry-mirror HOST"
+fi
+if [ -n "$registry_mirror" ]; then # fail before the first change when the file or the auth is unusable
+	registries_check "$registry_mirror" "$registry_auth_file" "$REGISTRIES_FILE" || die "registries.yaml not applied (see above)"
+fi
 
 write_if_changed() { # <path> <mode>; content on stdin. Prints "changed" when it wrote.
 	local tmp; tmp=$(mktemp)
@@ -99,6 +131,13 @@ kubelet_gc() { # <kubelet.conf.d dir>
 	EOF
 }
 
+registries() { # prints "changed" when registries.yaml was written or removed (no-op without --registry-mirror)
+	[ -n "$registry_mirror" ] || return 0
+	local rc=0
+	registries_apply "$registry_mirror" "$registry_auth_file" "$REGISTRIES_FILE" || rc=$?
+	[ "$rc" -eq 0 ] || die "registries.yaml not applied (see above)"
+}
+
 case $role in
 server)
 	data_dir=$(sed -n 's/^data-dir: *//p' /etc/rancher/k3s/config.yaml 2>/dev/null)
@@ -120,11 +159,15 @@ server)
 		ufw reload >/dev/null
 		log "ufw: agents ${agent_ips[*]} and the cluster CIDRs allowed"
 	fi
-	if [ -n "$(kubelet_gc "$data_dir/agent/etc/kubelet.conf.d")" ]; then
+	changed=''
+	[ -z "$(kubelet_gc "$data_dir/agent/etc/kubelet.conf.d")" ] || changed="kubelet GC drop-in"
+	reg=$(registries) || exit 1
+	[ -z "$reg" ] || changed="${changed:+$changed and }registries.yaml"
+	if [ -n "$changed" ]; then
 		if $restart; then
-			systemctl restart k3s && log "k3s restarted (kubelet GC settings applied)"
+			systemctl restart k3s && log "k3s restarted ($changed applied)"
 		else
-			log "kubelet GC drop-in written; applied at the next k3s restart (or rerun with --restart)"
+			log "$changed written; applied at the next k3s restart (or rerun with --restart)"
 		fi
 	fi
 	;;
@@ -165,14 +208,16 @@ agent)
 		  - container-log-max-files=3
 	EOF
 	gc_changed=$(kubelet_gc /var/lib/rancher/k3s/agent/etc/kubelet.conf.d)
+	# registries.yaml before the installer, so a first start already uses it
+	reg_changed=$(registries) || exit 1
 	if ! systemctl is-active -q k3s-agent; then
 		curl -sfL https://get.k3s.io -o /tmp/k3s-install.sh
 		INSTALL_K3S_VERSION=$K3S_VERSION INSTALL_K3S_EXEC=agent sh /tmp/k3s-install.sh
 		log "k3s agent $K3S_VERSION installed"
-	elif [ -n "$gc_changed" ]; then
-		systemctl restart k3s-agent && log "k3s-agent restarted (kubelet GC settings applied)"
+	elif [ -n "$gc_changed$reg_changed" ]; then
+		systemctl restart k3s-agent && log "k3s-agent restarted (${gc_changed:+kubelet GC settings}${gc_changed:+${reg_changed:+ and }}${reg_changed:+registries.yaml} applied)"
 	fi
 	;;
-*) die "usage: $0 server [--restart] [--agent-ip IP]... | agent --server-ip IP --node-ip IP [--token-file FILE] [--keep-docker] [--no-grow-root] [--label K=V]... [--taint K=V:EFFECT]..." ;;
+*) die "usage: $0 server [--restart] [--agent-ip IP]... | agent --server-ip IP --node-ip IP [--token-file FILE] [--keep-docker] [--no-grow-root] [--label K=V]... [--taint K=V:EFFECT]... (both: [--registry-mirror HOST|none --registry-auth-file FILE])" ;;
 esac
 log "done ($role)"
