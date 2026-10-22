@@ -26,6 +26,11 @@
 #   --registry-auth-file FILE     required with HOST: one line `username:password` (the robot
 #                                 $nodes of Harbor, Secret teknoir-system/harbor-nodes-pull), mode
 #                                 0600 and owned by root. The password is never printed.
+#                                 CAVEAT: the $nodes robot can pull the private ghcr.io/teknoir/*
+#                                 images, so any pod on this node, in any namespace and without a
+#                                 pull secret, can pull them too. Fine on staging; on a cluster with
+#                                 customer teamspaces use a robot without ghcr (plans/new-cluster-
+#                                 requirements.md section 10).
 #   An agent restarts k3s-agent when the file changed. The server restarts k3s only with --restart
 #   (the API is down for about a minute; pods keep running, KillMode=process); otherwise it logs
 #   that the change applies at the next restart.
