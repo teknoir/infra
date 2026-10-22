@@ -1,0 +1,40 @@
+# managed by ci-node-setup.sh
+# k3s private registry mirrors: pull-through cache on harbor.example.test (plans/harbor-proxy-staging.md).
+# containerd asks Harbor first and falls back to the upstream registry. Do not edit: rerun
+# ci-node-setup.sh (--registry-mirror none removes this file).
+mirrors:
+  docker.io:
+    endpoint:
+      - "https://harbor.example.test"
+    rewrite:
+      "^(.*)$": "dockerhub/$1"
+  ghcr.io:
+    endpoint:
+      - "https://harbor.example.test"
+    rewrite:
+      "^(.*)$": "ghcr/$1"
+  gcr.io:
+    endpoint:
+      - "https://harbor.example.test"
+    rewrite:
+      "^(.*)$": "gcr/$1"
+  quay.io:
+    endpoint:
+      - "https://harbor.example.test"
+    rewrite:
+      "^(.*)$": "quay/$1"
+  registry.k8s.io:
+    endpoint:
+      - "https://harbor.example.test"
+    rewrite:
+      "^(.*)$": "k8s/$1"
+  nvcr.io:
+    endpoint:
+      - "https://harbor.example.test"
+    rewrite:
+      "^(.*)$": "nvcr/$1"
+configs:
+  "harbor.example.test":
+    auth:
+      username: "robot$nodes"
+      password: "s3cr3tPassw0rdFORtest"
