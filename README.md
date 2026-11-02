@@ -47,7 +47,10 @@ Rotating the secret (delete it, re-run the script) resets every WireGuard tunnel
 install and manages itself; from then on change ArgoCD there, not in `charts/argo` here. Once that Application exists,
 `deploy-argo.sh` changes nothing in the cluster: when it is Synced/Healthy it moves `teknoir-argo.yaml` out of the k3s
 manifests directory (to `manifests-detached/`, so a k3s restart no longer re-applies it over the Application) and
-otherwise warns. `FORCE_DEPLOY=1` writes the file anyway (break-glass).
+otherwise warns; if it cannot read the cluster it stops without changing anything. `FORCE_DEPLOY=1` writes the file
+anyway (break-glass, only when ArgoCD cannot fix itself): turn off automated sync on `app-of-apps` first (its selfHeal
+would restore the next step), then on `argo`, run it, fix `charts/argo` in gitops to match, re-enable (`argo`, then
+`app-of-apps`), and re-run `deploy-argo.sh` without `FORCE_DEPLOY` to detach the file again.
 
 Staging (`teknoir-cloud`) does not follow the branch: ArgoCD follows one released commit of
 `platform-applications-gitops` (tag `staging-YYYYMMDD.N`). The root is therefore a template,
