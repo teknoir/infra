@@ -1,3 +1,6 @@
+# First install only (scripts/deploy-argo.sh). After that ArgoCD manages itself from the copy of this chart in
+# platform-applications-gitops (teknoir-cloud, charts/argo, Application argo): change it there. Keep the two
+# rendering the same objects, so a fresh install adopts without a change.
 
 namespace: teknoir-system
 domain: "teknoir.cloud"

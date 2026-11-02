@@ -3,9 +3,39 @@
 #   STAGING_HOST    ssh target (default anders@192.168.2.19, vpro; r415 until 2026-10-16)
 #   K3S_MANIFESTS   k3s server manifests dir (default /var/lib/rancher/k3s/server/manifests;
 #                   r415 used data-dir /opt/k3s)
+#   FORCE_DEPLOY=1  write teknoir-argo.yaml even when ArgoCD manages itself (break-glass)
+#
+# First install only. Once the Application teknoir-system/argo exists (platform-applications-gitops
+# teknoir-cloud, charts/argo, same Helm release name argo), ArgoCD manages itself and this script
+# changes nothing in the cluster: when that Application is Synced and Healthy it moves
+# teknoir-argo.yaml out of the manifests directory (k3s would re-apply it over the Application on
+# every restart); otherwise it warns and leaves the file for a later run. The kube-system Addon teknoir-argo stays behind:
+# k3s deletes nothing when a file disappears, so the Addon is a harmless orphan.
+# The ssh commands expand $K3S_MANIFESTS and $DETACHED_DIR locally on purpose.
+# shellcheck disable=SC2029
 set -e
 STAGING_HOST=${STAGING_HOST:-anders@192.168.2.19}
 K3S_MANIFESTS=${K3S_MANIFESTS:-/var/lib/rancher/k3s/server/manifests}
+DETACHED_DIR=$(dirname "$K3S_MANIFESTS")/manifests-detached
+
+app_status=$(ssh "$STAGING_HOST" "sudo k3s kubectl -n teknoir-system get applications.argoproj.io argo \
+  -o jsonpath='{.status.sync.status}/{.status.health.status}' 2>/dev/null" || true)
+
+if [ -n "$app_status" ] && [ "${FORCE_DEPLOY:-0}" != 1 ]; then
+  echo "deploy-argo: Application teknoir-system/argo exists ($app_status): ArgoCD manages itself; change it in platform-applications-gitops charts/argo"
+  if [ "$app_status" != "Synced/Healthy" ]; then
+    echo "deploy-argo: WARNING: teknoir-argo.yaml left in place until the Application is Synced/Healthy; re-run then" >&2
+    exit 0
+  fi
+  ssh "$STAGING_HOST" "if sudo test -f $K3S_MANIFESTS/teknoir-argo.yaml; then
+      sudo install -d $DETACHED_DIR && sudo mv $K3S_MANIFESTS/teknoir-argo.yaml $DETACHED_DIR/teknoir-argo.yaml.\$(date -u +%Y%m%dT%H%M%SZ) &&
+      echo 'deploy-argo: moved teknoir-argo.yaml to $DETACHED_DIR (k3s no longer applies it)'
+    else
+      echo 'deploy-argo: teknoir-argo.yaml already detached'
+    fi"
+  exit 0
+fi
+[ -z "$app_status" ] || echo "deploy-argo: FORCE_DEPLOY=1: writing teknoir-argo.yaml over the self-managed ArgoCD; the Application argo re-syncs it" >&2
 
 helm dependency build charts/argo >/dev/null
 helm template --namespace teknoir-system --values charts/argo/values.yaml argo charts/argo > teknoir-argo.yaml
