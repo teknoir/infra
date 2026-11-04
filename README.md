@@ -69,10 +69,22 @@ placeholders `__STAGING_RELEASE_SHA__` / `__STAGING_RELEASE__` would be applied 
   another release is refused (that is `scripts/staging-release`), and a live branch-following root (no annotation, the
   state before the cutover) is refused with a pointer to `scripts/staging-release --bootstrap` in `platform-applications-gitops`.
 - `--check` does everything `--apply` would check, applies nothing and prints `<release> <sha>`.
-- The contexts `*eks*`, `*online*`, `*prod*` and `*r415*` are refused.
+- The context must be exactly `vpro` or `r415`. Production-looking contexts (`*eks*`, `*online*`, `*prod*`) are
+  refused first, and anything else that is not exactly `vpro`/`r415` (`k3d-r415`, `r415-old`, …) is refused too.
+- Before a new cluster's first release the root can follow a gitops branch instead: `--pre-release BRANCH` renders
+  `teknoir-cloud-app-of-apps-prerelease.yaml.tmpl`, whose Application has no release annotation and sets
+  `targetRevision` and the `release` Helm parameter to the branch. The branch must exist on the remote and have the
+  release helper (`charts/app-of-apps/values.yaml` with a `release:` key); `teknoir-cloud` itself is refused (it is
+  staged by releases). `--apply` acts only on a fresh cluster or on a root already on that branch; it refuses a
+  released root and a root on another branch. `--check` prints `<branch> <sha>`. The cutover to a release is
+  `scripts/staging-release --bootstrap` in `platform-applications-gitops`.
 
-A fresh host is brought up with `scripts/staging-bootstrap.sh`, which resolves and verifies the release first
-(`staging-root.sh --check`), before any namespace, Secret or ArgoCD change, and passes it to `--apply` in step 3.
+A fresh host is brought up with `scripts/staging-bootstrap.sh --context vpro|r415`, which resolves and verifies the
+release first (`staging-root.sh --check`), before any namespace, Secret or ArgoCD change, and passes it to `--apply`
+in step 3. `--host` defaults to `anders@192.168.2.19` on vpro and `anders@192.168.2.166` on r415; on r415
+`K3S_MANIFESTS` defaults to `/opt/k3s/server/manifests` (r415's k3s data-dir) and is passed to `deploy-argo.sh`.
+`--pre-release BRANCH` does the same for a branch-following root, and `--no-ci` skips the `teknoir-ci` namespace and
+its `github-ci` Secret.
 Design: `plans/staging-releases.md` in the workspace. Tests: `scripts/tests/staging-root-test.sh`
 (`K3D_CONTEXT=k3d-teknoir-dev` adds a re-apply under the release guard in a scratch namespace).
 

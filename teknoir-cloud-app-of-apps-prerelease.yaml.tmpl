@@ -1,0 +1,53 @@
+# TEMPLATE of the pre-release staging (teknoir-cloud) root Application. A NEW staging cluster follows a
+# platform-applications-gitops branch until its first release; this is the root for that time. Rendered only by
+#   scripts/staging-root.sh --context vpro|r415 --pre-release BRANCH [--check | --apply]
+#   scripts/staging-bootstrap.sh --context vpro|r415 [--host ...] --pre-release BRANCH
+# and never applied by hand. The cutover to a released root is scripts/staging-release --bootstrap in
+# platform-applications-gitops. Unlike teknoir-cloud-app-of-apps.yaml.tmpl there is no teknoir.org/release
+# annotation and no releaseName parameter: this root follows a branch, it is not a release.
+#   __STAGING_BRANCH__  the gitops branch it follows (targetRevision and helm parameter `release`)
+# See plans/staging-releases.md and README.md.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: teknoir-system
+spec:
+  sourceRepos:
+    - '*'
+  sourceNamespaces: []
+  destinations:
+    - namespace: 'teknoir-system'
+      server: 'https://kubernetes.default.svc'
+  clusterResourceWhitelist:
+    - group: 'argoproj.io'
+      kind: 'AppProject'
+    - group: 'argoproj.io'
+      kind: 'Application'
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: teknoir-system
+spec:
+  destination:
+    namespace: teknoir-system
+    server: https://kubernetes.default.svc
+  source:
+    path: charts/app-of-apps
+    repoURL: https://github.com/teknoir/platform-applications-gitops
+    targetRevision: "__STAGING_BRANCH__"
+    helm:
+      parameters:
+        - name: release
+          value: "__STAGING_BRANCH__"
+          forceString: true
+  project: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      enabled: true

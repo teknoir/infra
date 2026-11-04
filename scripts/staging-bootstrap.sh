@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # staging-bootstrap.sh: bring up staging (teknoir-cloud) on a fresh single-node k3s server.
 #
-#   scripts/staging-bootstrap.sh --context vpro [--host anders@192.168.2.19] [--release TAG --sha SHA [--untagged]]
+#   scripts/staging-bootstrap.sh --context vpro|r415 [--host ...] [--release TAG --sha SHA [--untagged]] [--no-ci]
+#   scripts/staging-bootstrap.sh --context vpro|r415 [--host ...] --pre-release BRANCH [--no-ci]
+#
+# --host defaults to anders@192.168.2.19 on vpro and anders@192.168.2.166 on r415; on r415 K3S_MANIFESTS
+# defaults to /opt/k3s/server/manifests (r415's k3s data-dir) and is passed to scripts/deploy-argo.sh.
+# --pre-release BRANCH follows a platform-applications-gitops branch instead of a release, for a NEW staging
+# cluster before its first release (the cutover is scripts/staging-release --bootstrap). It excludes
+# --release/--sha/--untagged. --no-ci skips the teknoir-ci namespace and its github-ci Secret.
 #
 # The release of the root app-of-apps is resolved and verified FIRST (scripts/staging-root.sh --check, which
 # changes nothing); a failure there (no verified release, no gh auth, a pre-cutover branch-following root) stops
@@ -21,24 +28,36 @@
 #   3. ArgoCD (scripts/deploy-argo.sh) and the root app-of-apps, rendered for a RELEASE by scripts/staging-root.sh
 #      (optional --release staging-YYYYMMDD.N --sha <40-hex> to name one explicitly; --untagged if that tag does not
 #      exist yet, i.e. before the first release). Against a live branch-following root it refuses: that is the cutover,
-#      scripts/staging-release --bootstrap in platform-applications-gitops.
+#      scripts/staging-release --bootstrap in platform-applications-gitops. --pre-release BRANCH renders the
+#      pre-release template instead, so a new cluster can follow a gitops branch before its first release.
 # Idempotent: rerun it after providing a missing credential.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CONTEXT='' HOST=anders@192.168.2.19 ROOT_ARGS=() ROOT_FLAGS=()
+CONTEXT='' HOST='' ROOT_ARGS=() ROOT_FLAGS=() PRERELEASE='' NO_CI='' EXPLICIT=''
 while [ $# -gt 0 ]; do
 	case $1 in
 	--context) CONTEXT=$2; shift ;;
 	--host) HOST=$2; shift ;;
-	--release | --sha) ROOT_ARGS+=("$1" "$2"); shift ;; # explicit release for scripts/staging-root.sh
-	--untagged) ROOT_ARGS+=("$1"); ROOT_FLAGS+=("$1") ;;
+	--release | --sha) ROOT_ARGS+=("$1" "$2"); EXPLICIT=1; shift ;; # explicit release for scripts/staging-root.sh
+	--untagged) ROOT_ARGS+=("$1"); ROOT_FLAGS+=("$1"); EXPLICIT=1 ;;
+	--pre-release) PRERELEASE=$2; ROOT_ARGS+=("--pre-release" "$2"); shift ;;
+	--no-ci) NO_CI=1 ;;
 	*) echo "unknown argument $1" >&2; exit 2 ;;
 	esac
 	shift
 done
 [ -n "$CONTEXT" ] || { echo "--context is required (never the current context)" >&2; exit 2; }
-case $CONTEXT in *eks*|*online*|*prod*|*r415*) echo "refusing a production-looking or retired context: $CONTEXT" >&2; exit 2 ;; esac
+case $CONTEXT in *eks*|*online*|*prod*) echo "refusing a production-looking or retired context: $CONTEXT" >&2; exit 2 ;; esac
+case $CONTEXT in vpro|r415) ;; *) echo "context must be vpro or r415 (staging), got: $CONTEXT" >&2; exit 2 ;; esac
+[ -z "$PRERELEASE" ] || [ -z "$EXPLICIT" ] || { echo "--pre-release excludes --release, --sha and --untagged" >&2; exit 2; }
+if [ -z "$HOST" ]; then
+	case $CONTEXT in
+	r415) HOST=anders@192.168.2.166 ;;
+	*) HOST=anders@192.168.2.19 ;;
+	esac
+fi
+if [ "$CONTEXT" = r415 ] && [ -z "${K3S_MANIFESTS:-}" ]; then K3S_MANIFESTS=/opt/k3s/server/manifests; fi
 k() { kubectl --context "$CONTEXT" "$@"; }
 log() { printf 'staging-bootstrap: %s\n' "$*"; }
 warn() { printf 'staging-bootstrap: WARNING: %s\n' "$*" >&2; }
@@ -54,7 +73,11 @@ if ! root_release=$(scripts/staging-root.sh --context "$CONTEXT" --check ${ROOT_
 	exit 1
 fi
 read -r ROOT_RELEASE ROOT_SHA <<<"$root_release"
-log "root release: $ROOT_RELEASE ($ROOT_SHA)"
+if [ -n "$PRERELEASE" ]; then
+	log "root follows branch $PRERELEASE (pre-release), commit $ROOT_SHA"
+else
+	log "root release: $ROOT_RELEASE ($ROOT_SHA)"
+fi
 
 # 1. namespaces ------------------------------------------------------------------------
 ns() { # <name> <istio-injection>
@@ -64,7 +87,11 @@ ns() { # <name> <istio-injection>
 ns teknoir-system enabled
 ns teknoir-auth enabled
 ns cert-manager disabled
-ns teknoir-ci disabled
+if [ -z "$NO_CI" ]; then
+	ns teknoir-ci disabled
+else
+	log "--no-ci: namespace teknoir-ci and Secret github-ci skipped"
+fi
 ns stunner-system disabled
 log "namespaces ready"
 
@@ -81,10 +108,12 @@ if [ -n "$pat" ]; then
 				--from-file=.dockerconfigjson=/dev/stdin --dry-run=client -o yaml | apply_stdin
 		log "$n/ghcr-token created"
 	done
-	if has_secret teknoir-ci github-ci; then log "teknoir-ci/github-ci exists"; else
-		printf '%s' "$pat" | k -n teknoir-ci create secret generic github-ci --from-literal=username="$user" \
-			--from-file=token=/dev/stdin --dry-run=client -o yaml | apply_stdin
-		log "teknoir-ci/github-ci created"
+	if [ -z "$NO_CI" ]; then
+		if has_secret teknoir-ci github-ci; then log "teknoir-ci/github-ci exists"; else
+			printf '%s' "$pat" | k -n teknoir-ci create secret generic github-ci --from-literal=username="$user" \
+				--from-file=token=/dev/stdin --dry-run=client -o yaml | apply_stdin
+			log "teknoir-ci/github-ci created"
+		fi
 	fi
 	unset pat auth
 else
@@ -117,10 +146,20 @@ else
 fi
 
 # 3. ArgoCD + root app-of-apps ---------------------------------------------------------
-STAGING_HOST=$HOST scripts/deploy-argo.sh
+if [ -n "${K3S_MANIFESTS:-}" ]; then
+	STAGING_HOST=$HOST K3S_MANIFESTS=$K3S_MANIFESTS scripts/deploy-argo.sh
+else
+	STAGING_HOST=$HOST scripts/deploy-argo.sh
+fi
 log "waiting for the ArgoCD CRDs"
 until k get crd applications.argoproj.io appprojects.argoproj.io >/dev/null 2>&1; do sleep 5; done
 # Staging follows a released commit, not the branch: staging-root.sh fills teknoir-cloud-app-of-apps.yaml.tmpl with the
 # release resolved and verified in step 0 (see plans/staging-releases.md). A live root already at it is left alone.
-scripts/staging-root.sh --context "$CONTEXT" --apply --release "$ROOT_RELEASE" --sha "$ROOT_SHA" ${ROOT_FLAGS[@]+"${ROOT_FLAGS[@]}"}
-log "app-of-apps applied; ArgoCD now installs the platform from the released platform-applications-gitops commit"
+# --pre-release does the same with the prerelease template, for a new cluster before its first release.
+if [ -n "$PRERELEASE" ]; then
+	scripts/staging-root.sh --context "$CONTEXT" --apply --pre-release "$PRERELEASE"
+	log "app-of-apps applied; ArgoCD now installs the platform from branch $PRERELEASE (pre-release)"
+else
+	scripts/staging-root.sh --context "$CONTEXT" --apply --release "$ROOT_RELEASE" --sha "$ROOT_SHA" ${ROOT_FLAGS[@]+"${ROOT_FLAGS[@]}"}
+	log "app-of-apps applied; ArgoCD now installs the platform from the released platform-applications-gitops commit"
+fi
