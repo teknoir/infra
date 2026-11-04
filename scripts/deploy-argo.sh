@@ -1,8 +1,10 @@
 #!/bin/sh
 # Install ArgoCD on the staging k3s server through k3s's auto-deploy manifests directory.
-#   STAGING_HOST    ssh target (default anders@192.168.2.19, vpro; r415 until 2026-10-16)
+#   STAGING_HOST    ssh target (default anders@192.168.2.19, vpro; staging-bootstrap.sh passes the
+#                   r415 host, anders@192.168.2.166, for --context r415)
 #   K3S_MANIFESTS   k3s server manifests dir (default /var/lib/rancher/k3s/server/manifests;
-#                   r415 used data-dir /opt/k3s)
+#                   r415 uses data-dir /opt/k3s, and staging-bootstrap.sh passes
+#                   /opt/k3s/server/manifests for --context r415)
 #   FORCE_DEPLOY=1  write teknoir-argo.yaml even when ArgoCD manages itself (break-glass: turn off
 #                   automated sync on app-of-apps, then on argo, first, or selfHeal reverts it; the
 #                   file stays in the manifests directory until the next normal run detaches it)

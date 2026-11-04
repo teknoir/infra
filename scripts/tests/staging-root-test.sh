@@ -16,6 +16,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/../.." && pwd)"
 SCRIPT="${ROOT}/scripts/staging-root.sh"
 TMPL="${ROOT}/teknoir-cloud-app-of-apps.yaml.tmpl"
+PRERELEASE_TMPL="${ROOT}/teknoir-cloud-app-of-apps-prerelease.yaml.tmpl"
 BASELINE="${HERE}/fixtures/live-root-spec.yaml"
 GUARD_CHART="${RELEASE_GUARD_CHART:-$HOME/git/ai/.worktrees/gitops-release-tooling/charts/release-guard}"
 TMP=$(mktemp -d)
@@ -41,6 +42,9 @@ g commit -qam c2-release-helper; C2=$(g rev-parse HEAD)
 g checkout -q -b feature; echo f >"$GR/f"; g add f; g commit -qm f1-on-a-feature-branch; F1=$(g rev-parse HEAD)
 g checkout -q teknoir-cloud; g merge -q --no-ff feature -m m1-merge-of-feature; M1=$(g rev-parse HEAD)
 echo c >"$GR/c"; g add c; g commit -qm c3; C3=$(g rev-parse HEAD)
+# pre-release branches: r415-staging at the release-helper commit, no-helper at the commit without it
+g branch r415-staging "$C3"
+g branch no-helper "$C1"
 ELSE=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 export STAGING_GITOPS_URL="file://$GR"
 tags_reset() { g tag -l | xargs -r git -C "$GR" tag -d >/dev/null; }
@@ -91,6 +95,8 @@ run() { "$SCRIPT" "$@" >"$TMP/out" 2>"$TMP/err"; RC=$?; OUT=$(tr -d "'" <"$TMP/o
 # 1. template shape -----------------------------------------------------------------------------
 check "template has only the two placeholders" \
 	bash -c "[ \"\$(grep -o '__STAGING_[A-Z_]*__' '$TMPL' | LC_ALL=C sort -u | tr '\n' ' ')\" = '__STAGING_RELEASE_SHA__ __STAGING_RELEASE__ ' ]"
+check "prerelease template has only the branch placeholder" \
+	bash -c "[ \"\$(grep -o '__STAGING_[A-Z_]*__' '$PRERELEASE_TMPL' | LC_ALL=C sort -u | tr '\n' ' ')\" = '__STAGING_BRANCH__ ' ]"
 check "old root file is gone" test ! -e "$ROOT/teknoir-cloud-app-of-apps.yaml"
 check "template has no 'sources:' (the controller drops an empty list; re-applying it is a spec change)" bash -c "! grep -qE '^[[:space:]]*sources:' '$TMPL'"
 
@@ -135,10 +141,13 @@ reset; run --apply --release staging-20261017.1 --sha "$C3"
 check "--apply without --context rejected" test "$RC" -ne 0
 reset; run --check
 check "--check without --context rejected" test "$RC" -ne 0
-for c in teknoir-poc-eks prod-cluster teknoir-online r415 k3d-r415; do
+for c in teknoir-poc-eks prod-cluster teknoir-online k3d-r415 r415-old r415-prod vpro2; do
 	reset; run --context "$c" --release staging-20261017.1 --sha "$C3"
 	check "context $c refused, kubectl never called" bash -c "[ $RC -ne 0 ] && [ ! -s '$FIX/kubectl.log' ]"
 done
+reset; tag_ann staging-20261017.1 "$C3"; run --context r415 --release staging-20261017.1 --sha "$C3"
+check "context r415 accepted, kubectl called with --context r415" \
+	bash -c "[ $RC -eq 0 ] && grep -q -- '--context r415' '$FIX/kubectl.log' && grep -q ' get application ' '$FIX/kubectl.log'"
 reset; tag_ann staging-20261017.1 "$C3"; run --release staging-20261017.1 --sha "$C3"
 check "default is print: kubectl never called" test ! -s "$FIX/kubectl.log"
 
@@ -263,15 +272,87 @@ check "an unreachable cluster is an error, not a silent GitHub fallback" test "$
 gh_setup; run --context vpro --check
 check "--check on a fresh cluster prints '<release> <sha>' and applies nothing" bash -c "[ $RC -eq 0 ] && [ '$OUT' = 'staging-20261017.10 $C3' ] && ! grep -q ' apply ' '$FIX/kubectl.log'"
 
-# 8. staging-bootstrap.sh resolves and validates the release before it changes anything -------------------
+# 8. --pre-release: a branch-following root before the first release ------------------------------------
+PR_BRANCH=r415-staging
+reset; run --pre-release "$PR_BRANCH"
+check "pre-release render exits 0" test "$RC" -eq 0
+cp "$TMP/out" "$TMP/preroot.yaml"
+check "pre-release: no placeholder left" bash -c "! grep -q '__STAGING_' '$TMP/preroot.yaml'"
+check "pre-release: render drops the template's comment header" bash -c "[ \"\$(head -1 '$TMP/preroot.yaml')\" = '---' ] && ! grep -q '^#' '$TMP/preroot.yaml'"
+python3 -I - "$TMP/preroot.yaml" "$TMPL" "$PR_BRANCH" <<'PY' && ok "pre-release: no annotation, branch targetRevision, one release parameter, rest as the release template" || bad "pre-release: rendered spec differs"
+import sys, yaml
+def docs(path):
+    return [d for d in yaml.safe_load_all(open(path)) if d]
+mine, rel = docs(sys.argv[1]), docs(sys.argv[2])
+branch = sys.argv[3]
+assert len(mine) == 2 and len(rel) == 2, (len(mine), len(rel))
+app = [d for d in mine if d["kind"] == "Application"][0]
+rel_app = [d for d in rel if d["kind"] == "Application"][0]
+assert app["metadata"].get("annotations") is None, app["metadata"]
+src = app["spec"]["source"]
+assert src["targetRevision"] == branch, src
+assert src["helm"] == {"parameters": [{"name": "release", "value": branch, "forceString": True}]}, src["helm"]
+assert [d for d in mine if d["kind"] == "AppProject"][0] == [d for d in rel if d["kind"] == "AppProject"][0]
+for d in (app, rel_app):
+    d["metadata"].pop("annotations", None)
+    d["spec"]["source"].pop("targetRevision")
+    d["spec"]["source"].pop("helm")
+assert app == rel_app, (app, rel_app)
+PY
+reset; run --pre-release teknoir-cloud
+check "pre-release: the teknoir-cloud branch is refused" bash -c "[ $RC -ne 0 ] && grep -q 'staged by releases' <<<'$ERR'"
+reset; run --pre-release "$C3"
+check "pre-release: a 40-hex SHA is refused" bash -c "[ $RC -ne 0 ] && grep -q 'not a branch' <<<'$ERR'"
+reset; run --pre-release 'bad branch'
+check "pre-release: a bad branch name is refused" bash -c "[ $RC -ne 0 ] && grep -q 'bad branch name' <<<'$ERR'"
+reset; run --pre-release nope
+check "pre-release: a branch missing on the remote is refused" bash -c "[ $RC -ne 0 ] && grep -q 'does not exist' <<<'$ERR'"
+reset; run --pre-release no-helper
+check "pre-release: a branch without the release helper is refused" bash -c "[ $RC -ne 0 ] && grep -q 'release helper' <<<'$ERR'"
+reset; run --pre-release "$PR_BRANCH" --release staging-20261017.1 --sha "$C3"
+check "pre-release excludes --release/--sha" bash -c "[ $RC -ne 0 ] && grep -q 'excludes' <<<'$ERR'"
+reset; run --pre-release "$PR_BRANCH" --untagged
+check "pre-release excludes --untagged" bash -c "[ $RC -ne 0 ] && grep -q 'excludes' <<<'$ERR'"
+reset; run --context r415 --check --pre-release "$PR_BRANCH"
+check "pre-release --check on a fresh cluster prints '<branch> <sha>'" \
+	bash -c "[ $RC -eq 0 ] && [ '$OUT' = '$PR_BRANCH $C3' ] && ! grep -q ' apply ' '$FIX/kubectl.log'"
+reset; run --context r415 --apply --pre-release "$PR_BRANCH"
+check "pre-release --apply on a fresh cluster applies the rendered root" \
+	bash -c "[ $RC -eq 0 ] && grep -q 'targetRevision: \"$PR_BRANCH\"' '$FIX/applied' && ! grep -q 'teknoir.org/release' '$FIX/applied'"
+reset; live '' "$PR_BRANCH"; run --context r415 --apply --pre-release "$PR_BRANCH"
+check "pre-release: a live root already on the branch is a no-op" \
+	bash -c "[ $RC -eq 0 ] && grep -q 'already follows' <<<'$ERR' && [ ! -e '$FIX/applied' ] && ! grep -q ' apply ' '$FIX/kubectl.log'"
+reset; live '' other-branch; run --context r415 --apply --pre-release "$PR_BRANCH"
+check "pre-release --apply refuses a root on another branch" \
+	bash -c "[ $RC -ne 0 ] && grep -q 'follows other-branch' <<<'$ERR' && [ ! -e '$FIX/applied' ]"
+reset; live '' other-branch; run --context r415 --check --pre-release "$PR_BRANCH"
+check "pre-release --check refuses a root on another branch" \
+	bash -c "[ $RC -ne 0 ] && grep -q 'not moving it' <<<'$ERR' && [ -z '$OUT' ]"
+reset; live staging-20261017.10 "$C3"; run --context r415 --apply --pre-release "$PR_BRANCH"
+check "pre-release --apply never moves a released root back to a branch" \
+	bash -c "[ $RC -ne 0 ] && grep -q 'never moves a released root' <<<'$ERR' && [ ! -e '$FIX/applied' ]"
+reset; live staging-20261017.10 "$C3"; run --context r415 --pre-release "$PR_BRANCH"
+check "pre-release print mode with a released live root only notes it" \
+	bash -c "[ $RC -eq 0 ] && grep -q 'note: live root is on' <<<'$ERR' && grep -q 'targetRevision: \"$PR_BRANCH\"' <<<'$OUT'"
+
+# 9. staging-bootstrap.sh resolves and validates the release before it changes anything -------------------
 TREE="$TMP/tree"; mkdir -p "$TREE/scripts"
-cp "$ROOT/scripts/staging-bootstrap.sh" "$ROOT/scripts/staging-root.sh" "$TREE/scripts/"; cp "$TMPL" "$TREE/"
+cp "$ROOT/scripts/staging-bootstrap.sh" "$ROOT/scripts/staging-root.sh" "$TREE/scripts/"
+cp "$TMPL" "$PRERELEASE_TMPL" "$TREE/"
 cat >"$TREE/scripts/deploy-argo.sh" <<'F'
 #!/usr/bin/env bash
-echo "deploy-argo.sh (stub)" >>"$FIX/kubectl.log"
+echo "deploy-argo.sh (stub) STAGING_HOST=${STAGING_HOST:-<unset>} K3S_MANIFESTS=${K3S_MANIFESTS:-<unset>}" >>"$FIX/kubectl.log"
 F
 chmod +x "$TREE"/scripts/*.sh
-boot() { PATH="$TMP/bin:$PATH" GITHUB_PAT=dummy-not-a-token "$TREE/scripts/staging-bootstrap.sh" "$@" >"$TMP/out" 2>"$TMP/err"; RC=$?; OUT=$(cat "$TMP/out"); ERR=$(tr -d "'" <"$TMP/err"); }
+# K3S_MANIFESTS is unset for the bootstrap unless the test asks for a caller-set one (TEST_K3S_MANIFESTS)
+boot() {
+	(
+		unset K3S_MANIFESTS
+		[ -z "${TEST_K3S_MANIFESTS:-}" ] || export K3S_MANIFESTS="$TEST_K3S_MANIFESTS"
+		PATH="$TMP/bin:$PATH" GITHUB_PAT=dummy-not-a-token "$TREE/scripts/staging-bootstrap.sh" "$@" >"$TMP/out" 2>"$TMP/err"
+	)
+	RC=$?; OUT=$(cat "$TMP/out"); ERR=$(tr -d "'" <"$TMP/err")
+}
 # shellcheck disable=SC2317
 only_reads() { ! grep -vE ' get application ' "$FIX/kubectl.log" | grep -q .; }
 gh_setup; : >"$FIX/releases.tsv"; boot --context vpro
@@ -281,17 +362,39 @@ check "bootstrap: pre-cutover branch-following root aborts before any cluster ch
 gh_setup; boot --context vpro --release staging-20261017.10 --sha "$C1"
 check "bootstrap: an unverifiable explicit release aborts before any cluster change" bash -c "[ $RC -ne 0 ]" && check "bootstrap: only a read happened (explicit)" only_reads
 gh_setup; boot --context r415
-check "bootstrap refuses r415" bash -c "[ $RC -eq 2 ] && [ ! -s '$FIX/kubectl.log' ]"
+check "bootstrap: r415 succeeds" test "$RC" -eq 0
+check "bootstrap: r415 defaults to the r415 host and its k3s manifests dir" \
+	bash -c "grep -q 'deploy-argo.sh (stub) STAGING_HOST=anders@192.168.2.166 K3S_MANIFESTS=/opt/k3s/server/manifests' '$FIX/kubectl.log'"
+gh_setup; boot --context r415 --host x@y
+check "bootstrap: --host wins over the r415 default" \
+	bash -c "[ $RC -eq 0 ] && grep -q 'deploy-argo.sh (stub) STAGING_HOST=x@y K3S_MANIFESTS=/opt/k3s/server/manifests' '$FIX/kubectl.log'"
+gh_setup; TEST_K3S_MANIFESTS=/custom/manifests boot --context r415
+check "bootstrap: a caller-set K3S_MANIFESTS is kept" \
+	bash -c "[ $RC -eq 0 ] && grep -q 'deploy-argo.sh (stub) STAGING_HOST=anders@192.168.2.166 K3S_MANIFESTS=/custom/manifests' '$FIX/kubectl.log'"
 gh_setup; boot --context vpro
 check "bootstrap: fresh cluster succeeds" test "$RC" -eq 0
+check "bootstrap: vpro defaults to the vpro host and passes no K3S_MANIFESTS" \
+	bash -c "grep -q 'deploy-argo.sh (stub) STAGING_HOST=anders@192.168.2.19 K3S_MANIFESTS=<unset>' '$FIX/kubectl.log'"
 check "bootstrap: the release read comes first, the root is applied last, with the checked release" bash -c "
 	[ \"\$(head -1 '$FIX/kubectl.log' | grep -c ' get application ')\" = 1 ] &&
 	[ \"\$(tail -1 '$FIX/kubectl.log' | grep -c ' apply -f -$')\" = 1 ] &&
 	grep -q 'deploy-argo.sh' '$FIX/kubectl.log' && grep -q 'targetRevision: \"$C3\"' '$FIX/applied' && grep -q 'staging-20261017.10' '$FIX/applied'"
 gh_setup; live staging-20261017.10 "$C3"; rm -f "$FIX/kubectl-err" "$FIX/kubectl-rc"; boot --context vpro
 check "bootstrap rerun on a cluster already at the release does not touch the root" bash -c "[ $RC -eq 0 ] && [ ! -e '$FIX/applied' ] && grep -q 'nothing to apply' <<<'$ERR'"
+gh_setup; boot --context vpro --no-ci
+check "bootstrap: --no-ci skips the teknoir-ci namespace and its Secret" \
+	bash -c "[ $RC -eq 0 ] && grep -q -- '--no-ci: namespace teknoir-ci and Secret github-ci skipped' <<<'$OUT' && ! grep -q 'namespace teknoir-ci' '$FIX/kubectl.log' && ! grep -q 'github-ci' '$FIX/kubectl.log'"
+gh_setup; boot --context vpro
+check "bootstrap: without --no-ci the namespace and Secret are created" \
+	bash -c "grep -q 'create namespace teknoir-ci' '$FIX/kubectl.log' && grep -q 'create secret generic github-ci' '$FIX/kubectl.log'"
+gh_setup; boot --context r415 --pre-release r415-staging --no-ci
+check "bootstrap: pre-release succeeds" test "$RC" -eq 0
+check "bootstrap: pre-release root applied last, first kubectl call is the live-root read" bash -c "
+	[ \"\$(head -1 '$FIX/kubectl.log' | grep -c ' get application ')\" = 1 ] &&
+	[ \"\$(tail -1 '$FIX/kubectl.log' | grep -c ' apply -f -$')\" = 1 ] &&
+	grep -q 'targetRevision: \"r415-staging\"' '$FIX/applied' && ! grep -q 'teknoir.org/release' '$FIX/applied'"
 
-# 9. optional: re-apply under the guard on a throwaway cluster -------------------------------------------------
+# 10. optional: re-apply under the guard on a throwaway cluster ------------------------------------------------
 if [ -n "${K3D_CONTEXT:-}" ]; then
 	case $K3D_CONTEXT in vpro | r415 | *eks* | *online* | *prod*) bad "K3D_CONTEXT must be a throwaway cluster"; K3D_CONTEXT='' ;; esac
 fi
