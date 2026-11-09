@@ -77,7 +77,11 @@ case " $* " in
 	[ -f "$FIX/kubectl-out" ] && cat "$FIX/kubectl-out"
 	exit "$(cat "$FIX/kubectl-rc" 2>/dev/null || echo 0)" ;;
 *" get crd "*) exit 0 ;;
+*" -n teknoir-system get secret teknoirbot-model-keys "*" -o jsonpath={.data.teknoir-demo} "*) [ ! -f "$FIX/model-key-entry" ] || echo ZHVtbXk=; exit 0 ;;
+*" -n teknoir-system get secret teknoirbot-model-keys "*" -o name "*) [ ! -f "$FIX/model-key-exists" ] || echo secret/teknoirbot-model-keys; exit 0 ;;
 *" get secret "*) exit 0 ;;
+*" create secret generic teknoirbot-model-keys "*) cat >"$FIX/model-key-stdin"; printf 'kind: ModelKeyFake\ndata:\n  teknoir-demo: %s\n' "$(base64 -w0 <"$FIX/model-key-stdin")"; exit 0 ;;
+*" --force-conflicts -f - "*) cat >"$FIX/forced-stdin"; exit 0 ;;
 *" -f - "* | *" --from-file="*) cat >/dev/null; echo "kind: Fake"; exit 0 ;;
 *" create namespace "*) echo "kind: Namespace"; exit 0 ;;
 esac
@@ -347,8 +351,10 @@ chmod +x "$TREE"/scripts/*.sh
 # K3S_MANIFESTS is unset for the bootstrap unless the test asks for a caller-set one (TEST_K3S_MANIFESTS)
 boot() {
 	(
-		unset K3S_MANIFESTS
+		unset K3S_MANIFESTS TEKNOIRBOT_MODEL_KEY FORCE
 		[ -z "${TEST_K3S_MANIFESTS:-}" ] || export K3S_MANIFESTS="$TEST_K3S_MANIFESTS"
+		[ -z "${TEST_MODEL_KEY:-}" ] || export TEKNOIRBOT_MODEL_KEY="$TEST_MODEL_KEY"
+		[ -z "${TEST_FORCE:-}" ] || export FORCE=1
 		PATH="$TMP/bin:$PATH" GITHUB_PAT=dummy-not-a-token "$TREE/scripts/staging-bootstrap.sh" "$@" >"$TMP/out" 2>"$TMP/err"
 	)
 	RC=$?; OUT=$(cat "$TMP/out"); ERR=$(tr -d "'" <"$TMP/err")
@@ -387,6 +393,28 @@ check "bootstrap: --no-ci skips the teknoir-ci namespace and its Secret" \
 gh_setup; boot --context vpro
 check "bootstrap: without --no-ci the namespace and Secret are created" \
 	bash -c "grep -q 'create namespace teknoir-ci' '$FIX/kubectl.log' && grep -q 'create secret generic github-ci' '$FIX/kubectl.log'"
+gh_setup; boot --context r415
+check "bootstrap: without TEKNOIRBOT_MODEL_KEY the model key Secret is skipped with a warning" \
+	bash -c "[ $RC -eq 0 ] && grep -q 'TEKNOIRBOT_MODEL_KEY not set' <<<'$ERR' && ! grep -q 'secret generic teknoirbot-model-keys' '$FIX/kubectl.log'"
+gh_setup; TEST_MODEL_KEY=dummy-model-key-1 boot --context r415
+check "bootstrap: TEKNOIRBOT_MODEL_KEY becomes teknoir-system/teknoirbot-model-keys, data key teknoir-demo, read from stdin" \
+	bash -c "[ $RC -eq 0 ] && grep -q -- '-n teknoir-system create secret generic teknoirbot-model-keys --from-file=teknoir-demo=/dev/stdin --dry-run=client -o yaml' '$FIX/kubectl.log' &&
+		printf %s dummy-model-key-1 | cmp -s - '$FIX/model-key-stdin' && grep -q 'teknoir-system/teknoirbot-model-keys created' <<<'$OUT' && ! grep -q -- --force-conflicts '$FIX/kubectl.log'"
+check "bootstrap: the model key is never an argument and never printed" \
+	bash -c "! grep -q -e dummy-model-key-1 -e \"\$(printf %s dummy-model-key-1 | base64 -w0)\" '$FIX/kubectl.log' '$TMP/out' '$TMP/err'"
+gh_setup; touch "$FIX/model-key-exists"; TEST_MODEL_KEY=dummy-model-key-4 boot --context r415
+check "bootstrap: a model key Secret without a teknoir-demo entry gets the entry (no --force-conflicts)" \
+	bash -c "[ $RC -eq 0 ] && printf %s dummy-model-key-4 | cmp -s - '$FIX/model-key-stdin' && ! grep -q -- --force-conflicts '$FIX/kubectl.log' &&
+		grep -q 'teknoir-system/teknoirbot-model-keys created' <<<'$OUT'"
+gh_setup; touch "$FIX/model-key-exists" "$FIX/model-key-entry"; TEST_MODEL_KEY=dummy-model-key-2 boot --context r415
+check "bootstrap: an existing teknoir-demo entry is left alone" \
+	bash -c "[ $RC -eq 0 ] && grep -q 'teknoir-system/teknoirbot-model-keys exists' <<<'$OUT' && [ ! -e '$FIX/model-key-stdin' ]"
+gh_setup; touch "$FIX/model-key-exists" "$FIX/model-key-entry"; TEST_MODEL_KEY=dummy-model-key-3 TEST_FORCE=1 boot --context r415
+check "bootstrap: FORCE=1 replaces the model key and takes the field over from a hand edit (--force-conflicts)" \
+	bash -c "[ $RC -eq 0 ] && printf %s dummy-model-key-3 | cmp -s - '$FIX/model-key-stdin' &&
+		[ \"\$(grep -c -- '--force-conflicts' '$FIX/kubectl.log')\" = 1 ] &&
+		grep -qx -- '--context r415 apply --server-side --field-manager=staging-bootstrap --force-conflicts -f -' '$FIX/kubectl.log' &&
+		grep -q 'kind: ModelKeyFake' '$FIX/forced-stdin'"
 gh_setup; boot --context r415 --pre-release r415-staging --no-ci
 check "bootstrap: pre-release succeeds" test "$RC" -eq 0
 check "bootstrap: pre-release root applied last, first kubectl call is the live-root read" bash -c "

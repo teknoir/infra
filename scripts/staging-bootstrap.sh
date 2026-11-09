@@ -24,6 +24,8 @@
 #        teknoir-ci/github-ci                                CI token  (same PAT: repo + write:packages)
 #        cert-manager/godaddy-api-key-prod                   GODADDY_API_KEY + GODADDY_API_SECRET (DNS-01)
 #        teknoir-system/backstage-github-app-secret          BACKSTAGE_GITHUB_APP_FILE (+ BACKSTAGE_GCP_SA_FILE)
+#        teknoir-system/teknoirbot-model-keys                TEKNOIRBOT_MODEL_KEY: the Anthropic API key for the bots
+#                                                            of teamspace teknoir-demo (data key teknoir-demo)
 #      An existing Secret is left alone unless FORCE=1;
 #   3. ArgoCD (scripts/deploy-argo.sh) and the root app-of-apps, rendered for a RELEASE by scripts/staging-root.sh
 #      (optional --release staging-YYYYMMDD.N --sha <40-hex> to name one explicitly; --untagged if that tag does not
@@ -63,7 +65,7 @@ log() { printf 'staging-bootstrap: %s\n' "$*"; }
 warn() { printf 'staging-bootstrap: WARNING: %s\n' "$*" >&2; }
 
 has_secret() { [ -n "$(k -n "$1" get secret "$2" --ignore-not-found -o name)" ] && [ -z "${FORCE:-}" ]; }
-apply_stdin() { k apply --server-side --field-manager=staging-bootstrap -f - >/dev/null; }
+apply_stdin() { k apply --server-side --field-manager=staging-bootstrap "$@" -f - >/dev/null; } # [extra apply flags]
 
 # 0. release of the root, before anything changes ---------------------------------------
 # Print/check mode is read-only (kubectl get, gh, git ls-remote/fetch). It fails on no verified release, no gh
@@ -143,6 +145,25 @@ elif [ -n "${BACKSTAGE_GITHUB_APP_FILE:-}" ] && [ -r "$BACKSTAGE_GITHUB_APP_FILE
 	log "teknoir-system/backstage-github-app-secret created"
 else
 	warn "BACKSTAGE_GITHUB_APP_FILE not set: backstage-api will not start until the Secret exists"
+fi
+
+# TeknoirBot's model proxy in backstage-api reads one data key per teamspace from this Secret (60 s cache); staging
+# has teknoir-demo only. The check is for the teknoir-demo entry, not the Secret: a missing or empty entry is added to
+# an existing Secret. FORCE=1 replaces the teknoir-demo entry; --force-conflicts takes it over from a hand edit
+# (kubectl patch, or kubectl create without --save-config), which a plain apply refuses as a conflict. Another
+# teamspace's entry survives FORCE=1 only if it was added with `kubectl patch` or server-side apply under its own field
+# manager (e.g. --field-manager=teknoirbot-<namespace>). Never use --field-manager=staging-bootstrap for it (each
+# apply drops what the other sent), a client-side `kubectl apply` or `kubectl create --save-config` (kubectl's
+# server-side apply takes those fields over and drops them).
+if [ -n "$(k -n teknoir-system get secret teknoirbot-model-keys --ignore-not-found -o jsonpath='{.data.teknoir-demo}')" ] &&
+	[ -z "${FORCE:-}" ]; then log "teknoir-system/teknoirbot-model-keys exists (entry teknoir-demo)"
+elif [ -n "${TEKNOIRBOT_MODEL_KEY:-}" ]; then
+	printf '%s' "$TEKNOIRBOT_MODEL_KEY" |
+		k -n teknoir-system create secret generic teknoirbot-model-keys --from-file=teknoir-demo=/dev/stdin \
+			--dry-run=client -o yaml | apply_stdin ${FORCE:+--force-conflicts}
+	log "teknoir-system/teknoirbot-model-keys created"
+else
+	warn "TEKNOIRBOT_MODEL_KEY not set: TeknoirBot's model proxy answers 503 (no model key) until the Secret exists"
 fi
 
 # 3. ArgoCD + root app-of-apps ---------------------------------------------------------

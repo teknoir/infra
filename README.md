@@ -85,6 +85,13 @@ in step 3. `--host` defaults to `anders@192.168.2.19` on vpro and `anders@192.16
 `K3S_MANIFESTS` defaults to `/opt/k3s/server/manifests` (r415's k3s data-dir) and is passed to `deploy-argo.sh`.
 `--pre-release BRANCH` does the same for a branch-following root, and `--no-ci` skips the `teknoir-ci` namespace and
 its `github-ci` Secret.
+The external credentials come from the environment and are never printed; the script's header lists them. One of
+them is TeknoirBot's model key: `TEKNOIRBOT_MODEL_KEY` (an Anthropic API key, best from a workspace with a monthly
+spend limit) becomes data key `teknoir-demo` of Secret `teknoir-system/teknoirbot-model-keys`, which backstage-api
+reads. A missing credential only warns; an existing Secret (for the model key: an existing `teknoir-demo` entry) is
+kept unless `FORCE=1`. Add another teamspace's key with `kubectl patch` or
+`kubectl apply --server-side --field-manager=teknoirbot-<namespace>`: if it is added under `staging-bootstrap` or with
+a client-side `kubectl apply`, `FORCE=1` (and the next such apply) deletes the other entries.
 Design: `plans/staging-releases.md` in the workspace. Tests: `scripts/tests/staging-root-test.sh`
 (`K3D_CONTEXT=k3d-teknoir-dev` adds a re-apply under the release guard in a scratch namespace).
 
