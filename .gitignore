@@ -18,3 +18,4 @@ manifest-argocd-keycloak-secret.yaml
 manifest-teknoir-github-secret.yaml
 infra_.yaml
 *.pem
+.test-logs/
