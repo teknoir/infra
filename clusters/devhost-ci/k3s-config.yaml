@@ -1,0 +1,25 @@
+# /etc/rancher/k3s/config.yaml on the dev host teknoir.airgapped (192.168.2.181).
+# devhost-ci: single-node k3s for the ARC CI runners (plans/cicd/proposal-v4.md 5.1).
+# Pod/service CIDRs avoid r415 (10.42/10.43) and docker (172.17+). Installed by install.sh.
+node-name: devhost-ci
+node-ip: 192.168.2.181
+tls-san:
+  - 192.168.2.181
+  - teknoir.airgapped
+cluster-cidr: 10.52.0.0/16
+service-cidr: 10.53.0.0/16
+cluster-dns: 10.53.0.10
+disable:
+  - traefik
+  - servicelb
+write-kubeconfig-mode: "0600"
+kubelet-arg:
+  # The host has 32 GiB swap; pods never swap (swapBehavior NoSwap is the default), host processes can.
+  - fail-swap-on=false
+  # Held back for agent sessions, T3, the desktop and dockerd (peak 10-20 GiB). kubepods memory.max = 24.8 GiB.
+  - system-reserved=cpu=8,memory=18Gi
+  - kube-reserved=cpu=1,memory=2Gi
+  - eviction-hard=memory.available<2Gi,nodefs.available<10%,nodefs.inodesFree<5%,imagefs.available<10%,imagefs.inodesFree<5%
+  - eviction-soft=memory.available<4Gi
+  - eviction-soft-grace-period=memory.available=1m
+  - max-pods=60
