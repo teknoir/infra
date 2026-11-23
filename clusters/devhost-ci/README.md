@@ -28,3 +28,19 @@ Single-node k3s on the dev host teknoir.airgapped (192.168.2.181) that runs the 
 
 ## Network
 6443/tcp should only be reachable from r415 (192.168.2.166, for ArgoCD from P6.3) and the host itself; the host firewall is off today, so this relies on the office LAN.
+
+## Runner image import (until `ghcr.io/teknoir/ci-runner` is public)
+
+The ARC scale sets run `ghcr.io/teknoir/ci-runner:<ver>-<n>@sha256:…` (Dockerfile in `teknoir/ci-workflows`
+`runner-image/`). The ghcr package is private and devhost-ci has no ghcr pull secret, so the image is imported into
+the node's containerd and also tagged by digest, which is the reference kubelet looks up (`IfNotPresent`):
+
+```sh
+docker pull ghcr.io/teknoir/ci-runner:2.338.2-1        # or build it from runner-image/
+docker save ghcr.io/teknoir/ci-runner:2.338.2-1 | sudo k3s ctr -n k8s.io images import -
+sudo k3s ctr -n k8s.io images tag ghcr.io/teknoir/ci-runner:2.338.2-1 \
+  ghcr.io/teknoir/ci-runner@sha256:5034edd365726c3e259ec0946764c0ef08ba825c5426e09df6d390564f38be3a
+```
+
+Repeat after every runner image bump and after anything that prunes node images (kubelet image GC above 85 % disk).
+Once the package is public (GitHub UI: package settings, Change visibility), kubelet pulls it and this step goes away.
