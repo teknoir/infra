@@ -1,5 +1,21 @@
 apiVersion: v1
 entries:
+  argo:
+  - apiVersion: v2
+    appVersion: 10.4.0
+    created: "2026-11-23T13:38:46.323914852Z"
+    dependencies:
+    - name: argo-cd
+      repository: https://argoproj.github.io/argo-helm
+      version: 10.4.0
+    description: A Helm chart for Argo CD, a declarative, GitOps continuous delivery
+      tool for Kubernetes.
+    digest: 49eac96c54af5efdb72db398f056fe9eaf9d1448fd87cd8ae05484e8eddb0c16
+    name: argo
+    type: application
+    urls:
+    - https://github.com/teknoir/infra/releases/download/argo-0.0.1/argo-0.0.1.tgz
+    version: 0.0.1
   auth:
   - apiVersion: v2
     appVersion: 0.1.0
@@ -5183,4 +5199,4 @@ entries:
     urls:
     - https://github.com/teknoir/infra/releases/download/teknoir-gateway-0.0.3/teknoir-gateway-0.0.3.tgz
     version: 0.0.3
-generated: "2026-04-07T11:08:30.495457665Z"
+generated: "2026-11-23T13:38:46.324380152Z"
