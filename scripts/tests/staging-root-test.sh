@@ -177,6 +177,16 @@ reset; tag_ann $R "$C1"; run --release $R --sha "$C1"
 check "explicit: a sha without the release: key in values.yaml is refused" bash -c "[ $RC -ne 0 ] && grep -q 'release helper' <<<'$ERR'"
 reset; tag_ann $R "$C2"; run --release $R --sha "$C2"
 check "explicit: the first sha with the release: key is accepted" test "$RC" -eq 0
+# The gitops branch is main since the CI v4 rename; teknoir-cloud is only the fallback.
+g branch -q -m teknoir-cloud main
+reset; tag_ann $R "$C3"; run --release $R --sha "$C3"
+check "explicit: after the rename the sha is verified on main" bash -c "[ $RC -eq 0 ] && grep -q 'first-parent of the gitops branch' <<<'$ERR'"
+reset; run --release $R --sha "$ELSE" --untagged
+check "explicit: after the rename a sha not on main is refused, naming main" bash -c "[ $RC -ne 0 ] && grep -q 'first-parent history of main' <<<'$ERR'"
+g branch -q -m main other
+reset; tag_ann $R "$C3"; run --release $R --sha "$C3"
+check "explicit: neither main nor teknoir-cloud on the remote is refused" bash -c "[ $RC -ne 0 ] && grep -q 'cannot fetch the gitops branch' <<<'$ERR'"
+g branch -q -m other teknoir-cloud
 
 # 5. live root ------------------------------------------------------------------------------------------
 LIVE_R=staging-20261001.3
@@ -305,6 +315,8 @@ assert app == rel_app, (app, rel_app)
 PY
 reset; run --pre-release teknoir-cloud
 check "pre-release: the teknoir-cloud branch is refused" bash -c "[ $RC -ne 0 ] && grep -q 'staged by releases' <<<'$ERR'"
+reset; run --pre-release main
+check "pre-release: the main branch is refused" bash -c "[ $RC -ne 0 ] && grep -q 'staged by releases' <<<'$ERR'"
 reset; run --pre-release "$C3"
 check "pre-release: a 40-hex SHA is refused" bash -c "[ $RC -ne 0 ] && grep -q 'not a branch' <<<'$ERR'"
 reset; run --pre-release 'bad branch'
