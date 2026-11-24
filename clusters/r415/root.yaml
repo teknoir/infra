@@ -1,0 +1,73 @@
+# The r415 (staging, teknoir-cloud) root Application after the Kargo cut-over
+# (CI v4, P4.4/P5.2).
+#
+# What it is: the two objects that start GitOps on r415 - the AppProject
+# `default` (exactly as in teknoir-cloud-app-of-apps.yaml.tmpl) and the
+# Application `teknoir-system/app-of-apps`. Its targetRevision is ONE verified
+# commit of teknoir/platform-applications-gitops (never `main`, never a
+# staging-YYYYMMDD.N release tag). The helm parameter `release` is
+# `$ARGOCD_APP_REVISION`, which ArgoCD substitutes with the commit it renders
+# at, so every child Application is rendered for the verified commit.
+#
+# __VERIFIED_SHA__ is a placeholder and is never applied as is.
+# scripts/kargo-root.sh fills it: from its --sha <40-hex>, or else from the
+# commit of the newest stamped `verified/<UTC yyyymmddThhmmssZ>-<sha8>` tag of
+# the gitops repo, after checking that the commit is an ancestor of the gitops
+# default branch. It prints by default and applies only with
+# `--apply --context r415`; `scripts/staging-bootstrap.sh --kargo` uses it on a
+# fresh cluster.
+#
+# Kargo owns targetRevision after the cut-over: Stage platform/staging moves it
+# to each promoted commit (the annotation kargo.akuity.io/authorized-stage
+# authorizes exactly that Stage, and nothing else). Do not re-apply this file to
+# move a live root, and never patch app-of-apps by hand to move staging: that is
+# clusters/r415/BREAK-GLASS.md, which is Anders' alone. Day to day staging
+# changes by merging to gitops `main`: Kargo promotes, verifies and tags
+# `verified/*`.
+# Design: plans/cicd/proposal-v4.md sections 3.1-3.4 and 6.2.
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: default
+  namespace: teknoir-system
+spec:
+  sourceRepos:
+    - '*'
+  sourceNamespaces: []
+  destinations:
+    - namespace: 'teknoir-system'
+      server: 'https://kubernetes.default.svc'
+  clusterResourceWhitelist:
+    - group: 'argoproj.io'
+      kind: 'AppProject'
+    - group: 'argoproj.io'
+      kind: 'Application'
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: app-of-apps
+  namespace: teknoir-system
+  annotations:
+    kargo.akuity.io/authorized-stage: "platform:staging"
+spec:
+  destination:
+    namespace: teknoir-system
+    server: https://kubernetes.default.svc
+  source:
+    path: charts/app-of-apps
+    repoURL: https://github.com/teknoir/platform-applications-gitops
+    targetRevision: "__VERIFIED_SHA__"
+    helm:
+      parameters:
+        - name: release
+          value: $ARGOCD_APP_REVISION
+          forceString: true
+  project: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+      enabled: true

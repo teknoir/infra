@@ -166,16 +166,22 @@ release_helper() {
 		die "$sha predates the release helper (no 'release:' key in charts/app-of-apps/values.yaml); its children would keep following the branch"
 }
 
-# verify_sha <sha>: first-parent membership of teknoir-cloud, and the release helper in charts/app-of-apps
+# verify_sha <sha>: first-parent membership of the staging branch, and the release helper in charts/app-of-apps.
+# The staging branch is teknoir-cloud until the CI v4 cut-over renames it to main (P5.1); STAGING_BRANCH overrides,
+# otherwise teknoir-cloud is tried first and main second.
 verify_sha() {
-	local sha=$1 repo=$TMPD/repo
+	local sha=$1 repo=$TMPD/repo br
 	"$GIT" init -q --bare "$repo" || die "cannot set up a scratch repository"
 	"$GIT" -C "$repo" remote add origin "$REPO_URL" || die "cannot set up a scratch repository"
-	GIT_TERMINAL_PROMPT=0 "$GIT" -C "$repo" fetch -q --no-tags --filter=blob:none origin \
-		"+refs/heads/teknoir-cloud:refs/remotes/origin/teknoir-cloud" || die "cannot fetch teknoir-cloud from $REPO_URL"
-	"$GIT" -C "$repo" rev-list --first-parent refs/remotes/origin/teknoir-cloud |
+	for br in ${STAGING_BRANCH:-teknoir-cloud main}; do
+		GIT_TERMINAL_PROMPT=0 "$GIT" -C "$repo" fetch -q --no-tags --filter=blob:none origin \
+			"+refs/heads/$br:refs/remotes/origin/$br" 2>/dev/null && break
+		br=''
+	done
+	[ -n "$br" ] || die "cannot fetch the staging branch (${STAGING_BRANCH:-teknoir-cloud or main}) from $REPO_URL"
+	"$GIT" -C "$repo" rev-list --first-parent "refs/remotes/origin/$br" |
 		awk -v s="$sha" '$0 == s {f = 1} END {exit !f}' ||
-		die "$sha is not on the first-parent history of teknoir-cloud"
+		die "$sha is not on the first-parent history of $br"
 	release_helper "$sha"
 }
 
@@ -244,7 +250,7 @@ else
 	[[ $SHA =~ $SHA_RE ]] || die "bad SHA '$SHA' (want 40 lowercase hex characters)"
 	if [ "$SOURCE" != live ]; then
 		verify_sha "$SHA"
-		log "verified $RELEASE ($SHA): first-parent of teknoir-cloud, has the release helper"
+		log "verified $RELEASE ($SHA): first-parent of the staging branch, has the release helper"
 	fi
 fi
 

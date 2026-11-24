@@ -95,6 +95,24 @@ a client-side `kubectl apply`, `FORCE=1` (and the next such apply) deletes the o
 Design: `plans/staging-releases.md` in the workspace. Tests: `scripts/tests/staging-root-test.sh`
 (`K3D_CONTEXT=k3d-teknoir-dev` adds a re-apply under the release guard in a scratch namespace).
 
+#### r415 root after the Kargo cut-over
+
+Once Kargo owns staging (CI v4 P5.2), r415's root Application points at one **verified** commit of
+`platform-applications-gitops`, not at a `staging-YYYYMMDD.N` release, and Stage `platform/staging` moves
+`targetRevision` from then on. Three files, all infra `main`:
+
+- `clusters/r415/root.yaml`: the AppProject `default` plus the `teknoir-system/app-of-apps` Application with
+  `targetRevision: __VERIFIED_SHA__`, the `kargo.akuity.io/authorized-stage: "platform:staging"` annotation and helm
+  parameter `release=$ARGOCD_APP_REVISION`. The placeholder is never applied as is.
+- `scripts/kargo-root.sh`: fills it from `--sha <40-hex>` or the newest stamped `verified/<UTC yyyymmddThhmmssZ>-<sha8>`
+  tag, after checking that the commit is an ancestor of the gitops default branch. Print by default; `--check` prints
+  `<sha> <tag>`; `--apply` needs `--context r415` and refuses to move a Kargo-owned root. A fresh r415 comes up with
+  `scripts/staging-bootstrap.sh --context r415 --kargo` (`--sha` names the commit; `--release`, `--untagged` and
+  `--pre-release` are excluded).
+- `clusters/r415/BREAK-GLASS.md`: the only way to move a live root by hand. **Anders only**; agents never run it.
+
+Design: `plans/cicd/proposal-v4.md` sections 3.1-3.4 and 6.2; tests: `scripts/tests/kargo-root-test.sh`.
+
 ### 3. Important manual steps
 
 **Setup in Keycloak**

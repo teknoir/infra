@@ -3,6 +3,7 @@
 #
 #   scripts/staging-bootstrap.sh --context vpro|r415 [--host ...] [--release TAG --sha SHA [--untagged]] [--no-ci]
 #   scripts/staging-bootstrap.sh --context vpro|r415 [--host ...] --pre-release BRANCH [--no-ci]
+#   scripts/staging-bootstrap.sh --context r415 [--host ...] --kargo [--sha SHA] [--no-ci]
 #
 # --host defaults to anders@192.168.2.19 on vpro and anders@192.168.2.166 on r415; on r415 K3S_MANIFESTS
 # defaults to /opt/k3s/server/manifests (r415's k3s data-dir) and is passed to scripts/deploy-argo.sh.
@@ -10,9 +11,18 @@
 # cluster before its first release (the cutover is scripts/staging-release --bootstrap). It excludes
 # --release/--sha/--untagged. --no-ci skips the teknoir-ci namespace and its github-ci Secret.
 #
-# The release of the root app-of-apps is resolved and verified FIRST (scripts/staging-root.sh --check, which
-# changes nothing); a failure there (no verified release, no gh auth, a pre-cutover branch-following root) stops
-# the script before any namespace, Secret or ArgoCD change.
+# --kargo is the root of a cluster after the Kargo cut-over (CI v4 P5.2): step 3 uses scripts/kargo-root.sh and
+# clusters/r415/root.yaml instead of scripts/staging-root.sh and the release template, so the root starts at a
+# verified gitops commit (newest stamped verified/* tag, or --sha) and Kargo moves it from then on. It needs
+# --context r415, excludes --release, --untagged and --pre-release (--sha names the commit), and, like the rest of
+# this script, is for a FRESH cluster: against a live Kargo-moved root kargo-root.sh refuses, and moving a live root
+# is clusters/r415/BREAK-GLASS.md (Anders only). Everything else, including the order of the steps, is unchanged.
+# A rerun after the cut-over stays a no-op: with no --sha, a live root carrying kargo.akuity.io/authorized-stage
+# supplies its own targetRevision (kargo-root.sh --check prints "<sha> live"), and --apply finds the root already there.
+#
+# The release of the root app-of-apps is resolved and verified FIRST (scripts/staging-root.sh --check, or
+# scripts/kargo-root.sh --check with --kargo; both change nothing); a failure there (no verified release, no gh
+# auth, a pre-cutover branch-following root) stops the script before any namespace, Secret or ArgoCD change.
 #
 # Everything random is generated in-cluster by GitOps (platform-secrets), and Keycloak is
 # configured by GitOps (charts/auth realm file), so this script only does what GitOps
@@ -32,18 +42,22 @@
 #      exist yet, i.e. before the first release). Against a live branch-following root it refuses: that is the cutover,
 #      scripts/staging-release --bootstrap in platform-applications-gitops. --pre-release BRANCH renders the
 #      pre-release template instead, so a new cluster can follow a gitops branch before its first release.
+#      --kargo renders clusters/r415/root.yaml with scripts/kargo-root.sh instead (a verified gitops commit, Kargo
+#      moves it afterwards; see the top of this header).
 # Idempotent: rerun it after providing a missing credential.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CONTEXT='' HOST='' ROOT_ARGS=() ROOT_FLAGS=() PRERELEASE='' NO_CI='' EXPLICIT=''
+CONTEXT='' HOST='' ROOT_ARGS=() PRERELEASE='' NO_CI='' EXPLICIT='' KARGO='' RELEASE_ARG='' SHA_ARG='' UNTAGGED=''
 while [ $# -gt 0 ]; do
 	case $1 in
 	--context) CONTEXT=$2; shift ;;
 	--host) HOST=$2; shift ;;
-	--release | --sha) ROOT_ARGS+=("$1" "$2"); EXPLICIT=1; shift ;; # explicit release for scripts/staging-root.sh
-	--untagged) ROOT_ARGS+=("$1"); ROOT_FLAGS+=("$1"); EXPLICIT=1 ;;
+	--release) RELEASE_ARG=$2; ROOT_ARGS+=("$1" "$2"); EXPLICIT=1; shift ;;
+	--sha) SHA_ARG=$2; ROOT_ARGS+=("$1" "$2"); EXPLICIT=1; shift ;;
+	--untagged) ROOT_ARGS+=("$1"); UNTAGGED=1; EXPLICIT=1 ;;
 	--pre-release) PRERELEASE=$2; ROOT_ARGS+=("--pre-release" "$2"); shift ;;
+	--kargo) KARGO=1 ;;
 	--no-ci) NO_CI=1 ;;
 	*) echo "unknown argument $1" >&2; exit 2 ;;
 	esac
@@ -53,6 +67,13 @@ done
 case $CONTEXT in *eks*|*online*|*prod*) echo "refusing a production-looking or retired context: $CONTEXT" >&2; exit 2 ;; esac
 case $CONTEXT in vpro|r415) ;; *) echo "context must be vpro or r415 (staging), got: $CONTEXT" >&2; exit 2 ;; esac
 [ -z "$PRERELEASE" ] || [ -z "$EXPLICIT" ] || { echo "--pre-release excludes --release, --sha and --untagged" >&2; exit 2; }
+if [ -n "$KARGO" ]; then
+	[ -z "$PRERELEASE$RELEASE_ARG$UNTAGGED" ] || { echo "--kargo excludes --release, --untagged and --pre-release (--sha names the commit)" >&2; exit 2; }
+	[ "$CONTEXT" = r415 ] || { echo "--kargo is the r415 root after the Kargo cut-over; context must be r415" >&2; exit 2; }
+	# scripts/kargo-root.sh takes --sha, not --release/--untagged
+	ROOT_ARGS=()
+	[ -z "$SHA_ARG" ] || ROOT_ARGS=(--sha "$SHA_ARG")
+fi
 if [ -z "$HOST" ]; then
 	case $CONTEXT in
 	r415) HOST=anders@192.168.2.166 ;;
@@ -67,18 +88,28 @@ warn() { printf 'staging-bootstrap: WARNING: %s\n' "$*" >&2; }
 has_secret() { [ -n "$(k -n "$1" get secret "$2" --ignore-not-found -o name)" ] && [ -z "${FORCE:-}" ]; }
 apply_stdin() { k apply --server-side --field-manager=staging-bootstrap "$@" -f - >/dev/null; } # [extra apply flags]
 
-# 0. release of the root, before anything changes ---------------------------------------
-# Print/check mode is read-only (kubectl get, gh, git ls-remote/fetch). It fails on no verified release, no gh
-# auth, an unverifiable explicit release or a pre-cutover branch-following root, all before step 1.
-if ! root_release=$(scripts/staging-root.sh --context "$CONTEXT" --check ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"}); then
-	echo "staging-bootstrap: the root release cannot be resolved or applied; nothing was changed" >&2
-	exit 1
-fi
-read -r ROOT_RELEASE ROOT_SHA <<<"$root_release"
-if [ -n "$PRERELEASE" ]; then
-	log "root follows branch $PRERELEASE (pre-release), commit $ROOT_SHA"
+# 0. commit or release of the root, before anything changes ------------------------------
+# Print/check mode is read-only (kubectl get, gh, git ls-remote/fetch). It fails on no verified release (or no
+# stamped verified/* tag with --kargo), no gh auth, an unverifiable explicit release or a pre-cutover
+# branch-following root, all before step 1.
+if [ -n "$KARGO" ]; then
+	if ! root_commit=$(scripts/kargo-root.sh --context "$CONTEXT" --check ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"}); then
+		echo "staging-bootstrap: the root commit cannot be resolved or applied; nothing was changed" >&2
+		exit 1
+	fi
+	read -r ROOT_SHA ROOT_RELEASE <<<"$root_commit" # kargo-root.sh --check prints "<sha> <tag>"
+	log "root verified commit: $ROOT_RELEASE ($ROOT_SHA)"
 else
-	log "root release: $ROOT_RELEASE ($ROOT_SHA)"
+	if ! root_release=$(scripts/staging-root.sh --context "$CONTEXT" --check ${ROOT_ARGS[@]+"${ROOT_ARGS[@]}"}); then
+		echo "staging-bootstrap: the root release cannot be resolved or applied; nothing was changed" >&2
+		exit 1
+	fi
+	read -r ROOT_RELEASE ROOT_SHA <<<"$root_release"
+	if [ -n "$PRERELEASE" ]; then
+		log "root follows branch $PRERELEASE (pre-release), commit $ROOT_SHA"
+	else
+		log "root release: $ROOT_RELEASE ($ROOT_SHA)"
+	fi
 fi
 
 # 1. namespaces ------------------------------------------------------------------------
@@ -177,10 +208,15 @@ until k get crd applications.argoproj.io appprojects.argoproj.io >/dev/null 2>&1
 # Staging follows a released commit, not the branch: staging-root.sh fills teknoir-cloud-app-of-apps.yaml.tmpl with the
 # release resolved and verified in step 0 (see plans/staging-releases.md). A live root already at it is left alone.
 # --pre-release does the same with the prerelease template, for a new cluster before its first release.
+# --kargo fills clusters/r415/root.yaml with the verified commit resolved in step 0 (kargo-root.sh): Kargo then moves
+# targetRevision; against a live Kargo-moved root kargo-root.sh refuses (break-glass is Anders').
 if [ -n "$PRERELEASE" ]; then
 	scripts/staging-root.sh --context "$CONTEXT" --apply --pre-release "$PRERELEASE"
 	log "app-of-apps applied; ArgoCD now installs the platform from branch $PRERELEASE (pre-release)"
+elif [ -n "$KARGO" ]; then
+	scripts/kargo-root.sh --context "$CONTEXT" --apply --sha "$ROOT_SHA"
+	log "app-of-apps applied at verified commit $ROOT_SHA ($ROOT_RELEASE); Kargo owns targetRevision from now on"
 else
-	scripts/staging-root.sh --context "$CONTEXT" --apply --release "$ROOT_RELEASE" --sha "$ROOT_SHA" ${ROOT_FLAGS[@]+"${ROOT_FLAGS[@]}"}
+	scripts/staging-root.sh --context "$CONTEXT" --apply --release "$ROOT_RELEASE" --sha "$ROOT_SHA" ${UNTAGGED:+--untagged}
 	log "app-of-apps applied; ArgoCD now installs the platform from the released platform-applications-gitops commit"
 fi
