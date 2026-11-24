@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs every test in scripts/tests (no cluster: fakes, temp dirs, a throwaway local apiserver when envtest is
-# installed). K3D_CONTEXT is passed through to staging-root-test.sh (optional, throwaway cluster only).
+# installed); *-test.sh is picked up by name, so kargo-root-test.sh needs no entry here. K3D_CONTEXT is passed
+# through to staging-root-test.sh (optional, throwaway cluster only).
 #   scripts/tests/run.sh
 # Output: verbose for humans and CI. Under a coding agent (CLAUDECODE, AI_AGENT, Codex) it prints one totals line per
 # script and, for a failing script, its output without the ok lines. The full log is always in .test-logs/ (git-ignored).
