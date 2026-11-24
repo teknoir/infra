@@ -40,6 +40,10 @@ Resume, once you are done (section 3):
 kubectl --context r415 -n teknoir-system annotate application app-of-apps kargo.akuity.io/authorized-stage=platform:staging --overwrite
 ```
 
+After the annotation is back, Kargo does **not** retry a Promotion it refused while paused (P4.3 rehearsal, 2026-11-24:
+the refused one stays `Errored ... is not authorized`). Staging moves with the next merge to `main`, or promote the
+newest gitops-main Freight by hand (`plans/cicd/v4/rehearsal-tools/promote.sh staging <freight>`, with the r415 context).
+
 No Application syncs the root itself (it is the root), so nothing restores the annotation while it is off: the pause
 holds until you put it back in section 3. `clusters/r415/root.yaml` still names it, which is what a fresh cluster and
 the cutover need.
