@@ -15,8 +15,8 @@ A rebuilt cluster gets back only what its minter recreates. The "rebuild" column
 | `teknoir-system/backstage-github-app-secret` | Backstage GitHub App (+ GCP SA); device-controller reads the fleet repo with it | `staging-bootstrap.sh` (`BACKSTAGE_GITHUB_APP_FILE`) | re-provide |
 | `teknoir-system/teknoirbot-model-keys` | Anthropic API key for the teknoir-demo bots | `staging-bootstrap.sh` (`TEKNOIRBOT_MODEL_KEY`) | re-provide |
 | `cliproxy/cliproxyapi-config` | cliproxyapi config (hand-applied app, personal repo branch `deploy`) | Anders, by hand | re-provide |
-| `platform/gitops-git` (from P4.5) | Kargo PAT (fine-grained, gitops repo only), label `kargo.akuity.io/cred-type: git` | Opus, piped from the request_secret card (P4.3/P4.5) | re-provide; Anders renews yearly |
-| `platform/staging-test-user` (from P4.5) | Keycloak staging test user for the browser verification (`username`, `password`) | Opus, piped from the dev host | re-provide |
+| `platform/gitops-git` (from P4.5) | Kargo PAT (fine-grained, gitops repo only), label `kargo.akuity.io/cred-type: git` | Opus: request_secret card into k3d (P4.3), piped from there to r415 on 2026-11-24 (P4.5), never on disk | re-provide; Anders renews yearly |
+| `platform/staging-test-user` (from P4.5) | Keycloak staging test user for the browser verification (`username`, `password`) | Opus, from `~/.config/teknoir/staging-agent-user.env` on the dev host (2026-11-24) | re-provide |
 
 ## 2. Generated in-cluster by GitOps (random, recreated on a fresh install)
 
@@ -27,7 +27,7 @@ A rebuilt cluster gets back only what its minter recreates. The "rebuild" column
 | `stunner-system/stunner-auth-secret` | `charts/platform-secrets` |
 | `teknoir-system/harbor-registry-auth`, `harbor-token-service` | `charts/harbor` (registry-auth script; cert-manager for the token-service key pair) |
 | `teknoir-system/harbor-devhost-ci`, `harbor-nodes-pull`, `harbor-teamspace-pull` | `charts/harbor` harbor-config (robot accounts; never expire) |
-| `platform/harbor-read` (from P4.5) | rendered empty by `charts/kargo-config`, filled by harbor-config (robot `kargo`) |
+| `platform/harbor-read` (from P4.5) | rendered empty by `charts/kargo-config`, filled by harbor-config (robot `kargo`, created 2026-11-24) |
 | `teknoir-system/harbor-core`, `harbor-database`, `harbor-jobservice`, `harbor-registry`, `harbor-registryctl`, `harbor-trivy` | Harbor chart (ArgoCD-tracked) |
 | `teknoir-system/argocd-secret`, `argocd-notifications-secret`, `argocd-redis`, `argocd-initial-admin-secret` | ArgoCD install (`scripts/deploy-argo.sh`) and its chart |
 | `teknoir-system/monitoring-grafana`, `alertmanager-monitoring-alertmanager*`, `prometheus-monitoring-prometheus*` | `charts/monitoring` (kube-prometheus-stack, operator-generated) |
@@ -46,7 +46,8 @@ A rebuilt cluster gets back only what its minter recreates. The "rebuild" column
 | `teknoir-demo-vdev/tb-scout-cloudinit` | device-controller (virtual device cloud-init) |
 | `teknoir-demo/robot-*-k3s` | device-controller (per-robot k3s join) |
 | `teknoir-demo/emqx-bootstrap-api-keys`, `emqx-bootstrap-user`, `historian-mongodb-credentials`, `mongodb-credentials` | the teknoir-demo teamspace plugin charts |
-| `kargo/*` (from P4.5: API and webhook certificates, controller credentials) | the Kargo chart and cert-manager; list the names here after P4.5 |
+| `kargo/kargo-api-cert`, `kargo/kargo-webhooks-server-cert` | cert-manager (Certificates `kargo-api`, `kargo-webhooks-server` from the Kargo chart) |
+| `kargo/kargo-api` | the Kargo chart (API server settings; no admin credential, since the admin account is off) |
 
 `teknoir-ci/github-ci` (listed in `staging-bootstrap.sh`) does not exist on r415: r415 was bootstrapped with `--no-ci`
 (CI runs on devhost-ci, `clusters/devhost-ci/secrets.md`).
