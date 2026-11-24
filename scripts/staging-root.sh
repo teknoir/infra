@@ -24,7 +24,8 @@
 # Every release that does not come from the live root, resolved or explicit (--release/--sha), is verified the same way:
 #   - the tag exists and peels to the SHA (an explicit release without a tag needs --untagged, for the time
 #     before the first release exists);
-#   - the SHA is on the first-parent history of teknoir-cloud (blobless fetch of the branch);
+#   - the SHA is on the first-parent history of the gitops branch, main (teknoir-cloud before the CI v4 rename;
+#     blobless fetch of the branch);
 #   - the SHA has the release helper: charts/app-of-apps/values.yaml contains a top-level `release:` key.
 # --apply never moves a live root. A live root without the annotation is the pre-cutover branch-following root:
 # --apply refuses it (the cutover is scripts/staging-release --bootstrap in platform-applications-gitops). A live
@@ -33,8 +34,9 @@
 # --pre-release BRANCH is for a NEW staging cluster before its first release: it renders the pre-release template,
 # whose Application has no teknoir.org/release annotation and follows the gitops BRANCH (targetRevision and the helm
 # `release` parameter) instead of a released SHA. The branch must exist on the remote and have the release helper
-# (charts/app-of-apps/values.yaml with a top-level `release:` key); it is not required to be on teknoir-cloud's
-# first-parent history, and the teknoir-cloud branch itself is excluded (it is staged by releases). It excludes
+# (charts/app-of-apps/values.yaml with a top-level `release:` key); it is not required to be on the gitops branch's
+# first-parent history, and that branch itself (main, or teknoir-cloud before the rename) is excluded (it is staged by
+# releases). It excludes
 # --release, --sha and --untagged. --apply only acts on a fresh cluster or on a branch-following root already on
 # BRANCH; it refuses a released root (it never moves one back to a branch) and a root on another branch.
 # Applying needs an explicit --apply and --context; the context must be exactly vpro or r415 (production-looking
@@ -95,7 +97,7 @@ fi
 if [ -n "$PRERELEASE" ]; then
 	[[ $PRERELEASE =~ $BRANCH_RE ]] || die "bad branch name '$PRERELEASE'"
 	[[ ! $PRERELEASE =~ $SHA_RE ]] || die "'$PRERELEASE' is a SHA, not a branch; use --release/--sha"
-	[ "$PRERELEASE" != teknoir-cloud ] || die "the teknoir-cloud branch is staged by releases, not by --pre-release"
+	case $PRERELEASE in main | teknoir-cloud) die "the $PRERELEASE branch is staged by releases, not by --pre-release" ;; esac
 fi
 WRITE=${APPLY}${CHECK} # set when the run must meet the conditions of --apply
 
@@ -166,16 +168,22 @@ release_helper() {
 		die "$sha predates the release helper (no 'release:' key in charts/app-of-apps/values.yaml); its children would keep following the branch"
 }
 
-# verify_sha <sha>: first-parent membership of teknoir-cloud, and the release helper in charts/app-of-apps
+# verify_sha <sha>: first-parent membership of the gitops branch, and the release helper in charts/app-of-apps.
+# The gitops branch is main since the CI v4 rename (P5.1); teknoir-cloud is tried second, for a fork or mirror that
+# has not been renamed. STAGING_BRANCH overrides both.
 verify_sha() {
-	local sha=$1 repo=$TMPD/repo
+	local sha=$1 repo=$TMPD/repo br
 	"$GIT" init -q --bare "$repo" || die "cannot set up a scratch repository"
 	"$GIT" -C "$repo" remote add origin "$REPO_URL" || die "cannot set up a scratch repository"
-	GIT_TERMINAL_PROMPT=0 "$GIT" -C "$repo" fetch -q --no-tags --filter=blob:none origin \
-		"+refs/heads/teknoir-cloud:refs/remotes/origin/teknoir-cloud" || die "cannot fetch teknoir-cloud from $REPO_URL"
-	"$GIT" -C "$repo" rev-list --first-parent refs/remotes/origin/teknoir-cloud |
+	for br in ${STAGING_BRANCH:-main teknoir-cloud}; do
+		GIT_TERMINAL_PROMPT=0 "$GIT" -C "$repo" fetch -q --no-tags --filter=blob:none origin \
+			"+refs/heads/$br:refs/remotes/origin/$br" 2>/dev/null && break
+		br=''
+	done
+	[ -n "$br" ] || die "cannot fetch the gitops branch (${STAGING_BRANCH:-main or teknoir-cloud}) from $REPO_URL"
+	"$GIT" -C "$repo" rev-list --first-parent "refs/remotes/origin/$br" |
 		awk -v s="$sha" '$0 == s {f = 1} END {exit !f}' ||
-		die "$sha is not on the first-parent history of teknoir-cloud"
+		die "$sha is not on the first-parent history of $br"
 	release_helper "$sha"
 }
 
@@ -244,7 +252,7 @@ else
 	[[ $SHA =~ $SHA_RE ]] || die "bad SHA '$SHA' (want 40 lowercase hex characters)"
 	if [ "$SOURCE" != live ]; then
 		verify_sha "$SHA"
-		log "verified $RELEASE ($SHA): first-parent of teknoir-cloud, has the release helper"
+		log "verified $RELEASE ($SHA): first-parent of the gitops branch, has the release helper"
 	fi
 fi
 
