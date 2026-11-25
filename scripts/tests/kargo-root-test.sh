@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test of scripts/kargo-root.sh, clusters/r415/root.yaml and the --kargo path of scripts/staging-bootstrap.sh.
+# Test of scripts/kargo-root.sh, clusters/r415/root.yaml and the root path of scripts/staging-bootstrap.sh.
 # git and kubectl are fakes on PATH (fixture files say what the remote has and what the cluster answers), so nothing
 # outside $TMP is touched: no network, no cluster.
 #   scripts/tests/kargo-root-test.sh
@@ -12,7 +12,6 @@ ROOT="$(cd "${HERE}/../.." && pwd)"
 SCRIPT="${ROOT}/scripts/kargo-root.sh"
 BOOTSTRAP="${ROOT}/scripts/staging-bootstrap.sh"
 ROOTFILE="${ROOT}/clusters/r415/root.yaml"
-LEGACY_TMPL="${ROOT}/teknoir-cloud-app-of-apps.yaml.tmpl"
 TMP=$(mktemp -d)
 FIX="$TMP/fix"; mkdir -p "$FIX" "$TMP/bin" "$TMP/home"
 
@@ -59,17 +58,9 @@ cat >"$TMP/bin/kubectl" <<'F'
 printf 'kubectl %s\n' "$*" >>"$FIX/kubectl.log"
 case " $* " in
 *" get application "*)
-	# the first read is the live root; later ones (after a --cutover apply) are the read-back in $FIX/live2
-	n=$(cat "$FIX/live-count" 2>/dev/null || echo 0)
-	printf '%s\n' "$((n + 1))" >"$FIX/live-count"
-	if [ "$n" -ge 1 ] && [ -f "$FIX/live2" ]; then cat "$FIX/live2"; exit 0; fi
 	[ -f "$FIX/kubectl-err" ] && cat "$FIX/kubectl-err" >&2
 	[ -f "$FIX/live" ] && cat "$FIX/live"
 	exit "$(cat "$FIX/kubectl-rc" 2>/dev/null || echo 0)" ;;
-*" annotate application "*) exit 0 ;;
-*" get validatingadmissionpolicy "*)
-	[ -f "$FIX/guard" ] && cat "$FIX/guard"
-	exit "$(cat "$FIX/guard-rc" 2>/dev/null || echo 0)" ;;
 *" apply -f - "*) cat >"$FIX/applied"; exit 0 ;;
 *" get crd "*) exit 0 ;;
 *" create namespace "*) echo "kind: Namespace"; exit 0 ;;
@@ -87,8 +78,7 @@ trap cleanup EXIT
 
 # reset: fresh remote fixture (default branch main at C4, nothing ancestors), no cluster, no tags
 reset() {
-	rm -f "$FIX"/applied "$FIX"/live "$FIX"/live2 "$FIX"/live-count "$FIX"/guard "$FIX"/guard-rc \
-		"$FIX"/kubectl-err "$FIX"/kubectl-rc "$FIX"/tags
+	rm -f "$FIX"/applied "$FIX"/live "$FIX"/kubectl-err "$FIX"/kubectl-rc "$FIX"/tags
 	: >"$FIX/kubectl.log"; : >"$FIX/git.log"
 	printf 'ref: refs/heads/main\tHEAD\n%s\tHEAD\n' "$C4" >"$FIX/symref"
 	printf '%s\n' "$C1" "$C2" "$C3" "$C4" >"$FIX/ancestors"
@@ -98,11 +88,8 @@ tag() { printf '%s\trefs/tags/%s\n' "$2" "$1" >>"$FIX/tags"; }
 # the live root read, line by line: teknoir.org/release, kargo.akuity.io/authorized-stage, targetRevision
 live_kargo() { printf '%s\n%s\n%s\n' '' platform:staging "$1" >"$FIX/live"; } # Kargo-owned, targetRevision <sha>
 live_kargo_stale() { printf '%s\n%s\n%s\n' "$1" platform:staging "$2" >"$FIX/live"; } # + old release annotation
-live_legacy() { printf '%s\n%s\n%s\n' "$1" '' "$2" >"$FIX/live"; }            # teknoir.org/release, pre-cutover
+live_legacy() { printf '%s\n%s\n%s\n' "$1" '' "$2" >"$FIX/live"; }            # release annotation, not Kargo-owned
 live_branch() { printf '%s\n%s\n%s\n' '' '' "$1" >"$FIX/live"; }              # branch-following root
-# the read-back of a good --cutover apply, as kargo-root.sh's jsonpath prints it
-readback_ok() { printf '%s\n\n%s\n%s\n' "$1" platform:staging 'release=$ARGOCD_APP_REVISION' >"$FIX/live2"; }
-readback_bad() { printf '%s\n%s\n%s\n%s\n' "$@" >"$FIX/live2"; }
 
 # run <args...>: OUT/ERR are plain text (no interpolation into bash -c below)
 run() { "$SCRIPT" "$@" >"$TMP/out" 2>"$TMP/err"; RC=$?; OUT=$(cat "$TMP/out"); ERR=$(cat "$TMP/err"); }
@@ -118,14 +105,28 @@ check "root.yaml has the Kargo authorized-stage annotation and no release annota
 	! grep -q 'teknoir.org/release' '$ROOTFILE' && ! grep -q 'releaseName' '$ROOTFILE'"
 check "root.yaml documents that Kargo owns targetRevision and that it is never applied unfilled" bash -c "
 	grep -q 'Kargo owns targetRevision' '$ROOTFILE' && grep -q 'never applied as is' '$ROOTFILE'"
-check "root.yaml parses as two documents and its AppProject equals the legacy template's" \
-	bash -c "python3 -I - '$ROOTFILE' '$LEGACY_TMPL' <<'PY'
+check "root.yaml parses as two documents with the expected AppProject, syncPolicy and destination" \
+	bash -c "python3 -I - '$ROOTFILE' <<'PY'
 import sys, yaml
-def docs(path):
-    return [d for d in yaml.safe_load_all(open(path)) if d]
-mine, legacy = docs(sys.argv[1]), docs(sys.argv[2])
+mine = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+PROJECT = {
+    'apiVersion': 'argoproj.io/v1alpha1',
+    'kind': 'AppProject',
+    'metadata': {'name': 'default', 'namespace': 'teknoir-system'},
+    'spec': {
+        'sourceRepos': ['*'],
+        'sourceNamespaces': [],
+        'destinations': [{'namespace': 'teknoir-system', 'server': 'https://kubernetes.default.svc'}],
+        'clusterResourceWhitelist': [
+            {'group': 'argoproj.io', 'kind': 'AppProject'},
+            {'group': 'argoproj.io', 'kind': 'Application'},
+        ],
+    },
+}
+SYNC_POLICY = {'automated': {'prune': True, 'selfHeal': True, 'enabled': True}}
+DESTINATION = {'namespace': 'teknoir-system', 'server': 'https://kubernetes.default.svc'}
 assert [d['kind'] for d in mine] == ['AppProject', 'Application'], [d['kind'] for d in mine]
-assert mine[0] == [d for d in legacy if d['kind'] == 'AppProject'][0], mine[0]
+assert mine[0] == PROJECT, mine[0]
 app = mine[1]
 assert app['metadata']['name'] == 'app-of-apps' and app['metadata']['namespace'] == 'teknoir-system'
 assert app['metadata']['annotations'] == {'kargo.akuity.io/authorized-stage': 'platform:staging'}, app['metadata']
@@ -134,9 +135,8 @@ assert src['repoURL'] == 'https://github.com/teknoir/platform-applications-gitop
 assert src['path'] == 'charts/app-of-apps' and src['targetRevision'] == '__VERIFIED_SHA__', src
 assert src['helm'] == {'parameters': [{'name': 'release', 'value': '\$ARGOCD_APP_REVISION', 'forceString': True}]}, src['helm']
 assert app['spec']['project'] == 'default'
-legacy_app = [d for d in legacy if d['kind'] == 'Application'][0]
-assert app['spec']['syncPolicy'] == legacy_app['spec']['syncPolicy'], app['spec']['syncPolicy']
-assert app['spec']['destination'] == legacy_app['spec']['destination']
+assert app['spec']['syncPolicy'] == SYNC_POLICY, app['spec']['syncPolicy']
+assert app['spec']['destination'] == DESTINATION
 PY"
 
 # 2. explicit --sha: render -----------------------------------------------------------------
@@ -214,7 +214,8 @@ done
 reset; run --sha "$C3" --apply --context r415 --check
 check "--apply and --check exclude each other" test "$RC" -ne 0
 reset; run --sha "$C3" --cutover
-check "--cutover without --apply/--check is refused" test "$RC" -ne 0
+check "--cutover is gone (retired in P7.1): refused as unknown" bash -c "
+	[ $RC -ne 0 ] && grep -q 'unknown argument' '$TMP/err'"
 reset; run --context r415 --bogus
 check "an unknown argument is refused" test "$RC" -ne 0
 
@@ -249,9 +250,6 @@ reset; live_kargo "$C2"; run --context r415 --apply --sha "$C3"
 check "a Kargo-owned root at another commit is refused, with the BREAK-GLASS pointer" bash -c "
 	[ $RC -ne 0 ] && grep -q 'BREAK-GLASS.md' '$TMP/err' && grep -q 'Kargo owns' '$TMP/err'"
 check "a refused apply writes nothing" no_apply
-reset; live_kargo "$C2"; run --context r415 --apply --sha "$C3" --cutover
-check "--cutover does not move a Kargo-owned root either" bash -c "[ $RC -ne 0 ] && grep -q 'BREAK-GLASS.md' '$TMP/err'"
-check "--cutover refusal writes nothing" no_apply
 reset; live_kargo "$C3"; run --context r415 --apply --sha "$C3"
 check "a Kargo-owned root already at the commit is a no-op" bash -c "
 	[ $RC -eq 0 ] && grep -q 'nothing to apply' '$TMP/err' && [ ! -e '$FIX/applied' ]"
@@ -260,85 +258,44 @@ check "the no-op holds with a verified tag too" bash -c "[ $RC -eq 0 ] && [ ! -e
 # the Kargo annotation decides, whatever else the root carries (a leftover release annotation cannot make it legacy)
 reset; live_kargo_stale staging-20261116.4 "$C3"; run --context r415 --apply --sha "$C3"
 check "a Kargo-owned root that still carries teknoir.org/release is a no-op at its commit" bash -c "
-	[ $RC -eq 0 ] && grep -q 'nothing to apply' '$TMP/err' && [ ! -e '$FIX/applied' ] &&
-	! grep -q 'cut-over: replacing the legacy root' '$TMP/err'"
+	[ $RC -eq 0 ] && grep -q 'nothing to apply' '$TMP/err' && [ ! -e '$FIX/applied' ]"
 reset; live_kargo_stale staging-20261116.4 "$C3"; run --context r415 --check --sha "$C3"
 check "the same root is a no-op for --check" bash -c "[ $RC -eq 0 ] && [ \"\$(cat '$TMP/out')\" = '$C3 -' ]"
 reset; live_kargo_stale staging-20261116.4 "$C2"; run --context r415 --apply --sha "$C3"
 check "the same root at another commit is refused" bash -c "
 	[ $RC -ne 0 ] && grep -q 'BREAK-GLASS.md' '$TMP/err' && [ ! -e '$FIX/applied' ]"
-reset; live_kargo_stale staging-20261116.4 "$C2"; run --context r415 --apply --sha "$C3" --cutover
-check "--cutover is refused over it too: the annotation makes it Kargo-owned" bash -c "
-	[ $RC -ne 0 ] && grep -q 'Kargo owns' '$TMP/err' && grep -q 'BREAK-GLASS.md' '$TMP/err'"
-check "the refused --cutover writes nothing" no_apply
 
-# 11. cut-over from the pre-cutover roots ----------------------------------------------------
+# 11. roots the Kargo root never replaces (P7.1: only break-glass may move them) ----------------
 reset; live_legacy staging-20261116.4 "$C2"; run --context r415 --apply --sha "$C3"
-check "the legacy release-annotated root is refused without --cutover" bash -c "
-	[ $RC -ne 0 ] && grep -q -- '--cutover' '$TMP/err' && [ ! -e '$FIX/applied' ]"
-reset; live_legacy staging-20261116.4 "$C2"; readback_ok "$C3"; run --context r415 --apply --sha "$C3" --cutover
-check "legacy root + --cutover: applied at the verified commit" bash -c "
-	[ $RC -eq 0 ] && grep -qF 'targetRevision: \"$C3\"' '$FIX/applied' && ! grep -q 'teknoir.org/release' '$FIX/applied' &&
-	grep -q 'cut-over: replacing the legacy root' '$TMP/err'"
-check "cut-over removes the legacy annotations: client-side apply cannot" bash -c "
-	grep -q ' annotate application app-of-apps teknoir.org/release- teknoir.org/previous-release-' '$FIX/kubectl.log'"
-check "cut-over reads the root back and accepts it" bash -c "
-	grep -q 'cut-over: read back teknoir-system/app-of-apps at $C3' '$TMP/err'"
+check "a retired legacy release-annotated root is refused with the BREAK-GLASS pointer" bash -c "
+	[ $RC -ne 0 ] && grep -q 'retired legacy root' '$TMP/err' && grep -q 'BREAK-GLASS.md' '$TMP/err'"
+check "the refused legacy root writes nothing" no_apply
 reset; live_branch teknoir-cloud; run --context r415 --apply --sha "$C3"
-check "a branch-following root is refused without --cutover" bash -c "[ $RC -ne 0 ] && grep -q -- '--cutover' '$TMP/err'"
-reset; live_branch teknoir-cloud; readback_ok "$C3"; run --context r415 --apply --sha "$C3" --cutover
-check "branch-following root + --cutover: applied" bash -c "
-	[ $RC -eq 0 ] && grep -qF 'targetRevision: \"$C3\"' '$FIX/applied' && grep -q 'cut-over: replacing the branch-following root' '$TMP/err'"
-# a read-back that disagrees with the cut-over fails the run, after the apply and the annotation removal
-reset; live_legacy staging-20261116.4 "$C2"; readback_bad "$C2" '' platform:staging 'release=$ARGOCD_APP_REVISION'
-run --context r415 --apply --sha "$C3" --cutover
-check "read-back at another targetRevision fails the cut-over (non-zero)" bash -c "
-	[ $RC -ne 0 ] && grep -q 'read-back targetRevision' '$TMP/err'"
-reset; live_legacy staging-20261116.4 "$C2"; readback_bad "$C3" '' '' 'release=$ARGOCD_APP_REVISION'
-run --context r415 --apply --sha "$C3" --cutover
-check "read-back without the Kargo annotation fails the cut-over" bash -c "
-	[ $RC -ne 0 ] && grep -q 'authorized-stage is' '$TMP/err'"
-reset; live_legacy staging-20261116.4 "$C2"; readback_bad "$C3" '' platform:staging 'release=staging-20261116.4'
-run --context r415 --apply --sha "$C3" --cutover
-check "read-back with the wrong helm parameter fails the cut-over" bash -c "
-	[ $RC -ne 0 ] && grep -q 'helm parameters' '$TMP/err'"
+check "a non-Kargo, non-SHA root is refused with the BREAK-GLASS pointer" bash -c "
+	[ $RC -ne 0 ] && grep -q 'not Kargo-owned' '$TMP/err' && grep -q 'BREAK-GLASS.md' '$TMP/err'"
+check "the refused branch-following root writes nothing" no_apply
+reset; live_legacy staging-20261116.4 "$C2"; run --context r415 --check --sha "$C3"
+check "--check refuses it too, printing nothing" bash -c "[ $RC -ne 0 ] && [ -z \"\$(cat '$TMP/out')\" ]"
 
-# 11b. the staging release guard (P4.6) must be gone ------------------------------------------
-reset; echo 'validatingadmissionpolicy.admissionregistration.k8s.io/staging-release-guard' >"$FIX/guard"
-run --context r415 --check --sha "$C3"
-check "the release guard is still installed: --check refuses" bash -c "
-	[ $RC -ne 0 ] && grep -q 'staging release guard is still installed' '$TMP/err' && grep -q 'P4.6 first' '$TMP/err' &&
-	[ -z \"\$(cat '$TMP/out')\" ]"
-reset; echo 'validatingadmissionpolicy.admissionregistration.k8s.io/staging-release-guard' >"$FIX/guard"
-run --context r415 --apply --sha "$C3"
-check "the release guard is still installed: --apply refuses, applies nothing" bash -c "
-	[ $RC -ne 0 ] && grep -q 'P4.6 first' '$TMP/err' && [ ! -e '$FIX/applied' ]"
-reset; echo 'validatingadmissionpolicy.admissionregistration.k8s.io/staging-release-guard' >"$FIX/guard"
-printf "the server doesn't have a resource type \"application\"\n" >"$FIX/kubectl-err"; echo 1 >"$FIX/kubectl-rc"
-run --context r415 --apply --sha "$C3"
-check "no Application CRD (fresh cluster): the guard is not consulted" bash -c "
-	[ $RC -eq 0 ] && [ -e '$FIX/applied' ] && ! grep -q validatingadmissionpolicy '$FIX/kubectl.log'"
-reset; run --context r415 --apply --sha "$C3"
-check "no guard installed: applies" bash -c "[ $RC -eq 0 ] && [ -e '$FIX/applied' ]"
-reset; run --sha "$C3"
-check "print mode never asks the cluster about the guard" bash -c "[ ! -s '$FIX/kubectl.log' ]"
-
-# 12. staging-bootstrap.sh --kargo --------------------------------------------------------------
+# 12. staging-bootstrap.sh ---------------------------------------------------------------------
 # only the argument handling: nothing here reaches a cluster or the network
 boot() { (PATH="$TMP/bin:$PATH" "$BOOTSTRAP" "$@" >"$TMP/out" 2>"$TMP/err"); RC=$?; }
-reset; boot --kargo --context r415 --release staging-20261116.4 --sha "$C3"
-check "bootstrap --kargo excludes --release" bash -c "[ $RC -ne 0 ] && grep -q -- '--kargo excludes' '$TMP/err'"
-reset; boot --kargo --context r415 --untagged
-check "bootstrap --kargo excludes --untagged" bash -c "[ $RC -ne 0 ] && grep -q -- '--kargo excludes' '$TMP/err'"
-reset; boot --kargo --context r415 --pre-release main
-check "bootstrap --kargo excludes --pre-release" bash -c "[ $RC -ne 0 ] && grep -q -- '--kargo excludes' '$TMP/err'"
-reset; boot --kargo --context vpro
-check "bootstrap --kargo needs context r415" bash -c "[ $RC -ne 0 ] && grep -q 'context must be r415' '$TMP/err'"
-reset; boot --kargo --context r415
-check "bootstrap --kargo with no verified tag stops before any cluster change" bash -c "
+reset; boot --context r415 --release staging-20261116.4 --sha "$C3"
+check "bootstrap --release is refused: retired in P7.1" bash -c "
+	[ $RC -ne 0 ] && grep -q 'retired in CI v4 P7.1' '$TMP/err' && [ ! -s '$FIX/kubectl.log' ]"
+reset; boot --context r415 --untagged
+check "bootstrap --untagged is refused: retired in P7.1" bash -c "
+	[ $RC -ne 0 ] && grep -q 'retired in CI v4 P7.1' '$TMP/err'"
+reset; boot --context r415 --pre-release main
+check "bootstrap --pre-release is refused: retired in P7.1" bash -c "
+	[ $RC -ne 0 ] && grep -q 'retired in CI v4 P7.1' '$TMP/err'"
+reset; boot --context vpro
+check "bootstrap --context vpro is refused" bash -c "[ $RC -ne 0 ] && grep -q 'context must be r415' '$TMP/err'"
+reset; boot --context r415
+check "bootstrap with no verified tag stops before any cluster change" bash -c "
 	[ $RC -ne 0 ] && grep -q 'nothing was changed' '$TMP/err' && [ ! -e '$FIX/applied' ]"
 
-# a tree that has the two scripts and root.yaml side by side, so bootstrap's --kargo path runs for real
+# a tree that has the two scripts and root.yaml side by side, so bootstrap's root path runs for real
 TREE="$TMP/tree"; mkdir -p "$TREE/scripts" "$TREE/clusters/r415"
 cp "$BOOTSTRAP" "$ROOT/scripts/kargo-root.sh" "$TREE/scripts/"
 cp "$ROOTFILE" "$TREE/clusters/r415/"
@@ -346,30 +303,28 @@ cat >"$TREE/scripts/deploy-argo.sh" <<'F'
 #!/usr/bin/env bash
 echo "deploy-argo.sh (stub)" >>"$FIX/kubectl.log"
 F
-cat >"$TREE/scripts/staging-root.sh" <<'F'
-#!/usr/bin/env bash
-echo "staging-root.sh must not run with --kargo" >>"$FIX/kubectl.log"
-exit 9
-F
 chmod +x "$TREE"/scripts/*.sh
 boot_tree() { (PATH="$TMP/bin:$PATH" "$TREE/scripts/staging-bootstrap.sh" "$@" >"$TMP/out" 2>"$TMP/err"); RC=$?; }
-reset; tag verified/20261123T120000Z-33333333 "$C3"; boot_tree --kargo --context r415 --no-ci
-check "bootstrap --kargo: succeeds and applies clusters/r415/root.yaml at the verified commit last" bash -c "
+reset; tag verified/20261123T120000Z-33333333 "$C3"; boot_tree --context r415 --no-ci
+check "bootstrap: succeeds and applies clusters/r415/root.yaml at the verified commit last" bash -c "
 	[ $RC -eq 0 ] && [ \"\$(tail -1 '$FIX/kubectl.log' | grep -c ' apply -f -')\" = 1 ] &&
 	grep -qF 'targetRevision: \"$C3\"' '$FIX/applied' &&
 	grep -qF 'kargo.akuity.io/authorized-stage: \"platform:staging\"' '$FIX/applied' &&
 	! grep -q 'teknoir.org/release' '$FIX/applied'"
-check "bootstrap --kargo: staging-root.sh never runs, and the root read comes first" bash -c "
-	! grep -q 'staging-root.sh must not run' '$FIX/kubectl.log' && head -1 '$FIX/kubectl.log' | grep -q ' get application ' &&
-	grep -q 'Kargo owns targetRevision' '$TMP/out'"
-# rerun after the cut-over: a live Kargo-owned root, no --sha and no verified tag: its own commit, nothing applied
-reset; live_kargo "$C3"; boot_tree --kargo --context r415 --no-ci
-check "bootstrap --kargo rerun on a live Kargo root: uses its targetRevision ('<sha> live') and applies nothing" bash -c "
+check "bootstrap: the root read comes first, and the header says Kargo owns targetRevision" bash -c "
+	head -1 '$FIX/kubectl.log' | grep -q ' get application ' && grep -q 'Kargo owns targetRevision' '$TMP/out'"
+# --kargo is only a compatibility no-op: the same run with it applies the same root
+reset; tag verified/20261123T120000Z-33333333 "$C3"; boot_tree --kargo --context r415 --no-ci
+check "bootstrap --kargo is a no-op: accepted, same root applied" bash -c "
+	[ $RC -eq 0 ] && grep -qF 'targetRevision: \"$C3\"' '$FIX/applied'"
+# rerun: a live Kargo-owned root, no --sha and no verified tag: its own commit, nothing applied
+reset; live_kargo "$C3"; boot_tree --context r415 --no-ci
+check "bootstrap rerun on a live Kargo root: uses its targetRevision ('<sha> live') and applies nothing" bash -c "
 	[ $RC -eq 0 ] && grep -q 'root verified commit: live ($C3)' '$TMP/out' &&
 	grep -q 'live root on r415 is Kargo-owned at $C3' '$TMP/err' &&
 	grep -q 'nothing to apply' '$TMP/err' && [ ! -e '$FIX/applied' ]"
-reset; live_kargo "$C3"; boot_tree --kargo --context r415 --no-ci --sha "$C3"
-check "bootstrap --kargo rerun with --sha at the live commit: still a no-op" bash -c "
+reset; live_kargo "$C3"; boot_tree --context r415 --no-ci --sha "$C3"
+check "bootstrap rerun with --sha at the live commit: still a no-op" bash -c "
 	[ $RC -eq 0 ] && grep -q 'nothing to apply' '$TMP/err' && [ ! -e '$FIX/applied' ]"
 
 [ "$fail" -eq 0 ] && echo "ALL PASSED" || echo "FAILURES"

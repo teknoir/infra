@@ -2,7 +2,7 @@
 # (CI v4, P4.4/P5.2).
 #
 # What it is: the two objects that start GitOps on r415 - the AppProject
-# `default` (exactly as in teknoir-cloud-app-of-apps.yaml.tmpl) and the
+# `default` (the same project staging has always had) and the
 # Application `teknoir-system/app-of-apps`. Its targetRevision is ONE verified
 # commit of teknoir/platform-applications-gitops (never `main`, never a
 # staging-YYYYMMDD.N release tag). The helm parameter `release` is
@@ -14,7 +14,7 @@
 # commit of the newest stamped `verified/<UTC yyyymmddThhmmssZ>-<sha8>` tag of
 # the gitops repo, after checking that the commit is an ancestor of the gitops
 # default branch. It prints by default and applies only with
-# `--apply --context r415`; `scripts/staging-bootstrap.sh --kargo` uses it on a
+# `--apply --context r415`; `scripts/staging-bootstrap.sh` uses it on a
 # fresh cluster.
 #
 # Kargo owns targetRevision after the cut-over: Stage platform/staging moves it

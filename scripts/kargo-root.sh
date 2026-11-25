@@ -1,19 +1,17 @@
 #!/usr/bin/env bash
-# kargo-root.sh: render (default) or apply the r415 root Application clusters/r415/root.yaml after the Kargo
-# cut-over, filled with ONE verified commit of teknoir/platform-applications-gitops - never a branch and never a
-# staging-YYYYMMDD.N release tag.
+# kargo-root.sh: render (default) or apply the r415 root Application clusters/r415/root.yaml, filled with ONE
+# verified commit of teknoir/platform-applications-gitops - never a branch and never a staging-YYYYMMDD.N release
+# tag.
 #
 #   scripts/kargo-root.sh                      resolve the verified commit, print the manifest (no cluster access)
 #   scripts/kargo-root.sh --check              what --apply would do, applying nothing; stdout: "<sha> <tag>"
 #   scripts/kargo-root.sh --apply              apply it (--context r415 only)
 #   scripts/kargo-root.sh --sha <40-hex> ...   use this commit instead of the newest verified/* tag
-#   ... --cutover                              allow replacing a pre-cutover root (legacy release-annotated, or
-#                                              branch-following): the P5.2 cut-over only
 #
 # The commit is resolved as, in this order:
 #   1. --sha, if given;
-#   2. on a live Kargo-owned root and no --sha, that root's own targetRevision (the `staging-bootstrap.sh --kargo`
-#      rerun after the cut-over): the tag reported is `live`;
+#   2. on a live Kargo-owned root and no --sha, that root's own targetRevision (the staging-bootstrap.sh rerun):
+#      the tag reported is `live`;
 #   3. the commit of the newest stamped tag `verified/<UTC yyyymmddThhmmssZ>-<sha8>` of the gitops repo
 #      (`git ls-remote --tags`, the peeled commit for an annotated tag). Stamps are fixed-width UTC, so the
 #      lexically greatest stamp is the newest, and the tag's sha8 must be the start of the peeled commit.
@@ -27,15 +25,10 @@
 #   - no live Application (fresh cluster, or no Application CRD yet): it applies;
 #   - a Kargo-owned root - one carrying the kargo.akuity.io/authorized-stage annotation, whatever other
 #     annotations it also has - already at the resolved commit is left alone; at another commit it is refused,
-#     even with --cutover, because Kargo owns that field; the message points to clusters/r415/BREAK-GLASS.md
-#     (Anders only);
-#   - a pre-cutover root - the legacy root with the teknoir.org/release annotation and no Kargo annotation, or a
-#     branch-following root whose targetRevision is not a 40-hex SHA - is only replaced with --cutover. --cutover
-#     then removes the leftover teknoir.org/release and teknoir.org/previous-release annotations (a client-side
-#     apply does not) and reads the root back: targetRevision the SHA, no release annotation, the Kargo annotation
-#     for platform:staging, and exactly the one helm parameter release=$ARGOCD_APP_REVISION.
-# With the Application CRD present, --apply and --check first refuse while the P4.6 staging release guard
-# (ValidatingAdmissionPolicy staging-release-guard) is installed.
+#     because Kargo owns that field; the message points to clusters/r415/BREAK-GLASS.md (Anders only);
+#   - any other live root - a legacy root with the teknoir.org/release annotation, or a branch-following root
+#     whose targetRevision is not a 40-hex SHA - is refused too: no pre-cutover root exists anywhere any more, so
+#     moving one is break-glass (clusters/r415/BREAK-GLASS.md, Anders only).
 # --check applies nothing and prints "<sha> <tag>" on stdout; it refuses what --apply would refuse, and on a live
 # root already at the commit it prints that line too (nothing to apply).
 # Stdout carries only the manifest or that line; messages go to stderr.
@@ -51,7 +44,7 @@ STAMPED_RE='^verified/[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$'
 UNSTAMPED_RE='^verified/[0-9a-f]{8}$'
 BREAK_GLASS="clusters/r415/BREAK-GLASS.md"
 
-CONTEXT='' SHA='' APPLY='' CHECK='' CUTOVER=''
+CONTEXT='' SHA='' APPLY='' CHECK=''
 die() { echo "kargo-root: $*" >&2; exit 1; }
 log() { echo "kargo-root: $*" >&2; }
 usage() { sed -n '2,/^set -e/p' "$0" | sed '$d;s/^# \{0,1\}//' >&2; }
@@ -62,7 +55,6 @@ while [ $# -gt 0 ]; do
 	--sha) SHA=${2:?--sha needs a value}; shift ;;
 	--apply) APPLY=1 ;;
 	--check) CHECK=1 ;;
-	--cutover) CUTOVER=1 ;;
 	-h | --help) usage; exit 0 ;;
 	*) usage; die "unknown argument $1" ;;
 	esac
@@ -77,7 +69,6 @@ fi
 [ -z "$APPLY" ] || [ -n "$CONTEXT" ] || die "--apply needs --context r415 (never the current context)"
 [ -z "$CHECK" ] || [ -n "$CONTEXT" ] || die "--check needs --context r415"
 [ -z "$APPLY" ] || [ -z "$CHECK" ] || die "--apply and --check exclude each other"
-[ -z "$CUTOVER" ] || [ -n "$APPLY$CHECK" ] || die "--cutover only goes with --apply or --check"
 [ -z "$SHA" ] || [[ $SHA =~ $SHA_RE ]] || die "bad SHA '$SHA' (want 40 lowercase hex characters)"
 WRITE=${APPLY}${CHECK} # set when the run must meet the conditions of --apply
 
@@ -86,11 +77,10 @@ TMPD=$(mktemp -d); trap 'rm -rf "$TMPD"' EXIT
 
 # 1. live root on r415 ----------------------------------------------------------------
 # Read first: without --sha, a live Kargo-owned root's targetRevision is the commit (the bootstrap rerun).
-LIVE_STATE=absent LIVE_RELEASE='' LIVE_KARGO='' LIVE_TARGET='' CRD=''
+LIVE_STATE=absent LIVE_RELEASE='' LIVE_KARGO='' LIVE_TARGET=''
 if [ -n "$CONTEXT" ]; then
 	if out=$(k -n "$APP_NS" get application "$APP_NAME" --ignore-not-found \
 		-o jsonpath='{.metadata.annotations.teknoir\.org/release}{"\n"}{.metadata.annotations.kargo\.akuity\.io/authorized-stage}{"\n"}{.spec.source.targetRevision}' 2>"$TMPD/err"); then
-		CRD=1
 		if [ -n "$out" ]; then
 			# one line per field: an empty annotation keeps its line (read with IFS=$'\t' would collapse it)
 			LIVE_STATE=present
@@ -100,17 +90,6 @@ if [ -n "$CONTEXT" ]; then
 		log "no Application CRD on $CONTEXT yet (fresh cluster)"
 	else
 		die "cannot read the live root on $CONTEXT: $(tr '\n' ' ' <"$TMPD/err")"
-	fi
-fi
-
-# The P4.6 guard refuses exactly the apply this script makes: it must be gone before --apply or --check.
-if [ -n "$WRITE" ] && [ -n "$CRD" ]; then
-	if guard=$(k get validatingadmissionpolicy staging-release-guard --ignore-not-found -o name 2>"$TMPD/err"); then
-		[ -z "$guard" ] || die "the staging release guard is still installed: P4.6 first ($guard)"
-	elif grep -qiE "doesn't have a resource type|no matches for kind|could not find the requested resource" "$TMPD/err"; then
-		: # a cluster without ValidatingAdmissionPolicy in v1 has no guard
-	else
-		die "cannot check for the staging release guard on $CONTEXT: $(tr '\n' ' ' <"$TMPD/err")"
 	fi
 fi
 
@@ -200,43 +179,22 @@ log "verified $SHA: ancestor or equal of $BRANCH, tag ${TAG}"
 NOOP=''
 if [ -n "$WRITE" ] && [ "$LIVE_STATE" = present ]; then
 	if [ -n "$LIVE_KARGO" ]; then
-		# The Kargo annotation decides, whatever else the root carries: --cutover never applies over it.
+		# The Kargo annotation decides, whatever else the root carries.
 		if [ "$LIVE_TARGET" != "$SHA" ]; then
-			die "live root $APP_NS/$APP_NAME is Kargo-owned (kargo.akuity.io/authorized-stage=$LIVE_KARGO) at targetRevision '$LIVE_TARGET'; Kargo owns that field, so this script never applies over it, not even with --cutover. Break-glass is $BREAK_GLASS (Anders only)."
+			die "live root $APP_NS/$APP_NAME is Kargo-owned (kargo.akuity.io/authorized-stage=$LIVE_KARGO) at targetRevision '$LIVE_TARGET'; Kargo owns that field, so this script never applies over it. Break-glass is $BREAK_GLASS (Anders only)."
 		fi
 		NOOP=1
 	elif [ -n "$LIVE_RELEASE" ]; then
-		[ -n "$CUTOVER" ] ||
-			die "live root is the pre-cutover root for release $LIVE_RELEASE (targetRevision '$LIVE_TARGET'); the cut-over is $0 --cutover with the commit it starts at"
-		log "cut-over: replacing the legacy root for release $LIVE_RELEASE (was '$LIVE_TARGET')"
+		die "live root $APP_NS/$APP_NAME is the retired legacy root for release $LIVE_RELEASE (targetRevision '$LIVE_TARGET'); the release-based and pre-cutover roots are gone since CI v4 P7.1, so moving it is $BREAK_GLASS (Anders only)."
 	elif [[ $LIVE_TARGET =~ $SHA_RE ]]; then
 		if [ "$LIVE_TARGET" != "$SHA" ]; then
-			die "live root app-of-apps is at targetRevision '$LIVE_TARGET' without a kargo.akuity.io/authorized-stage annotation: a root pinned to a commit is not moved by hand (if the annotation was lost, restore it as clusters/r415/BREAK-GLASS.md says). Refusing to move it to $SHA."
+			die "live root $APP_NS/$APP_NAME is at targetRevision '$LIVE_TARGET' without a kargo.akuity.io/authorized-stage annotation: a root pinned to a commit is not moved by hand (if the annotation was lost, restore it as $BREAK_GLASS says). Refusing to move it to $SHA."
 		fi
 		NOOP=1
 	else
-		[ -n "$CUTOVER" ] || die "live root follows '$LIVE_TARGET', a pre-cutover branch-following root; the cut-over is $0 --cutover"
-		log "cut-over: replacing the branch-following root (was '$LIVE_TARGET')"
+		die "live root $APP_NS/$APP_NAME is not Kargo-owned: it follows '$LIVE_TARGET' (a branch-following root is retired since CI v4 P7.1), so moving it is $BREAK_GLASS (Anders only)."
 	fi
 fi
-
-# cut_over <sha>: after a --cutover apply, drop what a client-side apply cannot, then read the root back.
-# A merge patch's annotations (teknoir.org/release, teknoir.org/previous-release) survive an apply that no longer
-# names them, so they are removed explicitly.
-cut_over() {
-	local target release stage params
-	local -a lines
-	mapfile -t lines <"$TMPD/readback"
-	target=${lines[0]:-} release=${lines[1]:-} stage=${lines[2]:-}
-	params=$(printf '%s\n' "${lines[@]:3}")
-	[ "$target" = "$1" ] || die "cut-over: read-back targetRevision is '$target', not $1; the root is not the Kargo root"
-	[ -z "$release" ] || die "cut-over: read-back still carries teknoir.org/release='$release'"
-	[ "$stage" = platform:staging ] ||
-		die "cut-over: read-back kargo.akuity.io/authorized-stage is '$stage', want platform:staging"
-	[ "$params" = "release=\$ARGOCD_APP_REVISION" ] ||
-		die "cut-over: read-back helm parameters are '$params', want exactly one: release=\$ARGOCD_APP_REVISION"
-	log "cut-over: read back $APP_NS/$APP_NAME at $1, Kargo-owned by platform:staging"
-}
 
 # 5. render ---------------------------------------------------------------------------
 # the leading comment block of the template documents the placeholders; it is not part of the manifest
@@ -254,15 +212,6 @@ elif [ -n "$CHECK" ]; then
 	log "would apply the root at $SHA on $CONTEXT; --check applied nothing"
 else
 	printf '%s\n' "$MANIFEST" | k apply -f - >&2
-	if [ -n "$CUTOVER" ]; then
-		k -n "$APP_NS" annotate application "$APP_NAME" \
-			teknoir.org/release- teknoir.org/previous-release- >&2 ||
-			die "cut-over: cannot remove the legacy annotations from $APP_NS/$APP_NAME"
-		k -n "$APP_NS" get application "$APP_NAME" \
-			-o jsonpath='{.spec.source.targetRevision}{"\n"}{.metadata.annotations.teknoir\.org/release}{"\n"}{.metadata.annotations.kargo\.akuity\.io/authorized-stage}{"\n"}{range .spec.source.helm.parameters[*]}{.name}={.value}{"\n"}{end}' >"$TMPD/readback" ||
-			die "cut-over: cannot read back $APP_NS/$APP_NAME"
-		cut_over "$SHA"
-	fi
 	log "applied the root app-of-apps at $SHA (tag $TAG) on $CONTEXT"
 fi
 [ -z "$CHECK" ] || printf '%s %s\n' "$SHA" "$TAG"

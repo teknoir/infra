@@ -45,8 +45,8 @@ the refused one stays `Errored ... is not authorized`). Staging moves with the n
 newest gitops-main Freight by hand (`KCTX=r415 KARGO_REFS_OK=1 plans/cicd/v4/rehearsal-tools/promote.sh staging <freight>`).
 
 No Application syncs the root itself (it is the root), so nothing restores the annotation while it is off: the pause
-holds until you put it back in section 3. `clusters/r415/root.yaml` still names it, which is what a fresh cluster and
-the cutover need.
+holds until you put it back in section 3. `clusters/r415/root.yaml` still names it, which is what a fresh cluster
+needs.
 
 **Optional noise reduction, not the brake:** the `ProjectConfig` `platform` in namespace `platform` sets
 auto-promotion for the Stages `staging` and `staging-verified` (and one entry per `pin-<group>`). Check it:
@@ -146,8 +146,7 @@ resuming.
    ```
 
    A rendered root and a live root that only differ in what Kargo and this break-glass own (the annotations, the helm
-   parameters) is expected. If the live root is still the pre-cutover one (it carries the `teknoir.org/release`
-   annotation), that is the cutover (`scripts/kargo-root.sh --cutover`), not a break-glass step.
+   parameters) is expected. The P5.2 cut-over is done: a root still carrying `teknoir.org/release` is not expected.
 4. Resume Kargo: restore the annotation (section 1), and the `ProjectConfig` / `kargo-config` automated sync if
    section 1 disabled it.
 

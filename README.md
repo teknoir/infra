@@ -37,9 +37,7 @@ Rotating the secret (delete it, re-run the script) resets every WireGuard tunnel
 ### 2. Deploy
 
 ```sh
-./scripts/deploy-argo.sh
-./scripts/staging-root.sh --context <context>            # print the root Application for the current release
-./scripts/staging-root.sh --context <context> --apply    # apply it
+./scripts/staging-bootstrap.sh --context r415   # fresh r415 host: namespaces, Secrets, ArgoCD, the root
 ```
 
 `deploy-argo.sh` is the first install only. `platform-applications-gitops` (staging: branch `main`, renamed from `teknoir-cloud` 2026-11-24) renders the Application
@@ -52,39 +50,25 @@ anyway (break-glass, only when ArgoCD cannot fix itself): turn off automated syn
 would restore the next step), then on `argo`, run it, fix `charts/argo` in gitops to match, re-enable (`argo`, then
 `app-of-apps`), and re-run `deploy-argo.sh` without `FORCE_DEPLOY` to detach the file again.
 
-Staging (`teknoir-cloud`) does not follow the branch: ArgoCD follows one released commit of
-`platform-applications-gitops` (tag `staging-YYYYMMDD.N`). The root is therefore a template,
-`teknoir-cloud-app-of-apps.yaml.tmpl`, and a plain `kubectl apply -f` of it is no longer the way (the
-placeholders `__STAGING_RELEASE_SHA__` / `__STAGING_RELEASE__` would be applied as is).
-`scripts/staging-root.sh` fills them. It prints by default and applies only with `--apply --context <ctx>`.
+#### r415 root (the only staging root since CI v4 P7.1)
 
-- The release comes from the live root's `teknoir.org/release` annotation if there is one, otherwise from the newest
-  GitHub Release of `platform-applications-gitops` that is verified (not a draft or prerelease) and not marked by
-  `scripts/staging-release`: title starting `[rolled back]` or body line `Rolled-Back: true`, title starting
-  `[not applied]` or body line `Not-Applied: true` (nothing else counts). Or you name it: `--release staging-YYYYMMDD.N --sha <40-hex>`.
-- A release from GitHub or from `--release/--sha` is verified the same way: the tag exists and peels to the SHA
-  (`--untagged` allows a missing tag for the time before the first release), the SHA is on the first-parent history of
-  the gitops branch `main` (blobless fetch; `teknoir-cloud` as a fallback, `STAGING_BRANCH` overrides), and its `charts/app-of-apps/values.yaml` has the `release:` key.
-- `--apply` is for a fresh cluster. A live root already at the resolved release is left alone (no-op), a live root at
-  another release is refused (that is `scripts/staging-release`), and a live branch-following root (no annotation, the
-  state before the cutover) is refused with a pointer to `scripts/staging-release --bootstrap` in `platform-applications-gitops`.
-- `--check` does everything `--apply` would check, applies nothing and prints `<release> <sha>`.
-- The context must be exactly `vpro` or `r415`. Production-looking contexts (`*eks*`, `*online*`, `*prod*`) are
-  refused first, and anything else that is not exactly `vpro`/`r415` (`k3d-r415`, `r415-old`, …) is refused too.
-- Before a new cluster's first release the root can follow a gitops branch instead: `--pre-release BRANCH` renders
-  `teknoir-cloud-app-of-apps-prerelease.yaml.tmpl`, whose Application has no release annotation and sets
-  `targetRevision` and the `release` Helm parameter to the branch. The branch must exist on the remote and have the
-  release helper (`charts/app-of-apps/values.yaml` with a `release:` key); `main` and `teknoir-cloud` are refused (they
-  are staged by releases). `--apply` acts only on a fresh cluster or on a root already on that branch; it refuses a
-  released root and a root on another branch. `--check` prints `<branch> <sha>`. The cutover to a release is
-  `scripts/staging-release --bootstrap` in `platform-applications-gitops`.
+r415's root Application points at one **verified** commit of `platform-applications-gitops`, not at a branch or at a
+`staging-YYYYMMDD.N` release, and Stage `platform/staging` moves `targetRevision` from then on. Three files, all infra
+`main`:
 
-A fresh host is brought up with `scripts/staging-bootstrap.sh --context vpro|r415`, which resolves and verifies the
-release first (`staging-root.sh --check`), before any namespace, Secret or ArgoCD change, and passes it to `--apply`
-in step 3. `--host` defaults to `anders@192.168.2.19` on vpro and `anders@192.168.2.166` on r415; on r415
-`K3S_MANIFESTS` defaults to `/opt/k3s/server/manifests` (r415's k3s data-dir) and is passed to `deploy-argo.sh`.
-`--pre-release BRANCH` does the same for a branch-following root, and `--no-ci` skips the `teknoir-ci` namespace and
-its `github-ci` Secret.
+- `clusters/r415/root.yaml`: the AppProject `default` plus the `teknoir-system/app-of-apps` Application with
+  `targetRevision: __VERIFIED_SHA__`, the `kargo.akuity.io/authorized-stage: "platform:staging"` annotation and helm
+  parameter `release=$ARGOCD_APP_REVISION`. The placeholder is never applied as is.
+- `scripts/kargo-root.sh`: fills it from `--sha <40-hex>` or the newest stamped `verified/<UTC yyyymmddThhmmssZ>-<sha8>`
+  tag, after checking that the commit is an ancestor of the gitops default branch. Print by default; `--check` prints
+  `<sha> <tag>`; `--apply` needs `--context r415` and refuses to move a live root.
+- `clusters/r415/BREAK-GLASS.md`: the only way to move a live root by hand. **Anders only**; agents never run it.
+
+A fresh host is brought up with `scripts/staging-bootstrap.sh --context r415` (`--sha` names the commit), which
+resolves and verifies the commit first (`kargo-root.sh --check`), before any namespace, Secret or ArgoCD change, and
+passes it to `--apply` in step 3. `--host` defaults to `anders@192.168.2.166`; `K3S_MANIFESTS` defaults to
+`/opt/k3s/server/manifests` (r415's k3s data-dir) and is passed to `deploy-argo.sh`. `--no-ci` skips the `teknoir-ci`
+namespace and its `github-ci` Secret.
 The external credentials come from the environment and are never printed; the script's header lists them. One of
 them is TeknoirBot's model key: `TEKNOIRBOT_MODEL_KEY` (an Anthropic API key, best from a workspace with a monthly
 spend limit) becomes data key `teknoir-demo` of Secret `teknoir-system/teknoirbot-model-keys`, which backstage-api
@@ -92,25 +76,6 @@ reads. A missing credential only warns; an existing Secret (for the model key: a
 kept unless `FORCE=1`. Add another teamspace's key with `kubectl patch` or
 `kubectl apply --server-side --field-manager=teknoirbot-<namespace>`: if it is added under `staging-bootstrap` or with
 a client-side `kubectl apply`, `FORCE=1` (and the next such apply) deletes the other entries.
-Design: `plans/staging-releases.md` in the workspace. Tests: `scripts/tests/staging-root-test.sh`
-(`K3D_CONTEXT=k3d-teknoir-dev` adds a re-apply under the release guard in a scratch namespace).
-
-#### r415 root after the Kargo cut-over
-
-Once Kargo owns staging (CI v4 P5.2), r415's root Application points at one **verified** commit of
-`platform-applications-gitops`, not at a `staging-YYYYMMDD.N` release, and Stage `platform/staging` moves
-`targetRevision` from then on. Three files, all infra `main`:
-
-- `clusters/r415/root.yaml`: the AppProject `default` plus the `teknoir-system/app-of-apps` Application with
-  `targetRevision: __VERIFIED_SHA__`, the `kargo.akuity.io/authorized-stage: "platform:staging"` annotation and helm
-  parameter `release=$ARGOCD_APP_REVISION`. The placeholder is never applied as is.
-- `scripts/kargo-root.sh`: fills it from `--sha <40-hex>` or the newest stamped `verified/<UTC yyyymmddThhmmssZ>-<sha8>`
-  tag, after checking that the commit is an ancestor of the gitops default branch. Print by default; `--check` prints
-  `<sha> <tag>`; `--apply` needs `--context r415` and refuses to move a Kargo-owned root. A fresh r415 comes up with
-  `scripts/staging-bootstrap.sh --context r415 --kargo` (`--sha` names the commit; `--release`, `--untagged` and
-  `--pre-release` are excluded).
-- `clusters/r415/BREAK-GLASS.md`: the only way to move a live root by hand. **Anders only**; agents never run it.
-
 Design: `plans/cicd/proposal-v4.md` sections 3.1-3.4 and 6.2; tests: `scripts/tests/kargo-root-test.sh`.
 
 ### 3. Important manual steps
