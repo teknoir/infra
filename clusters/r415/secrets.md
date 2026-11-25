@@ -11,6 +11,7 @@ A rebuilt cluster gets back only what its minter recreates. The "rebuild" column
 | Namespace/Secret | What | Provided by | Rebuild |
 |---|---|---|---|
 | `cert-manager/godaddy-api-key-prod` | GoDaddy API key for DNS-01 | `scripts/staging-bootstrap.sh` (`GODADDY_API_KEY`, `GODADDY_API_SECRET`) | re-provide |
+| `teknoir-system/cluster-devhost-ci` | ArgoCD cluster Secret for devhost-ci (`https://192.168.2.181:6443`, bearer token of devhost-ci `kube-system/argocd-manager`), label `argocd.argoproj.io/secret-type: cluster` (CI v4 P6.3) | Opus pipes it from devhost-ci (`clusters/devhost-ci/argocd-manager.yaml`, `secrets.md` there); never printed | re-apply argocd-manager.yaml on devhost-ci, pipe again |
 | `teknoir-system/ghcr-token`, `teknoir-auth/ghcr-token` | ghcr pull (dockerconfigjson) | `staging-bootstrap.sh` (`GITHUB_PAT`) | re-provide |
 | `teknoir-system/backstage-github-app-secret` | Backstage GitHub App (+ GCP SA); device-controller reads the fleet repo with it | `staging-bootstrap.sh` (`BACKSTAGE_GITHUB_APP_FILE`) | re-provide |
 | `teknoir-system/teknoirbot-model-keys` | Anthropic API key for the teknoir-demo bots | `staging-bootstrap.sh` (`TEKNOIRBOT_MODEL_KEY`) | re-provide |
