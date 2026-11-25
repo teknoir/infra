@@ -1,0 +1,46 @@
+# devhost-ci: the identity staging's ArgoCD (r415) uses to manage this cluster (CI v4 P6.3, plans/cicd/proposal-v4.md
+# 5.7). r415's ArgoCD syncs the ci-runners Applications (gitops charts/app-of-apps/templates/ci-runners.yaml) here,
+# so it gets cluster-admin on devhost-ci: the same exposure as the dev host's docker group (accepted in 5.7).
+#
+#   kubectl --context devhost-ci apply -f clusters/devhost-ci/argocd-manager.yaml
+#
+# The token Secret below is filled by Kubernetes. It is piped, never printed, into the r415 ArgoCD cluster Secret
+# teknoir-system/cluster-devhost-ci (secrets.md). Rotate: delete the token Secret, re-apply this file, pipe again.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: argocd-manager
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: argocd-manager-role
+rules:
+  - apiGroups: ["*"]
+    resources: ["*"]
+    verbs: ["*"]
+  - nonResourceURLs: ["*"]
+    verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: argocd-manager-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: argocd-manager-role
+subjects:
+  - kind: ServiceAccount
+    name: argocd-manager
+    namespace: kube-system
+---
+apiVersion: v1
+kind: Secret
+type: kubernetes.io/service-account-token
+metadata:
+  name: argocd-manager-long-lived-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: argocd-manager
